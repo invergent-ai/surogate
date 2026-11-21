@@ -8,11 +8,17 @@
 //   MoE (synthetic weights, both formats): cosine / rel-L2 per token vs a host pipeline with fp64
 //   dots; width invariance BIT-EXACT (T = 1 vs 24 vs 300 rounds, padding via live_tokens);
 //   capture rows; expert LoRA: zero adapter bit-equal, base tokens bit-equal, delta vs host.
+// Capture mode (`sinfer_inkling_moe_test --capture <moe_capture_v*.safetensors>`, written by
+// lanes/d/scripts/extract_moe_capture.py from lane a's eager capture of the vLLM image's own kernels): every stage
+// compared BIT FOR BIT against the reference GPU kernels (routing, x quantisation, SiTU + requantisation on the
+// captured gate_up, the full op's y_q / down rows / output).
 // Golden-vector mode (lane a's vectors/) is added once their format is published (M3).
 
 #include "api/ops/inkling_moe.h"
 #include "core/arena.h"
 #include "ops/op_tester.h"
+
+#include <nlohmann/json.hpp>
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -24,6 +30,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <map>
+#include <string>
 #include <iostream>
 #include <vector>
 
@@ -558,7 +567,8 @@ int test_route(const Layer& l, const std::vector<float>& x, int tokens) {
                 dot += double(xt[k]) * l.router[static_cast<std::size_t>(e) * H + k];
                 mag += std::fabs(double(xt[k]) * l.router[static_cast<std::size_t>(e) * H + k]);
             }
-            bad_logits += std::fabs(logits[static_cast<std::size_t>(t) * E + e] - dot) > mag * 0x1p-21 + 1e-30;
+            // fp32 chains of up to 64 MMAs per K group: a few roundings of 2^-24 each, relative to sum |x w|.
+            bad_logits += std::fabs(logits[static_cast<std::size_t>(t) * E + e] - dot) > mag * 0x1p-17 + 1e-30;
         }
         // Selection from the device's own logits (host fp32 sigmoid; near-ties excused).
         std::vector<std::pair<float, int>> sel(E);
@@ -688,9 +698,226 @@ int test_moe(ops::InklingExpertFormat format) {
     return failures;
 }
 
+
+// ---- capture mode: bit test against the vLLM image's kernels -----------------------------------
+struct SafeTensors {
+    std::vector<char> data;
+    std::map<std::string, std::pair<std::size_t, std::size_t>> spans; // name -> (offset, bytes)
+    std::map<std::string, std::string> meta;
+    const void* get(const std::string& name, std::size_t* bytes = nullptr) const {
+        const auto it = spans.find(name);
+        if (it == spans.end()) { return nullptr; }
+        if (bytes != nullptr) { *bytes = it->second.second; }
+        return data.data() + it->second.first;
+    }
+    template <class T>
+    std::vector<T> vec(const std::string& name) const {
+        std::size_t bytes = 0;
+        const void* p = get(name, &bytes);
+        if (p == nullptr) { throw std::runtime_error("capture file lacks " + name); }
+        std::vector<T> out(bytes / sizeof(T));
+        std::memcpy(out.data(), p, bytes);
+        return out;
+    }
+};
+
+SafeTensors read_safetensors(const char* path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) { throw std::runtime_error(std::string("cannot open ") + path); }
+    std::uint64_t header_bytes = 0;
+    in.read(reinterpret_cast<char*>(&header_bytes), 8);
+    std::string header(header_bytes, '\0');
+    in.read(header.data(), static_cast<std::streamsize>(header_bytes));
+    const auto json = nlohmann::json::parse(header);
+    SafeTensors st;
+    in.seekg(0, std::ios::end);
+    const std::size_t total = static_cast<std::size_t>(in.tellg()) - 8 - header_bytes;
+    in.seekg(static_cast<std::streamoff>(8 + header_bytes));
+    st.data.resize(total);
+    in.read(st.data.data(), static_cast<std::streamsize>(total));
+    for (const auto& [name, value] : json.items()) {
+        if (name == "__metadata__") {
+            for (const auto& [k, v] : value.items()) { st.meta[k] = v.get<std::string>(); }
+            continue;
+        }
+        const auto begin = value["data_offsets"][0].get<std::size_t>();
+        const auto end   = value["data_offsets"][1].get<std::size_t>();
+        st.spans[name]   = {begin, end - begin};
+    }
+    return st;
+}
+
+template <class T>
+int count_mismatch(const std::vector<T>& a, const std::vector<T>& b) {
+    if (a.size() != b.size()) { return static_cast<int>(std::max(a.size(), b.size())); }
+    int bad = 0;
+    for (std::size_t i = 0; i < a.size(); ++i) { bad += std::memcmp(&a[i], &b[i], sizeof(T)) != 0; }
+    return bad;
+}
+
+int run_capture(const char* path) {
+    const SafeTensors st = read_safetensors(path);
+    const bool nv   = st.meta.at("format") == "nvfp4";
+    const int tokens = std::stoi(st.meta.at("tokens"));
+    std::printf("[capture %s: layer %s visit %s, %s, T=%d]\n", path, st.meta.at("layer").c_str(),
+                st.meta.at("visit").c_str(), nv ? "NVFP4" : "MXFP8", tokens);
+    const auto format = nv ? ops::InklingExpertFormat::Nvfp4 : ops::InklingExpertFormat::Mxfp8;
+    Layer l;
+    l.format = format;
+    l.d_router = to_device(st.vec<std::uint16_t>("router"));
+    l.d_bias   = to_device(st.vec<float>("router_bias"));
+    l.view.format      = format;
+    l.view.router      = l.d_router.p;
+    l.view.router_bias = static_cast<const float*>(l.d_bias.p);
+    const char* names[2] = {"w13", "w2"};
+    const int ks[2]      = {H, I};
+    ops::InklingExpertBank* banks[2] = {&l.view.w13, &l.view.w2};
+    for (int p = 0; p < 2; ++p) {
+        l.codes[p] = st.vec<std::uint8_t>(std::string(names[p]) + "_codes");
+        auto scales = st.vec<std::uint8_t>(std::string(names[p]) + "_scales");
+        if (nv) {
+            // checkpoint row-major [E * N][K/16] -> blockscale-k16-m128x4 (the artifact layout)
+            const int groups = ks[p] / 16;
+            l.scales[p].assign(scales.size(), 0);
+            for (std::size_t r = 0; r < static_cast<std::size_t>(E) * N; ++r) {
+                for (int g = 0; g < groups; ++g) { l.scales[p][nvfp4_scale_offset(r, g, groups)] = scales[r * groups + g]; }
+            }
+            l.amax[p] = st.vec<float>(std::string(names[p]) + "_amax");
+            l.den     = st.vec<float>(std::string(names[p]) + "_den")[0];
+            l.d_amax[p] = to_device(l.amax[p]);
+            banks[p]->amax = static_cast<const float*>(l.d_amax[p].p);
+        } else {
+            l.scales[p] = std::move(scales);
+        }
+        l.d_codes[p]  = to_device(l.codes[p]);
+        l.d_scales[p] = to_device(l.scales[p]);
+        banks[p]->codes  = static_cast<const std::uint8_t*>(l.d_codes[p].p);
+        banks[p]->scales = static_cast<const std::uint8_t*>(l.d_scales[p].p);
+    }
+    if (nv) {
+        l.d_den = to_device(std::vector<float>{l.den});
+        l.view.w13.outer_den = static_cast<const float*>(l.d_den.p);
+        l.view.w2.outer_den  = static_cast<const float*>(l.d_den.p);
+    }
+    int failures = 0;
+    const auto x_bits = st.vec<std::uint16_t>("x");
+    DeviceBuffer dx = to_device(x_bits);
+    Tensor tx(dx.p, DType::BF16, {H, tokens});
+    const auto ref_ids    = st.vec<int>("ids");
+    const auto ref_gammas = st.vec<float>("gammas");
+
+    // 1. routing
+    {
+        DeviceBuffer dl(static_cast<std::size_t>(tokens) * E * 4), di(static_cast<std::size_t>(tokens) * TOPK * 4),
+            dw(static_cast<std::size_t>(tokens) * TOPK * 4);
+        Tensor tl(dl.p, DType::FP32, {E, tokens}), ti(di.p, DType::I32, {TOPK, tokens}), tw(dw.p, DType::FP32, {TOPK, tokens});
+        ops::inkling_route(tx, l.view, tl, ti, tw, nullptr);
+        cuda_synchronize();
+        const int bad_ids = count_mismatch(from_device<int>(di, ref_ids.size()), ref_ids);
+        const int bad_w   = count_mismatch(from_device<float>(dw, ref_gammas.size()), ref_gammas);
+        std::printf("  route: ids off %d, gammas off %d (of %zu)\n", bad_ids, bad_w, ref_ids.size());
+        failures += report("capture: routing ids + weights bit-exact", bad_ids + bad_w);
+    }
+    // 2. x quantisation (+ the NVFP4 gate_up row scale)
+    {
+        const auto ref_codes  = st.vec<std::uint8_t>("x_codes");
+        const auto ref_scales = st.vec<std::uint8_t>("x_scales");
+        int bad = 0;
+        if (nv) {
+            DeviceBuffer c(static_cast<std::size_t>(tokens) * H / 2), s(static_cast<std::size_t>(tokens) * H / 16), a(tokens * 4);
+            Tensor tc(c.p, DType::U8, {H / 2, tokens}), ts(s.p, DType::U8, {H / 16, tokens}), ta(a.p, DType::FP32, {tokens});
+            ops::inkling_quant_nvfp4_4o6(tx, tc, ts, ta, nullptr);
+            cuda_synchronize();
+            bad += count_mismatch(from_device<std::uint8_t>(c, c.bytes), ref_codes);
+            bad += count_mismatch(from_device<std::uint8_t>(s, s.bytes), ref_scales);
+            const auto amax = from_device<float>(a, tokens);
+            const auto ref_rs = st.vec<float>("x_rowscale");
+            const float rcp = 1.0F / (1536.0F * l.den);
+            int bad_rs = 0;
+            for (int t = 0; t < tokens; ++t) {
+                for (int k = 0; k < TOPK; ++k) {
+                    const float rs = (amax[t] * l.amax[0][ref_ids[t * TOPK + k]]) * rcp;
+                    bad_rs += bits_of(rs) != bits_of(ref_rs[t * TOPK + k]);
+                }
+            }
+            std::printf("  x quant: code/scale bytes off %d, gate_up row scales off %d\n", bad, bad_rs);
+            bad += bad_rs;
+        } else {
+            DeviceBuffer c(static_cast<std::size_t>(tokens) * H), s(static_cast<std::size_t>(tokens) * H / 32);
+            Tensor tc(c.p, DType::U8, {H, tokens}), ts(s.p, DType::U8, {H / 32, tokens});
+            ops::inkling_quant_mxfp8(tx, tc, ts, nullptr);
+            cuda_synchronize();
+            bad += count_mismatch(from_device<std::uint8_t>(c, c.bytes), ref_codes);
+            bad += count_mismatch(from_device<std::uint8_t>(s, s.bytes), ref_scales);
+            std::printf("  x quant: code/scale bytes off %d\n", bad);
+        }
+        failures += report("capture: x quantisation bit-exact", bad);
+    }
+    // 3. SiTU + requantisation on the CAPTURED gate_up rows (isolates them from the GEMM)
+    const std::size_t slots = static_cast<std::size_t>(tokens) * TOPK;
+    {
+        DeviceBuffer gu = to_device(st.vec<std::uint16_t>("gate_up")), g = to_device(ref_gammas), y(slots * I * 2);
+        Tensor tgu(gu.p, DType::BF16, {2 * I, static_cast<int>(slots)}), tg(g.p, DType::FP32, {static_cast<int>(slots)}),
+            ty(y.p, DType::BF16, {I, static_cast<int>(slots)});
+        ops::inkling_softcap_swiglu(tgu, tg, ty, nullptr);
+        int bad = 0;
+        const auto ref_codes  = st.vec<std::uint8_t>("y_codes");
+        const auto ref_scales = st.vec<std::uint8_t>("y_scales");
+        if (nv) {
+            DeviceBuffer c(slots * I / 2), s(slots * I / 16), a(slots * 4);
+            Tensor tc(c.p, DType::U8, {I / 2, static_cast<int>(slots)}), ts(s.p, DType::U8, {I / 16, static_cast<int>(slots)}),
+                ta(a.p, DType::FP32, {static_cast<int>(slots)});
+            ops::inkling_quant_nvfp4_4o6(ty, tc, ts, ta, nullptr);
+            cuda_synchronize();
+            bad += count_mismatch(from_device<std::uint8_t>(c, c.bytes), ref_codes);
+            bad += count_mismatch(from_device<std::uint8_t>(s, s.bytes), ref_scales);
+            const auto amax   = from_device<float>(a, slots);
+            const auto ref_rs = st.vec<float>("y_rowscale");
+            const float rcp   = 1.0F / (1536.0F * l.den);
+            for (std::size_t i = 0; i < slots; ++i) {
+                bad += bits_of((amax[i] * l.amax[1][ref_ids[i]]) * rcp) != bits_of(ref_rs[i]);
+            }
+        } else {
+            DeviceBuffer c(slots * I), s(slots * I / 32);
+            Tensor tc(c.p, DType::U8, {I, static_cast<int>(slots)}), ts(s.p, DType::U8, {I / 32, static_cast<int>(slots)});
+            ops::inkling_quant_mxfp8(ty, tc, ts, nullptr);
+            cuda_synchronize();
+            bad += count_mismatch(from_device<std::uint8_t>(c, c.bytes), ref_codes);
+            bad += count_mismatch(from_device<std::uint8_t>(s, s.bytes), ref_scales);
+        }
+        std::printf("  SiTU + requant on captured gate_up: bytes / row scales off %d\n", bad);
+        failures += report("capture: SiTU + requantisation bit-exact", bad);
+    }
+    // 4. the whole op with taps: y_q, down rows, output
+    {
+        DeviceBuffer out(static_cast<std::size_t>(tokens) * H * 2), y_codes(slots * (nv ? I / 2 : I)),
+            y_scales(slots * (nv ? I / 16 : I / 32)), y_amax(slots * 4), down(slots * H * 2);
+        ops::InklingMoeTaps taps;
+        taps.y_codes  = static_cast<std::uint8_t*>(y_codes.p);
+        taps.y_scales = static_cast<std::uint8_t*>(y_scales.p);
+        taps.y_amax   = static_cast<float*>(y_amax.p);
+        taps.down     = down.p;
+        ops::InklingMoeOptions options;
+        options.taps = &taps;
+        DeviceArena arena(ops::inkling_moe_workspace_bytes(format, tokens, false));
+        Tensor tout(out.p, DType::BF16, {H, tokens});
+        ops::inkling_moe(tx, l.view, tout, arena, nullptr, options);
+        cuda_synchronize();
+        const int bad_y = count_mismatch(from_device<std::uint8_t>(y_codes, y_codes.bytes), st.vec<std::uint8_t>("y_codes")) +
+                          count_mismatch(from_device<std::uint8_t>(y_scales, y_scales.bytes), st.vec<std::uint8_t>("y_scales"));
+        const int bad_down = count_mismatch(from_device<std::uint16_t>(down, slots * H), st.vec<std::uint16_t>("down"));
+        const int bad_out  = count_mismatch(from_device<std::uint16_t>(out, static_cast<std::size_t>(tokens) * H), st.vec<std::uint16_t>("out"));
+        std::printf("  inkling_moe: y_q bytes off %d, down elements off %d, output elements off %d\n", bad_y, bad_down, bad_out);
+        failures += report("capture: gate_up GEMM + SiTU + requant (y_q) bit-exact", bad_y);
+        failures += report("capture: down GEMM rows bit-exact", bad_down);
+        failures += report("capture: combined output bit-exact", bad_out);
+    }
+    return failures;
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     if (cuda_unavailable()) {
         std::printf("no CUDA device: skipped\n");
         return 77;
@@ -703,6 +930,11 @@ int main() {
         return 77;
     }
     int failures = 0;
+    if (argc == 3 && std::string(argv[1]) == "--capture") {
+        failures = run_capture(argv[2]);
+        std::printf("%s (%d failing checks)\n", failures == 0 ? "ALL PASS" : "FAILURES", failures);
+        return failures == 0 ? 0 : 1;
+    }
     failures += test_quant_nvfp4(H);
     failures += test_quant_nvfp4(I);
     failures += test_quant_mxfp8(H);

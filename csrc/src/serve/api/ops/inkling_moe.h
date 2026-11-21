@@ -117,6 +117,17 @@ struct InklingMoeAdapters {
     std::int32_t max_rank          = 0;       ///< the store's padded rank (<= kMaxAdapterRank)
 };
 
+/// Test / debug taps: device buffers the call copies its intermediates into, by SLOT row
+/// (token * 8 + slot; only routed slots are written). Null fields are skipped. Not for serving.
+struct InklingMoeTaps {
+    std::int32_t* ids     = nullptr; ///< I32 [T * 8]
+    float* gammas         = nullptr; ///< FP32 [T * 8]
+    std::uint8_t* y_codes = nullptr; ///< the re-quantised SiTU output: NVFP4 [T*8][576] | MXFP8 [T*8][1152]
+    std::uint8_t* y_scales = nullptr; ///< its block scales, row-major: NVFP4 [T*8][72] | MXFP8 [T*8][36]
+    float* y_amax         = nullptr; ///< NVFP4 only: FP32 [T * 8]
+    void* down            = nullptr; ///< BF16 [T * 8][2304]: the down projection's rows
+};
+
 struct InklingMoeOptions {
     /// Device I32 [1]: the round's live token count (<= x's T). Tokens at or past it are padding:
     /// routed to no expert (they pull no expert bytes), output 0, not captured. Null = all T live.
@@ -127,6 +138,8 @@ struct InklingMoeOptions {
     /// thread's `ScopedSparseMoeCapture` target (api/ops/sparse_moe.h), if any, is used with
     /// token_stride 8 and first_token 0.
     const InklingMoeCapture* capture = nullptr;
+    /// Test / debug only (see InklingMoeTaps).
+    const InklingMoeTaps* taps = nullptr;
 };
 
 /// Transient workspace one `inkling_moe` call of up to `max_tokens` tokens needs (graph-stable,

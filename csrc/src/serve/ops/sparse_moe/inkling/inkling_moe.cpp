@@ -12,6 +12,7 @@
 #include "ops/sparse_moe/inkling/inkling_moe_internal.h"
 
 #include <cuda_bf16.h>
+#include <cuda_runtime.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -224,7 +225,9 @@ void inkling_moe(const Tensor& x, const InklingMoeWeights& weights, Tensor& out,
         launch_quant_nvfp4(b.y, slots, kIntermediate, b.ids, live, b.y_codes, b.y_scales, b.y_amax, stream);
     } else {
         launch_mxfp8_gate_up(gate_up, slots, schedule, stream);
-        launch_quant_mxfp8(b.y, slots, kIntermediate, b.ids, live, nullptr, nullptr, b.y_bf16, stream);
+        const InklingMoeTaps* taps = options.taps;
+        launch_quant_mxfp8(b.y, slots, kIntermediate, b.ids, live, taps != nullptr ? taps->y_codes : nullptr,
+                           taps != nullptr ? taps->y_scales : nullptr, b.y_bf16, stream);
     }
 
     if (adapted) {
@@ -251,6 +254,25 @@ void inkling_moe(const Tensor& x, const InklingMoeWeights& weights, Tensor& out,
     }
 
     launch_combine(b.down, b.ids, live, static_cast<__nv_bfloat16*>(out.data), stream);
+
+    if (const InklingMoeTaps* taps = options.taps; taps != nullptr) {
+        const auto copy = [&](void* destination, const void* source, std::size_t bytes) {
+            if (destination == nullptr || source == nullptr) { return; }
+            const cudaError_t status = cudaMemcpyAsync(destination, source, bytes, cudaMemcpyDeviceToDevice, stream);
+            if (status != cudaSuccess) {
+                throw std::runtime_error(std::string("inkling_moe taps: ") + cudaGetErrorString(status));
+            }
+        };
+        const std::size_t s = static_cast<std::size_t>(slots);
+        copy(taps->ids, b.ids, s * sizeof(std::int32_t));
+        copy(taps->gammas, b.gammas, s * sizeof(float));
+        if (nvfp4) {
+            copy(taps->y_codes, b.y_codes, s * (kIntermediate / 2));
+            copy(taps->y_scales, b.y_scales, s * (kIntermediate / 16));
+            copy(taps->y_amax, b.y_amax, s * sizeof(float));
+        }
+        copy(taps->down, b.down, s * kHidden * sizeof(__nv_bfloat16));
+    }
 }
 
 void inkling_route(const Tensor& x, const InklingMoeWeights& weights, Tensor& logits, Tensor& ids,
