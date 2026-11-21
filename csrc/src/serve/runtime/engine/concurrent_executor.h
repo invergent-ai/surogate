@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #include "core/limits.h"
 #include <deque>
@@ -82,10 +83,22 @@ public:
         }
     }
 
+    /// Lane f1: SUROGATE_SERVE_KV_IDLE_RELEASE=0 turns the two idle-KV releases below off (the
+    /// behaviour before them: a short head with nothing running is refused, one whose second pass
+    /// counted only shared prefixes is retried until it expires). A test / rollback switch.
+    static bool idle_kv_release_enabled() noexcept {
+        static const bool enabled = [] {
+            const char* raw = std::getenv("SUROGATE_SERVE_KV_IDLE_RELEASE");
+            return raw == nullptr || std::strcmp(raw, "0") != 0;
+        }();
+        return enabled;
+    }
+
     /// Lane f1: the shared-prefix cache's entries go (pages a running or retained fork borrows stay
     /// with it), and every lane re-plans: a plan that forks a dropped entry would keep its pages.
     /// Returns false when this program has no shared-prefix cache.
     bool drop_shared_prefixes_for_admission() noexcept {
+        if (!idle_kv_release_enabled()) { return false; }
         if constexpr (requires(typename Package::Program& p) { p.drop_shared_prefixes(); }) {
             instance_.program->drop_shared_prefixes();
             for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) { invalidate_lane_plans(lane); }
@@ -105,6 +118,7 @@ public:
     /// where there is one -- and returns true; the head re-plans and tries again. False when
     /// nothing idle is left, and only then is the head refused.
     bool release_idle_kv_for_head(const std::shared_ptr<Request>& head) {
+        if (!idle_kv_release_enabled()) { return false; }
         if (idle_release_head_ != head->id) {
             idle_release_head_ = head->id;
             if (drop_shared_prefixes_for_admission()) { return true; }
