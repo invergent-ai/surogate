@@ -105,34 +105,22 @@ __device__ __forceinline__ float cell_scale(const LinearSegment& s, int local, i
 }
 
 // ---- narrow: N <= 16 columns (decode, verify) ------------------------------------------------------------------------
-// A warp owns 8 weight rows (one n8 tile) and all N tokens (one m16 tile). ALL of its codes (8 rows x K) are copied to
-// shared memory with cp.async at entry, before the PDL wait (weights never depend on the previous kernel): every byte
-// of the launch is in flight at once, as the old GEMV had it, and the compiler cannot sink the copies. Copies are
-// committed in groups of 4 cells; the walk waits group by group. Lane (gid, lid) reads row gid's 8 codes of a chunk
-// (32-byte chunk j of row r at j ^ (r & 3): conflict-free) and tokens gid / gid + 8 of x (L1 / L2 resident). Two
-// cells run interleaved (independent chains).
-inline constexpr int kNarrowWarps = 2;
-inline constexpr int kNarrowRows  = kNarrowWarps * 8;
-
-__device__ __forceinline__ void cp_wait_upto(int pending) {
-    switch (pending) {
-    case 0: cp_wait<0>(); break;
-    case 1: cp_wait<1>(); break;
-    case 2: cp_wait<2>(); break;
-    case 3: cp_wait<3>(); break;
-    case 4: cp_wait<4>(); break;
-    case 5: cp_wait<5>(); break;
-    case 6: cp_wait<6>(); break;
-    default: cp_wait<7>(); break;
-    }
-}
+// A warp owns 8 weight rows (one n8 tile) and all N tokens (one m16 tile). Its codes stream through a per-warp
+// shared-memory ring of kNarrowStages cells (8 rows x 128 codes = 1 KiB a stage) filled with cp.async -- the copies are
+// in flight from entry (before the PDL wait: weights never depend on the previous kernel) and the compiler cannot sink
+// them, so kNarrowStages - 1 KiB per warp stay in flight. Lane (gid, lid) reads row gid's 8 codes of each chunk from the
+// ring (32-byte chunk j of row r at j ^ (r & 3): conflict-free) and tokens gid / gid + 8 of x (L1 / L2 resident). Two
+// cells run interleaved (independent chains). Measured best (perf5 11:24: qkvr N=1 13.4 us = 86 %, wo 9.3); a 16-cell ring
+// with an L2 slab prefetch (perf6) and all codes at entry (perf7 / 8) were slower.
+inline constexpr int kNarrowWarps  = 2;
+inline constexpr int kNarrowRows   = kNarrowWarps * 8;
+inline constexpr int kNarrowStages = 8;
 
 template <int K, bool PerRow>
 __global__ __launch_bounds__(kNarrowWarps * 32) void narrow_kernel(const LinearParams p) {
-    constexpr int Cells  = K / 128;
-    constexpr int Groups = (Cells + 3) / 4;
-    static_assert(Cells % 2 == 0 && Groups <= 8, "cells run in pairs; wait_group immediate");
-    extern __shared__ __align__(16) std::uint8_t narrow_smem[];
+    constexpr int Cells = K / 128;
+    static_assert(Cells % 2 == 0, "cells run in pairs");
+    __shared__ __align__(16) std::uint8_t ring_all[kNarrowWarps][kNarrowStages][8 * 128];
     const int block        = static_cast<int>(blockIdx.x);
     const LinearSegment& s = p.seg[segment_of(p, block)];
     const int warp         = static_cast<int>(threadIdx.x) >> 5;
@@ -140,10 +128,10 @@ __global__ __launch_bounds__(kNarrowWarps * 32) void narrow_kernel(const LinearP
     const int gid          = lane >> 2;
     const int lid          = lane & 3;
     const int local0       = (block - s.block_begin) * kNarrowRows + warp * 8;
-    std::uint8_t* slab     = narrow_smem + static_cast<std::size_t>(warp) * Cells * 1024; // [cell][row][128]
+    std::uint8_t (*ring)[8 * 128] = ring_all[warp];
 
-    // Cell c of the warp's 8 rows: 64 pieces of 16 bytes, two a lane. A row past the end re-reads the last row and
-    // writes nothing.
+    // Cell c of the warp's 8 rows into slot c % kNarrowStages: 64 pieces of 16 bytes, two a lane. A row past the end
+    // re-reads the last row and writes nothing.
     const auto stage = [&](int c) {
 #pragma unroll
         for (int i = 0; i < 2; ++i) {
@@ -152,14 +140,13 @@ __global__ __launch_bounds__(kNarrowWarps * 32) void narrow_kernel(const LinearP
             const int q     = piece & 7; // 16-byte piece of the row's 128-byte cell
             const std::uint8_t* src =
                 s.codes + static_cast<std::int64_t>(s.row_begin + min(local0 + r, s.rows - 1)) * K + c * 128 + q * 16;
-            std::uint8_t* dst = slab + c * 1024 + r * 128 + ((((q >> 1) ^ (r & 3)) << 5) | ((q & 1) << 4));
+            std::uint8_t* dst = &ring[c % kNarrowStages][r * 128 + ((((q >> 1) ^ (r & 3)) << 5) | ((q & 1) << 4))];
             cp_async<16, Cache::cg>(dst, src);
         }
     };
 #pragma unroll
-    for (int g = 0; g < Groups; ++g) {
-#pragma unroll
-        for (int c = 4 * g; c < 4 * g + 4 && c < Cells; ++c) { stage(c); }
+    for (int c = 0; c < kNarrowStages - 1; ++c) {
+        if (c < Cells) { stage(c); }
         cp_commit();
     }
     pdl::wait_for_dependencies();
@@ -171,18 +158,16 @@ __global__ __launch_bounds__(kNarrowWarps * 32) void narrow_kernel(const LinearP
     const __nv_bfloat16* x1 = s.x + static_cast<std::int64_t>(t1 ? gid + 8 : 0) * K + 8 * lid;
     const auto mask         = [](uint4 v, bool ok) { return ok ? v : make_uint4(0, 0, 0, 0); };
     const auto codes        = [&](int c, int j) {
-        const uint2 cw = load_vec<uint2>(slab + c * 1024 + gid * 128 + ((j ^ (gid & 3)) << 5) + 8 * lid);
+        const uint2 cw = load_vec<uint2>(&ring[c % kNarrowStages][gid * 128 + ((j ^ (gid & 3)) << 5) + 8 * lid]);
         return e4m3x8_to_bf16x8(make_int2(static_cast<int>(cw.x), static_cast<int>(cw.y)));
     };
     float acc[4]   = {0.0F, 0.0F, 0.0F, 0.0F};
     float part0[4] = {0.0F, 0.0F, 0.0F, 0.0F};
     float part1[4] = {0.0F, 0.0F, 0.0F, 0.0F};
-#pragma unroll
+#pragma unroll 1
     for (int c = 0; c < Cells; c += 2) {
-        if ((c & 3) == 0) {
-            cp_wait_upto(Groups - 1 - (c + 1) / 4); // the group holding cells c, c + 1 has landed (this lane's copies) ...
-            __syncwarp();                           // ... and every lane's
-        }
+        cp_wait<kNarrowStages - 3>(); // cells c and c + 1 have landed (this lane's copies) ...
+        __syncwarp();                 // ... and every lane's
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             const int ch0 = 4 * c + j, ch1 = 4 * c + 4 + j;
@@ -198,6 +183,11 @@ __global__ __launch_bounds__(kNarrowWarps * 32) void narrow_kernel(const LinearP
         }
         cell_end<PerRow>(acc, part0, s00, s01);
         cell_end<PerRow>(acc, part1, s10, s11);
+        __syncwarp(); // every lane is done with the two slots before they are refilled
+        if (c + kNarrowStages - 1 < Cells) { stage(c + kNarrowStages - 1); }
+        cp_commit();
+        if (c + kNarrowStages < Cells) { stage(c + kNarrowStages); }
+        cp_commit();
     }
 #pragma unroll
     for (int e = 0; e < 4; ++e) {
@@ -207,20 +197,6 @@ __global__ __launch_bounds__(kNarrowWarps * 32) void narrow_kernel(const LinearP
         const float y = PerRow ? __fmul_rn(acc[e], s.scales[(s.row_begin + local) / s.rows_per]) : acc[e];
         s.out[static_cast<std::int64_t>(tok) * s.out_stride + local] = __float2bfloat16_rn(y);
     }
-}
-
-template <int K, bool PerRow>
-void launch_narrow(const pdl::LaunchConfig& base, const LinearParams& params) {
-    constexpr int bytes = kNarrowWarps * (K / 128) * 1024;
-    auto* kernel        = narrow_kernel<K, PerRow>;
-    static const bool configured = [&] {
-        CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
-        return true;
-    }();
-    (void)configured;
-    pdl::LaunchConfig launch = base;
-    launch.dynamic_smem_bytes = bytes;
-    CUDA_CHECK(pdl::launch_dependent(launch, kernel, params));
 }
 
 // ---- GEMM: N > 16 columns ------------------------------------------------------------------------------------------
@@ -452,9 +428,11 @@ void inkling_attn_linear(std::span<const InklingProjection> projections, Workspa
     if (!gemm) {
         const pdl::LaunchConfig launch{dim3(static_cast<unsigned>(pr.blocks)), dim3(kNarrowWarps * 32), 0, stream};
         if (pr.k == 2304) {
-            if (per_row) { launch_narrow<2304, true>(launch, pr.params); } else { launch_narrow<2304, false>(launch, pr.params); }
+            CUDA_CHECK(per_row ? pdl::launch_dependent(launch, narrow_kernel<2304, true>, pr.params)
+                               : pdl::launch_dependent(launch, narrow_kernel<2304, false>, pr.params));
         } else {
-            if (per_row) { launch_narrow<3072, true>(launch, pr.params); } else { launch_narrow<3072, false>(launch, pr.params); }
+            CUDA_CHECK(per_row ? pdl::launch_dependent(launch, narrow_kernel<3072, true>, pr.params)
+                               : pdl::launch_dependent(launch, narrow_kernel<3072, false>, pr.params));
         }
         return;
     }

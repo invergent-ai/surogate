@@ -179,9 +179,9 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
     constexpr int NTW      = 8 / KS;  // score n-tiles of a warp
     constexpr int QW       = 4 / KS;  // key quarters of a warp
     constexpr int DTW      = 16 / KS; // P V dim n-tiles of a warp
-    // Decode with one row tile (W <= 5): q lives in shared memory (ldmatrix per k step) instead of 32 registers, which
-    // pays for a second block of codes in flight (two-deep register staging). Same q values, same bits.
-    constexpr bool QSmem   = Decode && MTiles == 1;
+    // QSmem (q in shared memory, ldmatrix per k step, which pays for a second block of codes in registers) is OFF:
+    // measured slower (perf8 12:0x: decode 1x8k 21.6 -> 23.1 us, 1x262k 380 -> 409). Kept compiled for a retry.
+    constexpr bool QSmem   = false;
     using Smem             = AttnSmem<MTiles, KS, Raw, Fold, QSmem>;
     constexpr int KeysW    = Smem::kKeysW;
     constexpr int kSS      = Smem::kStripStride;
@@ -1008,7 +1008,7 @@ Plan make_plan(InklingLayerKind kind, const GroupSpec& gs, std::int32_t width, s
 template <bool Local, bool Decode, int MTiles, int KS, int Mode>
 void launch_kernel(const Plan& plan, const AttnParams& p, cudaStream_t stream) {
     constexpr int Raw   = (Decode || KS > 1) ? 0 : pick_raw<MTiles, KS, Mode != kPartial>();
-    constexpr int bytes = static_cast<int>(sizeof(AttnSmem<MTiles, KS, Raw, Mode != kPartial, Decode && MTiles == 1>));
+    constexpr int bytes = static_cast<int>(sizeof(AttnSmem<MTiles, KS, Raw, Mode != kPartial, false>));
     static_assert(bytes <= kSmemLimit, "inkling attention: shared memory over the sm_120 limit");
     auto* kernel = rel_attention_kernel<Local, Decode, MTiles, KS, Mode, Raw>;
     static const bool configured = [&] {
