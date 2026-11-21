@@ -787,6 +787,10 @@ void run_invariance_case(const InvCase& c, const char* groups, std::uint32_t see
         compare("decode B4 persistent state", run_inv_route(c.kind, ip, layer, 1, r4, false, true));
         compare("decode B8 idle row persistent state", run_inv_route(c.kind, ip, layer, 1, r8, true, true));
         ops::inkling_attention_knobs().fused_fold_max = 0;
+        ops::inkling_attention_knobs().fold_fast = false; // fold_kernel's scan path for every row
+        compare("decode B4 scan fold", run_inv_route(c.kind, ip, layer, 1, r4));
+        compare("decode B8 idle row scan fold", run_inv_route(c.kind, ip, layer, 1, r8));
+        ops::inkling_attention_knobs().fold_fast = true;
         if (std::string(groups) == "p3" && std::getenv("SUROGATE_INKLING_ATTN_GROUPS") == nullptr) {
             g_key_groups = ops::InklingKeyGroups::Default; // the compiled default must be P3
             compare("decode B4 default key groups", run_inv_route(c.kind, ip, layer, 1, r4));
@@ -809,6 +813,9 @@ void run_invariance_case(const InvCase& c, const char* groups, std::uint32_t see
         compare("verify W16 B1 fused fold", run_inv_route(c.kind, ip, layer, 16, {{0, std::max(c.P0, std::min(v, c.L0 - 16)), 16}}));
         compare("verify W8 B4 persistent state", run_inv_route(c.kind, ip, layer, 8, r4, false, true));
         ops::inkling_attention_knobs().fused_fold_max = 0;
+        ops::inkling_attention_knobs().fold_fast = false;
+        compare("verify W8 B4 scan fold", run_inv_route(c.kind, ip, layer, 8, r4));
+        ops::inkling_attention_knobs().fold_fast = true;
         ops::inkling_attention_knobs().splits = 1;
         compare("verify W8 B4 workers 1", run_inv_route(c.kind, ip, layer, 8, r4));
         ops::inkling_attention_knobs().splits = 0;
@@ -2149,9 +2156,10 @@ void run_bench_fold() {
     g_key_groups = ops::InklingKeyGroups::Default;
     for (const char* meta : {"0", "1"}) {
         if (meta[0] == '1') { setenv("BENCH_META_STATIC", "1", 1); } else { unsetenv("BENCH_META_STATIC"); }
-        for (const int fused : {0, 1}) {
-            ops::inkling_attention_knobs().fused_fold_max = fused != 0 ? (1 << 30) : 0;
-            const std::string tag = std::string(fused != 0 ? " [fused" : " [kernel") + " meta=" + meta + "]";
+        for (const int fused : {2, 0, 1}) { // 2 = fold_kernel with its scan path (the pre-perf20 fold)
+            ops::inkling_attention_knobs().fused_fold_max = fused == 1 ? (1 << 30) : 0;
+            ops::inkling_attention_knobs().fold_fast      = fused != 2;
+            const std::string tag = std::string(fused == 1 ? " [fused" : fused == 2 ? " [scan kernel" : " [kernel") + " meta=" + meta + "]";
             const auto nm = [&](const char* w) { static std::string x; x = std::string(w) + tag; return x.c_str(); };
             bench_attention(nm("decode global 1x8k"), K::Global, 1, 1, 8191);
             bench_attention(nm("decode local 1x8k"), K::Local, 1, 1, 8191);
@@ -2189,6 +2197,7 @@ void run_bench_fold() {
         bench_fused_call(nm("call decode global 1x64k"), K::Global, 1, 1, 65535);
         bench_fused_call(nm("call verify W8 local 1x8k"), K::Local, 8, 1, 8184);
     }
+    ops::inkling_attention_knobs().fold_fast = true;
     unsetenv("BENCH_STATE");
     unsetenv("BENCH_META_STATIC");
     ops::inkling_attention_knobs().fused_fold_max = 0;

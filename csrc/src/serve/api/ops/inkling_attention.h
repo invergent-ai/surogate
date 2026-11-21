@@ -177,6 +177,9 @@ struct InklingAttentionKnobs {
     // launch (SUROGATE_INKLING_ATTN_FUSED_PROLOGUE=1). Same bits either way. Default off: perf18 measured it ~1 us
     // SLOWER per call than the separate prologue (local 1x8k call 8.4 -> 9.4 us with the fused fold).
     bool fused_prologue = false;
+    // fold_kernel: rows of <= 32 slots take the scan-free path (SUROGATE_INKLING_ATTN_FOLD_FAST=0 = always the scan).
+    // Same bits either way.
+    bool fold_fast = true;
 };
 [[nodiscard]] InklingAttentionKnobs& inkling_attention_knobs();
 

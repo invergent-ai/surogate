@@ -116,6 +116,7 @@ struct AttnParams {
     // (the call zeroes them: the prologue of the fused call, else zero_ints_kernel). Null: fold_kernel folds.
     std::int32_t* fold_counters;
     int final_mode; // the fused fold's output (kGated / kOutLse / kTrain / kDraft)
+    int fold_fast;  // fold_kernel's scan-free path for short rows (InklingAttentionKnobs::fold_fast)
     // In-kernel prologue (plain decode, W = 1, InPlace; the fused call only): the prologue's parameters. Each CTA forms
     // its 3 heads' q / r itself (q_values / r_value: prologue_kernel's functions) and the CTA whose groups hold the new
     // key runs kv_unit for its KV head (plane codes + the conv slot it alone reads). q / r stay in shared memory.
@@ -1250,7 +1251,7 @@ __global__ __launch_bounds__(128) void fold_kernel(const AttnParams p) {
     // A row of at most kFoldKernelFast slots (local rows, global rows below ~16k keys; uniform in the CTA: one row): every
     // operand in ONE round of loads, the running maximum and fold_coeffs on the fly, the two chains in slot order -- the
     // same operands and order as the scan path below, so the same bits -- without shared memory or barriers.
-    if (count <= kFoldKernelFast) {
+    if (p.fold_fast != 0 && count <= kFoldKernelFast) {
         float2 st[kFoldKernelFast];
         float xs[kFoldKernelFast];
         float gate_f = 0.0F, sink_f = 0.0F;
@@ -1475,6 +1476,7 @@ InklingAttentionKnobs& knobs() {
         x.fused_fold_max    = std::max(0, env_int("SUROGATE_INKLING_ATTN_FUSED_FOLD", x.fused_fold_max));
         x.linear_split      = std::clamp(env_int("SUROGATE_INKLING_LINEAR_SPLIT", x.linear_split), 0, 2);
         x.fused_prologue    = env_int("SUROGATE_INKLING_ATTN_FUSED_PROLOGUE", x.fused_prologue ? 1 : 0) != 0;
+        x.fold_fast         = env_int("SUROGATE_INKLING_ATTN_FOLD_FAST", 1) != 0;
         return x;
     }();
     return k;
@@ -1677,6 +1679,7 @@ AttnParams make_params(const InklingAttentionInputs& in, const InklingAttentionR
     p.l2_ahead        = std::clamp(k.l2_ahead, -1, 16); // -1: the route's default (run)
     p.pdl_trigger     = k.pdl_trigger ? 1 : 0;
     p.metadata_static = (rows.metadata_static && k.early_meta) ? 1 : 0;
+    p.fold_fast       = k.fold_fast ? 1 : 0;
     p.window          = Geo::kWindow;
     return p;
 }
