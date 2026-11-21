@@ -186,24 +186,34 @@ int test_gemm(const GemmShape& g, std::uint32_t seed) {
     return failures;
 }
 
-/// The 3-input qkvr of a global / looped visit: one grouped launch == three separate invariant calls, and a window of
-/// the grouped launch == the full round.
+/// The 3-input qkvr of a global visit with its dynamic taps: one grouped launch of 5 == the 3 row ranges as separate
+/// invariant calls + the 2 taps as a group of their own (every group problem runs unsplit), and a window of the
+/// grouped launch == the full round.
 int test_gemm_group(std::uint32_t seed) {
-    constexpr int kRows = 8600, kQ = 6552, kK = 6552, kV = 7576;
+    constexpr int kRows = 8600, kQ = 6552, kK = 6552, kV = 7576, kTap = 32;
     const auto w_bits = hash_bf16(static_cast<std::size_t>(kRows) * kD, seed, 0.06F);
+    const auto t_bits = hash_bf16(static_cast<std::size_t>(2) * kTap * kD, seed + 2, 0.06F);
+    DeviceBuffer d_t = to_device(t_bits);
+    const auto* tk = static_cast<const std::uint16_t*>(d_t.p);
+    const auto* tv = tk + static_cast<std::size_t>(kTap) * kD;
     const auto x_bits = hash_bf16(static_cast<std::size_t>(3) * kAll * kD, seed + 1, 1.0F);
     DeviceBuffer d_w = to_device(w_bits), d_x = to_device(x_bits);
     const auto* w = static_cast<const std::uint16_t*>(d_w.p);
     const auto x  = [&](int stream, int c0) {
         return static_cast<const std::uint16_t*>(d_x.p) + (static_cast<std::size_t>(stream) * kAll + c0) * kD;
     };
+    // out: [T][kRows] qkvr, then [T][32] k taps, then [T][32] v taps
     const auto grouped = [&](int c0, int T) {
-        DeviceBuffer out(static_cast<std::size_t>(T) * kRows * 2);
+        DeviceBuffer out(static_cast<std::size_t>(T) * (kRows + 2 * kTap) * 2);
         out.fill(0);
-        auto* o = static_cast<std::uint16_t*>(out.p);
+        auto* o  = static_cast<std::uint16_t*>(out.p);
+        auto* ok = o + static_cast<std::size_t>(T) * kRows;
+        auto* ov = ok + static_cast<std::size_t>(T) * kTap;
         const ops::InklingGemmProblem pr[] = {{w, kQ, x(0, c0), o, kRows},
                                               {w + static_cast<std::size_t>(kK) * kD, kV - kK, x(1, c0), o + kK, kRows},
-                                              {w + static_cast<std::size_t>(kV) * kD, kRows - kV, x(2, c0), o + kV, kRows}};
+                                              {w + static_cast<std::size_t>(kV) * kD, kRows - kV, x(2, c0), o + kV, kRows},
+                                              {tk, kTap, x(1, c0), ok, kTap},
+                                              {tv, kTap, x(2, c0), ov, kTap}};
         ops::inkling_gemm_inv_group(pr, kD, T, DType::BF16, nullptr);
         cuda_synchronize();
         return raw(out.p, out.bytes);
@@ -211,21 +221,36 @@ int test_gemm_group(std::uint32_t seed) {
     int failures = 0;
     const auto full = grouped(0, kAll);
     {
-        DeviceBuffer out(static_cast<std::size_t>(kAll) * kRows * 2);
+        DeviceBuffer out(static_cast<std::size_t>(kAll) * (kRows + 2 * kTap) * 2);
         out.fill(0);
-        auto* o = static_cast<std::uint16_t*>(out.p);
+        auto* o  = static_cast<std::uint16_t*>(out.p);
+        auto* ok = o + static_cast<std::size_t>(kAll) * kRows;
+        auto* ov = ok + static_cast<std::size_t>(kAll) * kTap;
         const int begin[] = {0, kK, kV}, rows[] = {kQ, kV - kK, kRows - kV};
         for (int i = 0; i < 3; ++i) {
             ops::inkling_gemm_inv(w + static_cast<std::size_t>(begin[i]) * kD, rows[i], kD, x(i, 0), kAll, o + begin[i],
                                   DType::BF16, kRows, {}, nullptr, 0, nullptr);
         }
+        const ops::InklingGemmProblem taps[] = {{tk, kTap, x(1, 0), ok, kTap}, {tv, kTap, x(2, 0), ov, kTap}};
+        ops::inkling_gemm_inv_group(taps, kD, kAll, DType::BF16, nullptr);
         cuda_synchronize();
-        failures += same_bits("I1 qkvr 3-input grouped launch == 3 separate calls (T=300)", full, raw(out.p, out.bytes), 2);
+        failures += same_bits("I1 qkvr + taps grouped (5) == 3 separate calls + the taps grouped alone (T=300)", full,
+                              raw(out.p, out.bytes), 2);
     }
+    // windows: the qkvr part and the two tap parts of the compact outputs
+    const auto part = [](const std::vector<std::uint8_t>& all, int T, std::size_t off_rows, int rows) {
+        return std::vector<std::uint8_t>(all.begin() + static_cast<std::ptrdiff_t>(T) * off_rows * 2,
+                                         all.begin() + static_cast<std::ptrdiff_t>(T) * (off_rows + rows) * 2);
+    };
     for (const auto& win : {std::pair<int, int>{0, 1}, std::pair<int, int>{299, 1}, std::pair<int, int>{100, 37}}) {
-        failures += same_bits("I1 qkvr grouped T=" + std::to_string(win.second) + " at " + std::to_string(win.first) +
-                                  " == T=300",
-                              grouped(win.first, win.second), gather(full, kRows, kAll, 1, win.first, win.second, 2), 2);
+        const auto sub          = grouped(win.first, win.second);
+        const std::string where = " T=" + std::to_string(win.second) + " at " + std::to_string(win.first) + " == T=300";
+        failures += same_bits("I1 grouped qkvr" + where, part(sub, win.second, 0, kRows),
+                              gather(part(full, kAll, 0, kRows), kRows, kAll, 1, win.first, win.second, 2), 2);
+        failures += same_bits("I1 grouped k taps" + where, part(sub, win.second, kRows, kTap),
+                              gather(part(full, kAll, kRows, kTap), kTap, kAll, 1, win.first, win.second, 2), 2);
+        failures += same_bits("I1 grouped v taps" + where, part(sub, win.second, kRows + kTap, kTap),
+                              gather(part(full, kAll, kRows + kTap, kTap), kTap, kAll, 1, win.first, win.second, 2), 2);
     }
     return failures;
 }

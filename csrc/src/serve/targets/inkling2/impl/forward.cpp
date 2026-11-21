@@ -353,7 +353,9 @@ void run_visit(Round& rd, int v) {
     // 2. projections: one GEMM over the fused rows, or three over their row ranges (q-side / K / V)
     Tensor qkvr = rd.work.alloc(DType::BF16, {C::qkvr_rows, T});
     const auto in = [&](int stream) { return bf16_ptr(attn_in) + static_cast<std::int64_t>(stream) * T * D; };
+    Tensor k_dyn, v_dyn;
     if (Q == 1) {
+        if (vi.global) { throw std::logic_error("inkling2: a global visit has three attention inputs"); }
         gemm_bf16(rd.work, L.qkvr, 0, C::qkvr_rows, in(0), T, qkvr.data, C::qkvr_rows, s);
     } else {
         // The q-side / K / V row ranges from their own inputs: one grouped launch, each element the chain of
@@ -363,21 +365,30 @@ void run_visit(Round& rd, int v) {
         }
         const auto* w = static_cast<const std::uint16_t*>(L.qkvr.qdata);
         const std::int64_t k = L.qkvr.k;
-        const ops::InklingGemmProblem problems[] = {
+        ops::InklingGemmProblem problems[5] = {
             {w, C::qkvr_query_end, in(0), qkvr.data, C::qkvr_rows},
             {w + C::qkvr_k_begin * k, C::qkvr_v_begin - C::qkvr_k_begin, in(1), bf16_ptr(qkvr) + C::qkvr_k_begin,
              C::qkvr_rows},
             {w + C::qkvr_v_begin * k, C::qkvr_rows - C::qkvr_v_begin, in(2), bf16_ptr(qkvr) + C::qkvr_v_begin,
              C::qkvr_rows},
+            {},
+            {},
         };
-        ops::inkling_gemm_inv_group(problems, static_cast<std::int32_t>(k), T, DType::BF16, s);
-    }
-    Tensor k_dyn, v_dyn;
-    if (vi.global) {
-        k_dyn = rd.work.alloc(DType::BF16, {32, T});
-        v_dyn = rd.work.alloc(DType::BF16, {32, T});
-        gemm_bf16(rd.work, *L.k_conv_proj, 0, 32, in(1), T, k_dyn.data, 32, s);
-        gemm_bf16(rd.work, *L.v_conv_proj, 0, 32, in(2), T, v_dyn.data, 32, s);
+        int count = 3;
+        if (vi.global) { // the dynamic K / V taps (32 rows each) ride in the same launch, from x_k / x_v
+            if (!L.k_conv_proj.has_value() || !L.v_conv_proj.has_value() || L.k_conv_proj->k != k ||
+                L.v_conv_proj->k != k || L.k_conv_proj->qtype != QType::BF16_CTRL ||
+                L.v_conv_proj->qtype != QType::BF16_CTRL) {
+                throw std::logic_error("inkling2: a global visit without its dynamic-conv projections");
+            }
+            k_dyn       = rd.work.alloc(DType::BF16, {32, T});
+            v_dyn       = rd.work.alloc(DType::BF16, {32, T});
+            problems[3] = {L.k_conv_proj->qdata, 32, in(1), k_dyn.data, 32};
+            problems[4] = {L.v_conv_proj->qdata, 32, in(2), v_dyn.data, 32};
+            count       = 5;
+        }
+        ops::inkling_gemm_inv_group(std::span<const ops::InklingGemmProblem>(problems, static_cast<std::size_t>(count)),
+                                    static_cast<std::int32_t>(k), T, DType::BF16, s);
     }
     // 3. attention per group (NAIVE)
     Tensor q_out = rd.work.alloc(DType::BF16, {C::attn_width, T});
@@ -597,9 +608,8 @@ std::size_t Variant::visit_workspace_capacity_bytes(const family::TextGeometry&,
     // the looped blend tile: dest + msg fp32, pair, h, gf fp32, blended
     bytes += up(tile * D * 3 * 4) + up(tile * D * 3 * 4) + up(tile * 2 * D * 3 * 2) + up(tile * C::gate_rank * 3 * 2) +
              up(tile * 2 * D * 3 * 4) + up(tile * D * 3 * 2);
-    // the invariant GEMM's split partials: the controller `down` of a blend tile, the dynamic taps of a round
+    // the invariant GEMM's split partials: the controller `down` of a blend tile (the taps run unsplit in the group)
     bytes += up(ops::inkling_gemm_inv_workspace_bytes(C::gate_rank, 2 * D, static_cast<std::int32_t>(tile), 3));
-    bytes += up(ops::inkling_gemm_inv_workspace_bytes(32, D, static_cast<std::int32_t>(T), 1));
     bytes += naive::moe_workspace_bytes(static_cast<std::int32_t>(T));
     return bytes + (1U << 20);
 }

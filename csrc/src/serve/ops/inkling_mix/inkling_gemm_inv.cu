@@ -52,7 +52,7 @@ using Tile64x64 = Schedule<64, 64, 32, 32, 3>;
 
 enum class Store : int { Bf16 = 0, Fp32 = 1, Partial = 2 };
 
-constexpr int kMaxGroup = 4;
+constexpr int kMaxGroup = 6;
 
 struct Args {
     const __nv_bfloat16* weight; // [batch][n][k]
@@ -318,7 +318,7 @@ void inkling_gemm_inv_group(std::span<const InklingGemmProblem> problems, std::i
     const auto aligned = [](const void* p) { return p != nullptr && (reinterpret_cast<std::uintptr_t>(p) & 15u) == 0; };
     if (problems.size() > static_cast<std::size_t>(kMaxGroup) || k <= 0 || k % 8 != 0 ||
         (out_dtype != DType::BF16 && out_dtype != DType::FP32)) {
-        throw std::invalid_argument("inkling_gemm_inv_group: 1-4 problems, k a positive multiple of 8, out BF16 or FP32");
+        throw std::invalid_argument("inkling_gemm_inv_group: 1-6 problems, k a positive multiple of 8, out BF16 or FP32");
     }
     Args a{};
     a.k       = k;
@@ -329,10 +329,8 @@ void inkling_gemm_inv_group(std::span<const InklingGemmProblem> problems, std::i
     a.rows    = 0;
     for (std::size_t i = 0; i < problems.size(); ++i) {
         const InklingGemmProblem& p = problems[i];
-        if (p.n <= 0 || p.ldc < p.n || !aligned(p.weight) || !aligned(p.x) || p.out == nullptr ||
-            inkling_gemm_split(p.n, k) != 1) {
-            throw std::invalid_argument("inkling_gemm_inv_group: a problem needs n > 0, ldc >= n, aligned weight / x, "
-                                        "and a shape that runs as one chunk");
+        if (p.n <= 0 || p.ldc < p.n || !aligned(p.weight) || !aligned(p.x) || p.out == nullptr) {
+            throw std::invalid_argument("inkling_gemm_inv_group: a problem needs n > 0, ldc >= n, aligned weight / x");
         }
         a.g_weight[i] = static_cast<const __nv_bfloat16*>(p.weight);
         a.g_x[i]      = static_cast<const __nv_bfloat16*>(p.x);

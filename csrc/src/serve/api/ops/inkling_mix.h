@@ -263,9 +263,10 @@ void inkling_gemm_inv(const void* weight, std::int32_t n, std::int32_t k, const 
                       void* out, DType out_dtype, std::int32_t ldc, const InklingGemmBatch& batch, void* workspace,
                       std::size_t workspace_bytes, cudaStream_t stream);
 
-/// Up to 4 problems of one k, token count and store type in ONE launch, each with its own weights, row count, input
-/// and output (the q-side / K / V row ranges of a 3-input qkvr). Each element runs exactly the chain of
-/// inkling_gemm_inv; shapes that split (inkling_gemm_split > 1) are refused here.
+/// Up to 6 problems of one k, token count and store type in ONE launch, each with its own weights, row count, input
+/// and output (a global / looped visit's q-side / K / V row ranges and, on a global visit, the dynamic K / V taps).
+/// Every problem runs as ONE chunk -- the chain of inkling_gemm_inv for an unsplit shape -- whatever
+/// inkling_gemm_split says for its shape: a shape that a caller sends through a group must always take this entry.
 struct InklingGemmProblem {
     const void* weight = nullptr; ///< [n, k]
     std::int32_t n     = 0;
