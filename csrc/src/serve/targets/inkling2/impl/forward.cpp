@@ -504,7 +504,9 @@ void run_visit(Round& rd, int v) {
         CUDA_CHECK(cudaMemcpy2DAsync(feature.data, static_cast<std::size_t>(D) * 2, src.data,
                                      static_cast<std::size_t>(src.nb[1]), static_cast<std::size_t>(D) * 2,
                                      static_cast<std::size_t>(T), cudaMemcpyDeviceToDevice, s));
-        rd.r.features.capture(rd.r.features.context, vi.feature, feature, s);
+        // The sink keys the feature by its visit label (kFeatureLabels): row vi.feature on one card, and the right stage's
+        // capture on two.
+        rd.r.features.capture(rd.r.features.context, kFeatureLabels[static_cast<std::size_t>(vi.feature)], feature, s);
     }
     // 1. attention inputs
     const int Q    = (vi.global || vi.looped) ? 3 : 1;
@@ -935,7 +937,7 @@ void Variant::run_visits(const ModelView& model, family::VisitRound& r) {
         auto scope    = rd.work.scope();
         Tensor hidden = rd.work.alloc(DType::BF16, {D, rd.T});
         final_residual_mix(model, r.x, hidden, rd.work, rd.s);
-        r.features.capture(r.features.context, 3, hidden, rd.s);
+        r.features.capture(r.features.context, kFeatureLabels[3], hidden, rd.s);
     }
     if (d.active) {
         dumped   = true;

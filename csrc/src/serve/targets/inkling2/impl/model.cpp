@@ -147,7 +147,11 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     runtime.weights_arena   = &backing.device_arena();
     runtime.features        = plan.features;
     if (plan.features.dflash()) {
-        if (!weights.has_draft) { throw std::invalid_argument("inkling2: --speculative dflash needs the DSpark drafter"); }
+        // The 2-card split keeps the drafter on the stage with the head (package.cpp); a stage without the head runs
+        // the DFlash round's target half only (verify columns from the drafter stage) and binds no drafter.
+        if (!weights.has_draft && weights.globals.has_head) {
+            throw std::invalid_argument("inkling2: --speculative dflash needs the DSpark drafter");
+        }
         runtime.dflash.emplace();
     }
     runtime.token_embedding = weights.globals.embedding;
