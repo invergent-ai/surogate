@@ -76,10 +76,13 @@ def test_plan():
             cnt[3] = 0
         max_rows = [64, 256, 8192][trial % 3]
         nb = 1 + trial % 4
+        LG.MOE_PAD_ROWS = [0, 512, 4096, 16384][trial % 4]
         plan = LG._moe_plan(cnt, max_rows, nb)
         seen = []
         for bt in plan:
             assert len(bt) <= B.EG
+            if LG.MOE_PAD_ROWS:  # the cap holds, except a single item longer than the cap
+                assert len(bt) == 1 or len(bt) * max(it[0] for it in bt) <= LG.MOE_PAD_ROWS
             for ln, e, first in bt:
                 assert 0 <= ln <= max_rows and 0 <= e < n  # 0 rows: only in the one-batch id-order layout
                 assert ln > 0 or len(bt) == n
@@ -90,6 +93,7 @@ def test_plan():
         for bt in plan:
             for ln, e, first in bt:
                 assert st[e] <= first and first + ln <= st[e] + cnt[e]
+    LG.MOE_PAD_ROWS = 0
     return {"trials": 300, "pass": True}
 
 
@@ -115,6 +119,14 @@ def test_moe():
             new = moe_grads(w, ids, x, g, lora, fast, rows, det=True)
             res[f"rows_{rows}_split{split}_det_fast{int(fast)}"] = {n: {"rel": rel(a, b)[0], "cos": rel(a, b)[1]}
                                                        for n, a, b in zip(names, new, ref)}
+        for cap in (256, 1024):  # the per-batch cap: same gradient, and the capped path repeats bit for bit
+            LG.MOE_PAD_ROWS = cap
+            new = moe_grads(w, ids, x, g, lora, True, rows, det=True)
+            again = moe_grads(w, ids, x, g, lora, True, rows, det=True)
+            LG.MOE_PAD_ROWS = 0
+            res[f"rows_{rows}_split{split}_cap{cap}"] = {n: {"rel": rel(a, b)[0], "cos": rel(a, b)[1]}
+                                                         for n, a, b in zip(names, new, ref)}
+            assert all(torch.equal(a, b) for a, b in zip(new, again)), "capped path not reproducible"
     LG.MOE_FAST, LG.MOE_ROWS, LG.MOE_DET, LG.MOE_SPLIT_MIN = False, 8192, False, 2048
     worst = max(v["rel"] for r in res.values() for v in r.values())
     res["worst_rel"] = worst

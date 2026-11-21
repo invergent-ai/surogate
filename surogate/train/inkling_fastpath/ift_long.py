@@ -463,6 +463,10 @@ MOE_DET = os.environ.get("IFT_MOE_DET", "0") == "1"
 # lev-all-1: MOE_FAST costs +1.0 s at 1k (3.2 vs 2.2 s; three batches of python ops + unit copies per group, for ~1k rows) and
 # gains 4.0 s at 8k. A group below MOE_SPLIT_MIN rows runs as ONE batch in expert-id order, without copying the units.
 MOE_SPLIT_MIN = int(os.environ.get("IFT_MOE_SPLIT_MIN", "2048"))
+# MOE_PAD_ROWS (0 = off, default OFF until its card check): at most this many padded rows (batch items x longest item) in one
+# MOE_FAST batch. MOE_ROWS caps an expert's ITEM, so a batch could hold 16 x 4,096 = 65,536 real rows (tools/moe_batch_mem.py on real
+# 32k routing: 576 MB per row tensor, vs 36 MB on the old block path); lev-all-3 / -4: MOE_FAST out of memory at 32k.
+MOE_PAD_ROWS = int(os.environ.get("IFT_MOE_PAD_ROWS", "0"))
 
 
 def _h2d(t, dev):
@@ -478,7 +482,8 @@ def _moe_plan(cnt, max_rows, nb):
     most nb contiguous batches minimising sum(batch items x its longest item), then batches above EG items are cut."""
     if sum(cnt) == 0:
         return []
-    if sum(cnt) < MOE_SPLIT_MIN and max(cnt) <= max_rows and len(cnt) <= B.EG:  # one batch, id order (rows may be 0)
+    if (sum(cnt) < MOE_SPLIT_MIN and max(cnt) <= max_rows and len(cnt) <= B.EG
+            and (not MOE_PAD_ROWS or len(cnt) * max(cnt) <= MOE_PAD_ROWS)):  # one batch, id order (rows may be 0)
         off, one = 0, []
         for e, c in enumerate(cnt):
             one.append((c, e, off))
@@ -512,7 +517,14 @@ def _moe_plan(cnt, max_rows, nb):
         parts.append(items[i:j])
         j = i
     parts.reverse()
-    return [bt[k:k + B.EG] for bt in parts for k in range(0, len(bt), B.EG)]
+    out = []
+    for bt in parts:  # items longest first: a batch's padded rows = its size x its first item
+        k = 0
+        while k < len(bt):
+            room = B.EG if not MOE_PAD_ROWS else max(1, min(B.EG, MOE_PAD_ROWS // bt[k][0]))
+            out.append(bt[k:k + room])
+            k += room
+    return out
 
 
 def _unit_bwd(g3, unit):
@@ -561,6 +573,7 @@ def _moe_fast_batch(items, r0, x, g, tok, gam_r, u13, f13, u2, f2, lora, scale, 
         gul = gu.detach().requires_grad_()
         gml = gam_r[rel].detach().requires_grad_()
         y = RA.inkling_softcap_swiglu(gul, gml)
+    del gu
     # the down projection's vjp at y
     c = g[tb]
     dyp = _unit_bwd(pad(c * fe2), U2)
@@ -571,8 +584,13 @@ def _moe_fast_batch(items, r0, x, g, tok, gam_r, u13, f13, u2, f2, lora, scale, 
         dB2 = torch.bmm(pc.transpose(1, 2), torch.bmm(yp, A2.transpose(1, 2)))
         dA2 = torch.bmm(dla2.transpose(1, 2), yp)
         dyp = dyp + torch.bmm(dla2, A2)
+        del yp, pc, dla2
+    del c
+    dy = unpad(dyp)
+    del dyp
     with torch.enable_grad():
-        dgu, dgm = torch.autograd.grad(y, (gul, gml), unpad(dyp))
+        dgu, dgm = torch.autograd.grad(y, (gul, gml), dy)
+    del y, gul, gml, dy
     # the gate / up projection's vjp at x
     dxp = _unit_bwd(pad(dgu * fe13), U13)
     if lora is not None:
