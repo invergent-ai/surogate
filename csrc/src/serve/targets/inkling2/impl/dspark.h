@@ -117,6 +117,10 @@ struct DSparkPropose {
     std::int32_t* drafts                 = nullptr; ///< I32 [draft_stride, B]: draft j of lane b at j + stride * b
     std::int32_t draft_stride            = 0;       ///< >= k; 0: k
     void* hidden_out                     = nullptr; ///< optional BF16 [2304, 8, B]: the block's final hidden (tests)
+    /// Device SamplingConfig [B] (null: greedy drafts for every lane): coupled untruncated sampled lanes draw their
+    /// drafts with the coupled verify's own Gumbel noise (ops::dspark_markov_vocab; SUROGATE_SERVE_DSPARK_SAMPLED_DRAFTS=0
+    /// keeps greedy drafts).
+    const ops::SamplingConfig* sampling  = nullptr;
 };
 
 /// Workspace of one append of `columns` (= W * B) columns / one proposal of `batch` lanes at the widest round.

@@ -13,6 +13,7 @@
 #include "api/family/startup_features.h"
 #include "core/arena.h"
 #include "core/tensor.h"
+#include "api/ops/sampling.h"
 
 #include <cuda_runtime.h>
 
@@ -101,6 +102,9 @@ struct DSparkProposeArgs {
     Tensor drafts;           ///< I32 [k, B]
     std::int32_t batch = 0;
     std::int32_t k     = 0;
+    /// The round's device SamplingConfig [B] (the verify's): a coupled sampled lane may draw sampled drafts with the
+    /// coupled verify's own noise (lane e2). Null: greedy drafts.
+    const ops::SamplingConfig* sampling = nullptr;
 };
 
 // Dispatch helpers: the Variant's DSpark leaves through a dependent name, so a runtime instantiated over any other

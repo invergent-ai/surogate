@@ -516,7 +516,8 @@ void dspark_propose(const load::InklingWeights& w, const DSparkDerived& d, const
                                 j == 0 ? nullptr : state[(j + 1) & 1], state[j & 1], latent, s);
         ops::dspark_markov_vocab(base, G::kVocabPadded, 1 + j, B, d.fp8_fold ? nullptr : d.fold_w, d.fold_b, latent,
                                  G::kVocab, nullptr, part_v, part_i, nullptr, nullptr, s,
-                                 d.fp8_fold ? d.fold_codes : nullptr, d.fp8_fold ? d.fold_scales : nullptr);
+                                 d.fp8_fold ? d.fold_codes : nullptr, d.fp8_fold ? d.fold_scales : nullptr,
+                                 p.sampling, p.sampling != nullptr ? p.anchor_positions : nullptr, j);
         ops::dspark_markov_pick(part_v, part_i, tiles, B, j, stride, p.drafts, s);
     }
 }
@@ -595,6 +596,12 @@ void Variant::dspark_propose(const ModelView& model, const family::DSparkRuntime
     p.drafts           = static_cast<std::int32_t*>(args.drafts.data);
     p.draft_stride     = args.drafts.ne[0];
     p.k                = args.k;
+    // Coupled sampled drafts (dspark.h) unless SUROGATE_SERVE_DSPARK_SAMPLED_DRAFTS=0 (greedy drafts, A/B).
+    static const bool sampled_drafts = [] {
+        const char* raw = std::getenv("SUROGATE_SERVE_DSPARK_SAMPLED_DRAFTS");
+        return raw == nullptr || raw[0] == '\0' || std::atoi(raw) != 0;
+    }();
+    p.sampling = sampled_drafts ? args.sampling : nullptr;
     // The vocabulary pass keeps 16 lanes' latents in shared memory: wider rounds run in groups of 16.
     for (std::int32_t b0 = 0; b0 < args.batch; b0 += 16) {
         p.batch = std::min<std::int32_t>(16, args.batch - b0);
@@ -604,6 +611,7 @@ void Variant::dspark_propose(const ModelView& model, const family::DSparkRuntime
         if (g.lanes != nullptr) { g.lanes += b0; }
         g.table_rows += b0;
         g.drafts += static_cast<std::int64_t>(b0) * p.draft_stride;
+        if (g.sampling != nullptr) { g.sampling += b0; }
         detail::dspark_propose(*im.weights, *im.dspark, dspark_kv(rt), g, *rt.work, rt.stream);
     }
 }
