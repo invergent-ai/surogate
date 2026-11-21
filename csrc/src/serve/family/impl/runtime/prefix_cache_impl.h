@@ -5,6 +5,52 @@
 
 namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS {
 
+// ---- Window-bounded KV pages (lane f1; rl/engine-inkling-2026-11-21/lanes/f1/DESIGN-window-kv.md)
+
+bool ProgramImplCore::window_paging() const noexcept { return decoder->text_kv.pool().has_window_class(); }
+
+std::vector<std::uint32_t> ProgramImplCore::window_pins(const SequenceState& sequence) const {
+    std::vector<std::uint32_t> pins;
+    if (sequence.rewrite_checkpoint.valid && sequence.rewrite_checkpoint.frontier != 0) {
+        pins.push_back(sequence.rewrite_checkpoint.frontier);
+    }
+    if (sequence.lane < requests.size()) {
+        const auto& prefill = requests[sequence.lane].prefill;
+        if (prefill && prefill->rewrite_checkpoint_capture && prefill->rewrite_checkpoint_capture->frontier != 0) {
+            pins.push_back(prefill->rewrite_checkpoint_capture->frontier);
+        }
+    }
+    return pins;
+}
+
+void ProgramImplCore::prepare_window_kv(SequenceState& sequence, std::uint32_t main_tokens) {
+    if (!window_paging() || !sequence.kv) { return; }
+    // The forward's first query is the committed KV length. A lane not running a request yet
+    // (admission maps the whole prompt for the full-context planes; restores map their prefix)
+    // maps no window page ahead: each chunk maps its own when it runs, so admitting many long
+    // prompts at once does not take a chunk's window pages for each.
+    const std::uint32_t first = std::min(sequence.text_kv_valid, main_tokens);
+    const bool running = requests[sequence.lane].lifecycle != Lifecycle::Empty;
+    sequence.kv->text.window_prepare(first, running ? main_tokens : first, window_pins(sequence), device.stream);
+}
+
+void ProgramImplCore::settle_window_kv(SequenceState& sequence) {
+    if (!window_paging() || !sequence.kv) { return; }
+    sequence.kv->text.window_settle(sequence.text_kv_valid, window_pins(sequence), device.stream);
+}
+
+bool ProgramImplCore::window_reusable(const SequenceState& sequence, std::uint32_t base,
+                                      bool archived) const noexcept {
+    if (!window_paging() || base == 0) { return true; }
+    if (!archived && sequence.kv) { return sequence.kv->text.window_covers(base); }
+    // A saved state carries the window behind its frontier (one token of margin: the frontier and
+    // the token before it) and behind its rewrite checkpoint when it kept one.
+    const std::uint32_t frontier = sequence.text_kv_valid;
+    if (base <= frontier && base + 1U >= frontier) { return true; }
+    const auto& checkpoint = sequence.rewrite_checkpoint;
+    return checkpoint.valid && base <= checkpoint.frontier && base + 1U >= checkpoint.frontier;
+}
+
 std::vector<Tensor> ProgramImplCore::prefix_state_tensors(const SequenceState& sequence,
                                                          bool checkpoint, bool draft,
                                                          bool with_hidden) const {
@@ -80,8 +126,10 @@ void ProgramImplCore::archive_sequence(const SequenceState& sequence) {
     try {
         std::vector<std::uint32_t> boundaries;
         const auto append = reusable_append_frontier(sequence);
-        if (append) { boundaries.push_back(append); }
-        const bool checkpoint = sequence.rewrite_checkpoint.valid && decoder->has_checkpoint(sequence.lane);
+        // Window-bounded KV: only frontiers whose window the lane still holds are offered.
+        if (append && window_reusable(sequence, append, false)) { boundaries.push_back(append); }
+        const bool checkpoint = sequence.rewrite_checkpoint.valid && decoder->has_checkpoint(sequence.lane) &&
+                                window_reusable(sequence, sequence.rewrite_checkpoint.frontier, false);
         if (checkpoint && sequence.rewrite_checkpoint.frontier) {
             boundaries.push_back(sequence.rewrite_checkpoint.frontier);
         }
@@ -93,6 +141,8 @@ void ProgramImplCore::archive_sequence(const SequenceState& sequence) {
         if (sequence.kv->backend) {
             bytes += sequence.kv->backend->mapped_page_count() * backend_kv_cache()->pool().occupancy().page_bytes;
         }
+        const auto window_slots = sequence.kv->text.window_slots();
+        bytes += window_slots.size() * decoder->text_kv.pool().window_occupancy().page_bytes;
         // Ledger, three position axes, token types, radix keys at both boundaries, and scores.
         bytes += sequence.ledger.size() * (9 * sizeof(TokenId) + 1);
         bytes += sequence.cached_scores.size() * sizeof(TokenScore);
@@ -107,8 +157,11 @@ void ProgramImplCore::archive_sequence(const SequenceState& sequence) {
         std::size_t payload = 0;
         for (const auto& tensor : current) { payload += family::detail::archive_aligned(tensor.bytes()); }
         for (const auto& tensor : saved) { payload += family::detail::archive_aligned(tensor.bytes()); }
-        for (std::size_t plane = 0; plane < text_pool.plane_count(); ++plane) {
+        for (std::size_t plane = 0; plane < text_pool.full_plane_count(); ++plane) {
             payload += family::detail::archive_aligned(text_pool.image_plane_bytes(plane, text_ids.size()));
+        }
+        for (std::size_t plane = 0; plane < text_pool.window_plane_count(); ++plane) {
+            payload += family::detail::archive_aligned(text_pool.window_image_plane_bytes(plane, window_slots.size()));
         }
         for (std::size_t plane = 0; backend_pool && plane < backend_pool->plane_count(); ++plane) {
             payload += family::detail::archive_aligned(backend_pool->image_plane_bytes(plane, backend_ids.size()));
@@ -166,10 +219,21 @@ void ProgramImplCore::archive_sequence(const SequenceState& sequence) {
         download(current, image->current);
         if (checkpoint) { download(saved, image->checkpoint); }
         image->text_pages = static_cast<std::uint32_t>(text_ids.size());
-        for (std::size_t plane = 0; plane < text_pool.plane_count(); ++plane) {
+        for (std::size_t plane = 0; plane < text_pool.full_plane_count(); ++plane) {
             image->text.push_back(take(text_pool.image_plane_bytes(plane, text_ids.size())).data());
         }
         text_pool.download_pages_to(text_ids, image->text, device.stream);
+        if (!window_slots.empty()) {
+            std::vector<std::int32_t> physical;
+            for (const KvWindowSlot& slot : window_slots) {
+                image->window_logical.push_back(slot.logical);
+                physical.push_back(slot.physical);
+            }
+            for (std::size_t plane = 0; plane < text_pool.window_plane_count(); ++plane) {
+                image->window.push_back(take(text_pool.window_image_plane_bytes(plane, physical.size())).data());
+            }
+            text_pool.download_window_pages_to(physical, image->window, device.stream);
+        }
         if (backend_pool) {
             image->backend_pages = static_cast<std::uint32_t>(backend_ids.size());
             for (std::size_t plane = 0; plane < backend_pool->plane_count(); ++plane) {
@@ -201,12 +265,18 @@ void ProgramImplCore::restore_archived_sequence(SequenceState& sequence, const R
     clear_lane(sequence, requests[sequence.lane]);
     sequence.copy_metadata(image.state);
     reserve_sequence_kv(sequence, plan.text_kv_page_entitlement, plan.backend_kv_page_entitlement);
-    const auto backend_tokens = speculative_backend == SpeculativeBackend::Mtp
-        ? plan.reuse_base - 1 : speculative_backend == SpeculativeBackend::DFlash ? plan.reuse_base : 0;
-    materialize_sequence_kv(sequence, plan.reuse_base, backend_tokens);
     const auto planes = [](const std::vector<std::byte*>& views) {
         return std::vector<const std::byte*>(views.begin(), views.end());
     };
+    if (!image.window_logical.empty()) {
+        // The window pages first: materializing checks that the reuse point's window is there.
+        const auto physical = sequence.kv->text.window_map_restored(image.window_logical, device.stream);
+        decoder->text_kv.pool().upload_window_pages_from(planes(image.window),
+            static_cast<std::uint32_t>(image.window_logical.size()), physical, device.stream);
+    }
+    const auto backend_tokens = speculative_backend == SpeculativeBackend::Mtp
+        ? plan.reuse_base - 1 : speculative_backend == SpeculativeBackend::DFlash ? plan.reuse_base : 0;
+    materialize_sequence_kv(sequence, plan.reuse_base, backend_tokens);
     decoder->text_kv.pool().upload_pages_from(planes(image.text), image.text_pages,
                                              sequence.kv->text.page_ids(), device.stream);
     if (sequence.kv->backend) {
@@ -242,6 +312,11 @@ void ProgramImplCore::capture_gpu_prefix(SequenceState& sequence,
                                         const std::shared_ptr<GpuPrefixStorage>& storage) {
     if (!key || !sequence.kv || !sequence.tail_hidden_valid) {
         throw std::logic_error("GPU prefix capture has no completed frontier");
+    }
+    if (window_paging()) {
+        // Refused at planning (request_plan_impl.h): an image count up to 1,025 cannot hold
+        // window pages from a class of fixed size.
+        throw std::logic_error("GPU prefix images are not supported with window-bounded KV");
     }
     if (gpu_prefixes.contains(key.get())) { throw std::invalid_argument("GPU prefix key was already captured"); }
     auto image = std::make_shared<GpuPrefix>();
@@ -459,7 +534,15 @@ void ProgramImplCore::capture_shared_prefix(SequenceState& sequence, RequestCont
     }
     // A plan that still holds an evicted entry keeps its slot until the plan is dropped.
     if (shared_prefix_storage->free.empty()) { return; }
+    // Window-bounded KV: a copy of the window behind the boundary, which forks copy back. No room
+    // in the class's image region (or no window there) means no capture, as for the states.
+    std::shared_ptr<const PagedKVWindowImage> window_image;
+    if (window_paging()) {
+        window_image = decoder->text_kv.pool().capture_window_image(sequence.kv->text, tokens, device.stream);
+        if (!window_image) { return; }
+    }
     auto entry = std::make_shared<SharedPrefix>();
+    entry->window = std::move(window_image);
     entry->hash = hash;
     entry->tokens = tokens;
     entry->state.copy_metadata(sequence);
@@ -522,6 +605,10 @@ void ProgramImplCore::restore_shared_prefix(SequenceState& sequence, const Reque
     SequenceKVBundle bundle;
     bundle.text = decoder->text_kv.pool().fork_prefix(entry.pages, entry.tokens,
                                                      plan.text_kv_page_entitlement, device.stream);
+    if (window_paging()) {
+        if (!entry.window) { throw std::logic_error("shared prefix has no window pages to fork"); }
+        bundle.text.window_restore_from_image(*entry.window, device.stream);
+    }
     if (entry.backend_pages) {
         // Through `tokens - 1`: the boundary page becomes the fork's own copy, where its
         // bridge rewrites the last column.

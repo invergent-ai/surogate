@@ -146,6 +146,12 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     if (gpu_prefix_readout && (prompt.has_media() || options.requested_output_tokens != 1)) {
         throw InvalidRequest("GPU prefix readout requires one-token text requests");
     }
+    if (gpu_prefix_readout && window_paging()) {
+        // An image keeps its lane's window pages, and up to 1,025 images cannot be held by the
+        // window class's fixed size (DESIGN-window-kv.md 4.3).
+        throw InvalidRequest("GPU prefix readouts are not supported with window-bounded KV "
+                             "(SUROGATE_SERVE_KV_WINDOW_PAGING=0 turns it off)");
+    }
     prune_gpu_prefixes();
     drop_stale_adapter_prefixes();
     if (gpu_prefix_readout) {
@@ -349,7 +355,8 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             return plan_request_for_sequence(lane, value.state, prompt, base_plan, true)
                 .summary().reusable_prompt_tokens;
         }, speculative_backend == SpeculativeBackend::None &&
-           decoder->linear_attention.layer_count() == 0 && decoder->ple.empty());
+           decoder->linear_attention.layer_count() == 0 && decoder->ple.empty() &&
+           !window_paging()); // a saved window exists at its frontiers only
         // A host-tier snapshot is usable only while the pool still holds every object of it (another
         // replica may have needed the room) and they are complete; the plan keeps them until done.
         std::shared_ptr<family::detail::HostKvPool::Lease> host_lease;
@@ -369,7 +376,8 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         const auto& hashes = base_plan.impl_->page_hashes;
         if (hashes && !shared_prefixes.empty()) {
             if (auto entry = find_shared_prefix(prompt, *hashes, base_plan.impl_->lora_slot);
-                entry && entry->tokens > resident.summary().reusable_prompt_tokens) {
+                entry && entry->tokens > resident.summary().reusable_prompt_tokens &&
+                (!window_paging() || entry->window)) {
                 auto shared = plan_request_for_sequence(lane, entry->state, prompt, base_plan, true);
                 if (shared.impl_->reuse == ReusePath::AppendAtFrontier &&
                     shared.impl_->reuse_base == entry->tokens) {
@@ -514,7 +522,10 @@ RequestPlan ProgramImplCore::plan_request_for_sequence(std::uint32_t lane,
         const bool dflash_append_ready =
             speculative_backend != SpeculativeBackend::DFlash ||
             sequence.dflash_context_frontier == sequence.execution_frontier;
-        if (append_frontier != 0 && dflash_append_ready &&
+        // Window-bounded KV: a frontier whose window is gone is no append point; the checkpoint
+        // below may still be one.
+        const bool append_window_ready = window_reusable(sequence, append_frontier, archived);
+        if (append_frontier != 0 && dflash_append_ready && append_window_ready &&
             family::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
                                             append_frontier, base.lora_slot, lora_generation)) {
             plan->reuse      = ReusePath::AppendAtFrontier;
@@ -529,6 +540,13 @@ RequestPlan ProgramImplCore::plan_request_for_sequence(std::uint32_t lane,
             plan->reuse      = restore_path(sequence.rewrite_checkpoint.kind);
             plan->reuse_base = sequence.rewrite_checkpoint.frontier;
         }
+    }
+
+    // Window-bounded KV: whatever path was chosen must find its window there (a checkpoint whose
+    // window was not kept, a saved state's inner prefix): otherwise start over.
+    if (plan->reuse != ReusePath::FullReset && !window_reusable(sequence, plan->reuse_base, archived)) {
+        plan->reuse      = ReusePath::FullReset;
+        plan->reuse_base = 0;
     }
 
     // A fork's borrowed pages are shared and read-only: a reuse that would rewind into them

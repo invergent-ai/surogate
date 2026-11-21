@@ -1966,6 +1966,7 @@ void ProgramImplCore::materialize_sequence_kv(SequenceState& sequence, std::uint
     if (backend_tokens != 0 && backend_tokens > sequence.kv->backend->mapped_token_capacity()) {
         sequence.kv->backend->materialize_tokens(backend_tokens, device.stream);
     }
+    if (window_paging()) { prepare_window_kv(sequence, main_tokens); }
 }
 
 void ProgramImplCore::materialize_graph_chunk_window(SequenceState& sequence, std::uint32_t cursor,
@@ -2063,6 +2064,8 @@ void ProgramImplCore::prepare_graphs() {
             Tensor table = pool.block_table_row(static_cast<std::int32_t>(row));
             CUDA_CHECK(cudaMemcpyAsync(table.data, repeated.data(), table.bytes(),
                                        cudaMemcpyHostToDevice, device.stream));
+            // The window class's table the same way: a private window page, never the sentinel.
+            if (pool.has_window_class()) { allocation.window_capture_fill(device.stream); }
         }
     };
     reserve_capture_rows(decoder->text_kv, text_capture_allocations, "target KV cache");
@@ -3068,6 +3071,11 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 staged.rewrite_checkpoint_capture
                     ? std::optional<std::uint32_t>(staged.rewrite_checkpoint_capture->frontier)
                     : std::nullopt;
+            // Window-bounded KV maps each chunk's window pages as the chunk runs (admission mapped
+            // only the full-context planes of the whole prompt); the graph path did it above.
+            if (!staged.use_graph && window_paging()) {
+                materialize_sequence_kv(sequence, staged.cursor + nominal, 0);
+            }
             if (staged.vision) {
                 mark_workspace_usage(workspace_plan.vision_encode);
                 result = schedule::prefill_multimodal_chunk(
@@ -3118,6 +3126,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             }
             staged.cursor += result.processed_tokens;
             sequence.text_kv_valid = staged.cursor;
+            if (window_paging()) { settle_window_kv(sequence); }
             if (staged.prepare_mtp) { sequence.mtp_kv_valid = staged.cursor; }
             if (staged.shared_capture && staged.cursor == *staged.shared_capture) {
                 // The chunk's last column, which the chunk left in place.
@@ -4455,6 +4464,7 @@ runtime::MixedRoundResult ProgramImplCore::consume_mixed_round(runtime::RoundHan
             entry.cursor += processed;
             if (entry.vision) { entry.vision->release_encoded_media_payloads(); }
             sequence.text_kv_valid = entry.cursor;
+            if (window_paging()) { settle_window_kv(sequence); }
             // The head's KV followed the trunk's through the segment (on the stage that
             // holds the head; the others keep the count, as the lone chunk does) -- to the
             // column before the prompt's last, whose pairing waits for the sampled token: the
