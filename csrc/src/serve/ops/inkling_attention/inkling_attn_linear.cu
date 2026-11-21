@@ -105,21 +105,21 @@ __device__ __forceinline__ float cell_scale(const LinearSegment& s, int local, i
 }
 
 // ---- narrow: N <= 16 columns (decode, verify) ------------------------------------------------------------------------
-// A warp owns 8 weight rows (one n8 tile) and all N tokens (one m16 tile). Its rows are one contiguous slab of codes:
-// lane 0 asks L2 for the whole slab at entry (before the PDL wait: weights never depend on the previous kernel), so
-// every byte is in flight at once. Lane (gid, lid) then streams row gid's codes, 8 a chunk, through a register ring
-// kNarrowDepth chunks deep, and tokens gid / gid + 8 of x (L1 / L2 resident) through a ring kNarrowXDepth deep; the
-// loads and MMAs are pinned in this order (volatile), so the rings keep their distance. Two cells run interleaved.
+// A warp owns 8 weight rows (one n8 tile) and all N tokens (one m16 tile). Its codes stream through a per-warp
+// shared-memory ring of kNarrowStages cells (8 rows x 128 codes = 1 KiB a stage) filled with cp.async -- the copies are
+// in flight from entry (before the PDL wait: weights never depend on the previous kernel) and the compiler cannot sink
+// them, so kNarrowStages - 1 KiB per warp stay in flight. Lane (gid, lid) reads row gid's 8 codes of each chunk from the
+// ring (32-byte chunk j of row r at j ^ (r & 3): conflict-free) and tokens gid / gid + 8 of x (L1 / L2 resident). Two
+// cells run interleaved (independent chains).
 inline constexpr int kNarrowWarps  = 2;
 inline constexpr int kNarrowRows   = kNarrowWarps * 8;
-inline constexpr int kNarrowDepth  = 16;
-inline constexpr int kNarrowXDepth = 4;
+inline constexpr int kNarrowStages = 8;
 
 template <int K, bool PerRow>
 __global__ __launch_bounds__(kNarrowWarps * 32) void narrow_kernel(const LinearParams p) {
-    constexpr int Chunks   = K / 32;
-    constexpr int Cells    = K / 128;
+    constexpr int Cells = K / 128;
     static_assert(Cells % 2 == 0, "cells run in pairs");
+    __shared__ __align__(16) std::uint8_t ring_all[kNarrowWarps][kNarrowStages][8 * 128];
     const int block        = static_cast<int>(blockIdx.x);
     const LinearSegment& s = p.seg[segment_of(p, block)];
     const int warp         = static_cast<int>(threadIdx.x) >> 5;
@@ -127,19 +127,27 @@ __global__ __launch_bounds__(kNarrowWarps * 32) void narrow_kernel(const LinearP
     const int gid          = lane >> 2;
     const int lid          = lane & 3;
     const int local0       = (block - s.block_begin) * kNarrowRows + warp * 8;
-    // A row past the end re-reads the last row and writes nothing.
-    const std::uint8_t* row = s.codes + static_cast<std::int64_t>(s.row_begin + min(local0 + gid, s.rows - 1)) * K + 8 * lid;
+    std::uint8_t (*ring)[8 * 128] = ring_all[warp];
 
-    if (lane == 0) {
-        const int first = min(local0, s.rows - 1);
-        const int rows  = min(8, s.rows - first);
-        prefetch_l2_bulk(s.codes + static_cast<std::int64_t>(s.row_begin + first) * K, static_cast<unsigned>(rows * K));
-    }
-    // Consumption order: cell pair (2 i, 2 i + 1), chunk j of the first then chunk j of the second, j = 0..3.
-    const auto order = [](int t) { return (t >> 3) * 8 + ((t & 1) << 2) + ((t >> 1) & 3); };
-    uint2 ring[kNarrowDepth];
+    // Cell c of the warp's 8 rows into slot c % kNarrowStages: 64 pieces of 16 bytes, two a lane. A row past the end
+    // re-reads the last row and writes nothing.
+    const auto stage = [&](int c) {
 #pragma unroll
-    for (int i = 0; i < kNarrowDepth; ++i) { ring[i] = ldg_pinned_v2(row + 32 * order(i)); }
+        for (int i = 0; i < 2; ++i) {
+            const int piece = lane + 32 * i;
+            const int r     = piece >> 3;
+            const int q     = piece & 7; // 16-byte piece of the row's 128-byte cell
+            const std::uint8_t* src =
+                s.codes + static_cast<std::int64_t>(s.row_begin + min(local0 + r, s.rows - 1)) * K + c * 128 + q * 16;
+            std::uint8_t* dst = &ring[c % kNarrowStages][r * 128 + ((((q >> 1) ^ (r & 3)) << 5) | ((q & 1) << 4))];
+            cp_async<16, Cache::cg>(dst, src);
+        }
+    };
+#pragma unroll
+    for (int c = 0; c < kNarrowStages - 1; ++c) {
+        if (c < Cells) { stage(c); }
+        cp_commit();
+    }
     pdl::wait_for_dependencies();
 
     const int n_tok         = p.columns;
@@ -148,44 +156,37 @@ __global__ __launch_bounds__(kNarrowWarps * 32) void narrow_kernel(const LinearP
     const __nv_bfloat16* x0 = s.x + static_cast<std::int64_t>(t0 ? gid : 0) * K + 8 * lid;
     const __nv_bfloat16* x1 = s.x + static_cast<std::int64_t>(t1 ? gid + 8 : 0) * K + 8 * lid;
     const auto mask         = [](uint4 v, bool ok) { return ok ? v : make_uint4(0, 0, 0, 0); };
-    uint4 xr0[kNarrowXDepth], xr1[kNarrowXDepth];
-#pragma unroll
-    for (int i = 0; i < kNarrowXDepth; ++i) {
-        xr0[i] = ldg_pinned_v4(x0 + 32 * order(i));
-        xr1[i] = ldg_pinned_v4(x1 + 32 * order(i));
-    }
+    const auto codes        = [&](int c, int j) {
+        const uint2 cw = load_vec<uint2>(&ring[c % kNarrowStages][gid * 128 + ((j ^ (gid & 3)) << 5) + 8 * lid]);
+        return e4m3x8_to_bf16x8(make_int2(static_cast<int>(cw.x), static_cast<int>(cw.y)));
+    };
     float acc[4]   = {0.0F, 0.0F, 0.0F, 0.0F};
     float part0[4] = {0.0F, 0.0F, 0.0F, 0.0F};
     float part1[4] = {0.0F, 0.0F, 0.0F, 0.0F};
+#pragma unroll 1
+    for (int c = 0; c < Cells; c += 2) {
+        cp_wait<kNarrowStages - 3>(); // cells c and c + 1 have landed (this lane's copies) ...
+        __syncwarp();                 // ... and every lane's
 #pragma unroll
-    for (int t = 0; t < Chunks; ++t) {
-        const int ch   = order(t);
-        const uint2 cw = ring[t % kNarrowDepth];
-        if (t + kNarrowDepth < Chunks) { ring[t % kNarrowDepth] = ldg_pinned_v2(row + 32 * order(t + kNarrowDepth)); }
-        const uint4 u = mask(xr0[t % kNarrowXDepth], t0);
-        const uint4 v = mask(xr1[t % kNarrowXDepth], t1);
-        if (t + kNarrowXDepth < Chunks) {
-            xr0[t % kNarrowXDepth] = ldg_pinned_v4(x0 + 32 * order(t + kNarrowXDepth));
-            xr1[t % kNarrowXDepth] = ldg_pinned_v4(x1 + 32 * order(t + kNarrowXDepth));
+        for (int j = 0; j < 4; ++j) {
+            const int ch0 = 4 * c + j, ch1 = 4 * c + 4 + j;
+            chunk_steps(part0, mask(load_ldg<uint4>(x0 + 32 * ch0), t0), mask(load_ldg<uint4>(x1 + 32 * ch0), t1), codes(c, j));
+            chunk_steps(part1, mask(load_ldg<uint4>(x0 + 32 * ch1), t0), mask(load_ldg<uint4>(x1 + 32 * ch1), t1), codes(c + 1, j));
         }
-        const int4 w = e4m3x8_to_bf16x8(make_int2(static_cast<int>(cw.x), static_cast<int>(cw.y)));
-        if ((t & 1) == 0) {
-            chunk_steps<true>(part0, u, v, w);
-        } else {
-            chunk_steps<true>(part1, u, v, w);
+        float s00 = 1.0F, s01 = 1.0F, s10 = 1.0F, s11 = 1.0F;
+        if constexpr (!PerRow) {
+            s00 = cell_scale(s, local0 + 2 * lid, c);
+            s01 = cell_scale(s, local0 + 2 * lid + 1, c);
+            s10 = cell_scale(s, local0 + 2 * lid, c + 1);
+            s11 = cell_scale(s, local0 + 2 * lid + 1, c + 1);
         }
-        if ((t & 7) == 7) { // both cells of the pair complete: join them in cell order
-            const int c0 = ch >> 2; // = the second cell
-            float s00 = 1.0F, s01 = 1.0F, s10 = 1.0F, s11 = 1.0F;
-            if constexpr (!PerRow) {
-                s00 = cell_scale(s, local0 + 2 * lid, c0 - 1);
-                s01 = cell_scale(s, local0 + 2 * lid + 1, c0 - 1);
-                s10 = cell_scale(s, local0 + 2 * lid, c0);
-                s11 = cell_scale(s, local0 + 2 * lid + 1, c0);
-            }
-            cell_end<PerRow>(acc, part0, s00, s01);
-            cell_end<PerRow>(acc, part1, s10, s11);
-        }
+        cell_end<PerRow>(acc, part0, s00, s01);
+        cell_end<PerRow>(acc, part1, s10, s11);
+        __syncwarp(); // every lane is done with the two slots before they are refilled
+        if (c + kNarrowStages - 1 < Cells) { stage(c + kNarrowStages - 1); }
+        cp_commit();
+        if (c + kNarrowStages < Cells) { stage(c + kNarrowStages); }
+        cp_commit();
     }
 #pragma unroll
     for (int e = 0; e < 4; ++e) {
