@@ -787,16 +787,18 @@ void run_invariance_case(const InvCase& c, const char* groups, std::uint32_t see
         compare("decode B8 idle row fused fold", run_inv_route(c.kind, ip, layer, 1, r8));
         compare("decode B4 persistent state", run_inv_route(c.kind, ip, layer, 1, r4, false, true));
         compare("decode B8 idle row persistent state", run_inv_route(c.kind, ip, layer, 1, r8, true, true));
+        const bool fence_saved = ops::inkling_attention_knobs().fold_fence_light;
         ops::inkling_attention_knobs().fold_fence_light = false; // the __threadfence arrival
         compare("decode B4 fused fold heavy fence", run_inv_route(c.kind, ip, layer, 1, r4));
-        ops::inkling_attention_knobs().fold_fence_light = true;
+        ops::inkling_attention_knobs().fold_fence_light = fence_saved;
         ops::inkling_attention_knobs().fused_fold_max = 0;
         ops::inkling_attention_knobs().fold_fast = false; // fold_kernel's scan path for every row
         compare("decode B4 scan fold", run_inv_route(c.kind, ip, layer, 1, r4));
         compare("decode B8 idle row scan fold", run_inv_route(c.kind, ip, layer, 1, r8));
         ops::inkling_attention_knobs().fold_fast = true;
         // Decode with the cp.async raw ring (decode_raw 2: both blocks of a group in flight, old blocks staged before the
-        // PDL wait under static metadata) and with register staging (0), whatever the auto rule picks for the default.
+        // PDL wait under static metadata) and with register staging (0), whatever the default is; the default restored.
+        const int raw_saved = ops::inkling_attention_knobs().decode_raw;
         for (const int raw : {0, 2}) {
             ops::inkling_attention_knobs().decode_raw = raw;
             const std::string t = " decode_raw " + std::to_string(raw);
@@ -810,7 +812,7 @@ void run_invariance_case(const InvCase& c, const char* groups, std::uint32_t see
             compare("decode B4 workers 1 static metadata" + t, run_inv_route(c.kind, ip, layer, 1, r4, true));
             ops::inkling_attention_knobs().splits = 0;
         }
-        ops::inkling_attention_knobs().decode_raw = 1;
+        ops::inkling_attention_knobs().decode_raw = raw_saved;
         if (std::string(groups) == "p3" && std::getenv("SUROGATE_INKLING_ATTN_GROUPS") == nullptr) {
             g_key_groups = ops::InklingKeyGroups::Default; // the compiled default must be P3
             compare("decode B4 default key groups", run_inv_route(c.kind, ip, layer, 1, r4));
@@ -839,6 +841,7 @@ void run_invariance_case(const InvCase& c, const char* groups, std::uint32_t see
         ops::inkling_attention_knobs().splits = 1;
         compare("verify W8 B4 workers 1", run_inv_route(c.kind, ip, layer, 8, r4));
         ops::inkling_attention_knobs().splits = 0;
+        const int raw_saved = ops::inkling_attention_knobs().decode_raw;
         for (const int raw : {0, 2}) { // one-row-tile verify (W3) through both decode staging forms
             ops::inkling_attention_knobs().decode_raw = raw;
             const std::string t = " decode_raw " + std::to_string(raw);
@@ -846,7 +849,7 @@ void run_invariance_case(const InvCase& c, const char* groups, std::uint32_t see
             compare("verify W3 B2" + t, run_inv_route(c.kind, ip, layer, 3, r2));
             compare("verify W3 B2 static metadata" + t, run_inv_route(c.kind, ip, layer, 3, r2, true));
         }
-        ops::inkling_attention_knobs().decode_raw = 1;
+        ops::inkling_attention_knobs().decode_raw = raw_saved;
     }
     // The whole segment again with the 4-warp prefill kernel (KS = 1; the default is KS = 2).
     ops::inkling_attention_knobs().prefill_ks = 1;
@@ -2424,6 +2427,7 @@ void test_pdl_chain() {
                     first_bad >= 0 ? (" (first visit " + std::to_string(first_bad) + ")").c_str() : "");
         if (!control) { check(bad == 0, "pdl chain " + route); }
     };
+    const bool xnc_saved = ops::inkling_attention_knobs().linear_x_nc;
     for (const bool ctl : {false, true}) {
         control                                     = ctl;
         ops::inkling_attention_knobs().linear_x_nc = ctl;
@@ -2444,7 +2448,7 @@ void test_pdl_chain() {
         cudaGraphExecDestroy(exec);
         cudaGraphDestroy(graph);
     }
-    ops::inkling_attention_knobs().linear_x_nc = false;
+    ops::inkling_attention_knobs().linear_x_nc = xnc_saved;
 }
 
 // Decode staging A/B (agent-EN-c4): register staging (decode_raw 0) vs the cp.async raw ring (2) vs the auto rule (1),
@@ -2453,6 +2457,7 @@ void run_bench_raw() {
     using K = InklingLayerKind;
     cuda_check(cudaStreamCreateWithFlags(&g_stream, cudaStreamNonBlocking), "stream");
     g_key_groups = ops::InklingKeyGroups::Default;
+    const int raw_saved = ops::inkling_attention_knobs().decode_raw;
     for (const char* meta : {"1", "0"}) {
         if (meta[0] == '1') { setenv("BENCH_META_STATIC", "1", 1); } else { unsetenv("BENCH_META_STATIC"); }
         for (const int raw : {0, 2, 1}) {
@@ -2479,7 +2484,7 @@ void run_bench_raw() {
         bench_fused_call(nm("call decode global 1x8k"), K::Global, 1, 1, 8191);
         bench_fused_call(nm("call decode local 8x8k"), K::Local, 1, 8, 8191);
     }
-    ops::inkling_attention_knobs().decode_raw = 1;
+    ops::inkling_attention_knobs().decode_raw = raw_saved;
     unsetenv("BENCH_META_STATIC");
 }
 
