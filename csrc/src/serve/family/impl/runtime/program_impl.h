@@ -351,6 +351,19 @@ void ProgramImplCore::configure_stage(const SequencePlanImpl& plan) {
     }
     if (stage_import.data) { std::memset(stage_import.data, 0, stage_boundary_bytes_); }
     if (stage_export.data) { std::memset(stage_export.data, 0, stage_boundary_bytes_); }
+    if (family::dspark_drafter<Variant>() && plan.features.dflash()) {
+        // DSpark on a pipeline (ENGINE-INKLING lane e1): the stage with the head holds the drafter and proposes each
+        // round's drafts before the first stage launches; the first stage verifies them from its draft import.
+        const std::size_t bytes = 2 * schedule::kDSparkDraftImportStride * sizeof(std::int32_t);
+        if (stage.last >= layers) {
+            CUDA_CHECK(cudaHostAlloc(&dspark_draft_export.data, bytes, cudaHostAllocPortable));
+            std::memset(dspark_draft_export.data, 0, bytes);
+        } else if (stage.first == 0) {
+            CUDA_CHECK(cudaHostAlloc(&dspark_draft_import.data, bytes, cudaHostAllocPortable));
+            std::memset(dspark_draft_import.data, 0, bytes);
+            stage.draft_import_pinned = dspark_draft_import.data;
+        }
+    }
     std::fprintf(stderr, "pipeline stage: layers [%d, %d) of %d, boundary %u columns%s%s\n", stage.first,
                  stage.last, layers, plan.pipeline_boundary_columns, stage.first > 0 ? ", imports" : "",
                  stage.last < layers ? ", exports" : "");
@@ -5026,6 +5039,8 @@ void ProgramImplCore::adopt_speculative_outcome(std::span<const std::uint32_t> l
 void ProgramImplCore::adopt_pipeline_prefill_features(std::uint32_t lane,
     std::span<const std::byte> packet, std::uint32_t tokens, std::int32_t mixed_base) {
     if (!stage.features || tokens == 0) { return; }
+    // DSpark on a pipeline: only the stage with the head holds the drafter, and it appended these columns itself.
+    if (family::dspark_drafter<Variant>()) { return; }
     // Classifier frontiers contain only target-model state. Pipeline packets
     // keep the model's fixed stride, but their draft feature columns are unused.
     if (lane < max_concurrency && requests[lane].target_only) { return; }
@@ -5075,6 +5090,8 @@ void ProgramImplCore::adopt_pipeline_prefill_features(std::uint32_t lane,
 void ProgramImplCore::adopt_pipeline_decode_features(std::span<const std::uint32_t> lanes,
     std::span<const std::byte> packet) {
     if (!stage.features || lanes.empty()) { return; }
+    // DSpark on a pipeline: the drafter stage keeps its own pending features (the first stage proposes nothing).
+    if (family::dspark_drafter<Variant>()) { return; }
     const auto width   = active_dflash_window + 1U;
     const auto columns = width * lanes.size();
     if (lanes.size() > batch_capacity || columns > static_cast<std::size_t>(dflash->prefill_features.ne[1]) ||
@@ -5312,6 +5329,85 @@ ProgramImplCore::launch_dflash_round(std::span<const std::uint32_t> lanes,
         }
         throw;
     }
+}
+
+bool ProgramImplCore::pipeline_drafts_on_head() const noexcept {
+    return family::dspark_drafter<Variant>() && speculative_backend == SpeculativeBackend::DFlash && pipeline_stage() &&
+           stage_holds_head() && dspark_draft_export.data != nullptr;
+}
+
+std::span<const std::byte> ProgramImplCore::prepare_pipeline_drafts(std::span<const std::uint32_t> lanes,
+                                                                    std::span<const runtime::RoundBudget> budgets,
+                                                                    std::uint32_t window) {
+    // DSpark on a pipeline (ENGINE-INKLING lane e1): the first half of launch_dflash_round's round on the drafter stage
+    // -- the same ingress for the same lanes / budgets / window, the context append and the proposal -- ahead of the
+    // first stage's launch. The round's own launch here later stages the same ingress again and verifies only.
+    if (!pipeline_drafts_on_head() || !io.dflash_decode || !dflash) {
+        throw std::logic_error("only the DSpark drafter stage of a pipeline proposes ahead of a round");
+    }
+    if (lanes.empty() || lanes.size() > batch_capacity || budgets.size() != lanes.size()) {
+        throw std::invalid_argument("DSpark pipeline proposal membership is invalid");
+    }
+    bind_dflash_window(window);
+    const std::uint32_t width      = active_dflash_window + 1U;
+    std::uint32_t maximum_frontier = 0;
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        const std::uint32_t lane = lanes[row];
+        if (lane >= max_concurrency) { throw std::invalid_argument("DSpark pipeline proposal lane is invalid"); }
+        SequenceState& sequence = sequences[lane];
+        RequestControl& request = requests[lane];
+        if (request.lifecycle != Lifecycle::Active || !sequence.kv || sequence.kv->text.bound_row() < 0 ||
+            sequence.dflash_context_frontier > sequence.execution_frontier ||
+            sequence.execution_frontier - sequence.dflash_context_frontier > draft_window + 1U ||
+            sequence.ledger_frontier != sequence.execution_frontier + 1) {
+            throw std::logic_error("DSpark pipeline proposal row is not decode-ready");
+        }
+        const std::uint32_t frontier      = sequence.execution_frontier;
+        const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
+                                                ? budgets[row].generated_tokens_remaining - 1U
+                                                : 0U;
+        const std::uint32_t lane_cap = adaptive_dflash && dspark_kind_policy()
+                                           ? dspark_lane_cap_if<Variant>(sequence)
+                                           : std::numeric_limits<std::uint32_t>::max();
+        const std::uint32_t extent =
+            std::min({active_dflash_window, max_by_budget, capacity - frontier - 1U, lane_cap});
+        maximum_frontier = std::max(maximum_frontier, frontier);
+        dflash_host_ingress->anchors[row] = sequence.ledger.back();
+        dflash_host_ingress->execution_frontiers[row] = checked_i32(frontier, "DFlash batch frontier");
+        dflash_host_ingress->context_frontiers[row] =
+            checked_i32(sequence.dflash_context_frontier, "DFlash context frontier");
+        dflash_host_ingress->proposal_extents[row]     = static_cast<std::int32_t>(extent);
+        dflash_host_ingress->target_valid_columns[row] = static_cast<std::int32_t>(extent + 1U);
+        for (std::uint32_t j = 0; j <= active_dflash_window; ++j) {
+            const auto position = frontier + std::min(j, extent);
+            dflash_host_ingress->target_rope_positions[row * width + j] =
+                checked_i32(position, "DFlash batch RoPE position") + sequence.rope_delta;
+        }
+        dflash_host_ingress->text_kv_table_rows[row]   = sequence.kv->text.bound_row();
+        dflash_host_ingress->dflash_kv_table_rows[row] = draft_kv_row(sequence);
+        dflash_host_ingress->lanes[row]                = static_cast<std::int32_t>(sequence.lane);
+        dflash_host_ingress->sampling[row]             = staged_sampling(request, sequence);
+        dflash_host_ingress->lora_slots[row]           = request.lora_slot;
+        // The proposal writes the block's own K / V at [frontier, frontier + 8) of the draft planes (dspark_round.h).
+        materialize_sequence_kv(sequence, std::min(capacity, std::max(frontier + extent + 1U, frontier + 8U)), frontier);
+    }
+    schedule::DFlashBatchContext schedule_state{{device, model, work, decoder->linear_attention,
+                                                 replay_records ? &*replay_records : nullptr,
+                                                 io, prefill_hidden, prefill_chunk,
+                                                 proposal_head, &decoder->ple, stage},
+                                                decoder->text_kv,
+                                                *dflash,
+                                                *io.dflash_decode,
+                                                *dflash_host_ingress,
+                                                *dflash_host_egress,
+                                                tail_hidden_store};
+    mark_workspace_usage(workspace_plan.dflash_round);
+    schedule::dflash_pipeline_propose(schedule_state, static_cast<std::int32_t>(lanes.size()), active_dflash_window,
+                                      dflash_envelopes(0, maximum_frontier, active_dflash_window),
+                                      dspark_draft_export.data);
+    device.synchronize();
+    return std::span<const std::byte>(static_cast<const std::byte*>(dspark_draft_export.data),
+                                      2 * schedule::kDSparkDraftImportStride * sizeof(std::int32_t));
 }
 
 runtime::BatchedGeneratedRound ProgramImplCore::consume_dflash_round(runtime::RoundHandle handle) {

@@ -138,6 +138,9 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
         bind.layer_placement = [resident, in_force](std::int32_t layer) {
             return resident[static_cast<std::size_t>(layer)] ? in_force : artifact::TensorPlacement::ValidateOnly;
         };
+        // DSpark: the drafter, its planes and its proposals live on the stage with the head (the last); the others
+        // run the DFlash round's target half only (verify ids from the drafter stage; DESIGN-2card.md 5).
+        if (last < detail::TextConfig::layers) { bind.draft_placement = artifact::TensorPlacement::ValidateOnly; }
     }
     bind.attention = attention_choice();
     if (bind.attention.fp8 != (weights_profile == WeightsProfile::Fp8Attention)) {
@@ -147,8 +150,9 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
     bind.draft = options.speculative.backend == SpeculativeBackend::DFlash;
     // FP8 drafter weights by default (fp8ab2 16:34: identity, tokens / round within noise, -0.29 GiB with the FP8
     // fold): the BF16 dense linears sit in the host bank (attached in LoadedModelData) and are re-quantised at load;
-    // SUROGATE_SERVE_DSPARK_BF16_WEIGHTS=1 keeps them BF16 on the device.
-    bind.draft_linears_host = bind.draft && detail::dspark_fp8_weights_requested();
+    // SUROGATE_SERVE_DSPARK_BF16_WEIGHTS=1 keeps them BF16 on the device. Not on a drafter-less pipeline stage.
+    bind.draft_linears_host = bind.draft && detail::dspark_fp8_weights_requested() &&
+                              bind.draft_placement != artifact::TensorPlacement::ValidateOnly;
     detail::ArtifactLoadPlan plan;
     plan.bindings.plan     = load::bind_artifact(binder, bind);
     plan.bindings.geometry = detail::visit_geometry(binder.reader());

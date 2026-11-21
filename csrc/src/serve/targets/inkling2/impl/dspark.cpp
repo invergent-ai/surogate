@@ -488,7 +488,9 @@ const InklingModel& dspark_model(const RuntimeModelView& model) {
 }
 
 DSparkKv dspark_kv(const family::DSparkRuntime& rt) {
-    if (rt.text_kv == nullptr || rt.text_kv->layers() < Variant::dspark_first_plane + G::kLayers) {
+    // On the 2-card split the last stage's pool holds the planes of visits 30..47 then 48..50 (layers() counts the
+    // stage's planes, not the global index): batch_layer_view checks the global plane against the stage's range.
+    if (rt.text_kv == nullptr || rt.text_kv->layers() < static_cast<std::uint32_t>(G::kLayers)) {
         throw std::logic_error("inkling2 DSpark: the text pool carries no draft planes (48..50)");
     }
     DSparkKv kv;

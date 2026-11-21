@@ -149,7 +149,9 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     if (plan.features.dflash()) {
         // The 2-card split keeps the drafter on the stage with the head (package.cpp); a stage without the head runs
         // the DFlash round's target half only (verify columns from the drafter stage) and binds no drafter.
-        if (!weights.has_draft && weights.globals.has_head) {
+        const bool drafter_elsewhere = plan.plan.options.draft_placement.has_value() &&
+                                       *plan.plan.options.draft_placement == artifact::TensorPlacement::ValidateOnly;
+        if (!weights.has_draft && !drafter_elsewhere) {
             throw std::invalid_argument("inkling2: --speculative dflash needs the DSpark drafter");
         }
         runtime.dflash.emplace();
