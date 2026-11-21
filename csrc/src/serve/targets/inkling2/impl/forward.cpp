@@ -164,6 +164,11 @@ void blended_inputs(Round& rd, const VisitInfo& vi, const load::InklingLayerWeig
             ops::inkling_gemm_inv(gfw, 2 * D, C::gate_rank, h.data, n, gf.data, DType::FP32, 2 * D, gf_batch, nullptr,
                                   0, rd.s);
         }
+        // One tile (every decode / verify round and every prompt round <= kTileColumns): straight into `out`.
+        if (n == rd.T) {
+            ops::inkling_blend_rms_norm(dest, msg, gf, norm_weight, C::rms_epsilon, out, rd.s);
+            continue;
+        }
         Tensor blended = rd.work.alloc(DType::BF16, {D, n, streams});
         ops::inkling_blend_rms_norm(dest, msg, gf, norm_weight, C::rms_epsilon, blended, rd.s);
         for (int j = 0; j < streams; ++j) {
