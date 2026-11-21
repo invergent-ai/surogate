@@ -235,6 +235,30 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
     const int g_first = any ? group_of(gs, lo) : 0;
     const int g_last  = any ? group_of(gs, hi - 1) : -1;
 
+    // This worker's groups [g_start, g_stop): the CTA's blocks split into `workers` contiguous, equal block ranges,
+    // each group owned by the worker whose range holds the group's first block (balanced by keys to one group; free:
+    // every group is computed the same way wherever it runs).
+    int g_start = g_first, g_stop = g_last + 1;
+    if (p.workers > 1 && any) {
+        const int kb_lo   = lo >> 6;
+        const int kb_last = (hi - 1) >> 6;
+        const int nb      = kb_last + 1 - kb_lo;
+        const auto first_group_from = [&](int blk) {
+            if (blk <= kb_lo) { return g_first; }
+            if (blk > kb_last) { return g_last + 1; }
+            int g = group_of(gs, blk * kBn);
+            if (group_begin(gs, g) < blk * kBn) { ++g; }
+            return g;
+        };
+        g_start = first_group_from(kb_lo + static_cast<int>(static_cast<std::int64_t>(worker) * nb / p.workers));
+        g_stop  = first_group_from(kb_lo + static_cast<int>(static_cast<std::int64_t>(worker + 1) * nb / p.workers));
+    }
+
+    // A split-route worker without a group has nothing to write: leave before touching q.
+    if constexpr (Mode == kPartial) {
+        if (g_start >= g_stop) { return; }
+    }
+
     // This warp's row tile.
     const int w_rho0  = mt * 16;
     const int w_j0    = row_column(w_rho0);
@@ -308,25 +332,6 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
     if constexpr (Fold) {
 #pragma unroll
         for (int i = 0; i < DTW * 4; ++i) { sm.fold_a[warp][i][lane] = 0.0F; }
-    }
-
-    // This worker's groups [g_start, g_stop): the CTA's blocks split into `workers` contiguous, equal block ranges,
-    // each group owned by the worker whose range holds the group's first block (balanced by keys to one group; free:
-    // every group is computed the same way wherever it runs).
-    int g_start = g_first, g_stop = g_last + 1;
-    if (p.workers > 1 && any) {
-        const int kb_lo   = lo >> 6;
-        const int kb_last = (hi - 1) >> 6;
-        const int nb      = kb_last + 1 - kb_lo;
-        const auto first_group_from = [&](int blk) {
-            if (blk <= kb_lo) { return g_first; }
-            if (blk > kb_last) { return g_last + 1; }
-            int g = group_of(gs, blk * kBn);
-            if (group_begin(gs, g) < blk * kBn) { ++g; }
-            return g;
-        };
-        g_start = first_group_from(kb_lo + static_cast<int>(static_cast<std::int64_t>(worker) * nb / p.workers));
-        g_stop  = first_group_from(kb_lo + static_cast<int>(static_cast<std::int64_t>(worker + 1) * nb / p.workers));
     }
 
     // Block cursor over the worker's groups, each group's blocks in key order.
