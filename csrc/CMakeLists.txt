@@ -1709,6 +1709,18 @@ set(SINFER_CUTLASS_INCLUDE "${cutlass_SOURCE_DIR}/include")
 sinfer_cuda_archive(sinfer_ops)
 target_link_libraries(sinfer_ops PUBLIC sinfer_core PRIVATE sinfer_nvfp4_tma sinfer_nvfp4_cutlass sinfer_fp8_block_sm90 sinfer_fp8_block_sm120 sinfer_gqa_sm90 sinfer_trtllm_moe CUDA::cublasLt)
 
+# ENGINE-INKLING lane c: the Inkling-2-Mini attention ops (api/ops/inkling_attention.h). An archive of its
+# own, deliberately NOT in SINFER_SHARED_ARCHIVES: nothing existing references it, so libsinfer and the
+# products (and the current model's numbers) stay exactly what they were; the inkling2 target links it.
+# No fast math: the kernels reproduce the reference's rounding with explicit intrinsics.
+add_library(sinfer_inkling_attention STATIC EXCLUDE_FROM_ALL
+  ${SERVE_ROOT}/ops/inkling_attention/inkling_prologue.cu
+  ${SERVE_ROOT}/ops/inkling_attention/inkling_rel_attention.cu
+  ${SERVE_ROOT}/ops/inkling_attention/inkling_attn_linear.cu)
+sinfer_internal_includes(sinfer_inkling_attention)
+sinfer_cuda_archive(sinfer_inkling_attention)
+target_link_libraries(sinfer_inkling_attention PUBLIC sinfer_core)
+
 # Product-independent text and media mechanisms.
 add_library(sinfer_text STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/text/unicode.cpp
