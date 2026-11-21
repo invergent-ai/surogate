@@ -538,7 +538,8 @@ void Variant::run_visits(const ModelView& model, family::VisitRound& r) {
     static bool dumped = false;
     cudaStreamCaptureStatus capturing = cudaStreamCaptureStatusNone;
     CUDA_CHECK(cudaStreamIsCapturing(rd.s, &capturing));
-    d.active = d.dir != nullptr && !dumped && capturing == cudaStreamCaptureStatusNone;
+    // A prompt round only (the graph warmup's dummy decode rows come first and are not a parity prompt).
+    d.active = d.dir != nullptr && !dumped && capturing == cudaStreamCaptureStatusNone && !r.segments.empty();
     for (int v = r.first_visit; v < r.last_visit; ++v) { run_visit(rd, v); }
     if (d.active) {
         dumped   = true;

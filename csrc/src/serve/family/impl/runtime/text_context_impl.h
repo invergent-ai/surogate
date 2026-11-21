@@ -914,7 +914,9 @@ void TextContext::proposal_argmax(const Tensor& wide, Tensor& logits, Tensor& pr
                                       ctx_.stream);
     } else {
         Tensor output_logits = matrix_window(logits, T);
-        head_logits<Variant>(weights_, hidden, *lm_head_, cfg_, output_logits, ctx_.stream);
+        // A draft head's proposal logits are BF16 for every target: the family head, not head_logits.
+        ops::linear(hidden, *lm_head_, output_logits, ctx_.stream);
+        apply_logit_softcap(cfg_, output_logits, ctx_.stream);
         ops::argmax(output_logits, proposal_tokens, cfg_.token_domain, ctx_.stream);
     }
 }
@@ -2047,6 +2049,7 @@ void TextContext::run_visit_round(Tensor& x, Tap& tap, std::span<const family::V
                                   const Tensor& positions) {
     if constexpr (family::visit_schedule<Variant>()) {
         family::VisitRound round;
+        round.phase       = block != nullptr ? family::TextPhase::Verify : family::TextPhase::Prefill;
         round.x           = x;
         round.ids         = active_ids_;
         round.positions   = positions;

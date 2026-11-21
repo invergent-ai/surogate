@@ -170,8 +170,10 @@ __global__ void __launch_bounds__(256) quant_kernel(const bf16* x, int k, int nv
             for (int i = 0; i < 16; ++i) {
                 v6[i]  = e2m1_value(xb[i] * inv6);
                 v4[i]  = e2m1_value(xb[i] * inv4);
-                e6s[i] = fabsf((v6[i] * s6) * outer - xb[i]);
-                e4s[i] = fabsf((v4[i] * s4) * outer - xb[i]);
+                // |rec - x| with rec = (v * s) * outer fused into one rounding, as the reference kernel
+                // compiles it (lane d: 3 of 36,864 blocks flip their choice unfused).
+                e6s[i] = fabsf(fmaf(v6[i] * s6, outer, -xb[i]));
+                e4s[i] = fabsf(fmaf(v4[i] * s4, outer, -xb[i]));
             }
             for (int width = 16; width > 1; width /= 2) { // pairwise tree of adjacent pairs
                 for (int i = 0; i < width / 2; ++i) {

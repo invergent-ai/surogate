@@ -187,7 +187,7 @@ __global__ void __launch_bounds__(128) prologue_kernel(const __grid_constant__ A
         const float vs  = sum128(vv * vv, scratch);
         const float vc  = vv * rsqrt_approx(__fdiv_rn(vs, 128.0F) + 1e-6F);
         const std::int64_t off =
-            static_cast<std::int64_t>(kHeadDim) * ops::kPagedKVPageSize * (hk + static_cast<std::int64_t>(kKvHeads) * page) +
+            static_cast<std::int64_t>(kHeadDim) * sinfer::kPagedKVPageSize * (hk + static_cast<std::int64_t>(kKvHeads) * page) +
             static_cast<std::int64_t>(kHeadDim) * (pos & ops::kPagedKVPageMask) + d;
         if (a.fp8) {
             static_cast<__nv_fp8_e4m3*>(a.k_pages)[off] = __nv_fp8_e4m3(kc);
@@ -235,7 +235,7 @@ __global__ void __launch_bounds__(128) attention_kernel(const __grid_constant__ 
         if (key <= hi) {
             page = table[key >> ops::kPagedKVPageShift];
             const std::int64_t base =
-                static_cast<std::int64_t>(kHeadDim) * ops::kPagedKVPageSize * (hk + static_cast<std::int64_t>(kKvHeads) * page) +
+                static_cast<std::int64_t>(kHeadDim) * sinfer::kPagedKVPageSize * (hk + static_cast<std::int64_t>(kKvHeads) * page) +
                 static_cast<std::int64_t>(kHeadDim) * (key & ops::kPagedKVPageMask);
             float dot = 0.0F;
             for (int e = 0; e < kHeadDim; ++e) { dot = fmaf(q_s[e], load_kv(a.k_pages, a.fp8, base + e), dot); }
@@ -261,7 +261,7 @@ __global__ void __launch_bounds__(128) attention_kernel(const __grid_constant__ 
             l += p;
             const int key_i = k0 + i;
             const std::int64_t off =
-                static_cast<std::int64_t>(kHeadDim) * ops::kPagedKVPageSize * (hk + static_cast<std::int64_t>(kKvHeads) * page_s[i]) +
+                static_cast<std::int64_t>(kHeadDim) * sinfer::kPagedKVPageSize * (hk + static_cast<std::int64_t>(kKvHeads) * page_s[i]) +
                 static_cast<std::int64_t>(kHeadDim) * (key_i & ops::kPagedKVPageMask) + d;
             acc = fmaf(p, load_kv(a.v_pages, a.fp8, off), acc);
         }
