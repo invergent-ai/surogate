@@ -859,6 +859,7 @@ struct Fp8Weight {
     int n = 0, k = 0, k_per = 0, rows_per = 0;
     std::vector<std::uint8_t> codes;
     std::vector<float> scales; // [n / rows_per][k / k_per]
+    std::vector<double> dequant; // e4m3(code) * scale, exact in double (lane a's fp8_quant_weight value)
     DeviceBuffer dcodes, dscales;
     Weight w{};
 
@@ -875,6 +876,14 @@ struct Fp8Weight {
         for (auto& x : scales) { x = rng.uni(1e-4F, 4e-3F); }
         dcodes  = to_device(codes);
         dscales = to_device(scales);
+        dequant.resize(codes.size());
+        for (int r = 0; r < n; ++r) {
+            for (int c = 0; c < k; ++c) {
+                dequant[static_cast<std::size_t>(r) * k + c] =
+                    static_cast<double>(e4m3_decode(codes[static_cast<std::size_t>(r) * k + c])) *
+                    scales[static_cast<std::size_t>(r / rows_per) * (k / k_per) + c / k_per];
+            }
+        }
         w.qtype       = k_per == k ? QType::FP8_E4M3FN_ROW_F32S : QType::FP8_E4M3FN_BLK128_F32S;
         w.layout      = QuantLayout::Fp8Block128;
         w.scale_dtype = DType::FP32;
@@ -887,10 +896,7 @@ struct Fp8Weight {
         w.group_size  = 128;
         w.group       = 128;
     }
-    double value(int row, int col) const {
-        return static_cast<double>(e4m3_decode(codes[static_cast<std::size_t>(row) * k + col])) *
-               scales[static_cast<std::size_t>(row / rows_per) * (k / k_per) + col / k_per];
-    }
+    const double* row(int r) const { return &dequant[static_cast<std::size_t>(r) * k]; }
 };
 
 void run_linear_case(const std::string& name, int k, int k_per, int rows_per, int columns,
@@ -931,10 +937,10 @@ void run_linear_case(const std::string& name, int k, int k_per, int rows_per, in
         std::vector<double> g, ref;
         for (int c = 0; c < columns; ++c) {
             for (int r = 0; r < rows; ++r) {
-                double acc = 0.0;
-                for (int kk = 0; kk < k; ++kk) {
-                    acc += fw.value(ranges[i].first + r, kk) * xs[i][static_cast<std::size_t>(c) * k + kk];
-                }
+                double acc       = 0.0;
+                const double* wr = fw.row(ranges[i].first + r);
+                const float* xc  = &xs[i][static_cast<std::size_t>(c) * k];
+                for (int kk = 0; kk < k; ++kk) { acc += wr[kk] * xc[kk]; }
                 ref.push_back(acc);
                 g.push_back(bf16_to_f32(got[static_cast<std::size_t>(c) * (n_rows + 8) + r]));
             }
