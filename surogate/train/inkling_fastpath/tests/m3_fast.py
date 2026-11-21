@@ -101,14 +101,39 @@ def main():
     finite = all(p.grad is not None and bool(torch.isfinite(p.grad).all()) for p in params)
     norms = [{k: float(lo[k].grad.norm()) for k in B.LORA_KEYS} for lo in lora]
     slices = {i: {k: lora[i][k].grad[:16].detach().cpu() for k in B.LORA_KEYS} for i in SLICE_LAYERS}
-    rep["grad"] = {"T": T, "loss": float(loss), "finite": finite, "forward_s": t_fwd, "backward_s": t_bwd,
+    rep["grad"] = {"T": T, "loss": float(loss.detach()), "finite": finite, "forward_s": t_fwd, "backward_s": t_bwd,
                    "peak_gib": torch.cuda.max_memory_allocated() / 2**30,
                    "norm_total": math.sqrt(sum(v * v for n in norms for v in n.values()))}
     log(f"grad: loss {float(loss):.5f} finite {finite} fwd {t_fwd:.2f}s bwd {t_bwd:.2f}s peak "
         f"{rep['grad']['peak_gib']:.2f} GiB")
-    torch.save({"ids": ids.cpu(), "routing": res["routing"].cpu(), "loss": float(loss), "norms": norms,
-                "slices": slices}, os.path.join(a.out, "m3_fast.pt"))
+    # D1 (glue check): the same LEVEL-0 machinery over the torch recompute's OWN chain (W4A16, the engine's routing):
+    # its gradient is the exact gradient of that chain = what lane L's rig computes (an independent implementation).
+    for p in params:
+        p.grad = None
+    x0, routing = res["x0"], res["routing"]
     del lp, res, loss
+    t3 = time.time()
+    vals = B.torch_chain(eng, W, ids, x0, routing, lora)
+    lp_d1 = tf.graph(ids, vals, lora)
+    loss_d1 = -lp_d1.mean()
+    loss_d1.backward()
+    torch.cuda.synchronize()
+    norms_d1 = [{k: float(lo[k].grad.norm()) for k in B.LORA_KEYS} for lo in lora]
+    slices_d1 = {i: {k: lora[i][k].grad[:16].detach().cpu() for k in B.LORA_KEYS} for i in SLICE_LAYERS}
+    cos_e_d1 = {}
+    for i in SLICE_LAYERS:
+        for k in B.LORA_KEYS:
+            a_, b_ = slices[i][k].flatten().double(), slices_d1[i][k].flatten().double()
+            cos_e_d1[f"L{i}.{k}"] = float(a_ @ b_ / (a_.norm() * b_.norm()).clamp_min(1e-300))
+    rep["d1"] = {"loss_torch_chain": float(loss_d1), "seconds": time.time() - t3, "cos_engine_vs_chain": cos_e_d1}
+    log(f"D1 torch chain: loss {float(loss_d1):.5f}; cos(engine LEVEL-0, chain LEVEL-0) min "
+        f"{min(cos_e_d1.values()):.4f} " + " ".join(f"{k}:{v:.3f}" for k, v in cos_e_d1.items() if k.endswith('A13')))
+    torch.save({"ids": ids.cpu(), "routing": routing.cpu(), "loss": rep["grad"]["loss"], "norms": norms,
+                "slices": slices, "loss_d1": float(loss_d1), "norms_d1": norms_d1, "slices_d1": slices_d1},
+               os.path.join(a.out, "m3_fast.pt"))
+    for p in params:
+        p.grad = None
+    del vals, lp_d1, loss_d1, x0, routing
 
     # 1. forward agreement (separate pass: engine forward with the same banks, then torch visits from its inputs)
     with torch.no_grad():

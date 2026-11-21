@@ -448,24 +448,55 @@ class TrainForward:
         self.eng, self.W = eng, W
 
     def build(self, ids: torch.Tensor, lora=None, banks: EngineBanks | None = None):
-        eng, W = self.eng, self.W
-        T = ids.numel()
+        eng = self.eng
         res = F.forward(eng, ids, save=True, adapters_per_layer=(None if banks is None else
                                                                  [L["adapters"] for L in banks.layers]))
-        x0 = res["x0"]
-        slots = {0: x0}
+        res["lp"] = F.logprobs(eng, res["hidden"], ids)
+        lp = self.graph(ids, res, lora)
+        return lp, res
+
+    def graph(self, ids: torch.Tensor, vals: dict, lora=None):
+        """The autograd graph over given forward values {x0, outs[48], routing [48, T, 8], hidden, lp [T - 1]} (the
+        engine's, or any other chain's: tests feed the torch recompute's own chain to check the glue)."""
+        eng, W = self.eng, self.W
+        slots = {0: vals["x0"]}
         for v, vi in enumerate(eng.visits):
             stack = [slots[s] for s in vi.stack]
             partial = slots[vi.partial]
             bank = [slots[vi.bank[0]], slots[vi.bank[1]]] if vi.looped else []
             lt = [lora[vi.layer][k] for k in LORA_KEYS] if lora is not None else []
             scale = lora[vi.layer]["scale"] if lora is not None else None
-            out = EngineVisit.apply(W, vi, res["routing"][v], len(stack), vi.looped, scale, res["outs"][v],
+            out = EngineVisit.apply(W, vi, vals["routing"][v], len(stack), vi.looped, scale, vals["outs"][v],
                                     *stack, partial, *bank, *lt)
             slots[vi.next_partial] = out
-        res["outs"] = None  # the fp32 visit outputs above hold the values
-        hid = FinalMix.apply(W, res["hidden"], slots[0], slots[1], slots[2], slots[3], slots[6])
+        vals["outs"] = None  # the fp32 visit outputs above hold the values
+        hid = FinalMix.apply(W, vals["hidden"], slots[0], slots[1], slots[2], slots[3], slots[6])
         tgt = ids[1:].contiguous()
-        lp_engine = F.logprobs(eng, res["hidden"], ids)
-        lp = HeadLogprob.apply(W, lp_engine, hid[:-1], tgt)
-        return lp, res
+        return HeadLogprob.apply(W, vals["lp"], hid[:-1], tgt)
+
+
+@torch.no_grad()
+def torch_chain(eng: InklingEngine, W: EngineWeights, ids: torch.Tensor, x0: torch.Tensor, routing: torch.Tensor,
+                lora=None) -> dict:
+    """The torch recompute run as a whole forward (W4A16, the given routing): {x0, outs, routing, hidden, lp}. Test
+    only: TrainForward.graph over these values must give the exact gradient of this chain (the glue check)."""
+    with torch.device(eng.dev):
+        slots = {0: x0}
+        outs = []
+        for v, vi in enumerate(eng.visits):
+            bank = (slots[vi.bank[0]], slots[vi.bank[1]]) if vi.looped else None
+            o = visit_torch(W, vi, [slots[s] for s in vi.stack], slots[vi.partial], bank, routing[v],
+                            None if lora is None else lora[vi.layer])
+            outs.append(o)
+            slots[vi.next_partial] = o
+        hid = RA.inkling_attn_res([slots[0], slots[1], slots[2], slots[3]], slots[6], None, W.q_out,
+                                  W.final_norm.reshape(1, D), EPS)[0]
+        tgt = ids[1:].long()
+        lps = []
+        headf = W.head.float()
+        for a in range(0, hid.shape[0] - 1, 256):
+            b = min(hid.shape[0] - 1, a + 256)
+            z = torch.tanh((hid[a:b] @ headf.T) / 30.0) * 30.0
+            lps.append(z.gather(1, tgt[a:b, None])[:, 0] - torch.logsumexp(z, -1))
+        del headf
+    return {"x0": x0, "outs": outs, "routing": routing, "hidden": hid, "lp": torch.cat(lps)}
