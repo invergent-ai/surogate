@@ -613,6 +613,16 @@ __global__ __launch_bounds__(Schedule::kThreads, 1) void nvfp4_expert_gemm_persi
         int fill = 0;
         for (int item = static_cast<int>(blockIdx.x); item < total_items; item += static_cast<int>(gridDim.x)) {
             const PersistentItem tile = persistent_item<Schedule>(shared.tile_prefix, p.offsets, item);
+            // kL2SliceNextItem: this CTA's next item's weight rows into L2 now (a hint; the ring below loads
+            // the same bytes either way).
+            if ((p.l2_slice & kL2SliceNextItem) != 0 && item + static_cast<int>(gridDim.x) < total_items) {
+                const PersistentItem next =
+                    persistent_item<Schedule>(shared.tile_prefix, p.offsets, item + static_cast<int>(gridDim.x));
+                prefetch_bank_rows<Schedule::kProducerThreads>(p.weights, true, K,
+                                                               static_cast<std::int64_t>(next.expert) * kGateUpRows +
+                                                                   next.n_begin,
+                                                               Schedule::kBlockN, producer);
+            }
             asm volatile("bar.sync 2, %0;" : : "n"(Schedule::kProducerThreads) : "memory");
             for (int row = producer; row < Schedule::kBlockM; row += Schedule::kProducerThreads) {
                 const int index = tile.row_begin + row;
@@ -835,7 +845,7 @@ void launch_nvfp4_gate_up(const GemmParams& params, std::int32_t slots, GemmSche
                           cudaStream_t stream) {
     require(params);
     GemmParams p = with_l2_prefetch(params, true);
-    if (schedule != GemmSchedule::Narrow) { p.l2_slice = 0; } // slice prefetches: narrow schedules only
+    if (schedule != GemmSchedule::Narrow) { p = wide_l2_slice(p); }
     if (schedule == GemmSchedule::Narrow) {
         launch_schedule<NarrowSchedule, kHidden, true>(p, slots, stream);
     } else {
@@ -847,7 +857,7 @@ void launch_nvfp4_down(const GemmParams& params, std::int32_t slots, GemmSchedul
                        cudaStream_t stream) {
     require(params);
     GemmParams p = with_l2_prefetch(params, true);
-    if (schedule != GemmSchedule::Narrow) { p.l2_slice = 0; }
+    if (schedule != GemmSchedule::Narrow) { p = wide_l2_slice(p); }
     if (schedule == GemmSchedule::Narrow) {
         // The y quantisation runs in this kernel's prologue (a_bf16 = y rows); w2 streams before the wait.
         if (p.a_bf16 == nullptr) { throw std::invalid_argument("inkling_moe: narrow NVFP4 down needs the y rows"); }

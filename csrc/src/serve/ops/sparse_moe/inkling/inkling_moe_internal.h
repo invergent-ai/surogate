@@ -180,6 +180,11 @@ struct GemmParams {
 inline constexpr int kL2SliceOwn           = 1;
 inline constexpr int kL2SliceNext          = 2;
 inline constexpr int kL2SliceOwnBeforeWait = 4;
+/// Prefill (T > 64) only: 8 = the per-tile wide kernels prefetch their own slice (as Own / OwnBeforeWait);
+/// 16 = the persistent NVFP4 kernel's producer prefetches the weight slice of its NEXT item (item + grid) when it
+/// starts an item, so the weight bytes of the following item stream from DRAM while this one computes.
+inline constexpr int kL2SliceWide          = 8;
+inline constexpr int kL2SliceNextItem      = 16;
 
 /// The weight loads' L2 prefetch hint (`GemmParams::l2_prefetch`): 128 bytes. Measured 12:54 (card 7, cold,
 /// layer 0 NVFP4): T = 8 151.6 -> 131.0 us, T = 64 336.9 -> 291.1, T = 1 36.9 -> 35.7; 256 B the same; T = 4,096
@@ -197,7 +202,7 @@ inline GemmParams with_l2_prefetch(GemmParams params, bool nvfp4) {
     // budget / one expert's bytes: NVFP4 4.48 MB, MXFP8 8.21 MB).
     static const int slice = [] {
         const char* text = std::getenv("SUROGATE_INKLING_L2_SLICE");
-        return text == nullptr ? 0 : std::atoi(text) & 7;
+        return text == nullptr ? 0 : std::atoi(text) & 31;
     }();
     static const int next_mb = [] {
         const char* text = std::getenv("SUROGATE_INKLING_L2_NEXT_MB");
@@ -205,6 +210,15 @@ inline GemmParams with_l2_prefetch(GemmParams params, bool nvfp4) {
     }();
     params.l2_slice = slice;
     params.next_max_tiles = next_mb * 1000 / (nvfp4 ? 4479 : 8211);
+    return params;
+}
+
+/// The l2_slice bits a prefill (wide) launch keeps: kL2SliceWide -> the kernels' own-slice bits; kL2SliceNextItem
+/// stays for the persistent kernel; never the w2 prefetch (Next).
+inline GemmParams wide_l2_slice(GemmParams params) {
+    const int bits  = params.l2_slice;
+    params.l2_slice = ((bits & kL2SliceWide) != 0 ? kL2SliceOwn | kL2SliceOwnBeforeWait : 0) | (bits & kL2SliceNextItem);
+    params.next_max_tiles = 0;
     return params;
 }
 

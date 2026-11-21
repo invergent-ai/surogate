@@ -159,11 +159,13 @@ __device__ __forceinline__ void cp_async_cg16_hint(void* smem_dst, const void* g
 /// cub/device/dispatch/kernels/transform.cuh): one `prefetch.global.L2` per 128-byte line, the block's
 /// threads strided, no unroll (a prefetch does not stall). A hint: nothing reaches the kernel through
 /// it, so no bit can change.
+/// `thread` in [0, Threads): the caller's index among the threads that share the range.
 template <int Threads>
-__device__ __forceinline__ void prefetch_l2(const void* begin, std::int64_t bytes) {
+__device__ __forceinline__ void prefetch_l2(const void* begin, std::int64_t bytes,
+                                            int thread = static_cast<int>(threadIdx.x)) {
     const char* base = static_cast<const char*>(begin);
 #pragma unroll 1
-    for (std::int64_t offset = static_cast<std::int64_t>(threadIdx.x) * 128; offset < bytes;
+    for (std::int64_t offset = static_cast<std::int64_t>(thread) * 128; offset < bytes;
          offset += static_cast<std::int64_t>(Threads) * 128) {
         asm volatile("prefetch.global.L2 [%0];" : : "l"(__cvta_generic_to_global(base + offset)) : "memory");
     }
@@ -173,15 +175,16 @@ __device__ __forceinline__ void prefetch_l2(const void* begin, std::int64_t byte
 /// 128-row scale tiles that hold them (K/64 x 512 bytes per tile); MXFP8 codes rows x K + exponents rows x K/32.
 template <int Threads>
 __device__ __forceinline__ void prefetch_bank_rows(const InklingExpertBank& bank, bool nvfp4, int k,
-                                                   std::int64_t row, int rows) {
+                                                   std::int64_t row, int rows,
+                                                   int thread = static_cast<int>(threadIdx.x)) {
     if (nvfp4) {
-        prefetch_l2<Threads>(bank.codes + row * (k / 2), static_cast<std::int64_t>(rows) * (k / 2));
+        prefetch_l2<Threads>(bank.codes + row * (k / 2), static_cast<std::int64_t>(rows) * (k / 2), thread);
         const std::int64_t first_tile = row / 128;
         const std::int64_t tiles      = (row + rows + 127) / 128 - first_tile;
-        prefetch_l2<Threads>(bank.scales + first_tile * (k / 64) * 512, tiles * (k / 64) * 512);
+        prefetch_l2<Threads>(bank.scales + first_tile * (k / 64) * 512, tiles * (k / 64) * 512, thread);
     } else {
-        prefetch_l2<Threads>(bank.codes + row * k, static_cast<std::int64_t>(rows) * k);
-        prefetch_l2<Threads>(bank.scales + row * (k / 32), static_cast<std::int64_t>(rows) * (k / 32));
+        prefetch_l2<Threads>(bank.codes + row * k, static_cast<std::int64_t>(rows) * k, thread);
+        prefetch_l2<Threads>(bank.scales + row * (k / 32), static_cast<std::int64_t>(rows) * (k / 32), thread);
     }
 }
 

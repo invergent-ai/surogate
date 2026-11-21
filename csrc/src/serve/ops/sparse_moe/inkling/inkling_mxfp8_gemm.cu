@@ -320,7 +320,7 @@ void launch_mxfp8_gate_up(const GemmParams& params, std::int32_t slots, GemmSche
                           cudaStream_t stream) {
     require(params);
     GemmParams p = with_l2_prefetch(params, false);
-    if (schedule != GemmSchedule::Narrow) { p.l2_slice = 0; } // slice prefetches: narrow schedules only
+    if (schedule != GemmSchedule::Narrow) { p = wide_l2_slice(p); }
     if (schedule == GemmSchedule::Narrow) {
         launch_schedule<NarrowSchedule, kHidden, true>(p, slots, stream);
     } else {
@@ -332,7 +332,7 @@ void launch_mxfp8_down(const GemmParams& params, std::int32_t slots, GemmSchedul
                        cudaStream_t stream) {
     require(params);
     GemmParams p = with_l2_prefetch(params, false);
-    if (schedule != GemmSchedule::Narrow) { p.l2_slice = 0; }
+    if (schedule != GemmSchedule::Narrow) { p = wide_l2_slice(p); }
     if (schedule == GemmSchedule::Narrow) {
         launch_schedule<NarrowSchedule, kIntermediate, false>(p, slots, stream);
     } else {
