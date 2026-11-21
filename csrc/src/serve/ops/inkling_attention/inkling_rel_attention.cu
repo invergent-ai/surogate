@@ -1187,9 +1187,9 @@ void run(const InklingAttentionInputs& in, InklingLayerKind kind, const InklingA
     const Plan plan = make_plan(kind, p.groups, rs.width, rs.batch, static_cast<std::int32_t>(rows.envelope.max_visible_keys));
     p.workers       = plan.workers;
     p.max_slots     = plan.max_slots;
-    // L2 prefetch ahead of the loads: measured 11:30 (perf6ab) to slow decode / verify at every distance (1x262k 376 ->
-    // 387 us at 4, 464 at 8): off there; prefill keeps 4 (not yet A/B-measured).
-    if (p.l2_ahead < 0) { p.l2_ahead = plan.decode ? 0 : 4; }
+    // L2 prefetch ahead of the loads: OFF by default -- measured slower at every distance on decode / verify (perf6ab
+    // 11:30: 1x262k 376 -> 387 us at 4, 464 at 8) and on prefill (perf16ab 13:28: 8k from 0 2.84 -> 2.93 ms at 4).
+    if (p.l2_ahead < 0) { p.l2_ahead = 0; }
     if (plan.workers == 1) {
         dispatch(kind, final_mode, plan, p, stream);
         return;

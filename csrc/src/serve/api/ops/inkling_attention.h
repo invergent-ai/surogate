@@ -141,7 +141,7 @@ struct InklingAttentionKnobs {
     int splits                      = 0;    // > 0: force this many workers (split route)
     int cta_target                  = 0;    // decode CTA target (0: 2 x SMs)
     int prefill_ks                  = 2;    // 2: 8-warp prefill kernel, 1: 4-warp
-    int l2_ahead                    = -1;   // blocks asked of L2 ahead (-1: decode 0, prefill 4)
+    int l2_ahead                    = -1;   // blocks asked of L2 ahead (-1: off; measured slower on every route)
     bool pdl_trigger                = true; // trigger dependents at kernel entry
     int variant                     = 17;   // numerics variant bits (production 17)
     bool early_meta                 = true; // honour InklingAttentionRows::metadata_static
