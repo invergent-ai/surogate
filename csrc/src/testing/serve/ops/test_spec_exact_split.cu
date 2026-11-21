@@ -409,9 +409,14 @@ struct ExactCase {
     int profile;    // 0 peaked (top ~0.9), 1 medium (top ~0.43), 2 flat (100 equal tokens), 3 medium, low-p draft
 };
 
-// Column logits of a case: `ids` = the bin tokens (explicit), tail at -10 / temperature-scaled.
+// Column logits of a case: `ids` = the bin tokens (explicit), the tail at -10 (T 1) or -7 (other T).
+// REACH (finding 2026-11-21 18:0x, both routes alike, and ops::sample too): sampling_gumbel draws from a 24-bit uniform,
+// so a Gumbel is at most ~17.3 and at least ~-2.85: a token whose scaled logit (x - max) / T lies more than ~20 below the
+// column maximum is never drawn by the Gumbel-max (correction / bonus / plain sampling). A T 0.7 case with the tail at
+// -10 (gap 20 scaled) failed on both routes with the tail bin empty (expected 59 of 256k: z 7.7). The tail is kept
+// inside reach here (gap 11 / 0.7 = 15.7); the reach itself is a property of the shared sampler, reported separately.
 void case_logits(const ExactCase& c, int col, int domain, std::vector<float>& x, std::vector<int>& ids, int& draft) {
-    x.assign(domain, -10.0f);
+    x.assign(domain, c.temperature == 1.0f ? -10.0f : -7.0f);
     ids.clear();
     std::mt19937 g(1234 + 17 * col + 1000 * c.profile);
     auto pick = [&]() {

@@ -548,7 +548,7 @@ void Variant::dspark_propose(const ModelView& model, const family::DSparkRuntime
     }
 }
 
-std::uint32_t Variant::dspark_draft_cap(std::span<const TokenId> ledger) {
+std::uint8_t Variant::dspark_content_kind(std::span<const TokenId> ledger) {
     // Inkling-2's content markers (model/tokenizer.json): <|content_thinking|> 200008, <|content_invoke_tool_json|>
     // 200049, <|content_text|> 200004; <|message_model|> 200001 opens a model message (structure until a marker).
     constexpr TokenId kThinking = 200008, kToolJson = 200049, kText = 200004, kMessageModel = 200001;
@@ -556,12 +556,51 @@ std::uint32_t Variant::dspark_draft_cap(std::span<const TokenId> ledger) {
     const std::size_t n = ledger.size();
     for (std::size_t i = 0; i < std::min(n, kScan); ++i) {
         const TokenId t = ledger[n - 1 - i];
-        if (t == kToolJson) { return 7; }
-        if (t == kThinking) { return 3; }
-        if (t == kText) { return 2; }
-        if (t == kMessageModel) { return 7; }
+        if (t == kToolJson) { return 0; }
+        if (t == kMessageModel) { return 1; }
+        if (t == kThinking) { return 2; }
+        if (t == kText) { return 3; }
     }
-    return 3; // no marker within reach: a long block of unknown kind -- thinking's cap
+    return 2; // no marker within reach: a long block of unknown kind -- thinking
+}
+
+std::uint32_t Variant::dspark_draft_cap(std::span<const TokenId> ledger, const family::DSparkLaneStats* stats) {
+    const std::uint8_t kind = dspark_content_kind(ledger);
+    if (stats == nullptr) {
+        // static per content kind (lanes/e2/k_policy.py): tool-call JSON 7, structure 7, thinking 3, text 2
+        constexpr std::uint32_t kStatic[4] = {7, 7, 3, 2};
+        return kStatic[kind];
+    }
+    // Per lane (agent-EN-e2c): the k of {0, 1, 2, 3, 7} with the most committed tokens per unit of round time,
+    //   E_k = 1 + a + ... + a^k (per-position acceptance a, geometric), cost_k = the 1-stream round time of window k,
+    // with a = this request's own acceptance on this content kind (accepted drafts / (accepted drafts + rejecting
+    // rounds), decayed), shrunk to the kind's prior by kPriorTrials pseudo-trials. Priors: the engine's real rounds
+    // (lane h M6 / e2c, temperature 0) and lanes/e2/k_policy.json (CPU, round dynamics): tool JSON ~0.92, structure
+    // ~0.85, thinking ~0.70, answer text ~0.52. Costs (ms, lane h M6 1 x 3k, graphs, T0; regression of decode seconds
+    // on rounds per window): k2 9.68, k3 10.44, k7 13.69; plain decode 6.1 (+0.5 for the context append at k 0); k1
+    // interpolated. Break-even vs k 0 near a = 0.42; k 7 overtakes k 3 near a = 0.76.
+    constexpr float kPrior[4]    = {0.92f, 0.85f, 0.70f, 0.52f};
+    constexpr float kPriorTrials = 8.0f;
+    constexpr std::uint32_t kWindows[5] = {0, 1, 2, 3, 7};
+    constexpr float kCost[5]            = {6.6f, 8.9f, 9.68f, 10.44f, 13.69f};
+    const float a = std::clamp((stats->accepted[kind] + kPriorTrials * kPrior[kind]) /
+                                   (stats->accepted[kind] + stats->stopped[kind] + kPriorTrials),
+                               0.0f, 0.999f);
+    std::uint32_t best = kWindows[0];
+    float best_rate    = 1.0f / kCost[0];
+    for (int w = 1; w < 5; ++w) {
+        float e = 1.0f, p = 1.0f;
+        for (std::uint32_t i = 0; i < kWindows[w]; ++i) {
+            p *= a;
+            e += p;
+        }
+        const float rate = e / kCost[w];
+        if (rate > best_rate) {
+            best      = kWindows[w];
+            best_rate = rate;
+        }
+    }
+    return best;
 }
 
 std::size_t Variant::dspark_append_workspace_bytes(std::int32_t columns) {

@@ -43,7 +43,7 @@ struct DSparkDerived {
     const void* w_sp       = nullptr; ///< BF16 [768, 512]   = rnn_proj[:, 0:512]    ([state | w1[prev]])
     const void* w_hf       = nullptr; ///< BF16 [768, 4608]  = rnn_proj[:, 512:5120] ([hidden | f_rnn])
     const void* fold_w     = nullptr; ///< BF16 [201024, 256] = bf16(unembed . hidden_out), fp64 (null with fp8_fold)
-    /// FP8 fold (opt-in, SUROGATE_SERVE_DSPARK_FP8_FOLD=1; M1 `fp8fold`: no acceptance loss): per-row e4m3 codes of the
+    /// FP8 fold (default since 8a146482; SUROGATE_SERVE_DSPARK_BF16_FOLD=1 keeps the BF16 fold; M1 `fp8fold`: no acceptance loss): per-row e4m3 codes of the
     /// BF16 fold + fp32 row scales; half the bytes of every Markov vocabulary pass.
     bool fp8_fold                   = false;
     const std::uint8_t* fold_codes  = nullptr; ///< U8 [201024, 256]

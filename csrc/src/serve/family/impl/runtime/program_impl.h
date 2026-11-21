@@ -96,28 +96,51 @@ void round_trace_state(const Pool& pool, cudaStream_t stream, const char* when) 
 namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS {
 namespace {
 
-/// DSpark under --spec-adaptive: the draft cap of a lane from the content kind it is writing (the Variant reads its
-/// ledger: tool-call JSON / message structure 7, thinking 3, answer text 2; lanes/e2/k_policy.py); no cap otherwise.
-/// SUROGATE_SERVE_DSPARK_K_POLICY=measured keeps the measured AdaptiveDFlash choice instead (no caps).
-[[nodiscard]] bool dspark_kind_policy() {
+/// DSpark under --spec-adaptive: the k policy (SUROGATE_SERVE_DSPARK_K_POLICY). 2 (default, "lane"): each lane's cap
+/// from its content kind AND its own request's acceptance on that kind (family::DSparkLaneStats, the Variant's
+/// dspark_draft_cap); 1 ("static"): the cap per content kind only (tool JSON / structure 7, thinking 3, text 2;
+/// lanes/e2/k_policy.py); 0 ("measured"): the measured AdaptiveDFlash choice per batch size and context band, no caps.
+/// Under 1 / 2 a lane's extent is its own cap whatever the batch (the window is the smallest captured one holding every
+/// cap), so its drafts, and its sampled tokens, do not depend on the other lanes or on timing.
+[[nodiscard]] int dspark_k_policy() {
     if constexpr (family::dspark_drafter<Variant>()) {
-        static const bool on = [] {
+        static const int mode = [] {
             const char* raw = std::getenv("SUROGATE_SERVE_DSPARK_K_POLICY");
-            return raw == nullptr || std::string_view(raw) != "measured";
+            if (raw != nullptr && std::string_view(raw) == "measured") { return 0; }
+            if (raw != nullptr && std::string_view(raw) == "static") { return 1; }
+            return 2;
         }();
-        return on;
+        return mode;
     } else {
-        return false;
+        return 0;
     }
 }
+
+[[nodiscard]] bool dspark_kind_policy() { return dspark_k_policy() != 0; }
+
+/// Decay of a lane's acceptance counts per round of the same content kind (window ~10 rounds).
+inline constexpr float kDSparkStatsDecay = 0.9f;
 
 template <class V, class Sequence>
 [[nodiscard]] std::uint32_t dspark_lane_cap_if(const Sequence& sequence) {
     if constexpr (family::dspark_drafter<V>()) {
-        return V::dspark_draft_cap(std::span<const TokenId>(sequence.ledger.data(), sequence.ledger.size()));
+        return V::dspark_draft_cap(std::span<const TokenId>(sequence.ledger.data(), sequence.ledger.size()),
+                                   dspark_k_policy() == 2 ? &sequence.dspark_stats : nullptr);
     } else {
         (void)sequence;
         return std::numeric_limits<std::uint32_t>::max();
+    }
+}
+
+/// The round's content kind and extent of a lane, kept for the acceptance update after the round (policy "lane").
+template <class V, class Sequence>
+void dspark_note_round_if(Sequence& sequence, std::uint32_t extent) {
+    if constexpr (family::dspark_drafter<V>()) {
+        sequence.dspark_stats.kind   = V::dspark_content_kind(std::span<const TokenId>(sequence.ledger.data(), sequence.ledger.size()));
+        sequence.dspark_stats.extent = extent;
+    } else {
+        (void)sequence;
+        (void)extent;
     }
 }
 
@@ -1159,6 +1182,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         request.timings            = {};
         request.pending            = {};
         sequence.mtp_draft_count   = 0;
+        sequence.dspark_stats      = {};
         sequence.tail_hidden_valid = base == prompt_tokens && sequence.tail_hidden_valid;
         sequence.ledger.assign(prompt.token_ids.begin(), prompt.token_ids.end());
         sequence.prefix_identity.assign(prompt, request_plan.lora_slot, lora_generation);
@@ -1548,6 +1572,11 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
 
             const PendingCandidate pending = request.pending;
             const std::uint32_t committed  = accepted_tokens[row];
+            if constexpr (family::dspark_drafter<Variant>()) {
+                if (adaptive_dflash && dspark_k_policy() == 2 && speculative_backend == SpeculativeBackend::DFlash) {
+                    sequence.dspark_stats.observe(committed, kDSparkStatsDecay);
+                }
+            }
             // Each lane keeps its decision; another round may already be copying into
             // the shared egress.
             const TokenId* token_base = request.outcome.licensed_tokens.data();
@@ -5247,6 +5276,7 @@ ProgramImplCore::launch_dflash_round(std::span<const std::uint32_t> lanes,
                                                : std::numeric_limits<std::uint32_t>::max();
             const std::uint32_t extent =
                 std::min({active_dflash_window, max_by_budget, capacity - frontier - 1U, lane_cap});
+            if (adaptive_dflash && dspark_k_policy() == 2) { dspark_note_round_if<Variant>(sequence, extent); }
             dflash_host_ingress->anchors[row] = sequence.ledger.back();
             dflash_host_ingress->execution_frontiers[row] =
                 checked_i32(frontier, "DFlash batch frontier");

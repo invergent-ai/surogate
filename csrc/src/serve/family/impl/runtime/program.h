@@ -18,6 +18,7 @@
 #include "family/impl/runtime/layouts.h"
 #include "family/impl/runtime/prefill_graph.h"
 #include "family/impl/runtime/dflash_context.h"
+#include "family/impl/runtime/dspark_round.h"
 #include "family/impl/runtime/linear_state_slots.h"
 #include "family/impl/runtime/prefix_identity.h"
 #include "family/impl/runtime/routing_rows.h"
@@ -299,6 +300,9 @@ struct SequenceState {
     bool cacheable                = true;
     bool target_only              = false;
     RewriteCheckpoint rewrite_checkpoint;
+    /// DSpark targets only (dspark_round.h): this request's draft acceptance by content kind; reset at every request
+    /// start, never copied with the metadata. Every other target leaves it untouched.
+    family::DSparkLaneStats dspark_stats{};
     void copy_metadata(const SequenceState& source) {
         execution_frontier = source.execution_frontier; ledger_frontier = source.ledger_frontier;
         ledger = source.ledger; cached_scores = source.cached_scores;

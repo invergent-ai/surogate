@@ -44,6 +44,30 @@ template <class Variant>
     }
 }
 
+/// A lane's draft acceptance by content kind, for the DSpark k policy under --spec-adaptive (agent-EN-e2c): decayed
+/// counts of accepted drafts and of rounds stopped by a rejection, per kind, from this request's own rounds only (reset
+/// at every request start), so a lane's k depends on nothing but its own tokens -- batch- and timing-independent, and a
+/// sampled rollout stays reproducible under its per-(request, position) seeds. Read by the Variant's
+/// dspark_draft_cap; updated by the runtime after each round (observe).
+struct DSparkLaneStats {
+    static constexpr int kKinds = 4; ///< the Variant's content kinds (inkling2: tool JSON, structure, thinking, text)
+    float accepted[kKinds] = {};     ///< decayed accepted drafts per kind
+    float stopped[kKinds]  = {};     ///< decayed rounds that ended on a rejected draft per kind
+    std::uint8_t kind      = 0;      ///< the kind of the round in flight
+    std::uint32_t extent   = 0;      ///< the drafts verified in the round in flight
+    /// The round's outcome: `committed` tokens (accepted drafts + the correction / bonus). The kind's counts decay by
+    /// `decay` every round of that kind, also at extent 0, so an estimate stuck low relaxes to the prior and re-probes.
+    void observe(std::uint32_t committed, float decay) {
+        const int k = kind < kKinds ? kind : 0;
+        accepted[k] *= decay;
+        stopped[k] *= decay;
+        if (extent == 0 || committed == 0) { return; }
+        const std::uint32_t a = committed - 1 < extent ? committed - 1 : extent;
+        accepted[k] += static_cast<float>(a);
+        if (a < extent) { stopped[k] += 1.0f; }
+    }
+};
+
 /// What the runtime gives a DSpark leaf: the text pool (draft planes included), the per-lane f_rnn state and the
 /// round's workspace / stream.
 struct DSparkRuntime {
