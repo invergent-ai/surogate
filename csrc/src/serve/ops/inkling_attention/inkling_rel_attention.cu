@@ -142,7 +142,7 @@ __device__ __forceinline__ float gated_value(float o, float gate, float sig_sink
 
 // ---- the attention kernel -----------------------------------------------------------------------------------------
 
-template <int MTiles, int KS, int Raw, bool Fold>
+template <int MTiles, int KS, int Raw, bool Fold, bool QSmem = false>
 struct AttnSmem {
     static constexpr int kWarps       = MTiles * KS;
     static constexpr int kKeysW       = kBn / KS;         // keys of a warp within a block
@@ -160,6 +160,7 @@ struct AttnSmem {
     uint4 xpk[kX][4][32];
     float fold_a[kF][kDtw * 4][32]; // thread-private fold totals: [warp][dim tile x element][lane]
     alignas(16) std::uint8_t raw[kRawBytes > 0 ? kRawBytes : 16]; // [slot][K | V][key][128]
+    alignas(16) __nv_bfloat16 qtile[QSmem ? 16 * Geo::kHeadDim : 8]; // QSmem: the row tile's q, 16-byte chunk c of row r at c ^ (r & 7)
 };
 
 template <int MTiles, int KS, bool Fold>
@@ -178,7 +179,10 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
     constexpr int NTW      = 8 / KS;  // score n-tiles of a warp
     constexpr int QW       = 4 / KS;  // key quarters of a warp
     constexpr int DTW      = 16 / KS; // P V dim n-tiles of a warp
-    using Smem             = AttnSmem<MTiles, KS, Raw, Fold>;
+    // Decode with one row tile (W <= 5): q lives in shared memory (ldmatrix per k step) instead of 32 registers, which
+    // pays for a second block of codes in flight (two-deep register staging). Same q values, same bits.
+    constexpr bool QSmem   = Decode && MTiles == 1;
+    using Smem             = AttnSmem<MTiles, KS, Raw, Fold, QSmem>;
     constexpr int KeysW    = Smem::kKeysW;
     constexpr int kSS      = Smem::kStripStride;
     extern __shared__ __align__(16) unsigned char attn_smem_raw[];
@@ -258,9 +262,22 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
     }
 
     // Q (eight k16 steps) and R fragments, in registers for the whole walk.
-    unsigned af[8][4];
+    unsigned af[QSmem ? 1 : 8][4];
     unsigned ar[4];
-    {
+    if constexpr (QSmem) {
+        // The row tile's 16 rows of q (zero for rows past the valid columns), 256 chunks of 16 bytes.
+        for (int c = tid; c < 16 * 16; c += Threads) {
+            const int r = c >> 4, ch = c & 15;
+            const int j = r / Geo::kGroup;
+            uint4 v     = make_uint4(0, 0, 0, 0);
+            if (r < Geo::kGroup * W && j < valid) {
+                const std::int64_t n = static_cast<std::int64_t>(j) + static_cast<std::int64_t>(W) * b;
+                v = load_vec<uint4>(p.q + (n * Geo::kQHeads + kvh * Geo::kGroup + r % Geo::kGroup) * Geo::kHeadDim + ch * 8);
+            }
+            store_vec(sm.qtile + r * Geo::kHeadDim + ((ch ^ (r & 7)) << 3), v);
+        }
+        // (made visible by the first block's __syncthreads)
+    } else {
         const __nv_bfloat16* q0 = p.q + (rn[0] * Geo::kQHeads + rh[0]) * Geo::kHeadDim + 2 * lid;
         const __nv_bfloat16* q1 = p.q + (rn[1] * Geo::kQHeads + rh[1]) * Geo::kHeadDim + 2 * lid;
 #pragma unroll
@@ -270,6 +287,8 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
             af[ks][2] = word_or_zero(q0 + 16 * ks + 8, rvalid[0]);
             af[ks][3] = word_or_zero(q1 + 16 * ks + 8, rvalid[1]);
         }
+    }
+    {
         const __nv_bfloat16* r0 = p.r + (rn[0] * Geo::kQHeads + rh[0]) * Geo::kRelDim + 2 * lid;
         const __nv_bfloat16* r1 = p.r + (rn[1] * Geo::kQHeads + rh[1]) * Geo::kRelDim + 2 * lid;
         ar[0] = word_or_zero(r0, rvalid[0]);
@@ -370,15 +389,24 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
         for (int nt = 0; nt < NTW; ++nt) { sc[nt][0] = sc[nt][1] = sc[nt][2] = sc[nt][3] = 0.0F; }
 #pragma unroll
         for (int ks = 0; ks < 8; ++ks) {
+            unsigned a0, a1, a2, a3;
+            if constexpr (QSmem) {
+                const int r = lane & 15, ch = 2 * ks + (lane >> 4);
+                ldmatrix_x4(a0, a1, a2, a3, smem_addr(sm.qtile) + static_cast<unsigned>(r * kRowBytes + ((ch ^ (r & 7)) << 4)));
+            } else {
+                a0 = af[ks][0];
+                a1 = af[ks][1];
+                a2 = af[ks][2];
+                a3 = af[ks][3];
+            }
 #pragma unroll
             for (int nt2 = 0; nt2 < NTW; nt2 += 2) {
                 const int key   = kbase + nt2 * 8 + (lane & 7) + ((lane >> 4) << 3);
                 const int chunk = 2 * ks + ((lane >> 3) & 1);
                 unsigned b0, b1, b2, b3;
                 ldmatrix_x4(b0, b1, b2, b3, k_base + static_cast<unsigned>(key * kRowBytes + ((chunk ^ (key & 7)) << 4)));
-                mma_bf16(sc[nt2][0], sc[nt2][1], sc[nt2][2], sc[nt2][3], af[ks][0], af[ks][1], af[ks][2], af[ks][3], b0, b1);
-                mma_bf16(sc[nt2 + 1][0], sc[nt2 + 1][1], sc[nt2 + 1][2], sc[nt2 + 1][3], af[ks][0], af[ks][1], af[ks][2],
-                         af[ks][3], b2, b3);
+                mma_bf16(sc[nt2][0], sc[nt2][1], sc[nt2][2], sc[nt2][3], a0, a1, a2, a3, b0, b1);
+                mma_bf16(sc[nt2 + 1][0], sc[nt2 + 1][1], sc[nt2 + 1][2], sc[nt2 + 1][3], a0, a1, a2, a3, b2, b3);
             }
         }
 #pragma unroll
@@ -596,9 +624,10 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
     if constexpr (Raw == 0) {
         // Register staging (decode / verify): the next block's codes are loaded into registers while the current one
         // is computed, then widened into the tiles; no raw ring, so two CTAs fit an SM.
-        constexpr int NR = (kBn * 16 + Threads - 1) / Threads; // 8-byte chunks of K (and of V) per thread
-        int2 rk[NR], rv[NR];
-        const auto load_raw = [&](int kb) {
+        constexpr int NR    = (kBn * 16 + Threads - 1) / Threads; // 8-byte chunks of K (and of V) per thread
+        constexpr int Depth = QSmem ? 2 : 1;                       // blocks of codes in registers
+        int2 rk[Depth][NR], rv[Depth][NR];
+        const auto load_raw = [&](int kb, int2 (&k)[NR], int2 (&v)[NR]) {
             const int k0           = kb * kBn;
             const std::int64_t off = kv_page_offset(table_row[k0 >> kPageShift], kvh, 0);
 #pragma unroll
@@ -608,8 +637,8 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
                 const int kabs = k0 + key;
                 const bool ok  = c < kBn * 16 && kabs >= lo && kabs < hi;
                 const std::int64_t o = off + key * Geo::kHeadDim + (c & 15) * 8;
-                rk[i] = ok ? load_ldg<int2>(p.k_pages + o) : make_int2(0, 0);
-                rv[i] = ok ? load_ldg<int2>(p.v_pages + o) : make_int2(0, 0);
+                k[i] = ok ? load_ldg<int2>(p.k_pages + o) : make_int2(0, 0);
+                v[i] = ok ? load_ldg<int2>(p.v_pages + o) : make_int2(0, 0);
             }
         };
         Cursor pf;
@@ -620,11 +649,15 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
                 advance(pf);
             }
         }
-        if (ld.g < g_stop) {
-            load_raw(ld.kb);
-            advance(ld);
+#pragma unroll
+        for (int d = 0; d < Depth; ++d) {
+            if (ld.g < g_stop) {
+                load_raw(ld.kb, rk[d], rv[d]);
+                advance(ld);
+            }
         }
-        while (cu.g < g_stop) {
+        // One block: widen buffer d into the tiles, refill d with the block Depth ahead, compute.
+        const auto step = [&](int2 (&k)[NR], int2 (&v)[NR]) {
             if (p.l2_ahead > 0 && pf.g < g_stop) {
                 prefetch_block_l2(pf.kb);
                 advance(pf);
@@ -636,19 +669,25 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
                 if (c < kBn * 16) {
                     const int key = c >> 4;
                     const int e   = key * Geo::kHeadDim + (((c & 15) ^ (key & 7)) << 3);
-                    store_vec(sm.k + e, e4m3x8_to_bf16x8(rk[i]));
-                    store_vec(sm.v + e, e4m3x8_to_bf16x8(rv[i]));
+                    store_vec(sm.k + e, e4m3x8_to_bf16x8(k[i]));
+                    store_vec(sm.v + e, e4m3x8_to_bf16x8(v[i]));
                 }
             }
             __syncthreads();
             if (ld.g < g_stop) {
-                load_raw(ld.kb); // in flight during this block's math
+                load_raw(ld.kb, k, v); // in flight during the next Depth blocks' math
                 advance(ld);
             }
             compute_block(cu.kb);
             const int g = cu.g;
             advance(cu);
             if (cu.g != g) { finish_group(g); }
+        };
+        while (cu.g < g_stop) {
+            step(rk[0], rv[0]);
+            if constexpr (Depth == 2) {
+                if (cu.g < g_stop) { step(rk[1], rv[1]); }
+            }
         }
     } else {
 #pragma unroll
@@ -959,7 +998,7 @@ Plan make_plan(InklingLayerKind kind, const GroupSpec& gs, std::int32_t width, s
 template <bool Local, bool Decode, int MTiles, int KS, int Mode>
 void launch_kernel(const Plan& plan, const AttnParams& p, cudaStream_t stream) {
     constexpr int Raw   = (Decode || KS > 1) ? 0 : pick_raw<MTiles, KS, Mode != kPartial>();
-    constexpr int bytes = static_cast<int>(sizeof(AttnSmem<MTiles, KS, Raw, Mode != kPartial>));
+    constexpr int bytes = static_cast<int>(sizeof(AttnSmem<MTiles, KS, Raw, Mode != kPartial, Decode && MTiles == 1>));
     static_assert(bytes <= kSmemLimit, "inkling attention: shared memory over the sm_120 limit");
     auto* kernel = rel_attention_kernel<Local, Decode, MTiles, KS, Mode, Raw>;
     static const bool configured = [&] {
