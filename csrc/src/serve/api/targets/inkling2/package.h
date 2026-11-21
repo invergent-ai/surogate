@@ -16,6 +16,7 @@
 
 #include <array>
 #include <cstdint>
+#include <vector>
 #include <memory>
 #include <string_view>
 
@@ -90,6 +91,10 @@ struct Package {
                                                                const family::VisionGeometry& vision_geometry = {});
     /// The SERVED geometry: 48 visits over the artifact's 24 physical layers (DESIGN-target.md 0.2).
     [[nodiscard]] static family::TextGeometry declared_geometry(const artifact::Reader& reader);
+    /// The visit split of a pipeline (lanes/e1/DESIGN-2card.md): stage bounds over the 48 visits, chosen by the
+    /// target because a core layer's weights sit on every stage that runs one of its passes (a per-visit byte
+    /// partition cannot see that) and the global visits' KV dominates at 1M.
+    [[nodiscard]] static std::vector<int> pipeline_stage_bounds(int stage_count);
     [[nodiscard]] static std::unique_ptr<Program>
     create_program(const LoadedModel& model, SequencePlan&& plan, DeviceContext& device);
 };

@@ -13,11 +13,14 @@
 #include "targets/inkling2/impl/lora_attention.h"
 #include "targets/inkling2/impl/model.h"
 #include "targets/inkling2/impl/variant.h"
+#include "targets/inkling2/impl/visits.h"
+#include "artifact/typed_binding.h"
 
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <array>
 #include <utility>
 #include <vector>
 
@@ -119,11 +122,23 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
 
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
                                      WeightsProfile weights_profile) {
-    if (options.pipeline_stage_first != 0 || options.pipeline_stage_last != 0) {
-        // The visit split (DESIGN-target.md 1.4, DESIGN.md S12) is not wired yet.
-        throw std::invalid_argument("inkling2: pipeline stages are not supported yet");
-    }
     load::BindOptions bind;
+    // The 2-card visit split (lanes/e1/DESIGN-2card.md): a pipeline stage runs visits [first, last) of the 48 and
+    // keeps on its device the physical layers those visits use (a core layer is on every stage that runs one of its
+    // passes); the other layers are validated only. The family hands the residual (the whole AttnRes stack, 7 x 2304
+    // per column) across the boundary and keeps each stage's KV planes and conv states.
+    if (options.pipeline_stage_first != 0 || options.pipeline_stage_last != 0) {
+        const int first = options.pipeline_stage_first, last = options.pipeline_stage_last;
+        if (first < 0 || last <= first || last > detail::TextConfig::layers) {
+            throw std::invalid_argument("inkling2: a pipeline stage covers visits [first, last) of 0..48");
+        }
+        std::array<bool, detail::TextConfig::physical_layers> resident{};
+        for (int v = first; v < last; ++v) { resident[static_cast<std::size_t>(detail::kVisits[v].layer)] = true; }
+        const artifact::TensorPlacement in_force = artifact::ScopedPlacement::current();
+        bind.layer_placement = [resident, in_force](std::int32_t layer) {
+            return resident[static_cast<std::size_t>(layer)] ? in_force : artifact::TensorPlacement::ValidateOnly;
+        };
+    }
     bind.attention = attention_choice();
     if (bind.attention.fp8 != (weights_profile == WeightsProfile::Fp8Attention)) {
         throw std::logic_error("inkling2: the weights profile and the attention choice disagree");
@@ -160,6 +175,14 @@ Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device, c
                                                         const family::TextGeometry& geometry,
                                                         const family::VisionGeometry& vision_geometry) {
     return family::make_sequence_planner<detail::Variant>(device, options, weights_profile, geometry, vision_geometry);
+}
+
+std::vector<int> Package::pipeline_stage_bounds(int stage_count) {
+    // 2 stages: cut after visit 24 (layer 11 of pass 1). Both stages then hold 18 physical layers (0-17 | 6-23) and
+    // 4 of the 8 global visits (layers 5, 11, 17 of pass 0, 11 of pass 1 | 17 of pass 1, 11 and 17 of pass 2, 23),
+    // so the 1M-token global KV splits evenly.
+    if (stage_count == 2) { return {0, 24, detail::TextConfig::layers}; }
+    throw std::invalid_argument("inkling2: the visit split is defined for 2 stages");
 }
 
 family::TextGeometry Package::declared_geometry(const artifact::Reader& reader) {
