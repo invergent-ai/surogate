@@ -1,5 +1,5 @@
 // Implements: include/sinfer/ops/speculative_round.h
-// Match: validated speculative state and BF16 verification logits.
+// Match: validated speculative state and BF16 or FP32 verification logits.
 // Algorithm assumptions: the shared sampling layout selects either one block
 // or a two-launch partial/group pipeline without host reads of device config.
 #include "ops/launcher/speculative_round.h"
@@ -47,13 +47,17 @@ void speculative_prepare_verify_ids_launch(const Tensor& anchors, const Tensor& 
     CUDA_CHECK(cudaGetLastError());
 }
 
-void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const Tensor& logits,
-                                             const Tensor& drafts, const Tensor& current_extents,
-                                             Tensor& lengths, Tensor& anchors,
-                                             Tensor& licensed_tokens, Tensor& licensed_counts,
-                                             Tensor& accepted, std::int32_t token_domain,
-                                             const SamplingConfig* configs, DeviceSpan workspace,
-                                             cudaStream_t stream, std::int32_t draft_count) {
+namespace {
+
+// One verification round for logits of element type LogitT (BF16 or FP32). The routes,
+// their launch order and the workspace are the same for both; only the logit loads differ.
+template <typename LogitT>
+void speculative_accept_greedy_drafts_launch_typed(
+    const Tensor& target_tokens, const Tensor& logits, const Tensor& drafts,
+    const Tensor& current_extents, Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,
+    Tensor& licensed_counts, Tensor& accepted, std::int32_t token_domain,
+    const SamplingConfig* configs, DeviceSpan workspace, cudaStream_t stream,
+    std::int32_t draft_count) {
     const std::int32_t physical_rows     = logits.ne[0];
     const std::int32_t cols              = draft_count + 1;
     const std::int32_t batch             = drafts.ne[1];
@@ -62,17 +66,17 @@ void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const 
     const auto* sorted = sampling_sort_launch(logits, token_domain, configs,
         static_cast<const int32_t*>(drafts.data), static_cast<const int32_t*>(current_extents.data),
         cols, batch, scratch, layout.bytes, stream);
-    speculative_accept_wide_kernel<<<batch, kSamplerBlock, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(logits.data), static_cast<const int32_t*>(drafts.data),
+    speculative_accept_wide_kernel<LogitT><<<batch, kSamplerBlock, 0, stream>>>(
+        static_cast<const LogitT*>(logits.data), static_cast<const int32_t*>(drafts.data),
         static_cast<const int32_t*>(current_extents.data), static_cast<int32_t*>(lengths.data),
         static_cast<int32_t*>(anchors.data), static_cast<int32_t*>(licensed_tokens.data),
         static_cast<int32_t*>(licensed_counts.data), static_cast<int32_t*>(accepted.data), configs,
         token_domain, physical_rows, draft_count, sorted, layout.bytes);
     CUDA_CHECK(cudaGetLastError());
     if (!layout.multiblock) {
-        speculative_accept_greedy_drafts_kernel<<<batch, kSamplerBlock, 0, stream>>>(
+        speculative_accept_greedy_drafts_kernel<LogitT><<<batch, kSamplerBlock, 0, stream>>>(
             static_cast<const std::int32_t*>(target_tokens.data),
-            static_cast<const __nv_bfloat16*>(logits.data),
+            static_cast<const LogitT*>(logits.data),
             static_cast<const std::int32_t*>(drafts.data),
             static_cast<const std::int32_t*>(current_extents.data),
             static_cast<std::int32_t*>(lengths.data), static_cast<std::int32_t*>(anchors.data),
@@ -86,10 +90,10 @@ void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const 
     const std::int32_t partial_blocks = div_up(token_domain, kSamplerPartialTileItems);
     const std::int32_t groups         = sampler_group_count(partial_blocks);
     const unsigned int partial_grid = sampling_resident_grid(
-        speculative_sampling_partial_topk_kernel,
+        speculative_sampling_partial_topk_kernel<LogitT>,
         static_cast<std::int64_t>(partial_blocks) * cols * batch);
-    speculative_sampling_partial_topk_kernel<<<partial_grid, kSamplerBlock, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(logits.data),
+    speculative_sampling_partial_topk_kernel<LogitT><<<partial_grid, kSamplerBlock, 0, stream>>>(
+        static_cast<const LogitT*>(logits.data),
         static_cast<const std::int32_t*>(drafts.data),
         static_cast<const std::int32_t*>(current_extents.data), configs, token_domain,
         physical_rows, cols, draft_count, batch, scratch, layout.bytes);
@@ -107,6 +111,26 @@ void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const 
         static_cast<std::int32_t*>(licensed_counts.data), static_cast<std::int32_t*>(accepted.data),
         configs, token_domain, cols, partial_blocks, groups, scratch, layout.bytes);
     CUDA_CHECK(cudaGetLastError());
+}
+
+} // namespace
+
+void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const Tensor& logits,
+                                             const Tensor& drafts, const Tensor& current_extents,
+                                             Tensor& lengths, Tensor& anchors,
+                                             Tensor& licensed_tokens, Tensor& licensed_counts,
+                                             Tensor& accepted, std::int32_t token_domain,
+                                             const SamplingConfig* configs, DeviceSpan workspace,
+                                             cudaStream_t stream, std::int32_t draft_count) {
+    if (logits.dtype == DType::FP32) {
+        speculative_accept_greedy_drafts_launch_typed<float>(
+            target_tokens, logits, drafts, current_extents, lengths, anchors, licensed_tokens,
+            licensed_counts, accepted, token_domain, configs, workspace, stream, draft_count);
+    } else {
+        speculative_accept_greedy_drafts_launch_typed<__nv_bfloat16>(
+            target_tokens, logits, drafts, current_extents, lengths, anchors, licensed_tokens,
+            licensed_counts, accepted, token_domain, configs, workspace, stream, draft_count);
+    }
 }
 
 void speculative_select_accepted_hidden_launch(const Tensor& hidden, const Tensor& selectors,

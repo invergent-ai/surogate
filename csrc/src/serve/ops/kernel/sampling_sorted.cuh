@@ -104,7 +104,8 @@ __device__ inline void sampling_for_each_unit(SamplingRowAdmission& rows, int ba
 
 // Sort fixed-size tiles in parallel, then merge them without device-side allocation.
 // The unique (adjusted logit, token ID) key preserves the sampler's exact tie order.
-static __global__ void sampling_sort_tiles_kernel(const __nv_bfloat16* logits,
+template <typename LogitT>
+static __global__ void sampling_sort_tiles_kernel(const LogitT* logits,
     unsigned long long* keys, const SamplingConfig* configs, const int32_t* drafts,
     const int32_t* extents, int domain, int physical_rows, int width, int batch, size_t row_stride) {
     __shared__ SamplingTileSort::TempStorage temp;
@@ -120,7 +121,7 @@ static __global__ void sampling_sort_tiles_kernel(const __nv_bfloat16* logits,
         unsigned long long items[kSamplerSortItems];
         for (int i = 0; i < kSamplerSortItems; ++i) {
             const int v = base + threadIdx.x + i * kSamplerBlock;
-            float x = v < domain ? sampling_adjusted_logit(__bfloat162float(column[v]), v, cfg, overlay, col) : -CUDART_INF_F;
+            float x = v < domain ? sampling_adjusted_logit(logit_value(column[v]), v, cfg, overlay, col) : -CUDART_INF_F;
             items[i] = isfinite(x) ? sampling_sort_key(x, v) : 0;
         }
         SamplingTileSort(temp).SortDescendingBlockedToStriped(items);
@@ -170,7 +171,20 @@ inline unsigned int sampling_resident_grid(Kernel* kernel, int64_t items) {
     return static_cast<unsigned int>(std::max<int64_t>(grid, 1));
 }
 
+template <typename LogitT>
+inline void sampling_sort_tiles_launch(const Tensor& logits, unsigned long long* keys, int domain,
+    const SamplingConfig* configs, const int32_t* drafts, const int32_t* extents,
+    int width, int batch, int64_t tiles, size_t row_stride, cudaStream_t stream) {
+    const unsigned int grid = sampling_resident_grid(sampling_sort_tiles_kernel<LogitT>, tiles);
+    sampling_sort_tiles_kernel<LogitT><<<grid, kSamplerBlock, 0, stream>>>(
+        static_cast<const LogitT*>(logits.data), keys, configs, drafts, extents,
+        domain, logits.ne[0], width, batch, row_stride);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 // row_stride is the caller-owned layout stride, including padding for speculative rows.
+// BF16 and FP32 logits differ only in the tile pass's load; the keys it writes are the
+// same (adjusted logit, token ID) words, so the merge passes are shared.
 inline const unsigned long long* sampling_sort_launch(const Tensor& logits, int domain,
     const SamplingConfig* configs, const int32_t* drafts, const int32_t* extents,
     int width, int batch, SamplingWorkspace scratch, size_t row_stride, cudaStream_t stream) {
@@ -178,10 +192,13 @@ inline const unsigned long long* sampling_sort_launch(const Tensor& logits, int 
     auto* input = scratch.sort_keys_a;
     auto* output = scratch.sort_keys_b;
     const int64_t tiles = int64_t(div_up(domain, kSamplerSortTile)) * width * batch;
-    sampling_sort_tiles_kernel<<<sampling_resident_grid(sampling_sort_tiles_kernel, tiles), kSamplerBlock, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(logits.data), input, configs, drafts, extents,
-        domain, logits.ne[0], width, batch, row_stride);
-    CUDA_CHECK(cudaGetLastError());
+    if (logits.dtype == DType::FP32) {
+        sampling_sort_tiles_launch<float>(logits, input, domain, configs, drafts, extents, width,
+                                          batch, tiles, row_stride, stream);
+    } else {
+        sampling_sort_tiles_launch<__nv_bfloat16>(logits, input, domain, configs, drafts, extents,
+                                                  width, batch, tiles, row_stride, stream);
+    }
     const int64_t blocks = int64_t(div_up(domain, kSamplerBlock)) * width * batch;
     const unsigned int merge_grid = sampling_resident_grid(sampling_merge_keys_kernel, blocks);
     for (int64_t run = kSamplerSortTile; run < domain; run *= 2) {
@@ -193,13 +210,14 @@ inline const unsigned long long* sampling_sort_launch(const Tensor& logits, int 
     return input;
 }
 
-__device__ inline const unsigned long long* sampling_sort_local(const __nv_bfloat16* logits,
+template <typename LogitT>
+__device__ inline const unsigned long long* sampling_sort_local(const LogitT* logits,
     int domain, const SamplingConfig& cfg, SortedSamplingScratch& scratch,
     const int32_t* overlay = nullptr, int col = 0) {
     unsigned long long items[kSamplerSortItems];
     for (int i = 0; i < kSamplerSortItems; ++i) {
         const int v = threadIdx.x + i * kSamplerBlock;
-        const float x = v < domain ? sampling_adjusted_logit(__bfloat162float(logits[v]), v, cfg, overlay, col) : -CUDART_INF_F;
+        const float x = v < domain ? sampling_adjusted_logit(logit_value(logits[v]), v, cfg, overlay, col) : -CUDART_INF_F;
         items[i] = isfinite(x) ? sampling_sort_key(x, v) : 0;
     }
     SamplingTileSort(scratch.sort).SortDescendingBlockedToStriped(items);
@@ -276,7 +294,8 @@ __device__ inline ExactSample sampling_sorted(const unsigned long long* sorted, 
     return {sampling_key_index(best), probability};
 }
 
-static __global__ void sampling_wide_kernel(const __nv_bfloat16* logits, const unsigned long long* sorted,
+template <typename LogitT>
+static __global__ void sampling_wide_kernel(const LogitT* logits, const unsigned long long* sorted,
     int32_t* out, const SamplingConfig* configs, const int32_t* positions, int purpose, int domain, int physical_rows) {
     const int row = blockIdx.x;
     const SamplingConfig cfg = configs[row];

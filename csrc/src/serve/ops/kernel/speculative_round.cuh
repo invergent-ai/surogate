@@ -1,7 +1,7 @@
 #pragma once
 
 // Implements: include/sinfer/ops/speculative_round.h
-// Match: contiguous request-major state and BF16 verification logits.
+// Match: contiguous request-major state and BF16 or FP32 verification logits.
 // Algorithm assumptions: small vocabularies use one cooperative block; the
 // registered full-vocabulary stochastic route uses the sampling partial/group
 // pipeline and caller-owned workspace, while greedy commit remains one thread.
@@ -69,8 +69,9 @@ speculative_workspace_row(SamplingWorkspace workspace, std::size_t row_stride, s
 // collapses to `u < p_i(drafts[i])`. Launch with a single block of kSamplerBlock
 // threads; only thread 0 performs the sequential accept/commit while the whole
 // block cooperates on the per-column truncated-distribution build.
+template <typename LogitT>
 __global__ void speculative_accept_wide_kernel(
-    const __nv_bfloat16* logits, const int32_t* drafts, const int32_t* extents,
+    const LogitT* logits, const int32_t* drafts, const int32_t* extents,
     int32_t* lengths, int32_t* anchors, int32_t* tokens, int32_t* counts, int32_t* accepted,
     const SamplingConfig* configs, int domain, int physical_rows, int k,
     const unsigned long long* sorted, size_t sorted_row_stride) {
@@ -96,7 +97,7 @@ __global__ void speculative_accept_wide_kernel(
                 reinterpret_cast<const char*>(sorted) + row * sorted_row_stride) + int64_t(col) * domain :
                 sampling_sort_local(column, domain, cfg, scratch.filtered, row_drafts, col);
             const float x = draft >= 0 && draft < domain ? sampling_adjusted_logit(
-                __bfloat162float(column[draft]), draft, cfg, row_drafts, col) : -CUDART_INF_F;
+                logit_value(column[draft]), draft, cfg, row_drafts, col) : -CUDART_INF_F;
             result = sampling_sorted(keys, domain, cfg, length + col + 1, purpose, scratch.filtered,
                 isfinite(x) ? sampling_sort_key(x, draft) : 0, draft);
         }
@@ -125,8 +126,9 @@ __global__ void speculative_accept_wide_kernel(
     }
 }
 
+template <typename LogitT>
 __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_drafts_kernel(
-    const std::int32_t* target_tokens, const __nv_bfloat16* logits, const std::int32_t* drafts,
+    const std::int32_t* target_tokens, const LogitT* logits, const std::int32_t* drafts,
     const std::int32_t* current_extents, std::int32_t* lengths, std::int32_t* anchors,
     std::int32_t* licensed_tokens, std::int32_t* licensed_counts, std::int32_t* accepted,
     const SamplingConfig* configs, std::int32_t token_domain, std::int32_t physical_rows,
@@ -141,7 +143,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
     const std::int32_t* row_targets = target_tokens + row * cols;
     const std::int32_t* row_drafts  = drafts + row * k;
     std::int32_t* row_tokens        = licensed_tokens + row * cols;
-    const __nv_bfloat16* row_logits =
+    const LogitT* row_logits =
         logits + static_cast<std::int64_t>(row) * cols * physical_rows;
 
     if (!(cfg.temperature > 0.0f)) {
@@ -256,8 +258,9 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
 
 // Candidate tiles of every verification column a bounded-candidate row licenses, walked
 // by a resident grid over [batch][cols][partial] (see sampling_for_each_unit).
+template <typename LogitT>
 __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_topk_kernel(
-    const __nv_bfloat16* logits, const std::int32_t* drafts, const std::int32_t* current_extents,
+    const LogitT* logits, const std::int32_t* drafts, const std::int32_t* current_extents,
     const SamplingConfig* configs, std::int32_t token_domain, std::int32_t physical_rows,
     std::int32_t cols, std::int32_t k, std::int32_t batch, SamplingWorkspace workspace,
     std::size_t workspace_row_stride) {
@@ -290,7 +293,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
         for (int item = 0; item < kSamplerItemsPerThread; ++item) {
             const int v = tile_start + item * blockDim.x + threadIdx.x;
             if (v < token_domain) {
-                const float x = sampling_adjusted_logit(__bfloat162float(logits[base + v]), v, cfg,
+                const float x = sampling_adjusted_logit(logit_value(logits[base + v]), v, cfg,
                                                         row_drafts, col);
                 keys[item]    = sampling_sort_key(x, v);
             } else {

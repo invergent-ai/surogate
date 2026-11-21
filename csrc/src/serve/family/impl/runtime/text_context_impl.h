@@ -875,6 +875,21 @@ void apply_logit_softcap(const ModelConfig& cfg, Tensor& logits, cudaStream_t st
     if (cfg.logit_softcap > 0.0F) { ops::logit_softcap(logits, cfg.logit_softcap, stream); }
 }
 
+/// The target LM head into `logits`: the family's linear + softcap, or an FP32-logits target's own head
+/// (family/impl/runtime/visit_round.h). `logits` then has that target's logits dtype.
+template <class V, class Model>
+void head_logits(const Model& weights, const Tensor& hidden, const Weight& lm_head, const ModelConfig& cfg,
+                 Tensor& logits, cudaStream_t stream) {
+    if constexpr (family::logits_fp32<V>()) {
+        (void)lm_head;
+        (void)cfg;
+        family::lm_head_if<V>(weights, hidden, logits, stream);
+    } else {
+        ops::linear(hidden, lm_head, logits, stream);
+        apply_logit_softcap(cfg, logits, stream);
+    }
+}
+
 template <class V>
 void TextContext::proposal_argmax(const Tensor& wide, Tensor& logits, Tensor& proposal_tokens) {
     const int T = wide.ne[1];
@@ -899,6 +914,7 @@ void TextContext::proposal_argmax(const Tensor& wide, Tensor& logits, Tensor& pr
                                       ctx_.stream);
     } else {
         Tensor output_logits = matrix_window(logits, T);
+        // A draft head's proposal logits are BF16 for every target: the family head, not head_logits.
         ops::linear(hidden, *lm_head_, output_logits, ctx_.stream);
         apply_logit_softcap(cfg_, output_logits, ctx_.stream);
         ops::argmax(output_logits, proposal_tokens, cfg_.token_domain, ctx_.stream);
@@ -1073,14 +1089,14 @@ Tensor TextContext::lm_head_view(const Tensor& stored, cudaStream_t stream) {
 void TextContext::logits_from_hidden(const Tensor& hidden, Tensor& logits) {
     if (hidden.ne[1] <= 0) throw std::invalid_argument("cached hidden batch is empty");
     require_tensor_shape(hidden, DType::BF16, {round_hidden_width(), hidden.ne[1]}, "cached hidden");
-    require_tensor_shape(logits, DType::BF16, {cfg_.vocab, hidden.ne[1]}, "cached hidden logits");
+    require_tensor_shape(logits, family::logits_dtype<Variant>(), {cfg_.vocab, hidden.ne[1]}, "cached hidden logits");
     auto scope = work_.scope();
-    ops::linear(lm_head_view(hidden, ctx_.stream), *lm_head_, logits, ctx_.stream);
-    apply_logit_softcap(cfg_, logits, ctx_.stream);
+    head_logits<Variant>(weights_, lm_head_view(hidden, ctx_.stream), *lm_head_, cfg_, logits, ctx_.stream);
 }
 
 bool TextContext::candidate_rows_exact() const {
-    return ops::linear_rows_match_linear(*lm_head_) && !ops::lora_active();
+    // An FP32-logits target's head is its own (Variant::lm_head): the BF16 row projection is not it.
+    return !family::logits_fp32<Variant>() && ops::linear_rows_match_linear(*lm_head_) && !ops::lora_active();
 }
 
 bool TextContext::candidate_logits_from_hidden(const Tensor& hidden,
@@ -1127,8 +1143,7 @@ void finish_round_hidden(const Model& weights, const Tensor& x, float eps, Tenso
         }
     }
     Hooks::finish(weights, x, eps, hidden, work, stream);
-    ops::linear(hidden, lm_head, logits, stream);
-    apply_logit_softcap(cfg, logits, stream);
+    head_logits<Variant>(weights, hidden, lm_head, cfg, logits, stream);
 }
 
 void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_positions,
@@ -1148,7 +1163,7 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
                          "ordinary decode Linear Attention slots");
     require_tensor_shape(hidden, DType::BF16, {round_hidden_width(), batch},
                          "ordinary decode hidden");
-    require_tensor_shape(logits, DType::BF16, {cfg_.vocab, batch}, "ordinary decode logits");
+    require_tensor_shape(logits, family::logits_dtype<Variant>(), {cfg_.vocab, batch}, "ordinary decode logits");
 
     cudaStream_t stream = ctx_.stream;
     work_.reset();
@@ -1206,7 +1221,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
                          "target verify batch Linear Attention slots");
     require_tensor_shape(hidden, DType::BF16, {round_hidden_width(), width, batch},
                          "target verify batch hidden");
-    require_tensor_shape(logits, DType::BF16, {cfg_.vocab, width, batch},
+    require_tensor_shape(logits, family::logits_dtype<Variant>(), {cfg_.vocab, width, batch},
                          "target verify batch logits");
     require_tensor_shape(target_tokens, DType::I32, {width, batch}, "target verify batch tokens");
 
@@ -2026,6 +2041,44 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, in
     debug_probe<Variant>("post_mlp_residual", x, cfg_.n_layers, s);
 }
 
+// A visit-schedule target's round (ENGINE-INKLING lane e1): the entry staged its columns and embedded into
+// `x`; the target's `run_visits` replaces the layer loop. Discarded for every other target.
+template <class Tap>
+void TextContext::run_visit_round(Tensor& x, Tap& tap, std::span<const family::VisitSegment> segments,
+                                  const family::VisitBlock* block, bool single_sequence,
+                                  const Tensor& positions) {
+    if constexpr (family::visit_schedule<Variant>()) {
+        family::VisitRound round;
+        round.phase       = block != nullptr ? family::TextPhase::Verify : family::TextPhase::Prefill;
+        round.x           = x;
+        round.ids         = active_ids_;
+        round.positions   = positions;
+        round.segments    = segments;
+        round.block       = block;
+        round.first_visit = stage_first_;
+        round.last_visit  = stage_last_;
+        round.text_kv     = batch_text_kv_;
+        if (single_sequence) { round.sequence_kv = kv_; }
+        round.state   = &state_;
+        round.records = family::VisitRecords{io_.visit_records_old, io_.visit_records_inputs,
+                                             io_.visit_records_visits, io_.visit_records_width,
+                                             io_.visit_records_batch};
+        round.routing = family::VisitRoutingCapture{io_.routing_capture, io_.routing_capture_columns,
+                                                    io_.routing_capture_top_k};
+        if constexpr (Tap::enabled) {
+            round.features = family::VisitFeatureCapture{
+                &tap, [](void* context, int feature, const Tensor& value, cudaStream_t stream) {
+                    static_cast<Tap*>(context)->capture_layer(feature, value, stream);
+                }};
+        }
+        round.work   = &work_;
+        round.stream = ctx_.stream;
+        family::run_visits_if<Variant>(weights_, round);
+    } else {
+        (void)x; (void)tap; (void)segments; (void)block; (void)single_sequence; (void)positions;
+    }
+}
+
 // Per-family prefill timing behind SUROGATE_SERVE_PREFILL_TIMING: events
 // around each mixer and MLP, summarised every 32 prefill chunks. It is the
 // instrument for "where does a prefill chunk's time go" when a profiler is
@@ -2036,6 +2089,32 @@ template <class Tap>
 void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap, const Tensor* deepstack,
                               std::span<const std::int32_t> visual_indices,
                               int first_layer, int last_layer) {
+    if constexpr (family::visit_schedule<Variant>()) {
+        // The target walks its own visit schedule over the round (family/impl/runtime/visit_round.h).
+        (void)deepstack; (void)visual_indices; (void)first_layer; (void)last_layer;
+        if (ph == Phase::Prefill) {
+            // One sequence: the row the entry staged in io_.text_kv_table_row, as the family's prefill
+            // attention reads it, and the lane's current state slot.
+            const family::VisitSegment segment{.column = 0, .count = x.ne[1], .kv_base = 0, .kv_table_row = -1,
+                                               .table_row = io_.text_kv_table_row,
+                                               .state_slot = linear_state_current_slot_};
+            run_visit_round(x, tap, std::span<const family::VisitSegment>(&segment, 1), nullptr, false,
+                            *active_cache_positions_);
+        } else {
+            family::VisitBlock block;
+            block.width         = active_sequence_width_;
+            block.batch         = active_sequence_batch_;
+            block.positions     = active_cache_positions_->view({block.width, block.batch});
+            block.kv_table_rows = *active_kv_table_rows_;
+            block.state_slots   = *active_linear_state_slots_;
+            block.valid_columns = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
+            // A row of several columns is a speculative verify: the conv state is recorded for the fold.
+            block.mode     = block.width > 1 ? family::VisitStateMode::Record : family::VisitStateMode::InPlace;
+            block.envelope = *active_gqa_envelope_;
+            run_visit_round(x, tap, {}, &block, false, active_cache_positions_->view({block.width * block.batch}));
+        }
+        return;
+    }
     const bool prefill = ph == Phase::Prefill;
     PrefillFamilyTimer& timer = prefill_family_timer();
     // Event synchronisation is illegal inside stream capture, and a captured
@@ -2618,8 +2697,44 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
         std::fprintf(stderr, "stage-trace: layers [%d, %d) of %d, columns %d\n", stage_first_,
                      stage_last_, cfg_.n_layers, x.ne[1]);
     }
+    // A visit-schedule target runs its own schedule over the round's segments and decode block; the
+    // family loop below then runs no layer (kFamilyLayerLoop is false only for such a target).
+    constexpr bool kFamilyLayerLoop = !family::visit_schedule<Variant>();
+    if constexpr (!kFamilyLayerLoop) {
+        std::vector<family::VisitSegment> visit_segments(segments.size());
+        for (std::size_t i = 0; i < segments.size(); ++i) {
+            // A negative row keeps the row the caller staged in io_.text_kv_table_row.
+            visit_segments[i] = family::VisitSegment{
+                .column       = segment_begin[i],
+                .count        = static_cast<std::int32_t>(segments[i].ids.size()),
+                .kv_base      = segments[i].kv_base,
+                .kv_table_row = segments[i].kv_table_row,
+                .table_row    = segments[i].kv_table_row < 0 ? io_.text_kv_table_row : Tensor{},
+                .state_slot   = segments[i].state_slot,
+                .capture_slot = segments[i].capture_slot,
+            };
+        }
+        family::VisitBlock visit_block;
+        if (batch > 0) {
+            visit_block.column        = prefill_cols;
+            visit_block.width         = width;
+            visit_block.batch         = batch;
+            visit_block.positions     = positions_decode.view({width, batch});
+            visit_block.kv_table_rows = decode.kv_table_rows;
+            visit_block.state_slots   = decode.linear_state_slots;
+            visit_block.valid_columns = decode.valid_columns;
+            visit_block.mode     = width > 1 ? family::VisitStateMode::Record : family::VisitStateMode::InPlace;
+            visit_block.envelope = decode.envelope;
+        }
+        if (sink != nullptr) {
+            run_visit_round(x, *sink, visit_segments, batch > 0 ? &visit_block : nullptr, false, positions);
+        } else {
+            NullTap no_tap;
+            run_visit_round(x, no_tap, visit_segments, batch > 0 ? &visit_block : nullptr, false, positions);
+        }
+    }
     attention_round_.begin();
-    for (int layer = stage_first_; layer < stage_last_; ++layer) {
+    for (int layer = stage_first_; kFamilyLayerLoop && layer < stage_last_; ++layer) {
         Hooks::layer_prologue(weights_, layer, x, prologue_, ple_state_, work_, ctx_.stream);
         if (cfg_.is_full(layer)) {
             const int fidx         = cfg_.full_idx(layer);
@@ -3024,8 +3139,7 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                                    cudaMemcpyDeviceToDevice, s));
         Tensor logits_decode = decode.logits;
         ops::ScopedLoraColumns decode_lora(roots.lora_slots.slice(0, prefill_cols, decode_columns));
-        ops::linear(xl_decode, *lm_head_, logits_decode, s);
-        apply_logit_softcap(cfg_, logits_decode, s);
+        head_logits<Variant>(weights_, xl_decode, *lm_head_, cfg_, logits_decode, s);
     }
 
     // The draft head over each segment's columns, so a round under the head keeps the head's
@@ -3149,8 +3263,7 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
             }
         }
         ops::ScopedLoraColumns final_lora(roots.lora_slots.slice(0, 0, finalizers));
-        ops::linear(lm_head_view(gathered, s), *lm_head_, logits, s);
-        apply_logit_softcap(cfg_, logits, s);
+        head_logits<Variant>(weights_, lm_head_view(gathered, s), *lm_head_, cfg_, logits, s);
         Tensor sampled   = finalize.tokens.slice(0, 0, finalizers);
         Tensor positions_out = finalize.positions.slice(0, 0, finalizers);
         ops::sample(logits, sampled, cfg_.token_domain, finalize.sampling, positions_out,
@@ -3260,6 +3373,9 @@ void TextContext::prefill_graph_window(std::int32_t bucket) {
 // shared scratch slot (the graphed-prompt discipline), so the slot baked at
 // capture is lane-independent.
 void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t batch_bucket) {
+    if constexpr (family::visit_schedule<Variant>()) {
+        throw std::logic_error("visit schedule: mixed-round graph bodies are not wired (prefill graphs are off)");
+    }
     cudaStream_t s             = ctx_.stream;
     PrefillGraphFamily& family = *prefill_graph_family_;
     if (rope_delta_ != 0) {
@@ -3608,8 +3724,7 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
                                cudaMemcpyDeviceToDevice, s));
     Tensor logits_decode = decode.logits;
     ops::ScopedLoraColumns decode_lora(roots.lora_slots.slice(0, prefill_cols, batch));
-    ops::linear(xl_decode, *lm_head_, logits_decode, s);
-    apply_logit_softcap(cfg_, logits_decode, s);
+    head_logits<Variant>(weights_, xl_decode, *lm_head_, cfg_, logits_decode, s);
 }
 
 // Stages one mixed round into the family, captures the (chunk bucket, batch
@@ -3689,16 +3804,17 @@ void TextContext::observe_prompt_logits(const Tensor& hidden, int base, cudaStre
     const std::size_t spare = work_.capacity() - work_.used();
     // Leave room for the head's normalization and projection scratch. Fall back
     // to the persistent one-column logits when a small model has no spare arena.
-    const std::size_t bytes_per_column = std::size_t(cfg_.vocab) * 2 + std::size_t(cfg_.hidden) * 16;
+    const std::size_t bytes_per_column =
+        std::size_t(cfg_.vocab) * dtype_size(family::logits_dtype<Variant>()) + std::size_t(cfg_.hidden) * 16;
     const int fits = spare > 16384 ? int((spare - 16384) / bytes_per_column) : 0;
     const int stripe = std::max(1, std::min({32, fits, end - first}));
-    Tensor storage = stripe > 1 ? work_.alloc(DType::BF16, {cfg_.vocab, stripe}) : matrix_window(io_.logits, 1);
+    Tensor storage = stripe > 1 ? work_.alloc(family::logits_dtype<Variant>(), {cfg_.vocab, stripe})
+                                : matrix_window(io_.logits, 1);
     for (int col = first; col < end; col += stripe) {
         auto scratch = work_.scope();
         const int count = std::min(stripe, end - col);
         Tensor logits = storage.slice(1, 0, count);
-        ops::linear(lm_head_view(hidden.slice(1, col, count), stream), *lm_head_, logits, stream);
-        apply_logit_softcap(cfg_, logits, stream);
+        head_logits<Variant>(weights_, lm_head_view(hidden.slice(1, col, count), stream), *lm_head_, cfg_, logits, stream);
         logprob_observer(logits, base + col + 1, false);
     }
 }
@@ -3744,8 +3860,7 @@ bool TextContext::try_prefill_graph_chunk(std::span<const int> ids, int t0, int 
         Tensor xf      = matrix_window(prefill_hidden_, len);
         Tensor last_xf = xf.slice(1, len - 1, 1);
         Tensor logits  = matrix_window(io_.logits, 1);
-        ops::linear(lm_head_view(last_xf, s), *lm_head_, logits, s);
-        apply_logit_softcap(cfg_, logits, s);
+        head_logits<Variant>(weights_, lm_head_view(last_xf, s), *lm_head_, cfg_, logits, s);
         ops::set_i32_scalar(io_.pos, base_i + T, s);
         ops::set_i32_scalar(io_.rope_pos, base_i + T + rope_delta_, s);
         work_.reset();
@@ -4018,8 +4133,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             if (is_last && stage_finishes()) {
                 Tensor last_xf = xf.slice(1, len - 1, 1);
                 Tensor logits  = matrix_window(io_.logits, 1);
-                ops::linear(lm_head_view(last_xf, s), *lm_head_, logits, s);
-        apply_logit_softcap(cfg_, logits, s);
+                head_logits<Variant>(weights_, lm_head_view(last_xf, s), *lm_head_, cfg_, logits, s);
                 // Set io_.pos to the bonus token's absolute position (base + T) before picking so
                 // the sampler RNG is keyed by it (prefill purpose keeps it distinct from the first
                 // decode step, which reuses the same io_.pos).

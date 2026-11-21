@@ -11,17 +11,22 @@ namespace {
 
 constexpr int kThreads = 512;
 
+/// One logit as a float: BF16 rows on every target but those that keep FP32 logits.
+__device__ __forceinline__ float logit_value(__nv_bfloat16 x) { return __bfloat162float(x); }
+__device__ __forceinline__ float logit_value(float x) { return x; }
+
 /// One block per column: a max pass and a sum pass over the vocabulary, each reduced within
 /// warps and then across them through shared memory.
+template <typename LogitT>
 __global__ void __launch_bounds__(kThreads)
-next_token_nll_kernel(const __nv_bfloat16* __restrict__ logits, const int* __restrict__ targets,
+next_token_nll_kernel(const LogitT* __restrict__ logits, const int* __restrict__ targets,
                       float* __restrict__ out, int* __restrict__ argmax, const int vocab,
                       const int domain) {
     constexpr int kWarps = kThreads / 32;
     __shared__ float partial[kWarps];
     __shared__ int partial_index[kWarps];
     const int column          = static_cast<int>(blockIdx.x);
-    const __nv_bfloat16* row  = logits + static_cast<std::size_t>(column) * vocab;
+    const LogitT* row         = logits + static_cast<std::size_t>(column) * vocab;
     const int tid             = static_cast<int>(threadIdx.x);
     const int warp            = tid >> 5;
     const int lane            = tid & 31;
@@ -29,7 +34,7 @@ next_token_nll_kernel(const __nv_bfloat16* __restrict__ logits, const int* __res
     float local_max = -INFINITY;
     int local_index = 0;
     for (int v = tid; v < domain; v += kThreads) {
-        const float value = __bfloat162float(row[v]);
+        const float value = logit_value(row[v]);
         if (value > local_max) { local_max = value; local_index = v; }
     }
     const float warp_best = warp_max(local_max);
@@ -50,7 +55,7 @@ next_token_nll_kernel(const __nv_bfloat16* __restrict__ logits, const int* __res
 
     float local_sum = 0.0f;
     for (int v = tid; v < domain; v += kThreads) {
-        local_sum += expf(__bfloat162float(row[v]) - block_max);
+        local_sum += expf(logit_value(row[v]) - block_max);
     }
     local_sum = warp_sum(local_sum);
     if (lane == 0) { partial[warp] = local_sum; }
@@ -61,7 +66,7 @@ next_token_nll_kernel(const __nv_bfloat16* __restrict__ logits, const int* __res
         for (int w = 0; w < kWarps; ++w) { total += partial[w]; }
         const int target         = targets[column];
         const float target_logit = target >= 0 && target < domain
-                                       ? __bfloat162float(row[target])
+                                       ? logit_value(row[target])
                                        : NAN;
         out[column] = (block_max + logf(total)) - target_logit;
         if (argmax != nullptr) { argmax[column] = block_index; }
@@ -74,10 +79,16 @@ void next_token_nll_launch(const Tensor& logits, const Tensor& targets, Tensor& 
                            Tensor* argmax, std::int32_t token_domain, cudaStream_t stream) {
     const int vocab   = logits.ne[0];
     const int columns = logits.ne[1];
-    next_token_nll_kernel<<<static_cast<unsigned>(columns), kThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(logits.data), static_cast<const int*>(targets.data),
-        static_cast<float*>(out.data), argmax != nullptr ? static_cast<int*>(argmax->data) : nullptr,
-        vocab, static_cast<int>(token_domain));
+    int* argmax_out   = argmax != nullptr ? static_cast<int*>(argmax->data) : nullptr;
+    if (logits.dtype == DType::FP32) {
+        next_token_nll_kernel<float><<<static_cast<unsigned>(columns), kThreads, 0, stream>>>(
+            static_cast<const float*>(logits.data), static_cast<const int*>(targets.data),
+            static_cast<float*>(out.data), argmax_out, vocab, static_cast<int>(token_domain));
+    } else {
+        next_token_nll_kernel<__nv_bfloat16><<<static_cast<unsigned>(columns), kThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(logits.data), static_cast<const int*>(targets.data),
+            static_cast<float*>(out.data), argmax_out, vocab, static_cast<int>(token_domain));
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
