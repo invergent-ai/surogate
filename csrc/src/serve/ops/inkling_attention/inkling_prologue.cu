@@ -113,11 +113,13 @@ __device__ void kv_unit(const PrologueParams& p, std::int64_t unit) {
     const int ch                  = head * Geo::kHeadDim + lane * 4; // channel within the stream
     const int state_ch            = (kv ? p.v_offset : p.k_offset) + ch;
     const std::int64_t row_slot   = p.slots[b];
-    const __nv_bfloat16* x        = kv ? p.v : p.k;
+    // Row b's columns start at batch column W * b of the [*, N] input views.
+    const std::int64_t col_base   = static_cast<std::int64_t>(p.width) * b;
     const std::int64_t x_stride   = kv ? p.v_stride : p.k_stride;
+    const __nv_bfloat16* x        = (kv ? p.v : p.k) + col_base * x_stride;
     const __nv_bfloat16* conv     = kv ? p.v_conv : p.k_conv;
-    const __nv_bfloat16* dyn      = kv ? p.v_dyn : p.k_dyn;
     const std::int64_t dyn_stride = kv ? p.v_dyn_stride : p.k_dyn_stride;
+    const __nv_bfloat16* dyn      = Global ? (kv ? p.v_dyn : p.k_dyn) + col_base * dyn_stride : nullptr;
     std::uint8_t* pages           = kv ? p.v_pages : p.k_pages;
     const std::int32_t* positions = p.positions + static_cast<std::int64_t>(p.width) * b;
     const std::int32_t* table =
