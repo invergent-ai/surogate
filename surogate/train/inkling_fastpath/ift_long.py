@@ -322,24 +322,29 @@ def _moe_rows(xr, gr, eg, pg, cap, ng, u13, f13, u2, f2, lo, scale):
     """down rows (fp32, bf16 values) of rows xr [n, H] routed to experts eg [n] (0..ng-1 within the group) at padded
     positions pg [n] (< cap; host int cap: no device sync here), gammas gr [n]: rig.moe_vec's per-group arithmetic
     (W4A16: unit GEMM x factor, + LoRA from the fp32 tensors, one rounding; softcapped SwiGLU with the gamma; down
-    likewise)."""
+    likewise). Padding / unpadding by flat row indices (index_copy / index_select: cheap backwards)."""
+    flat = eg * cap + pg
 
     def pad(rows):
-        z = torch.zeros(ng, cap, rows.shape[1], dtype=rows.dtype, device=rows.device)
-        return z.index_put((eg, pg), rows)
+        z = torch.zeros(ng * cap, rows.shape[1], dtype=rows.dtype, device=rows.device)
+        return z.index_copy(0, flat, rows).view(ng, cap, rows.shape[1])
 
+    def unpad(p3):
+        return p3.reshape(ng * cap, p3.shape[2]).index_select(0, flat)
+
+    fe = f13[eg][:, None]
     xp = pad(xr)
-    gu = UnitBMM.apply(xp, u13)[eg, pg] * f13[eg][:, None]
+    gu = unpad(UnitBMM.apply(xp, u13)) * fe
     if lo is not None:
         la = torch.bmm(xp, lo["A13"].transpose(1, 2))
-        gu = gu + scale * torch.bmm(la, lo["B13"].transpose(1, 2))[eg, pg]
+        gu = gu + scale * unpad(torch.bmm(la, lo["B13"].transpose(1, 2)))
     gu = RA.rb(gu)
     y = RA.inkling_softcap_swiglu(gu, gr)
     yp = pad(y)
-    dn = UnitBMM.apply(yp, u2)[eg, pg] * f2[eg][:, None]
+    dn = unpad(UnitBMM.apply(yp, u2)) * f2[eg][:, None]
     if lo is not None:
         la = torch.bmm(yp, lo["A2"].transpose(1, 2))
-        dn = dn + scale * torch.bmm(la, lo["B2"].transpose(1, 2))[eg, pg]
+        dn = dn + scale * unpad(torch.bmm(la, lo["B2"].transpose(1, 2)))
     return RA.rb(dn)
 
 
