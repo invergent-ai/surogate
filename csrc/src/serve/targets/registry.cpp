@@ -438,8 +438,11 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     auto load_plan = Target::plan_load(binder, options, weights_profile);
     const std::size_t derived_residency_bytes =
         projected_derived_residency_bytes(binder, load_plan.materialization(),
-                                          target_linear_policy<Target>()) +
-        target_extra_derived_bytes<Target>(options);
+                                          target_linear_policy<Target>());
+    // A target's own load-time derived buffers (target_extra_derived_bytes) exist once the model is constructed, so the
+    // final sizing's free-memory reading already holds them: they are booked in the PREFLIGHT only (auto context, the
+    // host-MoE probe), never subtracted again from the final reading.
+    const std::size_t preflight_extra_derived_bytes = target_extra_derived_bytes<Target>(options);
     const std::size_t startup_host_bytes = startup_host_growth_bytes(device.device, options.kv_capacity);
     if (startup_host_bytes != 0) {
         std::fprintf(stderr,
@@ -450,7 +453,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     const std::size_t preflight_runtime_bytes = subtract_saturating(
         runtime_bytes_after_planned_weights(options.borrowed_weights.empty()
             ? load_plan.materialization().device_capacity_bytes : 0),
-        derived_residency_bytes + startup_host_bytes);
+        derived_residency_bytes + preflight_extra_derived_bytes + startup_host_bytes);
     if (const std::size_t limit = device_memory_limit(device.device); limit != 0) {
         // The load also holds staging for the objects it rearranges; under a limit it must fit
         // beside the weights, or the limit is exceeded before serving even starts.
