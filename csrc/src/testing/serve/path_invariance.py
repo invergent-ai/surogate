@@ -11,8 +11,8 @@ Paths
   decode    prompt P, max_tokens |X| + K: X and Z come from decode rounds (X is P's greedy continuation, so S = P + X)
   verify    as decode, on an engine started with --verify-args (MTP / DFlash): X and Z from verify rounds
   cut@b     prompt S[:b] (max_tokens 1), then S: the suffix prefills from b (a GPU prefix hit = a chunk cut at b)
-  host@b    as cut@b on a 1-lane engine with a host tier, with an unrelated request in between: the lane is spilled,
-            S restores its prefix from the host tier
+  host@b    as cut@b on an engine with a host tier, with one unrelated request per lane in between (they take every
+            lane, the retained one included, so its prefix goes to the host tier); S restores it from there
 Exit status 0 iff every path equals the reference bitwise; the JSON report has the per-path detail.
 
 Example (gpubox2, Gemma 3 270M fixture):
@@ -27,6 +27,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 TOP = 20
 
@@ -130,7 +131,8 @@ def main():
     ap.add_argument("--verify-args", default="", help="flags of the speculative engine for the verify path")
     ap.add_argument("--env", action="append", default=[], help="KEY=VALUE for every engine")
     ap.add_argument("--max-model-len", type=int, default=32768)
-    ap.add_argument("--lanes", type=int, default=4)
+    ap.add_argument("--lanes", type=int, default=8, help="--max-num-seqs of every engine (Gemma 3 270M needs >= 8 "
+                    "for its CUDA graph allowance on the base engine too)")
     ap.add_argument("--prompt-chars", type=int, default=6000, help="length of P in characters")
     ap.add_argument("--x-tokens", type=int, default=48, help="|X|: tokens decoded after P that become part of S")
     ap.add_argument("--k-tokens", type=int, default=16, help="|Z|: tokens whose log-probs are compared")
@@ -186,10 +188,12 @@ def main():
             report["paths"][f"cut@{cut}"] = compare(ref, tail(eng.complete(s_text, k), k))
         finally:
             eng.close()
-        eng = Engine(args, f"host{cut}", lanes=1, host_gb=1)
+        eng = Engine(args, f"host{cut}", host_gb=1)
         try:
             eng.complete(text, 1)
-            eng.complete(material[-2000:], 1)  # takes the only lane: the prefix goes to the host tier
+            # One unrelated request per lane, at once: the retained lane is taken too and spilled to the host tier.
+            with ThreadPoolExecutor(max_workers=args.lanes) as pool:
+                list(pool.map(lambda i: eng.complete(material[-2000 - 37 * i:-1 - 37 * i], 1), range(args.lanes)))
             report["paths"][f"host@{cut}"] = compare(ref, tail(eng.complete(s_text, k), k))
         finally:
             eng.close()
