@@ -263,6 +263,10 @@ sinfer_add_test(sinfer_kv_admission_test
 sinfer_add_test(sinfer_kv_window_pages_test
   SOURCES test_kv_window_pages.cpp
   LIBRARIES sinfer_core)
+# The pool's window class on a device (exits 77 without one).
+sinfer_add_test(sinfer_kv_window_pool_test
+  SOURCES test_kv_window_pool.cpp
+  LIBRARIES sinfer_core)
 sinfer_add_test(sinfer_elastic_kv_region_test
   SOURCES test_elastic_kv_region.cpp
   LIBRARIES sinfer_core)
