@@ -152,6 +152,7 @@ __host__ __device__ inline uint32_t hash32(uint32_t x) {
 }
 
 void run_dram();
+void run_ctas();
 void run_mma();
 void run_host();
 void run_gap();

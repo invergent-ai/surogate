@@ -169,6 +169,45 @@ void chunk_case(const char* mode, const uint4* buf, std::size_t buf_bytes, std::
 
 } // namespace
 
+// Bandwidth reachable by a FIXED number of CTAs (one per SM up to the SM count), each with U x 16 B x 256 threads
+// of loads in flight, streaming a 2 GiB buffer: what a decode kernel with few CTAs (e.g. a fixed split size at short
+// context, one CTA per (stream, KV head) without split-KV) can pull.
+void run_ctas() {
+    const cudaDeviceProp p   = device_props();
+    const std::size_t bytes  = 2ull << 30;
+    const std::size_t n_vec  = bytes / 16;
+    uint4* src               = nullptr;
+    uint32_t* d_acc          = nullptr;
+    RF_CHECK(cudaMalloc(&src, bytes));
+    RF_CHECK(cudaMalloc(&d_acc, 64));
+    cudaStream_t s{};
+    RF_CHECK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
+    fill_kernel<<<p.multiProcessorCount * 8, kThreads, 0, s>>>(reinterpret_cast<uint32_t*>(src), bytes / 4);
+    for (int i = 0; i < 16; ++i)
+        read_chunk_kernel<8, false><<<p.multiProcessorCount * 4, kThreads, 0, s>>>(src, n_vec, d_acc);
+    RF_CHECK(cudaStreamSynchronize(s));
+    const int counts[] = {8, 16, 24, 32, 48, 64, 96, 128, 170, 256, 340, 680};
+    auto one = [&](auto kernel, int U, int n) {
+        auto run = [&] { kernel<<<n, kThreads, 0, s>>>(src, n_vec, d_acc); };
+        RF_CHECK(cudaMemsetAsync(d_acc, 0, 4, s));
+        run();
+        const bool ok  = read_acc(d_acc, s) == expected_sum(0, bytes / 4);
+        const Timing t = time_it(s, run, 1, options().trial_seconds * 0.5, 3);
+        const double g = bytes / t.best_ns;
+        emit("dram_ctas", {kv("ctas", n), kv("loads_in_flight", U), kv("bytes_in_flight_per_cta", U * 16 * kThreads),
+                           kv("gbps", g), kv("gbps_per_cta", g / n), kv("ok", ok)});
+        note("  dram_ctas %4d CTAs U=%2d (%3d KB in flight/CTA)  %8.1f GB/s  %6.2f GB/s per CTA  %s\n", n, U,
+             U * 16 * kThreads / 1024, g, g / n, ok ? "ok" : "CHECKSUM MISMATCH");
+    };
+    for (int n : counts) {
+        one(read_chunk_kernel<8, false>, 8, n);
+        one(read_chunk_kernel<16, false>, 16, n);
+    }
+    RF_CHECK(cudaStreamDestroy(s));
+    RF_CHECK(cudaFree(src));
+    RF_CHECK(cudaFree(d_acc));
+}
+
 void run_dram() {
     const cudaDeviceProp p = device_props();
     std::size_t free_b = 0, total_b = 0;

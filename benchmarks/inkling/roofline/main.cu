@@ -2,6 +2,7 @@
 //   dram  (1) DRAM streaming read / write / copy + one-kernel-per-chunk weight streaming (stream / graph / graph+PDL)
 //   mma   (2) dense MMA peaks: mma.sync instruction ceilings (BF16, FP8 e4m3, NVFP4) + cuBLASLt GEMMs
 //   host  (3) pinned H2D / D2H / bidirectional, pageable H2D, P2P if two devices are visible
+//   ctas  (1b) DRAM bandwidth reachable by a fixed number of CTAs (only with --only ctas or listed)
 //   gap   (4) per-kernel gap of a 400-kernel dependent chain: stream vs CUDA graph, without / with PDL
 // Usage: inkling_roofline [--only dram,mma,host,gap] [--quick] [--trial-seconds S] [--trials N] [--dram-gib G]
 //                         [--host-gib G]
@@ -63,6 +64,7 @@ int main(int argc, char** argv) {
              total_b / 1073741824.0, drv, rt);
     if (parts.count("gap")) rf::run_gap();
     if (parts.count("dram")) rf::run_dram();
+    if (parts.count("ctas")) rf::run_ctas();
     if (parts.count("host")) rf::run_host();
     if (parts.count("mma")) rf::run_mma();
     rf::emit("done", {rf::kv("ok", true)});
