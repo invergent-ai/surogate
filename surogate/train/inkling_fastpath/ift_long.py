@@ -283,6 +283,22 @@ class _Shift:
 # per visit per projection; rows of the whole sequence per group, in row blocks of MOE_ROWS)
 # ---------------------------------------------------------------------------------------------------------------
 MOE_ROWS = int(os.environ.get("IFT_MOE_ROWS", "32768"))
+# LEVEL-1 lever 3: query-block rows of the flash attention adapted to the key span (fewer, larger blocks; the per-block
+# score tensors [24, rows, keys] fp32 stay under ATTN_BLOCK_BYTES); 0 = the fixed 128 rows
+ATTN_ADAPT = os.environ.get("IFT_ATTN_ADAPT", "1") == "1"
+ATTN_BLOCK_BYTES = int(os.environ.get("IFT_ATTN_BLOCK_MB", "256")) << 20
+
+
+def _q_block(T, window, hq=24):
+    if not ATTN_ADAPT:
+        return 128
+    best = 128
+    for qb in (2048, 1024, 512, 256):
+        keys = min(T, qb + window - 1) if window > 0 else T
+        if hq * qb * keys * 4 <= ATTN_BLOCK_BYTES:
+            best = qb
+            break
+    return best
 MOE_GM = os.environ.get("IFT_MOE_GM", "1") == "1"
 
 
@@ -302,15 +318,11 @@ class UnitBMM(torch.autograd.Function):
         return torch.bmm(g.float(), ctx.unit.float()), None
 
 
-def _moe_rows(xr, gr, eg, ng, u13, f13, u2, f2, lo, scale):
-    """down rows (fp32, bf16 values) of rows xr [n, H] routed to experts eg [n] (0..ng-1 within the group), gammas gr
-    [n]: rig.moe_vec's per-group arithmetic (W4A16: unit GEMM x factor, + LoRA from the fp32 tensors, one rounding;
-    softcapped SwiGLU with the gamma; down likewise)."""
-    n = xr.shape[0]
-    counts = torch.bincount(eg, minlength=ng)
-    starts = torch.cumsum(counts, 0) - counts
-    pg = torch.arange(n, device=xr.device) - starts[eg]
-    cap = int(counts.max())
+def _moe_rows(xr, gr, eg, pg, cap, ng, u13, f13, u2, f2, lo, scale):
+    """down rows (fp32, bf16 values) of rows xr [n, H] routed to experts eg [n] (0..ng-1 within the group) at padded
+    positions pg [n] (< cap; host int cap: no device sync here), gammas gr [n]: rig.moe_vec's per-group arithmetic
+    (W4A16: unit GEMM x factor, + LoRA from the fp32 tensors, one rounding; softcapped SwiGLU with the gamma; down
+    likewise)."""
 
     def pad(rows):
         z = torch.zeros(ng, cap, rows.shape[1], dtype=rows.dtype, device=rows.device)
@@ -378,7 +390,9 @@ class MoEGM(torch.autograd.Function):
         tok = order // topk
         slot = order % topk
         counts = torch.bincount(flat, minlength=B.E)
-        starts = (torch.cumsum(counts, 0) - counts).tolist()
+        starts_d = torch.cumsum(counts, 0) - counts
+        pos_all = torch.arange(flat.numel(), device=dev) - starts_d[es]  # position within its expert
+        starts = starts_d.tolist()  # the visit's one host sync: every group's rows and padding are known from here
         cnt = counts.tolist()
         gam_r = gam[tok, slot]
         dx = torch.zeros(T, H, dtype=F32, device=dev)
@@ -398,6 +412,12 @@ class MoEGM(torch.autograd.Function):
                 b1 = min(r1, b0 + MOE_ROWS)
                 tb = tok[b0:b1]
                 eb = es[b0:b1] - g0
+                # padded positions of this row block (host arithmetic: rows of expert e in [b0, b1))
+                lo_e = [max(starts[e], b0) for e in range(g0, g1)]
+                hi_e = [min(starts[e] + cnt[e], b1) for e in range(g0, g1)]
+                cap = max(1, max(h - l for l, h in zip(lo_e, hi_e)))
+                off = torch.tensor([lo_e[i] - starts[g0 + i] for i in range(g1 - g0)]).pin_memory()
+                pb = pos_all[b0:b1] - off.to(dev, non_blocking=True)[eb]
                 with torch.enable_grad():
                     xr = x[tb].detach().requires_grad_()
                     grr = gam_r[b0:b1].detach().requires_grad_()
@@ -406,7 +426,7 @@ class MoEGM(torch.autograd.Function):
                     if lora is not None:
                         leaves = [t[g0:g1].detach().requires_grad_() for t in lora]
                         lo = dict(zip(B.LORA_KEYS, leaves))
-                    dn = _moe_rows(xr, grr, eb, g1 - g0, u13, f13, u2, f2, lo, ctx.scale)
+                    dn = _moe_rows(xr, grr, eb, pb, cap, g1 - g0, u13, f13, u2, f2, lo, ctx.scale)
                     grads = torch.autograd.grad(dn, [xr, grr] + leaves, g[tb])
                 dx.index_add_(0, tb, grads[0])
                 dgam_r[b0:b1] = grads[1]
@@ -588,7 +608,8 @@ def visit_torch_long(W: B.EngineWeights, vi, stack, partial, bank, ids, lora, ch
         del kc, vc, kh, vh, k_raw, v_raw, pr
     # 4. attention (flash, bias from r per block)
     with B._tick("fwd.attention"):
-        out, lse = RelAttentionR.apply(q_out, K.float(), V.float(), r_out, L.rel_proj, 1024 if L.is_local else 0)
+        win = 1024 if L.is_local else 0
+        out, lse = RelAttentionR.apply(q_out, K.float(), V.float(), r_out, L.rel_proj, win, _q_block(T, win))
         del K, V, q_out, r_out
     # 5. gate / sink + wo_ud (per token)
 
