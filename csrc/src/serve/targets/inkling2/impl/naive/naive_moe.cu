@@ -27,7 +27,6 @@ constexpr int kTopK   = 8;
 constexpr int kTile   = 256; // tokens per pass
 
 __device__ __forceinline__ float f(bf16 v) { return __bfloat162float(v); }
-__device__ __forceinline__ float rbf(float v) { return __bfloat162float(__float2bfloat16_rn(v)); }
 __device__ __forceinline__ float e4m3(std::uint8_t bits) {
     __nv_fp8_e4m3 v;
     v.__x = bits;

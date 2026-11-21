@@ -6,6 +6,7 @@
 // Design: rl/engine-inkling-2026-11-21/lanes/e1/DESIGN-target.md.
 
 #include "api/types.h"
+#include "api/ops/linear.h"
 #include "runtime/contract/types.h"
 #include "runtime/contract/transient_region.h"
 #include <api/family/frontend.h>
