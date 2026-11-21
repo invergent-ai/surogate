@@ -18,7 +18,7 @@ while [ "\$(awk '/MemAvailable/ {print int(\$2/1048576)}' /proc/meminfo)" -lt 60
 done
 exec 9>$R/nvcc.lock
 flock 9
-nice -n 19 ionice -c3 /usr/local/cuda-13.0/bin/nvcc -O3 -std=c++17 -arch=sm_120a -lineinfo \
+nice -n 19 ionice -c3 /usr/local/cuda-13.0/bin/nvcc -O3 -std=c++17 -gencode arch=compute_120a,code=sm_120a -lineinfo \
   -Xcompiler -Wall src/main.cu src/dram.cu src/mma.cu src/host.cu src/gap.cu -lcublasLt -o inkling_roofline.new
 mv inkling_roofline.new inkling_roofline
 sha256sum inkling_roofline
