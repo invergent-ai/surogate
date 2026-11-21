@@ -60,6 +60,24 @@ PagedKVPoolLayout plan_paged_kv_pool(LayoutBuilder& builder, const PagedKVPoolSp
         throw std::invalid_argument("Elastic Paged KV pools must be page-major");
     }
 
+    // Window class (DESIGN-window-kv.md): its largest window, and its page count -- the lanes',
+    // the shared-prefix images', and one sentinel page every recycled entry points at.
+    std::uint32_t window_tokens = 0;
+    for (const PagedKVPlaneSpec& plane : spec.planes) {
+        if (plane.window < 0) { throw std::invalid_argument("Paged KV plane window must not be negative"); }
+        window_tokens = std::max(window_tokens, static_cast<std::uint32_t>(plane.window));
+    }
+    std::int32_t window_pages = 0;
+    if (window_tokens != 0) {
+        const std::uint64_t pages =
+            std::uint64_t{spec.window_lane_pages} + spec.window_image_pages + 1U;
+        if (spec.window_lane_pages == 0 || spec.window_forward_tokens == 0 ||
+            pages > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
+            throw std::invalid_argument("Paged KV window class needs lane pages and a forward reach");
+        }
+        window_pages = static_cast<std::int32_t>(pages);
+    }
+
     PagedKVPoolLayout layout;
     layout.spec = spec;
     layout.planes.reserve(spec.planes.size());
@@ -78,6 +96,7 @@ PagedKVPoolLayout plan_paged_kv_pool(LayoutBuilder& builder, const PagedKVPoolSp
     if (spec.elastic) {
         for (const PagedKVPlaneSpec& plane : spec.planes) {
             if (plane.leading_extent <= 0 || plane.head_extent <= 0) { continue; }
+            if (plane.window > 0) { continue; } // window planes live in the arena, never mapped on demand
             const auto stride = static_cast<std::size_t>(
                 Tensor(nullptr, plane.dtype,
                        {plane.leading_extent, kPagedKVPageSize, plane.head_extent, 1})
@@ -102,7 +121,19 @@ PagedKVPoolLayout plan_paged_kv_pool(LayoutBuilder& builder, const PagedKVPoolSp
         const std::string label = "Paged KV plane " + std::to_string(index);
         PagedKVPlaneLayout planned;
         planned.spec = plane;
-        if (spec.plane_order == PagedKVPlaneOrder::PageMajor) {
+        if (plane.window > 0) {
+            // A window-class plane: its own (small) page count, in the arena even when the pool's
+            // other planes follow demand.
+            if (spec.plane_order == PagedKVPlaneOrder::PageMajor) {
+                planned.storage = builder.add_tensor(
+                    plane.dtype, {plane.leading_extent, kPagedKVPageSize, plane.head_extent, window_pages},
+                    plane.alignment, label + " (window)");
+            } else {
+                planned.storage = builder.add_tensor(
+                    plane.dtype, {plane.leading_extent, kPagedKVPageSize, window_pages, plane.head_extent},
+                    plane.alignment, label + " (window)");
+            }
+        } else if (spec.plane_order == PagedKVPlaneOrder::PageMajor) {
             const std::size_t alignment =
                 spec.elastic ? std::max(plane.alignment, kElasticKvGranuleBytes) : plane.alignment;
             planned.storage = planes_into.add_tensor(
@@ -124,6 +155,12 @@ PagedKVPoolLayout plan_paged_kv_pool(LayoutBuilder& builder, const PagedKVPoolSp
     }
     layout.block_tables = builder.add_tensor(DType::I32, {logical_pages, spec.table_rows}, 256,
                                              "Paged KV block tables");
+    if (window_tokens != 0) {
+        layout.window_tokens       = window_tokens;
+        layout.window_page_count   = static_cast<std::uint32_t>(window_pages);
+        layout.window_block_tables = builder.add_tensor(DType::I32, {logical_pages, spec.table_rows}, 256,
+                                                        "Paged KV window block tables");
+    }
     return layout;
 }
 
@@ -161,6 +198,7 @@ PagedKVPool::PagedKVPool(DeviceSpan backing, const PagedKVPoolLayout& layout,
         region.free_bytes_probe = elastic->free_bytes_probe;
         region.headroom_bytes   = elastic->headroom_bytes;
         for (const PagedKVPlaneLayout& plane : layout.planes) {
+            if (plane.spec.window > 0) { continue; } // in the arena (plan_paged_kv_pool)
             const auto& shape = plane.storage.shape;
             const Tensor page(nullptr, plane.storage.dtype, {shape[0], shape[1], shape[2], 1});
             region.planes.push_back(ElasticKvPlane{
@@ -186,12 +224,49 @@ PagedKVPool::PagedKVPool(DeviceSpan backing, const PagedKVPoolLayout& layout,
             plane.spec.head_extent != spec_.planes[index].head_extent) {
             throw std::logic_error("Paged KV plane layout does not match its spec");
         }
-        planes_.push_back(plane.storage.bind(plane_backing));
+        planes_.push_back(plane.storage.bind(plane.spec.window > 0 ? backing : plane_backing));
     }
 
     free_page_ids_.reserve(spec_.page_group_count);
     for (std::uint32_t page = 0; page < spec_.page_group_count; ++page) {
         free_page_ids_.push_back(static_cast<std::int32_t>(page));
+    }
+
+    // Window class. Without one every plane is a full plane, in order, and nothing below runs.
+    plane_windowed_.reserve(planes_.size());
+    for (std::size_t index = 0; index < planes_.size(); ++index) {
+        const bool windowed = spec_.planes[index].window > 0;
+        plane_windowed_.push_back(windowed);
+        (windowed ? window_planes_ : full_planes_).push_back(index);
+    }
+    if ((layout.window_tokens != 0) != !window_planes_.empty()) {
+        throw std::logic_error("Paged KV window class layout does not match its planes");
+    }
+    if (layout.window_tokens != 0) {
+        window_tokens_         = layout.window_tokens;
+        window_forward_tokens_ = spec_.window_forward_tokens;
+        window_lane_pages_     = spec_.window_lane_pages;
+        window_image_pages_    = spec_.window_image_pages;
+        if (layout.window_page_count != window_lane_pages_ + window_image_pages_ + 1U) {
+            throw std::logic_error("Paged KV window class page count is inconsistent");
+        }
+        window_sentinel_     = static_cast<std::int32_t>(layout.window_page_count - 1U);
+        window_block_tables_ = layout.window_block_tables.bind(backing);
+        if (window_block_tables_.ne[0] != block_tables_.ne[0] ||
+            window_block_tables_.ne[1] != block_tables_.ne[1]) {
+            throw std::logic_error("Paged KV window block-table layout is inconsistent");
+        }
+        // Lowest pages handed out first: pop_back takes from the end.
+        for (std::uint32_t page = window_lane_pages_; page > 0; --page) {
+            window_lane_free_.push_back(static_cast<std::int32_t>(page - 1U));
+        }
+        for (std::uint32_t page = window_lane_pages_ + window_image_pages_; page > window_lane_pages_; --page) {
+            window_image_free_.push_back(static_cast<std::int32_t>(page - 1U));
+        }
+        // Recycled entries point here: kernels that start a split before the window read it, so
+        // it must hold finite bytes (zeros), and nothing ever writes it.
+        zero_window_page(window_sentinel_, nullptr);
+        CUDA_CHECK(cudaStreamSynchronize(nullptr));
     }
 }
 
@@ -303,7 +378,8 @@ void PagedKVPool::copy_pages(std::span<const std::int32_t> source,
         if (source[i] < 0 || destination[i] < 0 || source[i] >= page_group_count() || destination[i] >= page_group_count()) {
             throw std::out_of_range("GPU page copy outside pool");
         }
-        for (const auto& plane : planes_) {
+        for (const std::size_t index : full_planes_) {
+            const auto& plane = planes_[index];
             const bool major = spec_.plane_order == PagedKVPlaneOrder::PageMajor;
             const auto stride = plane.nb[major ? 3 : 2];
             CUDA_CHECK(cudaMemcpy2DAsync(static_cast<std::byte*>(plane.data) + destination[i] * stride,
@@ -331,7 +407,8 @@ PagedKVOccupancy PagedKVPool::occupancy(std::size_t granule_bytes) const noexcep
     // one page across its heads, so no page-granular mapping scheme applies to it.
     const bool page_mappable = spec_.plane_order == PagedKVPlaneOrder::PageMajor;
     std::uint32_t granule    = 1;
-    for (const Tensor& plane : planes_) {
+    for (const std::size_t index : full_planes_) {
+        const Tensor& plane      = planes_[index];
         const std::int64_t stride = page_mappable ? plane.nb[3] : plane.nb[2];
         if (stride <= 0) { return out; }
         const auto span = static_cast<std::size_t>(stride) *
@@ -374,7 +451,8 @@ void PagedKVPool::zero_pages(std::span<const std::int32_t> page_ids, cudaStream_
     }
 
     const auto zero_run = [&](std::int32_t first, std::int32_t count) {
-        for (const Tensor& plane : planes_) {
+        for (const std::size_t index : full_planes_) {
+            const Tensor& plane = planes_[index];
             auto* base = static_cast<unsigned char*>(plane.data);
             if (spec_.plane_order == PagedKVPlaneOrder::PageMajor) {
                 CUDA_CHECK(cudaMemsetAsync(base + static_cast<std::int64_t>(first) * plane.nb[3], byte,
@@ -398,48 +476,61 @@ void PagedKVPool::zero_pages(std::span<const std::int32_t> page_ids, cudaStream_
 }
 
 std::size_t PagedKVPool::image_plane_bytes(std::size_t plane, std::size_t pages) const {
-    const auto& tensor   = planes_.at(plane);
+    const auto& tensor   = planes_.at(full_planes_.at(plane));
     const int page_axis  = spec_.plane_order == PagedKVPlaneOrder::PageMajor ? 3 : 2;
     const auto heads     = page_axis == 3 ? 1 : static_cast<std::size_t>(tensor.ne[3]);
     return pages * static_cast<std::size_t>(tensor.nb[page_axis]) * heads;
 }
 
-void PagedKVPool::download_pages_to(std::span<const std::int32_t> ids,
-                                    std::span<std::byte* const> destinations,
-                                    cudaStream_t stream) const {
-    if (destinations.size() != planes_.size()) {
-        throw std::invalid_argument("prefix image does not name every KV plane");
-    }
+void PagedKVPool::transfer_planes(const std::vector<std::size_t>& plane_set, std::uint32_t page_limit,
+                                  std::span<const std::int32_t> ids, std::span<std::byte* const> hosts,
+                                  std::uint32_t image_pages, bool to_device, cudaStream_t stream) const {
     for (const auto id : ids) {
-        if (id < 0 || static_cast<std::uint32_t>(id) >= page_group_count()) {
+        if (id < 0 || static_cast<std::uint32_t>(id) >= page_limit) {
             throw std::out_of_range("prefix image page is outside the KV pool");
         }
     }
-    for (std::size_t i = 0; i < planes_.size(); ++i) {
-        const auto& plane = planes_[i];
+    for (std::size_t i = 0; i < plane_set.size(); ++i) {
+        const auto& plane = planes_[plane_set[i]];
         const int page_axis = spec_.plane_order == PagedKVPlaneOrder::PageMajor ? 3 : 2;
         const auto stride = static_cast<std::size_t>(plane.nb[page_axis]);
         const auto heads = page_axis == 3 ? 1 : plane.ne[3];
-        std::byte* host = destinations[i];
+        std::byte* host = hosts[i];
         for (std::size_t first = 0; first < ids.size();) {
             std::size_t last = first + 1;
             while (last < ids.size() && ids[last] == ids[last - 1] + 1) { ++last; }
-            CUDA_CHECK(cudaMemcpy2DAsync(host + first * stride, ids.size() * stride,
-                static_cast<const std::byte*>(plane.data) + ids[first] * stride,
-                page_axis == 3 ? (last - first) * stride : plane.nb[3],
-                (last - first) * stride, heads, cudaMemcpyDeviceToHost, stream));
+            std::byte* device = static_cast<std::byte*>(plane.data) + ids[first] * stride;
+            const std::size_t device_pitch = page_axis == 3 ? (last - first) * stride : plane.nb[3];
+            if (to_device) {
+                CUDA_CHECK(cudaMemcpy2DAsync(device, device_pitch, host + first * stride,
+                    std::size_t(image_pages) * stride, (last - first) * stride, heads,
+                    cudaMemcpyHostToDevice, stream));
+            } else {
+                CUDA_CHECK(cudaMemcpy2DAsync(host + first * stride, std::size_t(image_pages) * stride,
+                    device, device_pitch, (last - first) * stride, heads, cudaMemcpyDeviceToHost, stream));
+            }
             first = last;
         }
     }
+}
+
+void PagedKVPool::download_pages_to(std::span<const std::int32_t> ids,
+                                    std::span<std::byte* const> destinations,
+                                    cudaStream_t stream) const {
+    if (destinations.size() != full_planes_.size()) {
+        throw std::invalid_argument("prefix image does not name every KV plane");
+    }
+    transfer_planes(full_planes_, page_group_count(), ids, destinations,
+                    static_cast<std::uint32_t>(ids.size()), false, stream);
 }
 
 PagedKVHostImage PagedKVPool::download_pages(std::span<const std::int32_t> ids,
                                              cudaStream_t stream) const {
     PagedKVHostImage image;
     image.pages = static_cast<std::uint32_t>(ids.size());
-    image.planes.resize(planes_.size());
-    std::vector<std::byte*> destinations(planes_.size());
-    for (std::size_t i = 0; i < planes_.size(); ++i) {
+    image.planes.resize(full_planes_.size());
+    std::vector<std::byte*> destinations(full_planes_.size());
+    for (std::size_t i = 0; i < full_planes_.size(); ++i) {
         image.planes[i].resize(image_plane_bytes(i, ids.size()));
         destinations[i] = image.planes[i].data();
     }
@@ -451,46 +542,172 @@ PagedKVHostImage PagedKVPool::download_pages(std::span<const std::int32_t> ids,
 void PagedKVPool::upload_pages_from(std::span<const std::byte* const> sources,
                                     std::uint32_t image_pages, std::span<const std::int32_t> ids,
                                     cudaStream_t stream) const {
-    if (ids.size() > image_pages || sources.size() != planes_.size()) {
+    if (ids.size() > image_pages || sources.size() != full_planes_.size()) {
         throw std::invalid_argument("prefix image does not cover the KV allocation");
     }
-    for (const auto id : ids) {
-        if (id < 0 || static_cast<std::uint32_t>(id) >= page_group_count()) {
-            throw std::out_of_range("prefix image page is outside the KV pool");
-        }
-    }
-    for (std::size_t i = 0; i < planes_.size(); ++i) {
-        const auto& plane = planes_[i];
-        const int page_axis = spec_.plane_order == PagedKVPlaneOrder::PageMajor ? 3 : 2;
-        const auto stride = static_cast<std::size_t>(plane.nb[page_axis]);
-        const auto heads = page_axis == 3 ? 1 : plane.ne[3];
-        const std::byte* host = sources[i];
-        for (std::size_t first = 0; first < ids.size();) {
-            std::size_t last = first + 1;
-            while (last < ids.size() && ids[last] == ids[last - 1] + 1) { ++last; }
-            CUDA_CHECK(cudaMemcpy2DAsync(static_cast<std::byte*>(plane.data) + ids[first] * stride,
-                page_axis == 3 ? (last - first) * stride : plane.nb[3],
-                host + first * stride, std::size_t(image_pages) * stride,
-                (last - first) * stride, heads, cudaMemcpyHostToDevice, stream));
-            first = last;
-        }
-    }
+    std::vector<std::byte*> hosts(sources.size());
+    for (std::size_t i = 0; i < sources.size(); ++i) { hosts[i] = const_cast<std::byte*>(sources[i]); }
+    transfer_planes(full_planes_, page_group_count(), ids, hosts, image_pages, true, stream);
 }
 
 void PagedKVPool::upload_pages(const PagedKVHostImage& image,
                                std::span<const std::int32_t> ids, cudaStream_t stream) const {
-    if (ids.size() > image.pages || image.planes.size() != planes_.size()) {
+    if (ids.size() > image.pages || image.planes.size() != full_planes_.size()) {
         throw std::invalid_argument("prefix image does not cover the KV allocation");
     }
     // Validate every plane before enqueueing a copy, including malformed images.
-    std::vector<const std::byte*> sources(planes_.size());
-    for (std::size_t i = 0; i < planes_.size(); ++i) {
+    std::vector<const std::byte*> sources(full_planes_.size());
+    for (std::size_t i = 0; i < full_planes_.size(); ++i) {
         if (image.planes[i].size() != image_plane_bytes(i, image.pages)) {
             throw std::invalid_argument("prefix image KV plane geometry differs");
         }
         sources[i] = image.planes[i].data();
     }
     upload_pages_from(sources, image.pages, ids, stream);
+}
+
+// ---- Window class (DESIGN-window-kv.md) ----------------------------------------------------
+
+Tensor PagedKVPool::window_block_table_row(std::int32_t row) const {
+    if (!has_window_class()) { throw std::logic_error("Paged KV pool has no window class"); }
+    if (row < 0 || row >= table_row_count()) {
+        throw std::out_of_range("Paged KV window block-table row out of range");
+    }
+    return window_block_tables_.slice(1, row, 1).view(
+        {static_cast<std::int32_t>(logical_page_capacity())});
+}
+
+std::int32_t PagedKVPool::take_window_page() {
+    if (window_lane_free_.empty()) {
+        // Sized by construction (kv_window_pages.h plan_kv_window_class): running dry means a
+        // forward or a holder the bound does not count. Never hand out the sentinel instead.
+        throw std::logic_error("window KV lane pages exhausted (" + std::to_string(window_lane_pages_) +
+                               " pages, window " + std::to_string(window_tokens_) +
+                               "): the window class bound missed a holder");
+    }
+    const std::int32_t page = window_lane_free_.back();
+    window_lane_free_.pop_back();
+    window_lane_peak_ = std::max(window_lane_peak_,
+                                 window_lane_pages_ - static_cast<std::uint32_t>(window_lane_free_.size()));
+    return page;
+}
+
+void PagedKVPool::give_back_window_page(std::int32_t physical) noexcept {
+    window_lane_free_.push_back(physical);
+}
+
+void PagedKVPool::copy_window_pages(std::span<const std::int32_t> source,
+                                    std::span<const std::int32_t> destination, cudaStream_t stream) const {
+    if (source.size() != destination.size()) { throw std::invalid_argument("window page copy size mismatch"); }
+    for (std::size_t i = 0; i < source.size(); ++i) {
+        if (source[i] < 0 || destination[i] < 0 || source[i] >= window_sentinel_ ||
+            destination[i] >= window_sentinel_) {
+            throw std::out_of_range("window page copy outside the class");
+        }
+        for (const std::size_t index : window_planes_) {
+            const auto& plane = planes_[index];
+            const bool major = spec_.plane_order == PagedKVPlaneOrder::PageMajor;
+            const auto stride = plane.nb[major ? 3 : 2];
+            CUDA_CHECK(cudaMemcpy2DAsync(static_cast<std::byte*>(plane.data) + destination[i] * stride,
+                major ? stride : plane.nb[3],
+                static_cast<const std::byte*>(plane.data) + source[i] * stride,
+                major ? stride : plane.nb[3], stride, major ? 1 : plane.ne[3], cudaMemcpyDeviceToDevice, stream));
+        }
+    }
+}
+
+void PagedKVPool::zero_window_page(std::int32_t page, cudaStream_t stream) const {
+    for (const std::size_t index : window_planes_) {
+        const Tensor& plane = planes_[index];
+        auto* base = static_cast<unsigned char*>(plane.data);
+        if (spec_.plane_order == PagedKVPlaneOrder::PageMajor) {
+            CUDA_CHECK(cudaMemsetAsync(base + static_cast<std::int64_t>(page) * plane.nb[3], 0,
+                                       static_cast<std::size_t>(plane.nb[3]), stream));
+        } else {
+            CUDA_CHECK(cudaMemset2DAsync(base + static_cast<std::int64_t>(page) * plane.nb[2], plane.nb[3], 0,
+                                         static_cast<std::size_t>(plane.nb[2]),
+                                         static_cast<std::size_t>(plane.ne[3]), stream));
+        }
+    }
+}
+
+std::size_t PagedKVPool::window_image_plane_bytes(std::size_t k, std::size_t pages) const {
+    const auto& tensor  = planes_.at(window_planes_.at(k));
+    const int page_axis = spec_.plane_order == PagedKVPlaneOrder::PageMajor ? 3 : 2;
+    const auto heads    = page_axis == 3 ? 1 : static_cast<std::size_t>(tensor.ne[3]);
+    return pages * static_cast<std::size_t>(tensor.nb[page_axis]) * heads;
+}
+
+void PagedKVPool::download_window_pages_to(std::span<const std::int32_t> physical,
+                                           std::span<std::byte* const> destinations,
+                                           cudaStream_t stream) const {
+    if (destinations.size() != window_planes_.size()) {
+        throw std::invalid_argument("window image does not name every window plane");
+    }
+    transfer_planes(window_planes_, static_cast<std::uint32_t>(window_sentinel_), physical, destinations,
+                    static_cast<std::uint32_t>(physical.size()), false, stream);
+}
+
+void PagedKVPool::upload_window_pages_from(std::span<const std::byte* const> sources, std::uint32_t image_pages,
+                                           std::span<const std::int32_t> physical, cudaStream_t stream) const {
+    if (physical.size() > image_pages || sources.size() != window_planes_.size()) {
+        throw std::invalid_argument("window image does not cover the window pages");
+    }
+    std::vector<std::byte*> hosts(sources.size());
+    for (std::size_t i = 0; i < sources.size(); ++i) { hosts[i] = const_cast<std::byte*>(sources[i]); }
+    transfer_planes(window_planes_, static_cast<std::uint32_t>(window_sentinel_), physical, hosts, image_pages,
+                    true, stream);
+}
+
+std::shared_ptr<const PagedKVWindowImage>
+PagedKVPool::capture_window_image(const PagedKVAllocation& allocation, std::uint32_t tokens, cudaStream_t stream) {
+    if (!has_window_class() || !allocation.belongs_to(*this) || tokens == 0) { return nullptr; }
+    const std::uint32_t first = KvWindowPages::keep_first_page(tokens, window_tokens_);
+    const std::uint32_t last  = KvWindowPages::pages_for(tokens);
+    std::vector<std::int32_t> source;
+    std::vector<KvWindowSlot> slots;
+    for (std::uint32_t page = first; page < last; ++page) {
+        const std::int32_t physical = allocation.window_.physical(page);
+        if (physical < 0) { return nullptr; }
+        source.push_back(physical);
+        slots.push_back(KvWindowSlot{page, -1});
+    }
+    if (slots.size() > window_image_free_.size()) { return nullptr; }
+    std::shared_ptr<PagedKVWindowImage> image(new PagedKVWindowImage());
+    image->pool_   = this;
+    image->tokens_ = tokens;
+    std::vector<std::int32_t> destination;
+    for (KvWindowSlot& slot : slots) {
+        slot.physical = window_image_free_.back();
+        window_image_free_.pop_back();
+        destination.push_back(slot.physical);
+    }
+    image->slots_ = std::move(slots);
+    copy_window_pages(source, destination, stream);
+    return image;
+}
+
+PagedKVWindowImage::~PagedKVWindowImage() {
+    if (pool_ == nullptr) { return; }
+    for (const KvWindowSlot& slot : slots_) { pool_->window_image_free_.push_back(slot.physical); }
+}
+
+PagedKVWindowOccupancy PagedKVPool::window_occupancy() const noexcept {
+    PagedKVWindowOccupancy out;
+    if (!has_window_class()) { return out; }
+    out.window_tokens = window_tokens_;
+    out.lane_pages    = window_lane_pages_;
+    out.image_pages   = window_image_pages_;
+    out.lane_in_use   = window_lane_pages_ - static_cast<std::uint32_t>(window_lane_free_.size());
+    out.lane_peak     = window_lane_peak_;
+    out.image_in_use  = window_image_pages_ - static_cast<std::uint32_t>(window_image_free_.size());
+    for (const std::size_t index : window_planes_) {
+        const Tensor& plane = planes_[index];
+        const bool major    = spec_.plane_order == PagedKVPlaneOrder::PageMajor;
+        out.page_bytes += static_cast<std::size_t>(plane.nb[major ? 3 : 2]) *
+                          (major ? 1U : static_cast<std::size_t>(plane.ne[3]));
+    }
+    return out;
 }
 
 std::vector<std::int32_t> PagedKVPool::take_pages(std::uint32_t count,
@@ -695,6 +912,7 @@ void PagedKVPool::release_row(std::int32_t row) noexcept {
 PagedKVAllocation::PagedKVAllocation(PagedKVPool& pool, std::uint32_t page_entitlement)
     : pool_(&pool), page_entitlement_(page_entitlement) {
     page_ids_.reserve(page_entitlement);
+    if (pool.has_window_class()) { window_ = KvWindowPages(pool.window_tokens()); }
 }
 
 PagedKVAllocation::~PagedKVAllocation() { release(); }
@@ -702,7 +920,9 @@ PagedKVAllocation::~PagedKVAllocation() { release(); }
 PagedKVAllocation::PagedKVAllocation(PagedKVAllocation&& other) noexcept
     : pool_(other.pool_), prefix_(std::move(other.prefix_)), borrowed_pages_(other.borrowed_pages_),
       page_ids_(std::move(other.page_ids_)),
-      page_entitlement_(other.page_entitlement_), bound_row_(other.bound_row_) {
+      page_entitlement_(other.page_entitlement_), bound_row_(other.bound_row_),
+      window_(std::move(other.window_)) {
+    other.window_           = KvWindowPages();
     other.borrowed_pages_   = 0;
     other.pool_             = nullptr;
     other.page_entitlement_ = 0;
@@ -718,6 +938,8 @@ PagedKVAllocation& PagedKVAllocation::operator=(PagedKVAllocation&& other) noexc
     page_ids_               = std::move(other.page_ids_);
     page_entitlement_       = other.page_entitlement_;
     bound_row_              = other.bound_row_;
+    window_                 = std::move(other.window_);
+    other.window_           = KvWindowPages();
     other.borrowed_pages_   = 0;
     other.pool_             = nullptr;
     other.page_entitlement_ = 0;
@@ -797,6 +1019,12 @@ void PagedKVAllocation::trim_pages(std::uint32_t pages, cudaStream_t stream) {
     if (pages > mapped_page_count() || pages < borrowed_pages_) {
         throw std::invalid_argument("Paged KV trim extent exceeds mapped or immutable prefix pages");
     }
+    if (window_.active()) {
+        // The window class rewinds with the full planes: pages holding no token below the trim.
+        const KvWindowChange change =
+            window_.rewind(pages * static_cast<std::uint32_t>(kPagedKVPageSize), *pool_);
+        publish_window(change, stream);
+    }
     if (pages == mapped_page_count()) { return; }
     const std::uint32_t trimmed = mapped_page_count() - pages;
     pool_->return_pages(std::span<const std::int32_t>(
@@ -825,6 +1053,7 @@ void PagedKVAllocation::bind_row(std::int32_t row, cudaStream_t stream) {
                      static_cast<void*>(pool_), row, page_ids_.size());
     }
     publish_mapping(stream);
+    if (window_.active()) { publish_window_row(stream); }
 }
 
 void PagedKVAllocation::publish_mapping(cudaStream_t stream) const {
@@ -857,6 +1086,7 @@ Tensor PagedKVAllocation::block_table() const {
 void PagedKVAllocation::release() noexcept {
     if (!valid()) { return; }
     unbind_row();
+    window_.release_all(*pool_);
     pool_->return_pages(std::span<const std::int32_t>(page_ids_).subspan(borrowed_pages_));
     pool_->replace_entitlement(owned_entitlement(), 0);
     prefix_.reset();
@@ -864,6 +1094,110 @@ void PagedKVAllocation::release() noexcept {
     page_ids_.clear();
     page_entitlement_ = 0;
     pool_             = nullptr;
+}
+
+namespace {
+bool window_trace() {
+    static const bool enabled = std::getenv("SUROGATE_SERVE_KV_WINDOW_TRACE") != nullptr;
+    return enabled;
+}
+} // namespace
+
+void PagedKVAllocation::window_prepare(std::uint32_t first, std::uint32_t end,
+                                       std::span<const std::uint32_t> pins, cudaStream_t stream) {
+    if (!window_.active()) { return; }
+    if (!valid()) { throw std::logic_error("Cannot prepare window pages of an empty Paged KV allocation"); }
+    const std::uint32_t limit = pool_->logical_page_capacity() * static_cast<std::uint32_t>(kPagedKVPageSize);
+    const KvWindowChange change =
+        window_.prepare(first, std::min(end, limit), pool_->window_forward_tokens(), pins, *pool_);
+    if (window_trace()) {
+        std::fprintf(stderr, "kv-window: %p row %d prepare first %u end %u released %zu mapped %zu live %u\n",
+                     static_cast<void*>(this), bound_row_, first, end, change.released.size(),
+                     change.mapped.size(), window_.page_count());
+    }
+    publish_window(change, stream);
+}
+
+void PagedKVAllocation::window_settle(std::uint32_t committed, std::span<const std::uint32_t> pins,
+                                      cudaStream_t stream) {
+    if (!window_.active()) { return; }
+    const KvWindowChange change = window_.settle(committed, pins, *pool_);
+    if (window_trace() && !change.empty()) {
+        std::fprintf(stderr, "kv-window: %p row %d settle %u released %zu live %u\n", static_cast<void*>(this),
+                     bound_row_, committed, change.released.size(), window_.page_count());
+    }
+    publish_window(change, stream);
+}
+
+std::vector<std::int32_t> PagedKVAllocation::window_map_restored(std::span<const std::uint32_t> logical,
+                                                                 cudaStream_t stream) {
+    std::vector<std::int32_t> physical;
+    if (!window_.active()) { return physical; }
+    const KvWindowChange change = window_.map_restored(logical, *pool_);
+    physical.reserve(change.mapped.size());
+    for (const KvWindowSlot& slot : change.mapped) { physical.push_back(slot.physical); }
+    publish_window(change, stream);
+    return physical;
+}
+
+void PagedKVAllocation::window_restore_from_image(const PagedKVWindowImage& image, cudaStream_t stream) {
+    if (!window_.active()) { return; }
+    std::vector<std::uint32_t> logical;
+    std::vector<std::int32_t> source;
+    for (const KvWindowSlot& slot : image.slots()) {
+        logical.push_back(slot.logical);
+        source.push_back(slot.physical);
+    }
+    const std::vector<std::int32_t> destination = window_map_restored(logical, stream);
+    pool_->copy_window_pages(source, destination, stream);
+}
+
+void PagedKVAllocation::window_capture_fill(cudaStream_t stream) {
+    if (!window_.active()) { return; }
+    if (bound_row_ < 0) { throw std::logic_error("Paged KV allocation is not bound"); }
+    if (window_.page_count() == 0) {
+        const std::uint32_t first = 0;
+        (void)window_.map_restored(std::span<const std::uint32_t>(&first, 1), *pool_);
+    }
+    // Capture profiles exercise arbitrary context envelopes: every logical page of the row reads
+    // and writes the row's one private window page, never the sentinel.
+    const std::vector<std::int32_t> repeated(pool_->logical_page_capacity(), window_.slots().front().physical);
+    const Tensor row = pool_->window_block_table_row(bound_row_);
+    CUDA_CHECK(cudaMemcpyAsync(row.data, repeated.data(), row.bytes(), cudaMemcpyHostToDevice, stream));
+}
+
+Tensor PagedKVAllocation::window_block_table() const {
+    if (bound_row_ < 0) { throw std::logic_error("Paged KV allocation is not bound"); }
+    return pool_->window_block_table_row(bound_row_);
+}
+
+void PagedKVAllocation::publish_window(const KvWindowChange& change, cudaStream_t stream) const {
+    if (bound_row_ < 0 || change.empty()) { return; }
+    std::uint32_t lo = std::numeric_limits<std::uint32_t>::max();
+    std::uint32_t hi = 0;
+    for (const std::uint32_t logical : change.released) { lo = std::min(lo, logical); hi = std::max(hi, logical + 1U); }
+    for (const KvWindowSlot& slot : change.mapped) { lo = std::min(lo, slot.logical); hi = std::max(hi, slot.logical + 1U); }
+    hi = std::min(hi, pool_->logical_page_capacity());
+    if (lo >= hi) { return; }
+    // One copy for the touched span, from the live set: entries in it that did not change are
+    // rewritten with what they already hold.
+    std::vector<std::int32_t> entries(hi - lo, pool_->window_sentinel_page());
+    for (const KvWindowSlot& slot : window_.slots()) {
+        if (slot.logical >= lo && slot.logical < hi) { entries[slot.logical - lo] = slot.physical; }
+    }
+    const Tensor row = pool_->window_block_table_row(bound_row_);
+    CUDA_CHECK(cudaMemcpyAsync(static_cast<std::int32_t*>(row.data) + lo, entries.data(),
+                               entries.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice, stream));
+}
+
+void PagedKVAllocation::publish_window_row(cudaStream_t stream) const {
+    if (bound_row_ < 0) { return; }
+    std::vector<std::int32_t> entries(pool_->logical_page_capacity(), pool_->window_sentinel_page());
+    for (const KvWindowSlot& slot : window_.slots()) {
+        if (slot.logical < entries.size()) { entries[slot.logical] = slot.physical; }
+    }
+    const Tensor row = pool_->window_block_table_row(bound_row_);
+    CUDA_CHECK(cudaMemcpyAsync(row.data, entries.data(), row.bytes(), cudaMemcpyHostToDevice, stream));
 }
 
 std::vector<PagedKVAllocation>

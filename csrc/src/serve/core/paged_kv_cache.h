@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/elastic_kv_region.h"
+#include "core/kv_window_pages.h"
 #include "core/layout.h"
 #include "core/tensor.h"
 
@@ -15,6 +16,8 @@
 namespace sinfer {
 
 inline constexpr std::int32_t kPagedKVPageSize = 64;
+static_assert(kKvWindowPageTokens == static_cast<std::uint32_t>(kPagedKVPageSize),
+              "the window page manager counts in the pool's pages");
 // Mapping quantum of an elastic pool's planes: the CUDA VMM minimum on every device we serve.
 // Fixed at plan time so the layout is a pure host computation; the region checks it against
 // the device's actual granularity when it reserves.
@@ -67,6 +70,11 @@ struct PagedKVPlaneSpec {
     std::int32_t leading_extent = 0;
     std::int32_t head_extent    = 0;
     std::size_t alignment       = 256;
+    // Tokens a query of this plane's layer reads back through its sliding window, 0 for a layer
+    // that attends to the whole context. A plane with a window belongs to the pool's WINDOW class
+    // (DESIGN-window-kv.md): own page ids, free list and block table, and only the pages the
+    // window can still read stay mapped. A pool none of whose planes has one is today's pool.
+    std::int32_t window          = 0;
 };
 
 enum class PagedKVPlaneOrder : std::uint8_t {
@@ -91,6 +99,12 @@ struct PagedKVPoolSpec {
     // is bounded by the page count and by what the device actually has free.
     bool overcommit                     = false;
     std::vector<PagedKVPlaneSpec> planes;
+    // Window class size (ignored when no plane has a window; kv_window_pages.h
+    // plan_kv_window_class): pages for the lanes, pages for shared-prefix window images, and
+    // the most tokens one forward writes (each forward maps only that far ahead).
+    std::uint32_t window_lane_pages     = 0;
+    std::uint32_t window_image_pages    = 0;
+    std::uint32_t window_forward_tokens = 0;
 };
 
 struct PagedKVPlaneLayout {
@@ -106,6 +120,11 @@ struct PagedKVPoolLayout {
     // bytes, mapped in granules of this many pages. Zero for pools inside the arena.
     std::size_t elastic_plane_bytes     = 0;
     std::uint32_t elastic_granule_pages = 0;
+    // Window class: its largest window, its page count (lanes + images + the sentinel, which is
+    // the last page) and its block tables. Zero / empty when no plane has a window.
+    std::uint32_t window_tokens        = 0;
+    std::uint32_t window_page_count    = 0;
+    TensorRegion window_block_tables;
 
     [[nodiscard]] std::size_t payload_bytes() const noexcept;
     [[nodiscard]] std::size_t metadata_bytes() const noexcept;
@@ -124,7 +143,40 @@ struct PagedKVElasticOptions {
                                                    const PagedKVPoolSpec& spec);
 
 class PagedKVAllocation;
+class PagedKVPool;
 struct PagedKVResize;
+
+/// A copy of one sequence's window-class pages behind a frontier, owned by a shared prefix entry
+/// so a fork can copy them back (window pages are never borrowed: borrowed ones would live as
+/// long as any fork's prefix chain). Its pages come from the class's image region and return
+/// there when the image dies.
+class PagedKVWindowImage {
+public:
+    PagedKVWindowImage(const PagedKVWindowImage&)            = delete;
+    PagedKVWindowImage& operator=(const PagedKVWindowImage&) = delete;
+    ~PagedKVWindowImage();
+
+    [[nodiscard]] std::uint32_t tokens() const noexcept { return tokens_; }
+    [[nodiscard]] std::span<const KvWindowSlot> slots() const noexcept { return slots_; }
+
+private:
+    friend class PagedKVPool;
+    PagedKVWindowImage() = default;
+    PagedKVPool* pool_ = nullptr;
+    std::uint32_t tokens_ = 0;
+    std::vector<KvWindowSlot> slots_; ///< logical page of the source, physical page of the image
+};
+
+/// Window-class occupancy, for startup lines and the window-paging tests.
+struct PagedKVWindowOccupancy {
+    std::uint32_t window_tokens = 0;
+    std::uint32_t lane_pages    = 0;
+    std::uint32_t image_pages   = 0;
+    std::uint32_t lane_in_use   = 0;
+    std::uint32_t lane_peak     = 0;
+    std::uint32_t image_in_use  = 0;
+    std::size_t page_bytes      = 0; ///< bytes one window page occupies across the class's planes
+};
 
 struct PagedKVHostImage {
     std::uint32_t pages = 0;
@@ -159,7 +211,7 @@ struct PagedKVOccupancy {
     std::size_t page_bytes                  = 0; ///< bytes one page occupies across every plane
 };
 
-class PagedKVPool {
+class PagedKVPool : private KvWindowPageSource {
 public:
     /// `elastic` is consulted only when the layout's spec is elastic, and is then required.
     PagedKVPool(DeviceSpan backing, const PagedKVPoolLayout& layout,
@@ -229,8 +281,48 @@ public:
     /// The demand-mapped plane region, or null for a pool inside the arena.
     [[nodiscard]] ElasticKvRegion* elastic_region() noexcept { return elastic_.get(); }
 
+    // ---- Window class (DESIGN-window-kv.md). Every call below is a no-op or empty for a pool
+    // without windowed planes, and every function above then acts on all planes exactly as
+    // before; with a window class, the functions above (copies, images, zeroing, occupancy)
+    // act on the FULL-context planes only and these on the windowed ones.
+    [[nodiscard]] bool has_window_class() const noexcept { return window_tokens_ != 0; }
+    [[nodiscard]] std::uint32_t window_tokens() const noexcept { return window_tokens_; }
+    [[nodiscard]] std::uint32_t window_forward_tokens() const noexcept { return window_forward_tokens_; }
+    [[nodiscard]] bool plane_windowed(std::size_t plane) const noexcept {
+        return plane < plane_windowed_.size() && plane_windowed_[plane];
+    }
+    /// Planes outside the window class, which image / copy / zero calls above address in order:
+    /// `plane_count()` when the pool has no window class.
+    [[nodiscard]] std::size_t full_plane_count() const noexcept { return full_planes_.size(); }
+    [[nodiscard]] std::size_t window_plane_count() const noexcept { return window_planes_.size(); }
+    [[nodiscard]] const Tensor& window_block_tables() const noexcept { return window_block_tables_; }
+    [[nodiscard]] Tensor window_block_table_row(std::int32_t row) const;
+    [[nodiscard]] std::int32_t window_sentinel_page() const noexcept { return window_sentinel_; }
+    /// Bytes of `pages` pages of the `k`-th windowed plane in a host image.
+    [[nodiscard]] std::size_t window_image_plane_bytes(std::size_t k, std::size_t pages) const;
+    void download_window_pages_to(std::span<const std::int32_t> physical,
+                                  std::span<std::byte* const> planes, cudaStream_t stream) const;
+    void upload_window_pages_from(std::span<const std::byte* const> planes, std::uint32_t image_pages,
+                                  std::span<const std::int32_t> physical, cudaStream_t stream) const;
+    /// Copies `allocation`'s window pages behind `tokens` into image pages; null when they are
+    /// not all live or the image region is full (a shared-prefix capture is opportunistic).
+    [[nodiscard]] std::shared_ptr<const PagedKVWindowImage>
+    capture_window_image(const PagedKVAllocation& allocation, std::uint32_t tokens, cudaStream_t stream);
+    [[nodiscard]] PagedKVWindowOccupancy window_occupancy() const noexcept;
+
 private:
     friend class PagedKVAllocation;
+    friend class PagedKVWindowImage;
+
+    // KvWindowPageSource: the lane region of the window class.
+    [[nodiscard]] std::int32_t take_window_page() override;
+    void give_back_window_page(std::int32_t physical) noexcept override;
+    void copy_window_pages(std::span<const std::int32_t> source, std::span<const std::int32_t> destination,
+                           cudaStream_t stream) const;
+    void zero_window_page(std::int32_t page, cudaStream_t stream) const;
+    void transfer_planes(const std::vector<std::size_t>& planes, std::uint32_t page_limit,
+                         std::span<const std::int32_t> ids, std::span<std::byte* const> host,
+                         std::uint32_t image_pages, bool to_device, cudaStream_t stream) const;
     friend void resize_paged_kv_bundle(std::span<const PagedKVResize> changes);
 
     [[nodiscard]] std::vector<std::int32_t> take_pages(std::uint32_t count,
@@ -255,6 +347,20 @@ private:
     std::vector<bool> row_in_use_;
     std::uint32_t entitled_pages_ = 0;
     std::uint32_t mapped_pages_   = 0;
+
+    // Window class; all empty / zero for a pool without windowed planes.
+    std::vector<bool> plane_windowed_;
+    std::vector<std::size_t> full_planes_;   ///< indices into planes_, in order
+    std::vector<std::size_t> window_planes_; ///< indices into planes_, in order
+    std::uint32_t window_tokens_         = 0;
+    std::uint32_t window_forward_tokens_ = 0;
+    std::uint32_t window_lane_pages_     = 0;
+    std::uint32_t window_image_pages_    = 0;
+    std::int32_t window_sentinel_        = -1;
+    Tensor window_block_tables_;
+    std::vector<std::int32_t> window_lane_free_;
+    std::vector<std::int32_t> window_image_free_;
+    std::uint32_t window_lane_peak_ = 0;
 };
 
 class PagedKVAllocation {
@@ -297,6 +403,23 @@ public:
 
     void release() noexcept;
 
+    // ---- Window class (no-ops / empty when the pool has none; DESIGN-window-kv.md section 3).
+    /// Before a forward whose first query is `first` and whose writes end at `end`.
+    void window_prepare(std::uint32_t first, std::uint32_t end, std::span<const std::uint32_t> pins,
+                        cudaStream_t stream);
+    /// After `committed` tokens are final: keep the window behind it and the pins.
+    void window_settle(std::uint32_t committed, std::span<const std::uint32_t> pins, cudaStream_t stream);
+    [[nodiscard]] bool window_covers(std::uint32_t tokens) const noexcept { return window_.covers(tokens); }
+    [[nodiscard]] std::span<const KvWindowSlot> window_slots() const noexcept { return window_.slots(); }
+    /// Fresh pages for `logical` (ascending, unmapped), returned in that order, for an upload.
+    [[nodiscard]] std::vector<std::int32_t> window_map_restored(std::span<const std::uint32_t> logical,
+                                                                cudaStream_t stream);
+    /// A fork's window: fresh pages holding a copy of the image's.
+    void window_restore_from_image(const PagedKVWindowImage& image, cudaStream_t stream);
+    /// Graph-capture rows: one private window page behind every logical page of the row.
+    void window_capture_fill(cudaStream_t stream);
+    [[nodiscard]] Tensor window_block_table() const;
+
 private:
     friend class PagedKVPool;
     friend void resize_paged_kv_bundle(std::span<const PagedKVResize> changes);
@@ -304,6 +427,8 @@ private:
     PagedKVAllocation(PagedKVPool& pool, std::uint32_t page_entitlement);
     void publish_range(std::uint32_t first_page, std::uint32_t page_count,
                        cudaStream_t stream) const;
+    void publish_window(const KvWindowChange& change, cudaStream_t stream) const;
+    void publish_window_row(cudaStream_t stream) const;
 
     PagedKVPool* pool_ = nullptr;
     std::shared_ptr<const PagedKVAllocation> prefix_;
@@ -311,6 +436,7 @@ private:
     std::vector<std::int32_t> page_ids_;
     std::uint32_t page_entitlement_ = 0;
     std::int32_t bound_row_         = -1;
+    KvWindowPages window_; ///< inactive (window 0) unless the pool has a window class
 };
 
 struct PagedKVReservation {
