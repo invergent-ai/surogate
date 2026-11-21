@@ -12,6 +12,8 @@
 #include "api/ops/inkling_attention.h"
 #include "api/ops/inkling_mix.h"
 #include "api/ops/inkling_moe.h"
+#include "api/ops/lora_store.h"
+#include "family/impl/lora_bind_inkling.h"
 #include "core/device.h"
 
 #include <algorithm>
@@ -440,7 +442,40 @@ void run_visit(Round& rd, int v) {
     Tensor qkvr = rd.work.alloc(DType::BF16, {C::qkvr_rows, T});
     const auto in = [&](int stream) { return bf16_ptr(attn_in) + static_cast<std::int64_t>(stream) * T * D; };
     Tensor k_dyn, v_dyn;
-    if (Q == 1) {
+    if (L.fp8_attention) {
+        // FP8 attention weights (the artifact's per-channel / 1x128 objects, SUROGATE_SERVE_INKLING_ATTENTION=fp8-*):
+        // lane c's inkling_attn_linear, every row range of the visit in ONE launch; the dynamic taps (BF16) ride the
+        // grouped invariant GEMM.
+        Tensor x0(in(0), DType::BF16, {D, T});
+        Tensor x1(in(Q == 3 ? 1 : 0), DType::BF16, {D, T});
+        Tensor x2(in(Q == 3 ? 2 : 0), DType::BF16, {D, T});
+        if (Q == 1) {
+            if (vi.global) { throw std::logic_error("inkling2: a global visit has three attention inputs"); }
+            Tensor out(qkvr.data, DType::BF16, {C::qkvr_rows, T});
+            const ops::InklingProjection pr[] = {{&x0, &L.qkvr, 0, &out}};
+            ops::inkling_attn_linear(pr, &rd.work, s);
+        } else {
+            Tensor out_q = column_view(qkvr.data, DType::BF16, {C::qkvr_query_end, T}, C::qkvr_rows);
+            Tensor out_k = column_view(bf16_ptr(qkvr) + C::qkvr_k_begin, DType::BF16,
+                                       {C::qkvr_v_begin - C::qkvr_k_begin, T}, C::qkvr_rows);
+            Tensor out_v = column_view(bf16_ptr(qkvr) + C::qkvr_v_begin, DType::BF16,
+                                       {C::qkvr_rows - C::qkvr_v_begin, T}, C::qkvr_rows);
+            const ops::InklingProjection pr[] = {{&x0, &L.qkvr, 0, &out_q},
+                                                 {&x1, &L.qkvr, C::qkvr_k_begin, &out_k},
+                                                 {&x2, &L.qkvr, C::qkvr_v_begin, &out_v}};
+            ops::inkling_attn_linear(pr, &rd.work, s);
+        }
+        if (vi.global) {
+            if (!L.k_conv_proj.has_value() || !L.v_conv_proj.has_value()) {
+                throw std::logic_error("inkling2: a global visit without its dynamic-conv projections");
+            }
+            k_dyn = rd.work.alloc(DType::BF16, {32, T});
+            v_dyn = rd.work.alloc(DType::BF16, {32, T});
+            const ops::InklingGemmProblem taps[] = {{L.k_conv_proj->qdata, 32, in(1), k_dyn.data, 32},
+                                                    {L.v_conv_proj->qdata, 32, in(2), v_dyn.data, 32}};
+            ops::inkling_gemm_inv_group(taps, static_cast<std::int32_t>(L.k_conv_proj->k), T, DType::BF16, s);
+        }
+    } else if (Q == 1) {
         if (vi.global) { throw std::logic_error("inkling2: a global visit has three attention inputs"); }
         gemm_bf16(rd.work, L.qkvr, 0, C::qkvr_rows, in(0), T, qkvr.data, C::qkvr_rows, s);
     } else {
@@ -591,7 +626,12 @@ void run_visit(Round& rd, int v) {
     dump("gated", v, gated.data, DType::BF16, C::attn_width, C::attn_width, T, 1, s);
     // 4. wo_ud
     Tensor attn_partial = rd.work.alloc(DType::BF16, {D, T});
-    gemm_bf16(rd.work, L.output, 0, D, gated.data, T, attn_partial.data, D, s);
+    if (L.fp8_attention) {
+        const ops::InklingProjection pr[] = {{&gated, &L.output, 0, &attn_partial}};
+        ops::inkling_attn_linear(pr, &rd.work, s);
+    } else {
+        gemm_bf16(rd.work, L.output, 0, D, gated.data, T, attn_partial.data, D, s);
+    }
     // 5. attention-output conv
     Tensor attn_out = rd.work.alloc(DType::BF16, {D, T});
     for (const Group& g : rd.groups) {
@@ -614,7 +654,20 @@ void run_visit(Round& rd, int v) {
     // 7. MoE: lane d's op (routing, NVFP4 four-over-six / MXFP8 activations, experts, combine); routed experts
     //    captured per VISIT
     Tensor moe_out = rd.work.alloc(DType::BF16, {D, T});
+    // S10: the round's adapter selection (published by the family schedule; none in a base round) on this
+    // physical layer's bank table (lane d's family/impl/lora_bind_inkling.h) -- every pass of a core layer shares it.
+    ops::InklingMoeAdapters adapter_storage;
+    ops::InklingMoeWeights moe_key;
+    moe_key.router = L.router.qdata;
+    const ops::InklingMoeAdapters* adapters = family::inkling_moe_round_adapters(moe_key, adapter_storage);
+    if (adapters != nullptr) {
+        const ops::LoraRound& round = ops::lora_current_round();
+        if (round.slots != nullptr && round.slots->numel() < static_cast<std::int64_t>(T)) {
+            throw std::logic_error("inkling2: the round's adapter slots are narrower than the round");
+        }
+    }
     if (use_naive()) {
+        if (adapters != nullptr) { throw std::logic_error("inkling2: the naive MoE serves no adapters"); }
         naive::MoeCall moe;
         moe.x      = mlp_in.data;
         moe.tokens = T;
@@ -634,6 +687,9 @@ void run_visit(Round& rd, int v) {
             capture.token_stride    = rd.r.routing.top_k;
             options.capture         = &capture;
         }
+        options.adapters = adapters;
+        // Lane d's narrow-round router + select fold: the stream's persistent counters (zeroed once at startup).
+        options.state = static_cast<std::int32_t*>(rd.r.target_state);
         const Tensor x(mlp_in.data, DType::BF16, {D, T});
         ops::inkling_moe(x, moe_weights(L), moe_out, rd.work, s, options);
     }
@@ -779,9 +835,11 @@ void Variant::run_visits(const ModelView& model, family::VisitRound& r) {
     }
 }
 
+std::size_t Variant::visit_target_state_bytes() { return ops::inkling_moe_state_bytes(); }
+
 std::size_t Variant::visit_workspace_capacity_bytes(const family::TextGeometry&, family::TextPhase, std::int32_t batch_size,
                                                     std::int32_t max_width, std::int32_t max_columns,
-                                                    std::uint32_t max_visible_keys) {
+                                                    std::uint32_t max_visible_keys, bool lora_enabled) {
     const auto up = [](std::size_t bytes) { return (bytes + 255U) & ~std::size_t{255}; };
     const std::size_t T    = static_cast<std::size_t>(std::max<std::int32_t>(max_columns, std::max(batch_size, 1) * std::max(max_width, 1)));
     const std::size_t tile = std::min<std::size_t>(T, kTileColumns);
@@ -810,10 +868,11 @@ std::size_t Variant::visit_workspace_capacity_bytes(const family::TextGeometry&,
                                                                                             envelope));
         }
     }
+    // An engine started with adapters (--enable-lora / --lora-modules) books the expert LoRA buffers.
     const std::size_t moe = std::max({ops::inkling_moe_workspace_bytes(ops::InklingExpertFormat::Nvfp4,
-                                                                       static_cast<std::int32_t>(T), false),
+                                                                       static_cast<std::int32_t>(T), lora_enabled),
                                       ops::inkling_moe_workspace_bytes(ops::InklingExpertFormat::Mxfp8,
-                                                                       static_cast<std::int32_t>(T), false),
+                                                                       static_cast<std::int32_t>(T), lora_enabled),
                                       naive::moe_workspace_bytes(static_cast<std::int32_t>(T))});
     bytes += up(attention) + up(moe);
     return bytes + (1U << 20);

@@ -536,12 +536,23 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         const auto width    = static_cast<std::size_t>(speculative_round_width());
         const auto rows     = static_cast<std::size_t>(batch_capacity);
         const std::size_t old_bytes = (channels * 3 * visits * rows * 2 + 255) & ~std::size_t{255};
-        visit_records_storage = DeviceBuffer(old_bytes + channels * width * visits * rows * 2);
-        io.visit_records_old    = visit_records_storage.p;
-        io.visit_records_inputs = static_cast<std::byte*>(visit_records_storage.p) + old_bytes;
+        if (!plan.persistent.visit_records ||
+            plan.persistent.visit_records->bytes < old_bytes + channels * width * visits * rows * 2) {
+            throw std::logic_error("visit records: the persistent layout planned no (or a smaller) region");
+        }
+        const DeviceSpan records = plan.persistent.visit_records->bind(backing);
+        io.visit_records_old    = records.data;
+        io.visit_records_inputs = static_cast<std::byte*>(records.data) + old_bytes;
         io.visit_records_visits = static_cast<std::int32_t>(visits);
         io.visit_records_width  = static_cast<std::int32_t>(width);
         io.visit_records_batch  = static_cast<std::int32_t>(rows);
+    }
+    // A visit-schedule target's persistent state for the compute stream (lane d's MoE counters): zeroed once here,
+    // then owned by the target's kernels (they leave it zeroed at the end of every call).
+    if (plan.persistent.visit_target_state) {
+        const DeviceSpan state = plan.persistent.visit_target_state->bind(backing);
+        CUDA_CHECK(cudaMemsetAsync(state.data, 0, state.bytes, device.stream));
+        io.visit_target_state = state.data;
     }
     // Rollout Routing Replay: when the engine runs with SUROGATE_SERVE_CAPTURE_ROUTING=1 every
     // main-model forward copies each layer's selected expert ids into a fixed buffer, which the

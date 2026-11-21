@@ -138,6 +138,9 @@ struct VisitRound {
     VisitRoutingCapture routing{};
     VisitFeatureCapture features{};
     std::uint32_t max_visible_keys = 0; ///< host promise: max over rows of the last position + 1
+    /// The target's persistent state for this compute stream (V::visit_target_state_bytes() bytes, zeroed once at
+    /// startup, never touched by the runtime afterwards); null when the target asks for none.
+    void* target_state             = nullptr;
     WorkspaceArena* work           = nullptr;
     cudaStream_t stream            = nullptr;
 };
@@ -166,14 +169,24 @@ void lm_head_if(const Model& model, const Tensor& hidden, Tensor& logits, cudaSt
 }
 
 template <class V>
+[[nodiscard]] std::size_t visit_target_state_bytes_if() {
+    if constexpr (visit_schedule<V>()) {
+        return V::visit_target_state_bytes();
+    } else {
+        return 0;
+    }
+}
+
+template <class V>
 [[nodiscard]] std::size_t visit_workspace_if(const TextGeometry& geometry, TextPhase phase, std::int32_t batch_size,
                                              std::int32_t max_width, std::int32_t max_columns,
-                                             std::uint32_t max_visible_keys) {
+                                             std::uint32_t max_visible_keys, bool lora_enabled) {
     if constexpr (visit_schedule<V>()) {
         return V::visit_workspace_capacity_bytes(geometry, phase, batch_size, max_width, max_columns,
-                                                 max_visible_keys);
+                                                 max_visible_keys, lora_enabled);
     } else {
         (void)geometry; (void)phase; (void)batch_size; (void)max_width; (void)max_columns; (void)max_visible_keys;
+        (void)lora_enabled;
         return 0;
     }
 }

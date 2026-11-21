@@ -6,7 +6,10 @@
 #include <api/family/prepared_prompt.h>
 #include <api/family/startup_features.h>
 
+#include "api/ops/lora_store.h"
 #include "artifact/reader.h"
+#include "family/impl/lora_bind.h"
+#include "family/impl/lora_bind_inkling.h"
 #include "targets/inkling2/impl/model.h"
 #include "targets/inkling2/impl/variant.h"
 
@@ -56,6 +59,23 @@ load::AttentionChoice attention_choice() {
     return choice;
 }
 
+/// S10, experts first (the kit's recipe trains expert w13 / w2): lane d's binding (family/impl/lora_bind_inkling.h)
+/// per PHYSICAL layer, keyed on its router weight. Every pass of a core layer reads the same bank table, so one
+/// adapter serves all its visits; adapters name physical layers (the trainer exports them that way).
+void bind_lora(const detail::LoadedModelData& data, const EngineOptions& options) {
+    if (!options.lora_enable && options.lora_payloads.empty()) { return; }
+    ops::LoraStore& store = ops::lora_store_for_current_device();
+    family::configure_lora_store(store, options);
+    for (std::size_t index = 0; index < data.weights.layers.size(); ++index) {
+        const load::InklingLayerWeights& L = data.weights.layers[index];
+        if (L.router.qdata == nullptr) { continue; } // not resident on this device
+        ops::InklingMoeWeights key;
+        key.router = L.router.qdata;
+        family::bind_lora_inkling_moe(store, static_cast<int>(index), key);
+    }
+    family::finish_lora_bind(store, options);
+}
+
 } // namespace
 
 ModelSamplingDefaults Package::sampling_defaults(std::string_view model) {
@@ -98,6 +118,7 @@ SINFER_TARGET_CONSTRUCT_LOADED_MODEL();
 
 Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineOptions& options) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
+    bind_lora(model.impl_->data, options);
     // The generic tokenizer frontend: token-id prompts and plain text until lane f2's native renderer is wired.
     return family::make_frontend(model.impl_->data.frontend,
                                  family::FrontendOptions{

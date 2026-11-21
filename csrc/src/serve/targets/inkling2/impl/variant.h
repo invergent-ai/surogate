@@ -57,12 +57,15 @@ struct Variant {
     /// Runs visits [round.first_visit, round.last_visit) over the round (DESIGN-target.md 1.2 / 1.4).
     static void run_visits(const ModelView& model, family::VisitRound& round);
     /// Workspace one `run_visits` call needs at the widest round of the phase.
+    /// Persistent state for the compute stream: lane d's `InklingMoeOptions::state` (zeroed once by the program).
+    [[nodiscard]] static std::size_t visit_target_state_bytes();
     [[nodiscard]] static std::size_t visit_workspace_capacity_bytes(const family::TextGeometry& geometry,
                                                                     family::TextPhase phase,
                                                                     std::int32_t batch_size,
                                                                     std::int32_t max_width,
                                                                     std::int32_t max_columns,
-                                                                    std::uint32_t max_visible_keys);
+                                                                    std::uint32_t max_visible_keys,
+                                                                    bool lora_enabled);
     /// The conv state: one "state layer" per visit, [K 1024 | V 1024 | attn 2304 | mlp 2304] x 3 taps.
     [[nodiscard]] static LinearAttentionStatePoolSpec visit_state_spec(const family::TextGeometry& geometry,
                                                                      std::int32_t slots);

@@ -123,6 +123,44 @@ __device__ __forceinline__ void stage_gathered_activation(const GemmParams& p, c
     }
 }
 
+/// `stage_nvfp4_w4a4_weight` (ops/linear/nvfp4/nvfp4_w4a4_mma.cuh) for contiguous expert rows, with the
+/// L2 prefetch hint on the code loads (`p.l2_prefetch`). Same destinations, same bytes.
+template <class Geometry, class Schedule>
+__device__ __forceinline__ void stage_expert_weight(const GemmParams& p, Nvfp4W4a4SharedStorage<Schedule>& shared,
+                                                    int stage, int k_tile, int row_begin) {
+    constexpr int kCodeTasks = Schedule::kBlockN * Schedule::kSegmentsPerRow;
+    for (int task = static_cast<int>(threadIdx.x); task < kCodeTasks; task += Schedule::kThreads) {
+        const int row             = task / Schedule::kSegmentsPerRow;
+        const int logical_segment = task - row * Schedule::kSegmentsPerRow;
+        const int physical_byte   = nvfp4_w4a4_swizzled_byte<Schedule>(row, logical_segment * 16);
+        auto* destination = shared.b_codes[stage] + row * Schedule::kCodeRowBytes + physical_byte;
+        const auto* input = p.weights.codes + static_cast<std::int64_t>(row_begin + row) * Geometry::kCodeBytesPerRow +
+                            k_tile * Schedule::kCodeRowBytes + logical_segment * 16;
+        cp_async_cg16_hint(destination, input, p.l2_prefetch);
+    }
+    static_assert((Schedule::kBlockN % 64) == 0);
+    constexpr int kScaleRowTiles     = Schedule::kBlockN >= 128 ? Schedule::kBlockN / 128 : 1;
+    constexpr int kQuartilesPerTile  = Schedule::kBlockN >= 128 ? 4 : Schedule::kBlockN / 32;
+    constexpr int kScaleBytesPerTask = kQuartilesPerTile * 4;
+    constexpr int kScaleTasks        = kScaleRowTiles * Schedule::kK64PerStage * 32;
+    for (int task = static_cast<int>(threadIdx.x); task < kScaleTasks; task += Schedule::kThreads) {
+        const int row_tile         = task / (Schedule::kK64PerStage * 32);
+        const int remainder        = task - row_tile * Schedule::kK64PerStage * 32;
+        const int local_k64        = remainder / 32;
+        const int row_mod32        = remainder - local_k64 * 32;
+        const int global_k64       = k_tile * Schedule::kK64PerStage + local_k64;
+        const int global_row_begin = row_begin + row_tile * 128;
+        const int persistent_tile  = global_row_begin / 128;
+        const int first_quartile   = (global_row_begin & 127) / 32;
+        auto* destination          = shared.b_scales[stage] +
+                            ((row_tile * Schedule::kK64PerStage + local_k64) * 32 + row_mod32) * kScaleBytesPerTask;
+        const auto* input = p.weights.scales +
+                            static_cast<std::int64_t>(persistent_tile * Geometry::kScaleTilesPerRow + global_k64) * 512 +
+                            row_mod32 * 16 + first_quartile * 4;
+        cp_async<kScaleBytesPerTask>(destination, input);
+    }
+}
+
 /// Narrow down with the y quantisation fused (DESIGN-moe 2.1): the tile's routed y rows quantised
 /// (four-over-six, the quant kernel's code) into a resident shared A operand; row stride 592 bytes
 /// (576 + 16: the 8 rows of an ldmatrix phase hit distinct bank groups).
@@ -196,9 +234,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
 #pragma unroll
         for (int stage = 0; stage < Schedule::kStages; ++stage) {
             if (stage < kKTiles) {
-                stage_nvfp4_w4a4_weight<Geometry, Schedule>(p.weights.codes, p.weights.scales, shared,
-                                                            stage, stage, weight_begin,
-                                                            Nvfp4W4a4IdentityRows{});
+                stage_expert_weight<Geometry, Schedule>(p, shared, stage, stage, weight_begin);
                 cp_commit();
             }
         }
@@ -245,9 +281,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
         for (int stage = 0; stage < Schedule::kStages; ++stage) {
             if (stage < kKTiles) {
                 stage_gathered_activation<Schedule, K>(p, source_rows, shared, stage, stage);
-                stage_nvfp4_w4a4_weight<Geometry, Schedule>(p.weights.codes, p.weights.scales, shared,
-                                                            stage, stage, weight_begin,
-                                                            Nvfp4W4a4IdentityRows{});
+                stage_expert_weight<Geometry, Schedule>(p, shared, stage, stage, weight_begin);
                 cp_commit();
             }
         }
@@ -332,9 +366,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
             if constexpr (!FusedYQuant) {
                 stage_gathered_activation<Schedule, K>(p, source_rows, shared, stage, next_k_tile);
             }
-            stage_nvfp4_w4a4_weight<Geometry, Schedule>(p.weights.codes, p.weights.scales, shared,
-                                                        stage, next_k_tile, weight_begin,
-                                                        Nvfp4W4a4IdentityRows{});
+            stage_expert_weight<Geometry, Schedule>(p, shared, stage, next_k_tile, weight_begin);
         }
         cp_commit();
     }
@@ -494,7 +526,7 @@ __device__ __forceinline__ void persistent_fill_stage(const GemmParams& p, Persi
                             persistent_swizzled_byte(row, segment * 16);
         const auto* input = p.weights.codes + static_cast<std::int64_t>(weight_begin + row) * kCodeBytesPerRow +
                             k_tile * Schedule::kCodeRowBytes + segment * 16;
-        cp_async<16, Cache::cg>(destination, input);
+        cp_async_cg16_hint(destination, input, p.l2_prefetch);
     }
     // Weight scales: the bank's 128-row tile layout, one 16-byte group (4 row quartiles) per task.
     constexpr int kBScaleTasks = Schedule::kScaleRowTiles * Schedule::kK64PerStage * 32;
@@ -794,22 +826,24 @@ void require(const GemmParams& params) {
 void launch_nvfp4_gate_up(const GemmParams& params, std::int32_t slots, GemmSchedule schedule,
                           cudaStream_t stream) {
     require(params);
+    const GemmParams p = with_l2_prefetch(params);
     if (schedule == GemmSchedule::Narrow) {
-        launch_schedule<NarrowSchedule, kHidden, true>(params, slots, stream);
+        launch_schedule<NarrowSchedule, kHidden, true>(p, slots, stream);
     } else {
-        launch_prefill<kHidden, true>(params, slots, stream);
+        launch_prefill<kHidden, true>(p, slots, stream);
     }
 }
 
 void launch_nvfp4_down(const GemmParams& params, std::int32_t slots, GemmSchedule schedule,
                        cudaStream_t stream) {
     require(params);
+    const GemmParams p = with_l2_prefetch(params);
     if (schedule == GemmSchedule::Narrow) {
         // The y quantisation runs in this kernel's prologue (a_bf16 = y rows); w2 streams before the wait.
-        if (params.a_bf16 == nullptr) { throw std::invalid_argument("inkling_moe: narrow NVFP4 down needs the y rows"); }
-        launch_schedule<NarrowSchedule, kIntermediate, false, true>(params, slots, stream);
+        if (p.a_bf16 == nullptr) { throw std::invalid_argument("inkling_moe: narrow NVFP4 down needs the y rows"); }
+        launch_schedule<NarrowSchedule, kIntermediate, false, true>(p, slots, stream);
     } else {
-        launch_prefill<kIntermediate, false>(params, slots, stream);
+        launch_prefill<kIntermediate, false>(p, slots, stream);
     }
 }
 
