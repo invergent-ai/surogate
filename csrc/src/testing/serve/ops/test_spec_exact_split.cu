@@ -209,13 +209,19 @@ struct Env {
                 if (o == 2) { x.top_p = 0.9f; }
                 break;
             }
+            case 8: { // temperature != 1 with min_p (reviews R5 minor 2, R7 minor 1)
+                const float t[4] = {0.3f, 0.7f, 1.5f, 2.0f};
+                x.temperature = t[g() % 4];
+                x.min_p       = (g() % 3 == 0) ? 0.02f : (g() % 2 ? 0.05f : 0.1f);
+                break;
+            }
             }
         }
         return r;
     }
 
     // One op call on the current route; returns every output (and the rows' token-count arrays).
-    Out run(Bufs& bf, const Rows& r, unsigned long long logit_seed, bool split) {
+    Out run(Bufs& bf, const Rows& r, unsigned long long logit_seed, bool split, bool regenerate = true) {
         const int B = bf.B, K = bf.K, cols = K + 1;
         std::vector<ops::SamplingConfig> cfg = r.cfg;
         for (int b = 0; b < B; ++b) {
@@ -235,14 +241,16 @@ struct Env {
         ck(cudaMemcpy(d_pk, r.peaks.data(), r.peaks.size() * 4, cudaMemcpyHostToDevice), "pk up");
         d_dr = bf.drafts;
         const long long n = static_cast<long long>(B) * cols * shape.physical;
-        if (shape.fp32) {
-            gen_logits<float><<<static_cast<unsigned>((n + 255) / 256), 256>>>(static_cast<float*>(bf.logits), B, cols, K,
-                shape.physical, shape.domain, logit_seed, d_dr, d_pk, d_q);
-        } else {
-            gen_logits<__nv_bfloat16><<<static_cast<unsigned>((n + 255) / 256), 256>>>(
-                static_cast<__nv_bfloat16*>(bf.logits), B, cols, K, shape.physical, shape.domain, logit_seed, d_dr, d_pk, d_q);
+        if (regenerate) { // false: the call keeps the logits already in bf.logits
+            if (shape.fp32) {
+                gen_logits<float><<<static_cast<unsigned>((n + 255) / 256), 256>>>(static_cast<float*>(bf.logits), B, cols, K,
+                    shape.physical, shape.domain, logit_seed, d_dr, d_pk, d_q);
+            } else {
+                gen_logits<__nv_bfloat16><<<static_cast<unsigned>((n + 255) / 256), 256>>>(
+                    static_cast<__nv_bfloat16*>(bf.logits), B, cols, K, shape.physical, shape.domain, logit_seed, d_dr, d_pk, d_q);
+            }
+            ck(cudaGetLastError(), "gen");
         }
-        ck(cudaGetLastError(), "gen");
         ops::detail::speculative_exact_split() = split;
         Tensor lt(bf.logits, shape.fp32 ? DType::FP32 : DType::BF16, {shape.physical, cols, B});
         Tensor tt(bf.targets, DType::I32, {cols, B});
@@ -457,11 +465,11 @@ int test_coupled(const Shape& s) {
     Bufs big, one;
     big.alloc(s, B, K);
     one.alloc(s, 1, 1);
-    const int kinds[5] = {0, 1, 2, 4, 5}; // t1, temperatures, min_p, bias + barred + mask (+counts only), ties
-    const char* names[5] = {"t1 untruncated", "temperatures 0.3-2", "min_p", "bias + barred draft + mask", "ties (quantised)"};
+    const int kinds[6] = {0, 1, 2, 8, 4, 5}; // t1, temperatures, min_p, T != 1 + min_p, bias + barred + mask (+counts only), ties
+    const char* names[6] = {"t1 untruncated", "temperatures 0.3-2", "min_p", "T != 1 + min_p", "bias + barred draft + mask", "ties (quantised)"};
     int failures = 0;
     std::printf("\n| shape | coupled row class | rows | committed tokens | == ops::sample (MTP-off draw) | accepted drafts | repeat identical | alone (B=1) == in batch |\n|---|---|---|---|---|---|---|---|\n");
-    for (int ki = 0; ki < 5; ++ki) {
+    for (int ki = 0; ki < 6; ++ki) {
         long rows = 0, committed = 0, same = 0, acc = 0, rep = 0, alone = 0;
         for (int call = 0; call < 12; ++call) {
             Rows r = env.make_rows(kinds[ki], 500 + call, B, K);
@@ -513,6 +521,90 @@ int test_coupled(const Shape& s) {
         if (same != committed || rep != rows || alone != rows) { ++failures; }
     }
     return failures;
+}
+
+// ---------------------------------------------------------------------------------------------- coupled min_p floor
+// Reviews R5 minor 2 / R7 minor 1: the coupled floor must be the ordinary sampler's floor to the bit. Each column puts
+// every token but one within +-2 ulps of the floor (scaled logit = RN(top / T) + ln(min_p)), so a floor that moves by
+// one ulp admits or drops about a fifth of the vocabulary and changes the winner of the Gumbel draw. Drafts = the
+// ordinary sampler's chain, so every column is verified. CONTROL: the same draw with min_p * (1 + 4e-6) (a floor a few
+// ulps higher) must change tokens, or the band does not resolve a floor shift and the class proves nothing.
+int test_coupled_floor(const Shape& s) {
+    if (!s.fp32) { return 0; } // the ulp grid needs FP32 logits (Inkling's)
+    Env env(s);
+    const int K = 3, B = 4, cols = K + 1;
+    Bufs big, one;
+    big.alloc(s, B, K);
+    one.alloc(s, 1, 1);
+    const float temps[4] = {1.0f, 0.7f, 0.3f, 1.5f};
+    const float mins[3]  = {0.02f, 0.05f, 0.1f};
+    std::mt19937_64 g(0xF100Full);
+    std::vector<float> x(static_cast<std::size_t>(s.physical) * cols * B);
+    long columns = 0, same = 0, moved = 0;
+    const auto draw = [&](int b, int j, ops::SamplingConfig c, int pos) {
+        ck(cudaMemcpy(one.logits, static_cast<float*>(big.logits) + (static_cast<std::size_t>(b) * cols + j) * s.physical,
+                      static_cast<std::size_t>(s.physical) * 4, cudaMemcpyDeviceToDevice), "floor col");
+        ck(cudaMemcpy(one.cfg, &c, sizeof c, cudaMemcpyHostToDevice), "floor cfg");
+        ck(cudaMemcpy(one.lengths, &pos, 4, cudaMemcpyHostToDevice), "floor pos");
+        Tensor lt(one.logits, DType::FP32, {s.physical, 1});
+        Tensor ot(one.anchors, DType::I32, {1});
+        Tensor pt(one.lengths, DType::I32, {1});
+        ops::sample(lt, ot, s.domain, one.cfg, pt, ops::kSamplePurposeDecode, *env.work, nullptr);
+        int t = -1;
+        ck(cudaMemcpy(&t, one.anchors, 4, cudaMemcpyDeviceToHost), "floor t");
+        return t;
+    };
+    for (int call = 0; call < 24; ++call) {
+        Rows r = env.make_rows(0, 7000 + call, B, K);
+        for (int b = 0; b < B; ++b) {
+            ops::SamplingConfig& c = r.cfg[b];
+            c.temperature = temps[g() % 4];
+            c.min_p       = mins[g() % 3];
+            c.speculative_coupled = 1;
+            r.extents[b]  = K;
+            const float inv = 1.0f / c.temperature, lnp = std::log(c.min_p);
+            for (int j = 0; j < cols; ++j) {
+                float* col = x.data() + (static_cast<std::size_t>(b) * cols + j) * s.physical;
+                const float top   = 5.0f + static_cast<float>(g() % 1000) * 0.01f;
+                const float floor_x = top * inv + lnp;
+                for (int v = 0; v < s.domain; ++v) {
+                    float tx = floor_x;
+                    for (int o = static_cast<int>(g() % 5) - 2; o != 0; o += o > 0 ? -1 : 1) {
+                        tx = std::nextafter(tx, o > 0 ? HUGE_VALF : -HUGE_VALF);
+                    }
+                    float val = tx * c.temperature;
+                    for (int it = 0; it < 4 && val * inv != tx; ++it) {
+                        val = std::nextafter(val, val * inv < tx ? HUGE_VALF : -HUGE_VALF);
+                    }
+                    col[v] = val;
+                }
+                col[g() % s.domain] = top;
+            }
+        }
+        ck(cudaMemcpy(big.logits, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "floor logits");
+        std::vector<int> chain(static_cast<std::size_t>(B) * cols);
+        for (int b = 0; b < B; ++b) {
+            for (int j = 0; j < cols; ++j) {
+                chain[static_cast<std::size_t>(b) * cols + j] = draw(b, j, r.cfg[b], r.lengths[b] + j);
+                ops::SamplingConfig shifted = r.cfg[b];
+                shifted.min_p *= 1.0f + 4e-6f;
+                moved += draw(b, j, shifted, r.lengths[b] + j) != chain[static_cast<std::size_t>(b) * cols + j];
+                if (j < K) { r.drafts[static_cast<std::size_t>(b) * K + j] = chain[static_cast<std::size_t>(b) * cols + j]; }
+            }
+        }
+        const Out a = env.run(big, r, 0, true, false);
+        for (int b = 0; b < B; ++b) {
+            for (int j = 0; j < cols; ++j) {
+                ++columns;
+                same += j < a.counts[b] &&
+                        a.tokens[static_cast<std::size_t>(b) * cols + j] == chain[static_cast<std::size_t>(b) * cols + j];
+            }
+        }
+    }
+    std::printf("\n| shape | coupled min_p floor band (T 0.3-1.5) | columns | == ops::sample | control: columns a floor a few ulps higher changes |\n|---|---|---|---|---|\n");
+    std::printf("| %s | every token within +-2 ulps of the floor | %ld | %ld | %ld |\n", s.name, columns, same, moved);
+    std::fflush(stdout);
+    return same == columns && moved > 0 ? 0 : 1;
 }
 
 // ---------------------------------------------------------------------------------------------- exactness
@@ -771,6 +863,7 @@ int main(int argc, char** argv) {
     }
     if (mode == "all" || mode == "coupled" || mode == "quick") {
         for (const Shape& s : shapes) { failures += test_coupled(s); }
+        for (const Shape& s : shapes) { failures += test_coupled_floor(s); }
     }
     if (mode == "all" || mode == "exact" || mode == "quick") {
         failures += test_exactness(shapes[0], mode == "quick");
