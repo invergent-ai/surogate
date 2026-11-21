@@ -92,7 +92,8 @@ void speculative_prepare_verify_ids(const Tensor& anchors, const Tensor& drafts,
  * split_routes (opt-in per target; the DSpark / Inkling family -- every other target passes false and runs M7's
  * launches exactly): untruncated stochastic rows take the split routes -- the exact split (one-hot rule, chunked,
  * every column in parallel) or, for rows with SamplingConfig::speculative_coupled, the coupled rule (each column's
- * token = the ordinary sampler's own draw, a draft accepted iff equal). SUROGATE_SPEC_EXACT_SPLIT=0 turns them off.
+ * token = the ordinary sampler's own draw, a draft accepted iff equal). SUROGATE_SPEC_EXACT_SPLIT=0 turns them off,
+ * the coupled rule included: such rows then take the one-hot rule in the wide kernel, so MTP on != MTP off at T > 0.
  */
 void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor& logits,
                                       const Tensor& drafts, const Tensor& current_extents,

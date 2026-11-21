@@ -147,6 +147,27 @@ void dspark_note_round_if(Sequence& sequence, std::uint32_t extent) {
     }
 }
 
+/// DSpark targets only (reviews R6 finding 4 = R7 minor 3): how many consecutive draws may share one staged stop
+/// barrier. While produced < min_tokens the stop ids are barred for draws produced + 1 .. min_tokens and allowed from
+/// the next one; a verify round or a chained ordinary burst stages the barrier once, so it must end at min_tokens and
+/// the next round is staged without it. Verify column j is draw produced + 1 + j: extent <= draws - 1. A burst of n
+/// rounds: n <= draws. MTP on and off then lift the barrier at the same token, at any load. Other targets: no limit,
+/// their rounds keep the per-round barrier (rule 7: W4g stays token-identical; its fix is the owner's call).
+template <class V, class Request, class Sequence>
+[[nodiscard]] std::uint32_t dspark_barrier_draws_if(const Request& request, const Sequence& sequence) {
+    if constexpr (family::dspark_drafter<V>()) {
+        if (request.stop_barrier_count == 0) { return std::numeric_limits<std::uint32_t>::max(); }
+        const std::size_t ledger   = sequence.ledger.size();
+        const std::size_t produced = ledger > request.prompt_tokens ? ledger - request.prompt_tokens : 0;
+        if (produced >= request.min_tokens) { return std::numeric_limits<std::uint32_t>::max(); }
+        return static_cast<std::uint32_t>(request.min_tokens - produced);
+    } else {
+        (void)request;
+        (void)sequence;
+        return std::numeric_limits<std::uint32_t>::max();
+    }
+}
+
 /// The block-table row a lane's draft KV is addressed with: DFlash's own pool row, or -- for a DSpark target, whose
 /// draft planes are text-pool planes (family/impl/runtime/dspark_round.h) -- the text pool's row.
 template <class Sequence>
@@ -507,6 +528,18 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     if (plan.persistent.dflash) {
         dflash.emplace(backing, *plan.persistent.dflash, *decoder);
         if (pipeline_stage()) { stage.features = &dflash->prefill_features; }
+        if (family::dspark_drafter<Variant>()) {
+            // Review R5 minor 3: the split routes carry the coupled verify, so switching them off leaves the row on the
+            // one-hot rule even though SUROGATE_SPEC_COUPLED still reads 1. Debug knob: say so at startup.
+            const char* coupled_raw = std::getenv("SUROGATE_SPEC_COUPLED");
+            const char* split_raw   = std::getenv("SUROGATE_SPEC_EXACT_SPLIT");
+            const bool coupled_on = coupled_raw == nullptr || coupled_raw[0] == '\0' || std::atoi(coupled_raw) != 0;
+            const bool split_on   = split_raw == nullptr || split_raw[0] == '\0' || std::atoi(split_raw) != 0;
+            if (coupled_on && !split_on) {
+                std::fprintf(stderr, "engine: WARNING SUROGATE_SPEC_EXACT_SPLIT=0 disables coupled verification: untruncated "
+                                     "sampled rows use the one-hot rule, so MTP on != MTP off at temperature > 0\n");
+            }
+        }
     }
     if (dflash.has_value() != plan.features.dflash()) {
         throw std::logic_error("DFlash state does not match the frozen sequence plan");
@@ -2957,6 +2990,8 @@ void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& 
     if constexpr (family::dspark_drafter<Variant>()) {
         // DSpark (lane e2): coupled verification of untruncated sampled rows (ops/kernel/speculative_round.cuh) --
         // MTP on commits the tokens MTP-off decoding samples. SUROGATE_SPEC_COUPLED=0: the one-hot rejection rule.
+        // SUROGATE_SPEC_EXACT_SPLIT=0 has the same effect whatever this flag says (the coupled verify is a split route;
+        // the engine warns at startup).
         static const bool coupled = [] {
             const char* raw = std::getenv("SUROGATE_SPEC_COUPLED");
             return raw == nullptr || raw[0] == '\0' || std::atoi(raw) != 0;
@@ -3529,6 +3564,9 @@ ProgramImplCore::launch_ordinary_round(std::span<const std::uint32_t> lanes,
             burst = std::min(burst, budget.generated_tokens_remaining);
         }
         burst = std::min(burst, capacity - maximum_frontier);
+        for (const auto lane : lanes) {
+            burst = std::min(burst, dspark_barrier_draws_if<Variant>(requests[lane], sequences[lane]));
+        }
         if (burst == 0 || pipeline_stage() || std::any_of(lanes.begin(), lanes.end(),
             [&](auto lane) { return requests[lane].constraint != nullptr; })) { burst = 1; }
 
@@ -5263,8 +5301,9 @@ ProgramImplCore::launch_dflash_round(std::span<const std::uint32_t> lanes,
         const std::uint32_t lane_cap      = adaptive_dflash && dspark_kind_policy()
                                                 ? dspark_lane_cap_if<Variant>(sequence)
                                                 : std::numeric_limits<std::uint32_t>::max();
+        const std::uint32_t barrier_cap   = dspark_barrier_draws_if<Variant>(requests[lane], sequence) - 1U;
         const std::uint32_t extent        = std::min(
-            {active_dflash_window, max_by_budget, capacity - sequence.execution_frontier - 1U, lane_cap});
+            {active_dflash_window, max_by_budget, capacity - sequence.execution_frontier - 1U, lane_cap, barrier_cap});
         maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
         maximum_target_tokens =
             std::max(maximum_target_tokens, sequence.execution_frontier + extent + 1U);
@@ -5312,8 +5351,9 @@ ProgramImplCore::launch_dflash_round(std::span<const std::uint32_t> lanes,
             const std::uint32_t lane_cap = adaptive_dflash && dspark_kind_policy()
                                                ? dspark_lane_cap_if<Variant>(sequence)
                                                : std::numeric_limits<std::uint32_t>::max();
+            const std::uint32_t barrier_cap = dspark_barrier_draws_if<Variant>(request, sequence) - 1U;
             const std::uint32_t extent =
-                std::min({active_dflash_window, max_by_budget, capacity - frontier - 1U, lane_cap});
+                std::min({active_dflash_window, max_by_budget, capacity - frontier - 1U, lane_cap, barrier_cap});
             if (adaptive_dflash && dspark_k_policy() == 2) { dspark_note_round_if<Variant>(sequence, extent); }
             dflash_host_ingress->anchors[row] = sequence.ledger.back();
             dflash_host_ingress->execution_frontiers[row] =
@@ -5419,8 +5459,9 @@ std::span<const std::byte> ProgramImplCore::prepare_pipeline_drafts(std::span<co
         const std::uint32_t lane_cap = adaptive_dflash && dspark_kind_policy()
                                            ? dspark_lane_cap_if<Variant>(sequence)
                                            : std::numeric_limits<std::uint32_t>::max();
+        const std::uint32_t barrier_cap = dspark_barrier_draws_if<Variant>(request, sequence) - 1U;
         const std::uint32_t extent =
-            std::min({active_dflash_window, max_by_budget, capacity - frontier - 1U, lane_cap});
+            std::min({active_dflash_window, max_by_budget, capacity - frontier - 1U, lane_cap, barrier_cap});
         maximum_frontier = std::max(maximum_frontier, frontier);
         dflash_host_ingress->anchors[row] = sequence.ledger.back();
         dflash_host_ingress->execution_frontiers[row] = checked_i32(frontier, "DFlash batch frontier");

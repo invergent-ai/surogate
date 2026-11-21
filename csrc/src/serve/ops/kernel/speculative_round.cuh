@@ -342,10 +342,14 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_coupled_partial_ker
         const int position   = key.position;
         float floor_value    = no_floor;
         if (cfg.min_p > 0.0f) {
-            // max over v of (x * inv_temp) == (max over v of x) * inv_temp: rounding is monotone (inv_temp > 0)
+            // max over v of RN(x * inv_temp) == RN((max over v of x) * inv_temp): rounding is monotone (inv_temp > 0).
+            // The explicit RN product is the rounded row maximum sampling_full_vocab_kernel adds __logf(min_p) to; a
+            // plain product here could contract into one fma with that sum (this file builds with fmad) and move the
+            // floor by 1 ulp (reviews R5 minor 2, R7 minor 1).
             const float top = speculative_exact_column_max(
                 speculative_exact_slot(partials, row_stride, row, 0, width, col, chunks), chunks, scratch);
-            floor_value = top * inv_temp + __logf(cfg.min_p);
+            const float scaled_top = __fmul_rn(top, inv_temp);
+            floor_value            = scaled_top + __logf(cfg.min_p);
         }
         const int begin = chunk * kSamplerFullVocabChunkItems;
         const int end   = min(domain, begin + kSamplerFullVocabChunkItems);

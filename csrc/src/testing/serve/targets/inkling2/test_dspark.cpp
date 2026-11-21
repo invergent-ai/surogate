@@ -557,7 +557,7 @@ int run(const std::string& dir, const std::string& tag) {
                std::to_string(same_c) + " / 21 and " + std::to_string(same_r) + " / 21");
     }
     {
-        // R5: the FP8 drafter (FP8 weights + FP8 Markov fold; the serving default 8a146482 .. M8, opt-in since M9) on
+        // R5: the FP8 drafter (FP8 weights + FP8 Markov fold; the serving default 8a146482 .. M9, opt-in since M10) on
         // every tag's inputs: drafts vs the reference (>= 19 / 21) / vs the round above
         D::DSparkDerived der8;
         D::derive_dspark(w, der8, true, true);

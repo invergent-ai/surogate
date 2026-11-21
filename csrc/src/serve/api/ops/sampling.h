@@ -65,6 +65,9 @@ struct SamplingConfig {
     /// those of MTP-off decoding with the same seed. Zero: the one-hot rejection rule. Ignored outside verification.
     std::int32_t speculative_coupled        = 0;
 };
+// A public header, copied to the device every round and sized into the persistent layout (24 -> 26 words per lane at
+// M10): a change of this size is deliberate and needs every separately built consumer rebuilt (review R5 minor 5).
+static_assert(sizeof(SamplingConfig) == 104, "SamplingConfig layout changed");
 
 /// The (position, purpose) a row's draw is keyed by; see SamplingConfig::continue_decode_key.
 struct SampleKey {

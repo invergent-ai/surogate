@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -111,7 +112,7 @@ bool dspark_bf16_weights_forced() {
 }
 
 bool dspark_fp8_weights_requested() {
-    // OPT-IN (SUROGATE_SERVE_DSPARK_FP8_WEIGHTS=1) since M9: the BF16 drafter is the default again -- h2's drafter A/B on
+    // OPT-IN (SUROGATE_SERVE_DSPARK_FP8_WEIGHTS=1) since M10: the BF16 drafter is the default again -- h2's drafter A/B on
     // M7 (perf/h2/m7-55c27326-1121-1757/dab): the FP8 route (W8A16 dspark_gemm_w8 + the FP8 fold) costs ~9.5 % per
     // stream at 8 streams (T0 105.9 vs 117.1, T1 78.5 vs 86.7 tok/s), equal at 1 stream, same tokens / round.
     // SUROGATE_SERVE_DSPARK_BF16_WEIGHTS=1 still forces BF16.
@@ -139,12 +140,18 @@ void dense(WorkspaceArena& work, const DSparkDerived& d, const Weight& w, const 
 } // namespace
 
 bool dspark_fp8_fold_requested() {
-    // OPT-IN (SUROGATE_SERVE_DSPARK_FP8_FOLD=1) since M9, with the FP8 weights (dspark_fp8_weights_requested); CPU r1+r2:
-    // no acceptance loss. SUROGATE_SERVE_DSPARK_BF16_FOLD=1 still forces the BF16 fold.
+    // OPT-IN (SUROGATE_SERVE_DSPARK_FP8_FOLD=1) since M10, only with the FP8 weights (dspark_fp8_weights_requested); CPU
+    // r1+r2: no acceptance loss. An FP8 fold over BF16 weights has no proof (review R5 minor 7): the flag alone is ignored,
+    // with one line on stderr. SUROGATE_SERVE_DSPARK_BF16_FOLD=1 still forces the BF16 fold.
     static const bool fp8 = [] {
         const char* fp8_raw  = std::getenv("SUROGATE_SERVE_DSPARK_FP8_FOLD");
         const char* bf16_raw = std::getenv("SUROGATE_SERVE_DSPARK_BF16_FOLD");
-        return fp8_raw != nullptr && fp8_raw[0] == '1' && !(bf16_raw != nullptr && bf16_raw[0] == '1');
+        const bool asked = fp8_raw != nullptr && fp8_raw[0] == '1' && !(bf16_raw != nullptr && bf16_raw[0] == '1');
+        if (asked && !dspark_fp8_weights_requested()) {
+            std::fprintf(stderr, "dspark: SUROGATE_SERVE_DSPARK_FP8_FOLD=1 ignored: it needs SUROGATE_SERVE_DSPARK_FP8_WEIGHTS=1\n");
+            return false;
+        }
+        return asked;
     }();
     return fp8;
 }

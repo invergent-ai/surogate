@@ -209,13 +209,19 @@ struct Env {
                 if (o == 2) { x.top_p = 0.9f; }
                 break;
             }
+            case 8: { // temperature != 1 with min_p (reviews R5 minor 2, R7 minor 1)
+                const float t[4] = {0.3f, 0.7f, 1.5f, 2.0f};
+                x.temperature = t[g() % 4];
+                x.min_p       = (g() % 3 == 0) ? 0.02f : (g() % 2 ? 0.05f : 0.1f);
+                break;
+            }
             }
         }
         return r;
     }
 
     // One op call on the current route; returns every output (and the rows' token-count arrays).
-    Out run(Bufs& bf, const Rows& r, unsigned long long logit_seed, bool split) {
+    Out run(Bufs& bf, const Rows& r, unsigned long long logit_seed, bool split, bool regenerate = true) {
         const int B = bf.B, K = bf.K, cols = K + 1;
         std::vector<ops::SamplingConfig> cfg = r.cfg;
         for (int b = 0; b < B; ++b) {
@@ -235,14 +241,16 @@ struct Env {
         ck(cudaMemcpy(d_pk, r.peaks.data(), r.peaks.size() * 4, cudaMemcpyHostToDevice), "pk up");
         d_dr = bf.drafts;
         const long long n = static_cast<long long>(B) * cols * shape.physical;
-        if (shape.fp32) {
-            gen_logits<float><<<static_cast<unsigned>((n + 255) / 256), 256>>>(static_cast<float*>(bf.logits), B, cols, K,
-                shape.physical, shape.domain, logit_seed, d_dr, d_pk, d_q);
-        } else {
-            gen_logits<__nv_bfloat16><<<static_cast<unsigned>((n + 255) / 256), 256>>>(
-                static_cast<__nv_bfloat16*>(bf.logits), B, cols, K, shape.physical, shape.domain, logit_seed, d_dr, d_pk, d_q);
+        if (regenerate) { // false: the call keeps the logits already in bf.logits
+            if (shape.fp32) {
+                gen_logits<float><<<static_cast<unsigned>((n + 255) / 256), 256>>>(static_cast<float*>(bf.logits), B, cols, K,
+                    shape.physical, shape.domain, logit_seed, d_dr, d_pk, d_q);
+            } else {
+                gen_logits<__nv_bfloat16><<<static_cast<unsigned>((n + 255) / 256), 256>>>(
+                    static_cast<__nv_bfloat16*>(bf.logits), B, cols, K, shape.physical, shape.domain, logit_seed, d_dr, d_pk, d_q);
+            }
+            ck(cudaGetLastError(), "gen");
         }
-        ck(cudaGetLastError(), "gen");
         ops::detail::speculative_exact_split() = split;
         Tensor lt(bf.logits, shape.fp32 ? DType::FP32 : DType::BF16, {shape.physical, cols, B});
         Tensor tt(bf.targets, DType::I32, {cols, B});
@@ -457,11 +465,11 @@ int test_coupled(const Shape& s) {
     Bufs big, one;
     big.alloc(s, B, K);
     one.alloc(s, 1, 1);
-    const int kinds[5] = {0, 1, 2, 4, 5}; // t1, temperatures, min_p, bias + barred + mask (+counts only), ties
-    const char* names[5] = {"t1 untruncated", "temperatures 0.3-2", "min_p", "bias + barred draft + mask", "ties (quantised)"};
+    const int kinds[6] = {0, 1, 2, 8, 4, 5}; // t1, temperatures, min_p, T != 1 + min_p, bias + barred + mask (+counts only), ties
+    const char* names[6] = {"t1 untruncated", "temperatures 0.3-2", "min_p", "T != 1 + min_p", "bias + barred draft + mask", "ties (quantised)"};
     int failures = 0;
     std::printf("\n| shape | coupled row class | rows | committed tokens | == ops::sample (MTP-off draw) | accepted drafts | repeat identical | alone (B=1) == in batch |\n|---|---|---|---|---|---|---|---|\n");
-    for (int ki = 0; ki < 5; ++ki) {
+    for (int ki = 0; ki < 6; ++ki) {
         long rows = 0, committed = 0, same = 0, acc = 0, rep = 0, alone = 0;
         for (int call = 0; call < 12; ++call) {
             Rows r = env.make_rows(kinds[ki], 500 + call, B, K);
@@ -512,6 +520,217 @@ int test_coupled(const Shape& s) {
         // the first draft is barred; the chi-square cases test acceptance on peaked columns)
         if (same != committed || rep != rows || alone != rows) { ++failures; }
     }
+    return failures;
+}
+
+// ---------------------------------------------------------------------------------------------- coupled min_p floor
+// Reviews R5 minor 2 / R7 minor 1: the coupled floor must be the ordinary sampler's floor to the bit. Each column puts
+// every token but one within +-2 ulps of the floor (scaled logit = RN(top / T) + ln(min_p)), so a floor that moves by
+// one ulp admits or drops about a fifth of the vocabulary and changes the winner of the Gumbel draw. Drafts = the
+// ordinary sampler's chain, so every column is verified. CONTROL: the same draw with min_p * (1 + 4e-6) (a floor a few
+// ulps higher) must change tokens, or the band does not resolve a floor shift and the class proves nothing.
+int test_coupled_floor(const Shape& s) {
+    if (!s.fp32) { return 0; } // the ulp grid needs FP32 logits (Inkling's)
+    Env env(s);
+    const int K = 3, B = 4, cols = K + 1;
+    Bufs big, one;
+    big.alloc(s, B, K);
+    one.alloc(s, 1, 1);
+    const float temps[4] = {1.0f, 0.7f, 0.3f, 1.5f};
+    const float mins[3]  = {0.02f, 0.05f, 0.1f};
+    std::mt19937_64 g(0xF100Full);
+    std::vector<float> x(static_cast<std::size_t>(s.physical) * cols * B);
+    long columns = 0, same = 0, moved = 0;
+    const auto draw = [&](int b, int j, ops::SamplingConfig c, int pos) {
+        ck(cudaMemcpy(one.logits, static_cast<float*>(big.logits) + (static_cast<std::size_t>(b) * cols + j) * s.physical,
+                      static_cast<std::size_t>(s.physical) * 4, cudaMemcpyDeviceToDevice), "floor col");
+        ck(cudaMemcpy(one.cfg, &c, sizeof c, cudaMemcpyHostToDevice), "floor cfg");
+        ck(cudaMemcpy(one.lengths, &pos, 4, cudaMemcpyHostToDevice), "floor pos");
+        Tensor lt(one.logits, DType::FP32, {s.physical, 1});
+        Tensor ot(one.anchors, DType::I32, {1});
+        Tensor pt(one.lengths, DType::I32, {1});
+        ops::sample(lt, ot, s.domain, one.cfg, pt, ops::kSamplePurposeDecode, *env.work, nullptr);
+        int t = -1;
+        ck(cudaMemcpy(&t, one.anchors, 4, cudaMemcpyDeviceToHost), "floor t");
+        return t;
+    };
+    for (int call = 0; call < 24; ++call) {
+        Rows r = env.make_rows(0, 7000 + call, B, K);
+        for (int b = 0; b < B; ++b) {
+            ops::SamplingConfig& c = r.cfg[b];
+            c.temperature = temps[g() % 4];
+            c.min_p       = mins[g() % 3];
+            c.speculative_coupled = 1;
+            r.extents[b]  = K;
+            const float inv = 1.0f / c.temperature, lnp = std::log(c.min_p);
+            for (int j = 0; j < cols; ++j) {
+                float* col = x.data() + (static_cast<std::size_t>(b) * cols + j) * s.physical;
+                const float top   = 5.0f + static_cast<float>(g() % 1000) * 0.01f;
+                const float floor_x = top * inv + lnp;
+                for (int v = 0; v < s.domain; ++v) {
+                    float tx = floor_x;
+                    for (int o = static_cast<int>(g() % 5) - 2; o != 0; o += o > 0 ? -1 : 1) {
+                        tx = std::nextafter(tx, o > 0 ? HUGE_VALF : -HUGE_VALF);
+                    }
+                    float val = tx * c.temperature;
+                    for (int it = 0; it < 4 && val * inv != tx; ++it) {
+                        val = std::nextafter(val, val * inv < tx ? HUGE_VALF : -HUGE_VALF);
+                    }
+                    col[v] = val;
+                }
+                col[g() % s.domain] = top;
+            }
+        }
+        ck(cudaMemcpy(big.logits, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "floor logits");
+        std::vector<int> chain(static_cast<std::size_t>(B) * cols);
+        for (int b = 0; b < B; ++b) {
+            for (int j = 0; j < cols; ++j) {
+                chain[static_cast<std::size_t>(b) * cols + j] = draw(b, j, r.cfg[b], r.lengths[b] + j);
+                ops::SamplingConfig shifted = r.cfg[b];
+                shifted.min_p *= 1.0f + 4e-6f;
+                moved += draw(b, j, shifted, r.lengths[b] + j) != chain[static_cast<std::size_t>(b) * cols + j];
+                if (j < K) { r.drafts[static_cast<std::size_t>(b) * K + j] = chain[static_cast<std::size_t>(b) * cols + j]; }
+            }
+        }
+        const Out a = env.run(big, r, 0, true, false);
+        for (int b = 0; b < B; ++b) {
+            for (int j = 0; j < cols; ++j) {
+                ++columns;
+                same += j < a.counts[b] &&
+                        a.tokens[static_cast<std::size_t>(b) * cols + j] == chain[static_cast<std::size_t>(b) * cols + j];
+            }
+        }
+    }
+    std::printf("\n| shape | coupled min_p floor band (T 0.3-1.5) | columns | == ops::sample | control: columns a floor a few ulps higher changes |\n|---|---|---|---|---|\n");
+    std::printf("| %s | every token within +-2 ulps of the floor | %ld | %ld | %ld |\n", s.name, columns, same, moved);
+    std::fflush(stdout);
+    return same == columns && moved > 0 ? 0 : 1;
+}
+
+// ---------------------------------------------------------------------------------------------- coupled overlay
+// Review R5 minor 4: the per-column state of a verify. Column j's token must be the ordinary sampler's draw on that
+// column with the state MTP-off decoding has there: class P = the request's token counts + the round's tokens 0..j-1
+// (presence / frequency / repetition penalties); class M = the column's own grammar mask (token_bitmask_stride > 0).
+// Drafts = the MTP-off chain, so every column is verified and the whole round must be accepted. CONTROL: columns whose
+// reference token changes when that state is dropped (P: counts without the round's tokens; M: column 0's mask); a
+// class with a zero control proves nothing and FAILS.
+int test_coupled_overlay(const Shape& s) {
+    Env env(s);
+    const int K = 7, B = 8, cols = K + 1;
+    const int words = (s.domain + 31) / 32;
+    Bufs big, one;
+    big.alloc(s, B, K);
+    one.alloc(s, 1, 1);
+    int* d_ref_counts     = nullptr;
+    std::int32_t* d_masks = nullptr;
+    ck(cudaMalloc(&d_ref_counts, static_cast<std::size_t>(s.domain) * 4), "ref counts");
+    ck(cudaMalloc(&d_masks, static_cast<std::size_t>(B) * cols * words * 4), "column masks");
+    const std::size_t col_bytes = static_cast<std::size_t>(s.physical) * (s.fp32 ? 4 : 2);
+    const auto draw = [&](int b, int j, ops::SamplingConfig c, int pos) {
+        ck(cudaMemcpy(one.logits, static_cast<char*>(big.logits) + (static_cast<std::size_t>(b) * cols + j) * col_bytes,
+                      col_bytes, cudaMemcpyDeviceToDevice), "overlay col");
+        ck(cudaMemcpy(one.cfg, &c, sizeof c, cudaMemcpyHostToDevice), "overlay cfg");
+        ck(cudaMemcpy(one.lengths, &pos, 4, cudaMemcpyHostToDevice), "overlay pos");
+        Tensor lt(one.logits, s.fp32 ? DType::FP32 : DType::BF16, {s.physical, 1});
+        Tensor ot(one.anchors, DType::I32, {1});
+        Tensor pt(one.lengths, DType::I32, {1});
+        ops::sample(lt, ot, s.domain, one.cfg, pt, ops::kSamplePurposeDecode, *env.work, nullptr);
+        int t = -1;
+        ck(cudaMemcpy(&t, one.anchors, 4, cudaMemcpyDeviceToHost), "overlay t");
+        return t;
+    };
+    const auto upload_counts = [&](int slot, const std::vector<int>& extra) {
+        std::vector<int> c(env.counts0.begin() + static_cast<std::ptrdiff_t>(slot) * s.domain,
+                           env.counts0.begin() + static_cast<std::ptrdiff_t>(slot + 1) * s.domain);
+        for (const int t : extra) { c[t] += 1; }
+        ck(cudaMemcpy(d_ref_counts, c.data(), c.size() * 4, cudaMemcpyHostToDevice), "ref counts up");
+    };
+    const char* names[2] = {"P: penalties, counts + the round's tokens", "M: a different grammar mask per column"};
+    int failures = 0;
+    std::printf("\n| shape | coupled per-column state | columns | == ops::sample with that state | counts after the round right | control: columns that change without the state |\n|---|---|---|---|---|---|\n");
+    for (int cls = 0; cls < 2; ++cls) {
+        long columns = 0, same = 0, control = 0, counts_ok = 0, counts_n = 0;
+        for (int call = 0; call < 6; ++call) {
+            std::mt19937_64 g(0xC0DEull + 1009ull * static_cast<unsigned long long>(cls) + static_cast<unsigned long long>(call));
+            Rows r = env.make_rows(cls == 0 ? 3 : 0, 900 + call, B, K);
+            std::vector<std::int32_t> masks;
+            if (cls == 1) {
+                masks.resize(static_cast<std::size_t>(B) * cols * words);
+                for (auto& w : masks) { w = static_cast<std::int32_t>(g() | g()); }
+                ck(cudaMemcpy(d_masks, masks.data(), masks.size() * 4, cudaMemcpyHostToDevice), "masks up");
+            }
+            const float heights[3] = {10.0f, 12.0f, 14.0f};
+            for (int b = 0; b < B; ++b) {
+                ops::SamplingConfig& c = r.cfg[b];
+                c.speculative_coupled = 1;
+                r.extents[b]          = K;
+                if (cls == 0) {
+                    // one token peaks in every column, so the round's own earlier tokens move the draw
+                    r.count_slot[b] = b;
+                    const int tok   = static_cast<int>(g() % s.domain);
+                    for (int j = 0; j < K; ++j) {
+                        r.drafts[static_cast<std::size_t>(b) * K + j]      = tok;
+                        r.peaks[static_cast<std::size_t>(b) * cols + j] = heights[g() % 3];
+                    }
+                } else {
+                    r.count_slot[b]       = -1;
+                    c.token_bitmask        = d_masks + static_cast<std::size_t>(b) * cols * words;
+                    c.token_bitmask_stride = words;
+                }
+            }
+            const unsigned long long ls = 0xBEEFull + 257ull * static_cast<unsigned long long>(cls * 100 + call);
+            (void)env.run(big, r, ls, true); // generates the logits (peaks at the rows' drafts above)
+            std::vector<int> chain(static_cast<std::size_t>(B) * cols);
+            for (int b = 0; b < B; ++b) {
+                std::vector<int> prefix;
+                for (int j = 0; j < cols; ++j) {
+                    ops::SamplingConfig c = r.cfg[b], ctrl = r.cfg[b];
+                    const int pos = r.lengths[b] + j;
+                    int t, t_ctrl;
+                    if (cls == 0) {
+                        upload_counts(b, {});
+                        c.token_counts = ctrl.token_counts = d_ref_counts;
+                        t_ctrl = draw(b, j, ctrl, pos);
+                        upload_counts(b, prefix);
+                        t = draw(b, j, c, pos);
+                    } else {
+                        c.token_bitmask        = d_masks + (static_cast<std::size_t>(b) * cols + j) * words;
+                        c.token_bitmask_stride = 0;
+                        ctrl.token_bitmask     = d_masks + static_cast<std::size_t>(b) * cols * words;
+                        ctrl.token_bitmask_stride = 0;
+                        t_ctrl = draw(b, j, ctrl, pos);
+                        t      = draw(b, j, c, pos);
+                    }
+                    control += j > 0 && t_ctrl != t;
+                    chain[static_cast<std::size_t>(b) * cols + j] = t;
+                    prefix.push_back(t);
+                    if (j < K) { r.drafts[static_cast<std::size_t>(b) * K + j] = t; }
+                }
+            }
+            const Out a = env.run(big, r, 0, true, false);
+            for (int b = 0; b < B; ++b) {
+                std::map<int, int> added;
+                for (int j = 0; j < cols; ++j) {
+                    ++columns;
+                    const int t = chain[static_cast<std::size_t>(b) * cols + j];
+                    same += j < a.counts[b] && a.tokens[static_cast<std::size_t>(b) * cols + j] == t;
+                    added[t] += 1;
+                }
+                if (cls == 0) {
+                    for (const auto& [t, n] : added) {
+                        ++counts_n;
+                        counts_ok += a.token_counts.at(b)[t] ==
+                                     env.counts0[static_cast<std::size_t>(b) * s.domain + t] + n;
+                    }
+                }
+            }
+        }
+        std::printf("| %s | %s | %ld | %ld | %ld / %ld | %ld |\n", s.name, names[cls], columns, same, counts_ok, counts_n, control);
+        std::fflush(stdout);
+        if (same != columns || counts_ok != counts_n || control == 0) { ++failures; }
+    }
+    cudaFree(d_ref_counts);
+    cudaFree(d_masks);
     return failures;
 }
 
@@ -771,6 +990,8 @@ int main(int argc, char** argv) {
     }
     if (mode == "all" || mode == "coupled" || mode == "quick") {
         for (const Shape& s : shapes) { failures += test_coupled(s); }
+        for (const Shape& s : shapes) { failures += test_coupled_floor(s); }
+        for (const Shape& s : shapes) { failures += test_coupled_overlay(s); }
     }
     if (mode == "all" || mode == "exact" || mode == "quick") {
         failures += test_exactness(shapes[0], mode == "quick");
