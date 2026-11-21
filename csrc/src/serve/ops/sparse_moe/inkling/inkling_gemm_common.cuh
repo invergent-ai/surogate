@@ -150,6 +150,31 @@ __device__ __forceinline__ void cp_async_cg16_hint(void* smem_dst, const void* g
     }
 }
 
+/// PDL audit (2026-11-21): bf16 activation rows (x, y) are written by a kernel that may still run when the reading
+/// grid launches (PDL), at arena addresses reused every visit. They are read with plain (weak) ld.global after the
+/// dependency wait -- griddepcontrol.wait makes the prerequisite grid's writes visible to such loads -- and NEVER
+/// through the non-coherent path (ld.global.nc / __ldg / LDG.CONSTANT), whose data must stay unchanged for the
+/// reading kernel's whole lifetime, which a PDL-overlapped producer violates. Plain loads keep the L1 hit of the
+/// quantisers' second pass over a row (ld.global.cg measured +2.0 us per NVFP4 call at T=1, 2128f247).
+/// `RowLoad` is a compile-time TEST-ONLY mode (inkling_test_read_only_loads picks the kernel instantiation on the
+/// host): 0 = plain (the only form serving launches), 1 = ld.global.nc (negative control), 2 = ld.global.cg.
+template <int RowLoad = 0>
+__device__ __forceinline__ uint4 load_row16(const uint4* address) {
+    if constexpr (RowLoad == 1) {
+        return __ldg(address);
+    } else if constexpr (RowLoad == 2) {
+        return __ldcg(address);
+    } else {
+        return *address;
+    }
+}
+
+/// The host side of the test-only row-load mode (one per translation unit; 0 in serving).
+inline int& row_load_mode_host() {
+    static int mode = 0;
+    return mode;
+}
+
 /// fp32 -> bf16 -> fp32: the reference's bf16 store of gate_up followed by the SiTU's load.
 __device__ __forceinline__ float round_bf16(float value) {
     return __bfloat162float(__float2bfloat16_rn(value));

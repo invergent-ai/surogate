@@ -12,6 +12,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <bit>
 #include <cstdint>
 #include <stdexcept>
@@ -41,12 +42,22 @@ __device__ __forceinline__ int live_count(LiveTokens live) {
     return live.device != nullptr ? min(*live.device, live.tokens) : live.tokens;
 }
 
-/// 16 bf16 at `source` (32-byte aligned) as fp32.
+/// PDL audit (agent-EN 17:48, lane c's FP8 finding): per-step activations (x, y, logits, ids, gammas, down rows)
+/// are written by a kernel that may still be in flight when this grid is launched (PDL) and live at arena addresses
+/// reused every visit, so they are NEVER read through the non-coherent read-only path (ld.global.nc / __ldg / a
+/// `const __restrict__` pointer the compiler turns into LDG.CONSTANT): explicit ld.global.cg (L2) loads instead.
+/// Same bytes: no bit changes. The bf16 ROW loads (x / y in the quantisers) are plain ld.global (load_row16 in
+/// inkling_gemm_common.cuh, shared with the fused-y down: an L1 hit on the second pass); single-touch reads (logits,
+/// ids, lora rows, combine / softcap operands) are ld.global.cg. Test-only controls (`inkling_test_read_only_loads`):
+/// 1 = the row loads back on ld.global.nc (negative control), 2 = ld.global.cg.
+
+/// 16 bf16 at `source` (32-byte aligned) as fp32 (load_row16).
+template <int RowLoad>
 __device__ __forceinline__ void load16(const __nv_bfloat16* source, float* x) {
     const uint4* words = reinterpret_cast<const uint4*>(source);
 #pragma unroll
     for (int half = 0; half < 2; ++half) {
-        const uint4 v                 = words[half];
+        const uint4 v                 = load_row16<RowLoad>(words + half);
         const std::uint32_t parts[4] = {v.x, v.y, v.z, v.w};
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
@@ -80,8 +91,9 @@ __device__ __forceinline__ void router_logits_tile(const __nv_bfloat16* __restri
     const int row1     = row0 + 8;
     const bool valid0  = row0 < tokens;
     const bool valid1  = row1 < tokens;
-    const auto* x0     = reinterpret_cast<const std::uint32_t*>(x + static_cast<std::int64_t>(valid0 ? row0 : 0) * kHidden);
-    const auto* x1     = reinterpret_cast<const std::uint32_t*>(x + static_cast<std::int64_t>(valid1 ? row1 : 0) * kHidden);
+    // x through L2 (PDL audit: written by the predecessor, reused address).
+    const auto* x0     = reinterpret_cast<const unsigned int*>(x + static_cast<std::int64_t>(valid0 ? row0 : 0) * kHidden);
+    const auto* x1     = reinterpret_cast<const unsigned int*>(x + static_cast<std::int64_t>(valid1 ? row1 : 0) * kHidden);
     const auto* w      = reinterpret_cast<const std::uint32_t*>(router + static_cast<std::int64_t>(e0 + group_id) * kHidden);
 
     // One chain of m16n8k16 MMAs from zero over the group, k ascending: `_k_group_tile`'s
@@ -90,10 +102,10 @@ __device__ __forceinline__ void router_logits_tile(const __nv_bfloat16* __restri
     for (int k = k_begin; k < k_end; k += 16) {
         const int lo = (k + 2 * quad) >> 1;
         const int hi = (k + 8 + 2 * quad) >> 1;
-        const std::uint32_t a0 = valid0 ? x0[lo] : 0U;
-        const std::uint32_t a1 = valid1 ? x1[lo] : 0U;
-        const std::uint32_t a2 = valid0 ? x0[hi] : 0U;
-        const std::uint32_t a3 = valid1 ? x1[hi] : 0U;
+        const std::uint32_t a0 = valid0 ? __ldcg(x0 + lo) : 0U;
+        const std::uint32_t a1 = valid1 ? __ldcg(x1 + lo) : 0U;
+        const std::uint32_t a2 = valid0 ? __ldcg(x0 + hi) : 0U;
+        const std::uint32_t a3 = valid1 ? __ldcg(x1 + hi) : 0U;
         mma_bf16(c0, c1, c2, c3, a0, a1, a2, a3, w[lo], w[hi]);
     }
     __shared__ float partial[3][16][8];
@@ -280,7 +292,8 @@ __device__ __forceinline__ void select_token(const float* __restrict__ logits, c
     }
     if (token < tokens) {
         const float* row = logits + static_cast<std::int64_t>(token) * kExperts;
-        const auto logit = [&](int expert) { return L2Logits ? __ldcg(row + expert) : row[expert]; };
+        // Logits through L2 on both paths (PDL audit: written by the logits kernel / other CTAs of this grid).
+        const auto logit = [&](int expert) { return __ldcg(row + expert); };
         if (token < alive) {
             std::uint64_t keys[4];
 #pragma unroll
@@ -416,11 +429,12 @@ __global__ __launch_bounds__(256) void router_place_kernel(RouteOutputs out, std
 // Row quantisers: a warp per row, 8 rows per block.
 // ---------------------------------------------------------------------------------------------
 __device__ __forceinline__ bool row_is_live(int row, const std::int32_t* row_ids, LiveTokens live) {
-    if (row_ids != nullptr) { return row_ids[row] >= 0; }
+    if (row_ids != nullptr) { return __ldcg(row_ids + row) >= 0; }
     return row < live_count(live);
 }
 
 /// One row's NVFP4 four-over-six by one warp.
+template <int RowLoad>
 __device__ __forceinline__ void quant_nvfp4_row(const __nv_bfloat16* __restrict__ input, std::int32_t rows,
                                                 std::int32_t k, const std::int32_t* __restrict__ row_ids,
                                                 LiveTokens live, std::uint8_t* __restrict__ codes,
@@ -433,7 +447,7 @@ __device__ __forceinline__ void quant_nvfp4_row(const __nv_bfloat16* __restrict_
     float amax                  = 0.0F;
     for (int block = lane; block < blocks; block += 32) {
         float x[16];
-        load16(source + block * 16, x);
+        load16<RowLoad>(source + block * 16, x);
 #pragma unroll
         for (int j = 0; j < 16; ++j) { amax = fmaxf(amax, fabsf(x[j])); }
     }
@@ -441,7 +455,7 @@ __device__ __forceinline__ void quant_nvfp4_row(const __nv_bfloat16* __restrict_
     const Nvfp4RowScales row_scales = nvfp4_row_scales(amax);
     for (int block = lane; block < blocks; block += 32) {
         float x[16];
-        load16(source + block * 16, x);
+        load16<RowLoad>(source + block * 16, x);
         const Nvfp4Block quantized = nvfp4_quantize_block_4o6(x, row_scales, nvfp4_block_in_head(block, k));
         *reinterpret_cast<uint2*>(codes + static_cast<std::int64_t>(row) * (k / 2) + block * 8) =
             make_uint2(static_cast<std::uint32_t>(quantized.codes),
@@ -451,6 +465,7 @@ __device__ __forceinline__ void quant_nvfp4_row(const __nv_bfloat16* __restrict_
     if (lane == 0) { amax_out[row] = amax; }
 }
 
+template <int RowLoad>
 __global__ __launch_bounds__(256) void quant_nvfp4_kernel(const __nv_bfloat16* __restrict__ input,
                                                           std::int32_t rows, std::int32_t k,
                                                           const std::int32_t* __restrict__ row_ids,
@@ -460,11 +475,12 @@ __global__ __launch_bounds__(256) void quant_nvfp4_kernel(const __nv_bfloat16* _
                                                           float* __restrict__ amax_out) {
     pdl::wait_for_dependencies();
     pdl::trigger_dependents();
-    quant_nvfp4_row(input, rows, k, row_ids, live, codes, scales, amax_out,
+    quant_nvfp4_row<RowLoad>(input, rows, k, row_ids, live, codes, scales, amax_out,
                     static_cast<int>(blockIdx.x) * 8 + (static_cast<int>(threadIdx.x) >> 5));
 }
 
 /// One row's MXFP8 quantisation by one warp.
+template <int RowLoad>
 __device__ __forceinline__ void quant_mxfp8_row(const __nv_bfloat16* __restrict__ input, std::int32_t rows,
                                                 std::int32_t k, const std::int32_t* __restrict__ row_ids,
                                                 LiveTokens live, std::uint8_t* __restrict__ codes,
@@ -476,8 +492,8 @@ __device__ __forceinline__ void quant_mxfp8_row(const __nv_bfloat16* __restrict_
     const int blocks            = k / 32;
     for (int block = lane; block < blocks; block += 32) {
         float x[32];
-        load16(source + block * 32, x);
-        load16(source + block * 32 + 16, x + 16);
+        load16<RowLoad>(source + block * 32, x);
+        load16<RowLoad>(source + block * 32 + 16, x + 16);
         float amax = 0.0F;
 #pragma unroll
         for (int j = 0; j < 32; ++j) { amax = fmaxf(amax, fabsf(x[j])); }
@@ -520,6 +536,7 @@ __device__ __forceinline__ void quant_mxfp8_row(const __nv_bfloat16* __restrict_
     }
 }
 
+template <int RowLoad>
 __global__ __launch_bounds__(256) void quant_mxfp8_kernel(const __nv_bfloat16* __restrict__ input,
                                                           std::int32_t rows, std::int32_t k,
                                                           const std::int32_t* __restrict__ row_ids,
@@ -529,7 +546,7 @@ __global__ __launch_bounds__(256) void quant_mxfp8_kernel(const __nv_bfloat16* _
                                                           __nv_bfloat16* __restrict__ dequantised) {
     pdl::wait_for_dependencies();
     pdl::trigger_dependents();
-    quant_mxfp8_row(input, rows, k, row_ids, live, codes, exponents, dequantised,
+    quant_mxfp8_row<RowLoad>(input, rows, k, row_ids, live, codes, exponents, dequantised,
                     static_cast<int>(blockIdx.x) * 8 + (static_cast<int>(threadIdx.x) >> 5));
 }
 
@@ -639,7 +656,7 @@ struct XQuantOutputs {
     __nv_bfloat16* dequantised = nullptr; ///< MXFP8
 };
 
-template <bool Nvfp4>
+template <bool Nvfp4, int RowLoad>
 __global__ __launch_bounds__(96) void route_quant_narrow_kernel(const __nv_bfloat16* __restrict__ x,
                                                                 const __nv_bfloat16* __restrict__ router,
                                                                 float* __restrict__ logits, std::int32_t tokens,
@@ -660,9 +677,9 @@ __global__ __launch_bounds__(96) void route_quant_narrow_kernel(const __nv_bfloa
     }
     const int row = (block - router_tiles) * 3 + (static_cast<int>(threadIdx.x) >> 5);
     if constexpr (Nvfp4) {
-        quant_nvfp4_row(x, tokens, kHidden, nullptr, live, q.codes, q.scales, q.amax, row);
+        quant_nvfp4_row<RowLoad>(x, tokens, kHidden, nullptr, live, q.codes, q.scales, q.amax, row);
     } else {
-        quant_mxfp8_row(x, tokens, kHidden, nullptr, live, nullptr, nullptr, q.dequantised, row);
+        quant_mxfp8_row<RowLoad>(x, tokens, kHidden, nullptr, live, nullptr, nullptr, q.dequantised, row);
     }
 }
 
@@ -677,7 +694,8 @@ __global__ __launch_bounds__(96) void route_quant_narrow_kernel(const __nv_bfloa
 // ---------------------------------------------------------------------------------------------
 inline constexpr int kFusedRouteThreads = 256;
 
-template <bool Nvfp4>
+
+template <bool Nvfp4, int RowLoad>
 __global__ __launch_bounds__(kFusedRouteThreads) void route_select_narrow_kernel(
     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ router, const float* __restrict__ bias,
     float* __restrict__ logits, LiveTokens live, XQuantOutputs q, RouteOutputs out, std::int32_t* tile_arrivals) {
@@ -694,9 +712,9 @@ __global__ __launch_bounds__(kFusedRouteThreads) void route_select_narrow_kernel
     if (block >= router_tiles) {
         const int row = (block - router_tiles) * (kFusedRouteThreads / 32) + (thread >> 5);
         if constexpr (Nvfp4) {
-            quant_nvfp4_row(x, tokens, kHidden, nullptr, live, q.codes, q.scales, q.amax, row);
+            quant_nvfp4_row<RowLoad>(x, tokens, kHidden, nullptr, live, q.codes, q.scales, q.amax, row);
         } else {
-            quant_mxfp8_row(x, tokens, kHidden, nullptr, live, nullptr, nullptr, q.dequantised, row);
+            quant_mxfp8_row<RowLoad>(x, tokens, kHidden, nullptr, live, nullptr, nullptr, q.dequantised, row);
         }
         return;
     }
@@ -757,9 +775,8 @@ __global__ __launch_bounds__(256) void softcap_swiglu_kernel(const __nv_bfloat16
     if (index >= static_cast<std::int64_t>(rows) * kIntermediate) { return; }
     const std::int64_t row = index / kIntermediate;
     const int column       = static_cast<int>(index - row * kIntermediate);
-    const std::uint32_t pair =
-        reinterpret_cast<const std::uint32_t*>(gate_up + row * kGateUpRows)[column];
-    y[index] = situ(__uint_as_float(pair << 16), __uint_as_float(pair & 0xFFFF0000U), gamma[row]);
+    const std::uint32_t pair = __ldcg(reinterpret_cast<const unsigned int*>(gate_up + row * kGateUpRows) + column);
+    y[index] = situ(__uint_as_float(pair << 16), __uint_as_float(pair & 0xFFFF0000U), __ldcg(gamma + row));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -779,9 +796,9 @@ __global__ __launch_bounds__(128) void combine_kernel(const __nv_bfloat16* __res
 #pragma unroll
         for (int slot = 0; slot < kTopK; ++slot) {
             const int index = token * kTopK + slot;
-            if (ids[index] >= 0) {
-                const std::uint32_t pair = *reinterpret_cast<const std::uint32_t*>(
-                    down + static_cast<std::int64_t>(index) * kHidden + column);
+            if (__ldcg(ids + index) >= 0) {
+                const std::uint32_t pair = __ldcg(reinterpret_cast<const unsigned int*>(
+                    down + static_cast<std::int64_t>(index) * kHidden + column));
                 acc0 = __fadd_rn(acc0, __uint_as_float(pair << 16));
                 acc1 = __fadd_rn(acc1, __uint_as_float(pair & 0xFFFF0000U));
             }
@@ -808,7 +825,7 @@ __global__ __launch_bounds__(256) void lora_shrink_kernel(const __nv_bfloat16* _
     const int bank_index = task - index * banks;
     if (index >= live.tokens * kTopK) { return; }
     const int token  = index / kTopK;
-    const int expert = ids[index];
+    const int expert = __ldcg(ids + index);
     if (expert < 0 || token >= live_count(live)) { return; }
     const int slot = lora_slot_of(lora, token);
     if (slot < 0) { return; }
@@ -822,7 +839,7 @@ __global__ __launch_bounds__(256) void lora_shrink_kernel(const __nv_bfloat16* _
 #pragma unroll
         for (int r = 0; r < 16; ++r) { acc[r] = 0.0F; }
         for (int k = lane * 8; k < source_k; k += 256) {
-            const uint4 xv = *reinterpret_cast<const uint4*>(x + k);
+            const uint4 xv = __ldcg(reinterpret_cast<const uint4*>(x + k)); // x / y rows through L2 (PDL audit)
             const std::uint32_t xw[4] = {xv.x, xv.y, xv.z, xv.w};
 #pragma unroll
             for (int r = 0; r < 16; ++r) {
@@ -1000,7 +1017,11 @@ void launch_route_quant_narrow(const __nv_bfloat16* x, const __nv_bfloat16* rout
     q.amax        = x_amax;
     q.dequantised = x_dequantised;
     const int blocks = (kExperts / 8) * ((tokens + kStagedTileTokens - 1) / kStagedTileTokens) + (tokens + 2) / 3;
-    auto* kernel = nvfp4 ? route_quant_narrow_kernel<true> : route_quant_narrow_kernel<false>;
+    const int mode = row_load_mode_host();
+    auto* kernel   = nvfp4 ? (mode == 1 ? route_quant_narrow_kernel<true, 1>
+                                        : mode == 2 ? route_quant_narrow_kernel<true, 2> : route_quant_narrow_kernel<true, 0>)
+                           : (mode == 1 ? route_quant_narrow_kernel<false, 1>
+                                        : mode == 2 ? route_quant_narrow_kernel<false, 2> : route_quant_narrow_kernel<false, 0>);
     cudaError_t status = ::sinfer::ops::set_func_attribute_per_device(
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kStagedSharedBytes);
     if (status == cudaSuccess) {
@@ -1028,7 +1049,11 @@ void launch_route_select_narrow(const __nv_bfloat16* x, const __nv_bfloat16* rou
     q.dequantised = x_dequantised;
     const int token_tiles = (live.tokens + kStagedTileTokens - 1) / kStagedTileTokens;
     const int blocks      = (kExperts / 8) * token_tiles + (live.tokens + kFusedRouteThreads / 32 - 1) / (kFusedRouteThreads / 32);
-    auto* kernel = nvfp4 ? route_select_narrow_kernel<true> : route_select_narrow_kernel<false>;
+    const int mode = row_load_mode_host();
+    auto* kernel   = nvfp4 ? (mode == 1 ? route_select_narrow_kernel<true, 1>
+                                        : mode == 2 ? route_select_narrow_kernel<true, 2> : route_select_narrow_kernel<true, 0>)
+                           : (mode == 1 ? route_select_narrow_kernel<false, 1>
+                                        : mode == 2 ? route_select_narrow_kernel<false, 2> : route_select_narrow_kernel<false, 0>);
     cudaError_t status = ::sinfer::ops::set_func_attribute_per_device(
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kStagedSharedBytes);
     if (status == cudaSuccess) {
@@ -1052,16 +1077,20 @@ void launch_quant_nvfp4(const __nv_bfloat16* input, std::int32_t rows, std::int3
                         const std::int32_t* row_ids, LiveTokens live, std::uint8_t* codes,
                         std::uint8_t* scales, float* amax, cudaStream_t stream) {
     if (k % 16 != 0) { throw std::invalid_argument("inkling_quant_nvfp4_4o6: k must be a multiple of 16"); }
+    const int mode = row_load_mode_host();
     launch("quant nvfp4", dim3(static_cast<unsigned>((rows + 7) / 8)), dim3(256), stream,
-           quant_nvfp4_kernel, input, rows, k, row_ids, live, codes, scales, amax);
+           mode == 1 ? quant_nvfp4_kernel<1> : mode == 2 ? quant_nvfp4_kernel<2> : quant_nvfp4_kernel<0>, input, rows, k,
+           row_ids, live, codes, scales, amax);
 }
 
 void launch_quant_mxfp8(const __nv_bfloat16* input, std::int32_t rows, std::int32_t k,
                         const std::int32_t* row_ids, LiveTokens live, std::uint8_t* codes,
                         std::uint8_t* exponents, __nv_bfloat16* dequantised, cudaStream_t stream) {
     if (k % 32 != 0) { throw std::invalid_argument("inkling_quant_mxfp8: k must be a multiple of 32"); }
+    const int mode = row_load_mode_host();
     launch("quant mxfp8", dim3(static_cast<unsigned>((rows + 7) / 8)), dim3(256), stream,
-           quant_mxfp8_kernel, input, rows, k, row_ids, live, codes, exponents, dequantised);
+           mode == 1 ? quant_mxfp8_kernel<1> : mode == 2 ? quant_mxfp8_kernel<2> : quant_mxfp8_kernel<0>, input, rows, k,
+           row_ids, live, codes, exponents, dequantised);
 }
 
 void launch_softcap_swiglu(const __nv_bfloat16* gate_up, const float* gamma, std::int32_t rows,
@@ -1122,6 +1151,67 @@ __global__ __launch_bounds__(32) void bench_predecessor_kernel(std::int32_t nano
 }
 
 } // namespace
+
+/// Test-only "planter" (pdl-chain negative control): every CTA reads the whole buffer through the non-coherent path,
+/// so each SM's L1 / texture cache holds the buffer's CURRENT (soon stale) lines when the writer overwrites it.
+__global__ __launch_bounds__(256) void test_plant_reads_kernel(const uint4* buffer, std::int64_t words, int* sink) {
+    pdl::wait_for_dependencies();
+    pdl::trigger_dependents();
+    std::uint32_t acc = 0;
+    for (std::int64_t i = threadIdx.x; i < words; i += 256) {
+        const uint4 v = __ldg(buffer + i);
+        acc ^= v.x ^ v.y ^ v.z ^ v.w;
+    }
+    if (acc == 0x9E3779B9U) { sink[0] = 1; } // keeps the loads; never true in practice (a race-free write anyway)
+}
+
+void launch_test_plant_reads(const void* buffer, std::int64_t bytes, int* sink, cudaStream_t stream) {
+    int device = 0, sms = 1;
+    cudaGetDevice(&device);
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
+    launch("test plant reads", dim3(static_cast<unsigned>(2 * sms)), dim3(256), stream, test_plant_reads_kernel,
+           static_cast<const uint4*>(buffer), bytes / 16, sink);
+}
+
+/// Test-only PDL writer (pdl-chain regression): waits for its predecessor (the previous MoE call may still read
+/// `dst`), lets its dependents launch at once (as the engine's kernels do), then copies `words` 16-byte words.
+/// `hostile` (negative control): 2 CTAs per SM; after the trigger -- the dependent's CTAs are being launched -- every
+/// CTA first reads ALL of the old `dst` through ld.global.nc, planting old lines in the non-coherent cache of every
+/// SM the dependent may run on, and only then writes its slice.
+__global__ __launch_bounds__(256) void test_copy_rows_kernel(const uint4* source, uint4* destination, std::int64_t words,
+                                                             int hostile, int* sink) {
+    pdl::wait_for_dependencies();
+    pdl::trigger_dependents();
+    if (hostile != 0) {
+        std::uint32_t acc = 0;
+        for (std::int64_t i = threadIdx.x; i < words; i += 256) {
+            const uint4 v = __ldg(destination + i);
+            acc ^= v.x ^ v.y ^ v.z ^ v.w;
+        }
+        if (acc == 0x9E3779B9U) { sink[0] = 1; }
+        __syncthreads();
+    }
+    for (std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * 256 + threadIdx.x; i < words;
+         i += static_cast<std::int64_t>(gridDim.x) * 256) {
+        destination[i] = __ldcg(source + i);
+    }
+}
+
+void launch_test_copy_rows(const void* source, void* destination, std::int64_t bytes, int hostile, int* sink,
+                           cudaStream_t stream) {
+    const std::int64_t words = bytes / 16;
+    int blocks               = static_cast<int>(std::min<std::int64_t>((words + 255) / 256, 1024));
+    if (hostile != 0) {
+        int device = 0, sms = 1;
+        cudaGetDevice(&device);
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
+        blocks = 2 * sms;
+    }
+    launch("test copy rows", dim3(static_cast<unsigned>(blocks)), dim3(256), stream, test_copy_rows_kernel,
+           static_cast<const uint4*>(source), static_cast<uint4*>(destination), words, hostile, sink);
+}
+
+void set_read_only_control(int mode) { row_load_mode_host() = mode; }
 
 void launch_bench_predecessor(std::int32_t nanoseconds, cudaStream_t stream) {
     launch("bench predecessor", dim3(1), dim3(32), stream, bench_predecessor_kernel, nanoseconds);
