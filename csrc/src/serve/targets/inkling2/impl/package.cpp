@@ -153,6 +153,7 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
     plan.bindings.geometry = detail::visit_geometry(binder.reader());
     plan.bindings.features = family::startup_features(options);
     plan.materialization   = binder.finish();
+    plan.bindings.host_bank = family::collect_host_bank(binder, plan.materialization);
     return LoadPlan(std::make_unique<LoadPlan::Impl>(weights_profile, std::move(plan)));
 }
 
