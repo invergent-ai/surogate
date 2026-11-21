@@ -14,7 +14,10 @@
 #include "ops/linear/bf16/bf16_cublaslt.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -232,6 +235,51 @@ PlaneView plane_view(const Round& rd, int visit) {
     return out;
 }
 
+/// SUROGATE_SERVE_INKLING_DUMP=<dir> (parity work only; synchronises the stream): the first eager forward of the
+/// process writes, per visit, its attention inputs, qkvr, gated attention, attn_out, mlp_in, moe_out and the
+/// partial it wrote, as `<dir>/v<visit>_<name>.bin` = header {u32 'INK1', u32 dtype (0 bf16, 1 fp32), i32 rows,
+/// i32 columns, i32 planes} + the values, column-major [rows, columns, planes] (lane a's `record_visits`, T7).
+struct Dump {
+    const char* dir = nullptr;
+    bool active     = false;
+};
+
+Dump& dump_state() {
+    static Dump d = [] {
+        Dump out;
+        out.dir = std::getenv("SUROGATE_SERVE_INKLING_DUMP");
+        return out;
+    }();
+    return d;
+}
+
+void dump(const char* name, int visit, const void* data, DType dtype, std::int64_t column_stride, int rows,
+          int columns, int planes, cudaStream_t s) {
+    Dump& d = dump_state();
+    if (!d.active) { return; }
+    cudaStreamCaptureStatus capturing = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(s, &capturing));
+    if (capturing != cudaStreamCaptureStatusNone) { return; }
+    const std::size_t element = dtype == DType::FP32 ? 4 : 2;
+    std::vector<std::byte> host(static_cast<std::size_t>(rows) * columns * planes * element);
+    CUDA_CHECK(cudaStreamSynchronize(s));
+    for (int p = 0; p < planes; ++p) {
+        for (int c = 0; c < columns; ++c) {
+            const auto* src = static_cast<const std::byte*>(data) +
+                              (static_cast<std::int64_t>(p) * columns * column_stride + static_cast<std::int64_t>(c) * column_stride) * element;
+            CUDA_CHECK(cudaMemcpy(host.data() + (static_cast<std::size_t>(p) * columns + c) * rows * element, src,
+                                  static_cast<std::size_t>(rows) * element, cudaMemcpyDeviceToHost));
+        }
+    }
+    const std::string path = std::string(d.dir) + "/v" + std::to_string(visit) + "_" + name + ".bin";
+    if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
+        const std::int32_t header[5] = {0x314b4e49, dtype == DType::FP32 ? 1 : 0, rows, columns, planes};
+        std::fwrite(header, sizeof(header), 1, f);
+        std::fwrite(host.data(), 1, host.size(), f);
+        std::fclose(f);
+    }
+}
+
 naive::AttentionLayer attention_layer(const load::InklingLayerWeights& L) {
     naive::AttentionLayer out;
     out.global   = L.global;
@@ -283,6 +331,7 @@ void run_visit(Round& rd, int v) {
     const int Q    = (vi.global || vi.looped) ? 3 : 1;
     Tensor attn_in = rd.work.alloc(DType::BF16, {D, T, Q});
     attention_inputs(rd, v, vi, L, attn_in);
+    dump("attn_in", v, attn_in.data, DType::BF16, D, D, T, Q, s);
     // 2. projections: one GEMM over the fused rows, or three over their row ranges (q-side / K / V)
     Tensor qkvr = rd.work.alloc(DType::BF16, {C::qkvr_rows, T});
     const auto in = [&](int stream) { return bf16_ptr(attn_in) + static_cast<std::int64_t>(stream) * T * D; };
@@ -360,6 +409,8 @@ void run_visit(Round& rd, int v) {
             ops::inkling_conv_copy_slot(state, G::kStreamK, 2048, seg->state_slot, seg->capture_slot, s);
         }
     }
+    dump("qkvr", v, qkvr.data, DType::BF16, C::qkvr_rows, C::qkvr_rows, T, 1, s);
+    dump("gated", v, gated.data, DType::BF16, C::attn_width, C::attn_width, T, 1, s);
     // 4. wo_ud
     Tensor attn_partial = rd.work.alloc(DType::BF16, {D, T});
     gemm_bf16(L.output, 0, D, gated.data, T, attn_partial.data, D, s);
@@ -377,9 +428,11 @@ void run_visit(Round& rd, int v) {
             ops::inkling_conv_copy_slot(state, G::kStreamAttn, D, seg->state_slot, seg->capture_slot, s);
         }
     }
+    dump("attn_out", v, attn_out.data, DType::BF16, D, D, T, 1, s);
     // 6. MLP input
     Tensor mlp_in = rd.work.alloc(DType::BF16, {D, T, 1});
     mlp_input(rd, vi, L, attn_out, mlp_in);
+    dump("mlp_in", v, mlp_in.data, DType::BF16, D, D, T, 1, s);
     // 7. MoE (NAIVE), routed experts captured per VISIT
     Tensor moe_out = rd.work.alloc(DType::BF16, {D, T});
     naive::MoeCall moe;
@@ -391,6 +444,7 @@ void run_visit(Round& rd, int v) {
         moe.capture = rd.r.routing.ids + static_cast<std::int64_t>(v) * rd.r.routing.columns * rd.r.routing.top_k;
     }
     naive::moe(moe, rd.work, s);
+    dump("moe_out", v, moe_out.data, DType::BF16, D, D, T, 1, s);
     // 8. MLP-output conv: (residual + attn_out) + conv(moe_out) into the next partial (in place when not first)
     for (const Group& g : rd.groups) {
         const family::VisitSegment* seg = g.segment;
@@ -406,6 +460,7 @@ void run_visit(Round& rd, int v) {
             ops::inkling_conv_copy_slot(state, G::kStreamMlp, D, seg->state_slot, seg->capture_slot, s);
         }
     }
+    dump("partial", v, bf16_ptr(rd.r.x) + static_cast<std::int64_t>(vi.next_partial) * D, DType::BF16, kColumn, D, T, 1, s);
 }
 
 const InklingModel& model_of(const RuntimeModelView& model) {
@@ -479,7 +534,16 @@ void Variant::run_visits(const ModelView& model, family::VisitRound& r) {
                                              r.records.batch_max};
         ops::inkling_conv_backup(rd.pool, g.slots, g.batch, rd.records, rd.s);
     }
+    Dump& d = dump_state();
+    static bool dumped = false;
+    cudaStreamCaptureStatus capturing = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(rd.s, &capturing));
+    d.active = d.dir != nullptr && !dumped && capturing == cudaStreamCaptureStatusNone;
     for (int v = r.first_visit; v < r.last_visit; ++v) { run_visit(rd, v); }
+    if (d.active) {
+        dumped   = true;
+        d.active = false;
+    }
 }
 
 std::size_t Variant::visit_workspace_capacity_bytes(const family::TextGeometry&, family::TextPhase, std::int32_t batch_size,
