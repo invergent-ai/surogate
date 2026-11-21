@@ -104,7 +104,7 @@ class TokenChunked(torch.autograd.Function):
                 x = ctx.vals[i]
             toks.append(x)
         ctx.host = None
-        need = ctx.needs_input_grad[7:]
+        need = ctx.needs_input_grad[8:]
         T = toks[0].shape[tdi[0]]
 
         def chunk_of(i, c0, n):
