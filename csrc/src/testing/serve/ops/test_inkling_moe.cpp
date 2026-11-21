@@ -15,7 +15,10 @@
 // Golden-vector mode (lane a's vectors/) is added once their format is published (M3).
 
 #include "api/ops/inkling_moe.h"
+#include "api/ops/lora_store.h"
 #include "core/arena.h"
+#include "core/engine_context.h"
+#include "family/impl/lora_bind_inkling.h"
 #include "ops/op_tester.h"
 
 #include <nlohmann/json.hpp>
@@ -401,10 +404,11 @@ struct Adapter {
     DeviceBuffer d_a[3], d_b[3], d_table;
 };
 
+void upload_adapter(Adapter& ad);
+
 void build_adapter(Adapter& ad, std::uint64_t seed, bool zero_b) {
     Rng rng(seed);
     const int ks[3] = {H, H, I}, ns[3] = {I, I, H};
-    std::vector<ops::LoraBank> table(2 + 3 * E);
     for (int p = 0; p < 3; ++p) {
         ad.a[p].resize(static_cast<std::size_t>(E) * ad.slots * ad.rank * ks[p]);
         ad.b[p].resize(static_cast<std::size_t>(E) * ad.slots * ns[p] * ad.rank);
@@ -412,6 +416,15 @@ void build_adapter(Adapter& ad, std::uint64_t seed, bool zero_b) {
         for (auto& v : ad.b[p]) { v = zero_b ? 0.0F : rng.uniform(-0.02F, 0.02F); }
         round_to_bf16(ad.a[p]);
         round_to_bf16(ad.b[p]);
+    }
+    upload_adapter(ad);
+}
+
+/// Device copies of a host adapter's banks and a device table in the `bind_lora_moe` order.
+void upload_adapter(Adapter& ad) {
+    const int ks[3] = {H, H, I}, ns[3] = {I, I, H};
+    std::vector<ops::LoraBank> table(2 + 3 * E);
+    for (int p = 0; p < 3; ++p) {
         ad.d_a[p] = to_device(to_bf16_bits(ad.a[p]));
         ad.d_b[p] = to_device(to_bf16_bits(ad.b[p]));
         for (int e = 0; e < E; ++e) {
@@ -609,6 +622,396 @@ int test_route(const Layer& l, const std::vector<float>& x, int tokens) {
     return report("inkling_route vs host", bad_logits + bad_ids + bad_weights);
 }
 
+/// `inkling_decode_expert_units` (the trainer's dX operand) vs the host decode, bit for bit, on experts at
+/// both ends and in the middle of the bank, both projections; the factor vs amax / den.
+int test_decode_units(const Layer& l, const char* label) {
+    const bool nv = l.format == ops::InklingExpertFormat::Nvfp4;
+    const ops::InklingExpertBank* banks[2] = {&l.view.w13, &l.view.w2};
+    const int ks[2] = {H, I};
+    const int ranges[3][2] = {{0, 2}, {61, 3}, {126, 2}};
+    int bad_unit = 0, bad_factor = 0;
+    for (int p = 0; p < 2; ++p) {
+        for (const auto& range : ranges) {
+            const int first = range[0], count = range[1], k = ks[p];
+            DeviceBuffer du(static_cast<std::size_t>(count) * N * k * 2), df(static_cast<std::size_t>(count) * 4);
+            Tensor tu(du.p, DType::BF16, {k, count * N}), tf(df.p, DType::FP32, {count});
+            ops::inkling_decode_expert_units(*banks[p], l.format, k, first, count, tu, tf, nullptr);
+            cuda_synchronize();
+            const auto unit   = from_device<std::uint16_t>(du, static_cast<std::size_t>(count) * N * k);
+            const auto factor = from_device<float>(df, count);
+            for (int i = 0; i < count; ++i) {
+                std::vector<float> w;
+                decode_expert(l, p, first + i, w);
+                for (std::size_t j = 0; j < w.size(); ++j) {
+                    // the host decode is exact in fp32 and in bf16: compare bits (incl. the sign of zero)
+                    bad_unit += unit[static_cast<std::size_t>(i) * N * k + j] != f32_to_bf16(w[j]) ||
+                                bf16_to_f32(f32_to_bf16(w[j])) != w[j];
+                }
+                const float expect = nv ? l.amax[p][first + i] / l.den : 1.0F;
+                bad_factor += bits_of(factor[i]) != bits_of(expect);
+            }
+        }
+    }
+    std::printf("  decode units (%s): unit bf16 off %d, factor off %d\n", label, bad_unit, bad_factor);
+    return report((std::string("decode units ") + label + ": bit-exact vs host (unit, amax/den)").c_str(),
+                  bad_unit + bad_factor);
+}
+
+/// Fused-gate_up LoRA in PEFT form for every expert: A [E][rank][2304], B [E][2304 interleaved][rank],
+/// down A [E][rank][1152], B [E][2304][rank] (bf16 values); or split gate / up (B [E][1152][rank] each).
+struct PeftAdapter {
+    int rank = 16;
+    float scale = 2.0F;
+    bool fused = true;
+    std::vector<float> a13, b13, a_up, b_up, a2, b2; // a_up / b_up: split form only (a13 / b13 = gate)
+};
+
+PeftAdapter make_peft(std::uint64_t seed, int rank, float scale, bool fused) {
+    Rng rng(seed);
+    PeftAdapter p;
+    p.rank = rank, p.scale = scale, p.fused = fused;
+    const std::size_t e = E, r = rank;
+    const auto fill = [&](std::vector<float>& v, std::size_t n) {
+        v.resize(n);
+        for (auto& x : v) { x = rng.uniform(-0.03F, 0.03F); }
+        round_to_bf16(v);
+    };
+    fill(p.a13, e * r * H);
+    fill(p.b13, e * (fused ? 2 * I : I) * r);
+    if (!fused) { fill(p.a_up, e * r * H); fill(p.b_up, e * I * r); }
+    fill(p.a2, e * r * I);
+    fill(p.b2, e * H * r);
+    return p;
+}
+
+std::vector<std::uint16_t> bits_slice(const std::vector<float>& v, std::size_t begin, std::size_t n) {
+    std::vector<std::uint16_t> out(n);
+    for (std::size_t i = 0; i < n; ++i) { out[i] = f32_to_bf16(v[begin + i]); }
+    return out;
+}
+
+/// Loads `p` into `slot` of the store by module name, as the engine's adapter loader does.
+void load_peft(ops::LoraStore& store, const PeftAdapter& p, int slot) {
+    const std::size_t r = p.rank;
+    for (int e = 0; e < E; ++e) {
+        const std::string prefix = "mlp.experts." + std::to_string(e) + ".";
+        if (p.fused) {
+            store.set_module_slot(0, prefix + "gate_up_proj", slot, bits_slice(p.a13, e * r * H, r * H),
+                                  bits_slice(p.b13, e * 2 * I * r, 2 * I * r), p.rank, H, 2 * I, p.scale);
+        } else {
+            store.set_module_slot(0, prefix + "gate_proj", slot, bits_slice(p.a13, e * r * H, r * H),
+                                  bits_slice(p.b13, e * I * r, I * r), p.rank, H, I, p.scale);
+            store.set_module_slot(0, prefix + "up_proj", slot, bits_slice(p.a_up, e * r * H, r * H),
+                                  bits_slice(p.b_up, e * I * r, I * r), p.rank, H, I, p.scale);
+        }
+        store.set_module_slot(0, prefix + "down_proj", slot, bits_slice(p.a2, e * r * I, r * I),
+                              bits_slice(p.b2, e * H * r, H * r), p.rank, I, H, p.scale);
+    }
+}
+
+/// What the store must hold for `p` in `slot` of a host Adapter (bank layout, padded to ad.rank, alpha/r
+/// folded into A with one bf16 rounding, gate = even / up = odd rows of a fused B).
+void expect_peft(Adapter& ad, const PeftAdapter& p, int slot) {
+    const int ks[3] = {H, H, I}, ns[3] = {I, I, H};
+    for (int port = 0; port < 3; ++port) {
+        for (int e = 0; e < E; ++e) {
+            const std::vector<float>& a = port == 2 ? p.a2 : (port == 1 && !p.fused ? p.a_up : p.a13);
+            const int k = ks[port], n = ns[port];
+            float* da = ad.a[port].data() + ((static_cast<std::size_t>(e) * ad.slots + slot) * ad.rank) * k;
+            float* db = ad.b[port].data() + ((static_cast<std::size_t>(e) * ad.slots + slot) * n) * ad.rank;
+            std::fill(da, da + static_cast<std::size_t>(ad.rank) * k, 0.0F);
+            std::fill(db, db + static_cast<std::size_t>(n) * ad.rank, 0.0F);
+            for (int r = 0; r < p.rank; ++r) {
+                for (int i = 0; i < k; ++i) {
+                    da[static_cast<std::size_t>(r) * k + i] = bf(a[(static_cast<std::size_t>(e) * p.rank + r) * k + i] * p.scale);
+                }
+            }
+            for (int row = 0; row < n; ++row) {
+                float const* source;
+                if (port == 2) {
+                    source = p.b2.data() + (static_cast<std::size_t>(e) * H + row) * p.rank;
+                } else if (p.fused) {
+                    source = p.b13.data() + (static_cast<std::size_t>(e) * 2 * I + 2 * row + port) * p.rank;
+                } else {
+                    source = (port == 0 ? p.b13 : p.b_up).data() + (static_cast<std::size_t>(e) * I + row) * p.rank;
+                }
+                std::copy(source, source + p.rank, db + static_cast<std::size_t>(row) * ad.rank);
+            }
+        }
+    }
+}
+
+/// Expert LoRA through the engine's slot store (family/impl/lora_bind_inkling.h): binding, bank bytes,
+/// zero / base rows bit-exact, store table == a hand-built table bit for bit, vs the host pipeline, uniform
+/// slot, width, hot swap (staged commit) under a captured graph, unload, the round helper, refusals.
+int test_lora_store(const Layer& l, const std::vector<float>& x, const DeviceRun& base, const std::vector<int>& ids,
+                    const std::vector<float>& gammas, const std::vector<std::vector<float>>& w13,
+                    const std::vector<std::vector<float>>& w2) {
+    constexpr int kT = 24, kSlots = 3, kRank = 16;
+    int failures = 0;
+    struct ScopedContext {
+        ops::EngineOpsContext context;
+        ScopedContext() { ops::bind_ops_context(&context); }
+        ~ScopedContext() { ops::lora_clear_round(); ops::bind_ops_context(nullptr); }
+    } scoped;
+    ops::LoraStore& store = ops::lora_store_for_current_device();
+    store.configure(kSlots, kRank, 300);
+    family::bind_lora_inkling_moe(store, 0, l.view);
+    store.ensure_banks();
+    store.set_active(true);
+    const auto* table = store.bank_table(l.view.router);
+    failures += report("LoRA store: bank table registered under the router key", table != nullptr ? 0 : 1);
+    if (table == nullptr) { return failures; }
+
+    std::vector<int> slots(kT);
+    for (int t = 0; t < kT; ++t) { slots[t] = t % 4 - 1; } // base, empty slot 0, slot 1, slot 2
+    DeviceBuffer dslots = to_device(slots);
+    const ops::InklingMoeAdapters store_round{table, static_cast<const std::int32_t*>(dslots.p), nullptr, kRank};
+    const auto rows_equal = [&](const DeviceRun& a, const DeviceRun& b, int t) {
+        return std::equal(a.out.begin() + static_cast<std::size_t>(t) * H, a.out.begin() + static_cast<std::size_t>(t + 1) * H,
+                          b.out.begin() + static_cast<std::size_t>(t) * H);
+    };
+
+    // 1. Fresh banks are zero: every token (any slot) == base, bit for bit.
+    const DeviceRun empty = run_moe(l, x, kT, nullptr, &store_round);
+    failures += report("LoRA store: empty slots == base (bit-exact)", empty.out == base.out ? 0 : 1);
+
+    // 2. Load P (fused gate_up_proj r16 alpha 32 = the kit's recipe) into slot 1 and Q (split gate / up, r8,
+    //    scale 1.5: the fold rounds) into slot 2, by module name.
+    const PeftAdapter P = make_peft(41, 16, 2.0F, true), Q = make_peft(43, 8, 1.5F, false);
+    load_peft(store, P, 1);
+    load_peft(store, Q, 2);
+    Adapter expected;
+    expected.rank = kRank, expected.slots = kSlots;
+    const int ks[3] = {H, H, I}, ns[3] = {I, I, H};
+    for (int port = 0; port < 3; ++port) {
+        expected.a[port].assign(static_cast<std::size_t>(E) * kSlots * kRank * ks[port], 0.0F);
+        expected.b[port].assign(static_cast<std::size_t>(E) * kSlots * ns[port] * kRank, 0.0F);
+    }
+    expect_peft(expected, P, 1);
+    expect_peft(expected, Q, 2);
+    upload_adapter(expected);
+
+    // 2a. The store's device banks hold exactly the expected bytes (layout, padding, fold, row map).
+    {
+        std::vector<ops::LoraBank> views(2 + 3 * E);
+        cuda_check(cudaMemcpy(views.data(), table, views.size() * sizeof(ops::LoraBank), cudaMemcpyDeviceToHost), "table");
+        int bad_bytes = 0, bad_shape = 0;
+        bad_shape += views[0].a != nullptr || views[1].a != nullptr;
+        for (int e = 0; e < E; ++e) {
+            for (int port = 0; port < 3; ++port) {
+                const ops::LoraBank& bank = views[2 + 3 * e + port];
+                bad_shape += bank.rank != kRank || bank.k != ks[port] || bank.n != ns[port] ||
+                             bank.a_stride != static_cast<std::int64_t>(kRank) * ks[port] ||
+                             bank.b_stride != static_cast<std::int64_t>(ns[port]) * kRank;
+                std::vector<std::uint16_t> a(static_cast<std::size_t>(kSlots) * bank.a_stride),
+                    b(static_cast<std::size_t>(kSlots) * bank.b_stride);
+                cuda_check(cudaMemcpy(a.data(), bank.a, a.size() * 2, cudaMemcpyDeviceToHost), "bank a");
+                cuda_check(cudaMemcpy(b.data(), bank.b, b.size() * 2, cudaMemcpyDeviceToHost), "bank b");
+                const std::size_t ea = static_cast<std::size_t>(e) * kSlots * bank.a_stride;
+                const std::size_t eb = static_cast<std::size_t>(e) * kSlots * bank.b_stride;
+                for (std::size_t i = 0; i < a.size(); ++i) { bad_bytes += a[i] != f32_to_bf16(expected.a[port][ea + i]); }
+                for (std::size_t i = 0; i < b.size(); ++i) { bad_bytes += b[i] != f32_to_bf16(expected.b[port][eb + i]); }
+            }
+        }
+        std::printf("  lora store: bank bytes off %d, bank shapes off %d\n", bad_bytes, bad_shape);
+        failures += report("LoRA store: device banks == expected bytes (fold, padding, interleaved rows)",
+                           bad_bytes + bad_shape);
+    }
+
+    // 2b. The op through the store's table == through a hand-built table of the same bytes; base and
+    //     empty-slot rows == base; adapted rows vs the host pipeline.
+    const DeviceRun loaded = run_moe(l, x, kT, nullptr, &store_round);
+    const ops::InklingMoeAdapters direct_round{static_cast<const ops::LoraBank*>(expected.d_table.p),
+                                               static_cast<const std::int32_t*>(dslots.p), nullptr, kRank};
+    const DeviceRun direct = run_moe(l, x, kT, nullptr, &direct_round);
+    failures += report("LoRA store: store table == hand-built table (bit-exact)", loaded.out == direct.out ? 0 : 1);
+    int base_bad = 0;
+    double worst_cos = 1.0, worst_rel = 0.0, worst_delta = 1.0;
+    for (int t = 0; t < kT; ++t) {
+        if (slots[t] <= 0) { base_bad += !rows_equal(loaded, base, t); continue; }
+        const std::size_t begin = static_cast<std::size_t>(t) * H;
+        const auto ref_base = host_moe_token(l, w13, w2, x.data() + begin, ids.data() + t * TOPK, gammas.data() + t * TOPK, nullptr, -1);
+        const auto ref = host_moe_token(l, w13, w2, x.data() + begin, ids.data() + t * TOPK, gammas.data() + t * TOPK,
+                                        &expected, slots[t]);
+        double fd = 0, fr = 0, fg = 0, fdiff = 0, dd = 0, na = 0, nb = 0;
+        for (int n = 0; n < H; ++n) {
+            const double g = bf16_to_f32(loaded.out[begin + n]);
+            const double dg = g - bf16_to_f32(base.out[begin + n]), dr = double(ref[n]) - ref_base[n];
+            fd += g * ref[n]; fr += double(ref[n]) * ref[n]; fg += g * g; fdiff += (g - ref[n]) * (g - ref[n]);
+            dd += dg * dr; na += dg * dg; nb += dr * dr;
+        }
+        worst_cos = std::min(worst_cos, fd / std::sqrt(fr * fg + 1e-300));
+        worst_rel = std::max(worst_rel, std::sqrt(fdiff / (fr + 1e-300)));
+        worst_delta = std::min(worst_delta, dd / std::sqrt(na * nb + 1e-300));
+    }
+    std::printf("  lora store: base / empty-slot rows changed %d; adapted vs host worst cos %.6f rel-L2 %.3e, delta cos %.5f\n",
+                base_bad, worst_cos, worst_rel, worst_delta);
+    failures += report("LoRA store: base and empty-slot rows bit-exact in an adapter round", base_bad);
+    failures += report("LoRA store: adapted rows vs host pipeline (cos >= 0.9999, rel-L2 <= 1e-2, delta cos >= 0.99)",
+                       (worst_cos >= 0.9999 && worst_rel <= 1e-2 && worst_delta >= 0.99) ? 0 : 1);
+
+    // 3. Uniform slot (a prefill chunk): == every token at that slot by token slots == the mixed round's rows.
+    {
+        store.write_uniform_slot(1, nullptr);
+        const ops::InklingMoeAdapters uniform{table, nullptr, store.uniform_cell(), kRank};
+        const DeviceRun by_cell = run_moe(l, x, kT, nullptr, &uniform);
+        DeviceBuffer ones = to_device(std::vector<int>(kT, 1));
+        const ops::InklingMoeAdapters all_one{table, static_cast<const std::int32_t*>(ones.p), nullptr, kRank};
+        const DeviceRun by_tokens = run_moe(l, x, kT, nullptr, &all_one);
+        int bad = by_cell.out == by_tokens.out ? 0 : 1;
+        for (int t = 0; t < kT; ++t) { bad += slots[t] == 1 && !rows_equal(by_cell, loaded, t); }
+        // width: an adapted token alone (T = 1, both slot forms) == its row in the round
+        for (int t : {2, 3, 10, 11}) {
+            std::vector<float> one(x.begin() + static_cast<std::size_t>(t) * H, x.begin() + static_cast<std::size_t>(t + 1) * H);
+            DeviceBuffer s1 = to_device(std::vector<int>{slots[t]});
+            const ops::InklingMoeAdapters a1{table, static_cast<const std::int32_t*>(s1.p), nullptr, kRank};
+            const DeviceRun single = run_moe(l, one, 1, nullptr, &a1);
+            bad += !std::equal(single.out.begin(), single.out.end(), loaded.out.begin() + static_cast<std::size_t>(t) * H);
+        }
+        store.write_uniform_slot(-1, nullptr);
+        failures += report("LoRA store: uniform slot == token slots == mixed rows; T=1 rows (bit-exact)", bad);
+    }
+
+    // 4. Hot swap under a captured graph: R replaces P in slot 1 by a staged in-place commit between replays.
+    {
+        cudaStream_t stream = nullptr;
+        cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
+        DeviceBuffer dx = to_device(to_bf16_bits(std::vector<float>(x.begin(), x.begin() + static_cast<std::size_t>(kT) * H)));
+        DeviceBuffer dout(static_cast<std::size_t>(kT) * H * 2);
+        DeviceArena arena(ops::inkling_moe_workspace_bytes(l.format, kT, true));
+        Tensor tx(dx.p, DType::BF16, {H, kT}), tout(dout.p, DType::BF16, {H, kT});
+        ops::InklingMoeOptions options;
+        options.adapters = &store_round;
+        ops::inkling_moe(tx, l.view, tout, arena, stream, options); // warm (attributes) outside the capture
+        arena.reset();
+        cuda_synchronize(stream);
+        cudaGraph_t graph = nullptr;
+        cudaGraphExec_t exec = nullptr;
+        cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "begin capture");
+        ops::inkling_moe(tx, l.view, tout, arena, stream, options);
+        arena.reset();
+        cuda_check(cudaStreamEndCapture(stream, &graph), "end capture");
+        cuda_check(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
+        const auto replay = [&]() {
+            cuda_check(cudaMemsetAsync(dout.p, 0xFF, dout.bytes, stream), "poison");
+            cuda_check(cudaGraphLaunch(exec, stream), "launch");
+            cuda_synchronize(stream);
+            DeviceRun run;
+            run.out = from_device<std::uint16_t>(dout, static_cast<std::size_t>(kT) * H);
+            return run;
+        };
+        const DeviceRun before = replay();
+        int bad = before.out == loaded.out ? 0 : 1;
+        // stage while "serving" (host only), commit at a round boundary
+        const PeftAdapter R = make_peft(47, 16, 2.0F, true);
+        std::vector<std::string> names;
+        std::vector<std::vector<std::uint16_t>> tensors;
+        names.reserve(2 * E);
+        tensors.reserve(4 * E);
+        std::vector<ops::LoraStore::StagedModule> modules;
+        for (int e = 0; e < E; ++e) {
+            const std::size_t r = R.rank;
+            names.push_back("mlp.experts." + std::to_string(e) + ".gate_up_proj");
+            tensors.push_back(bits_slice(R.a13, e * r * H, r * H));
+            tensors.push_back(bits_slice(R.b13, e * 2 * I * r, 2 * I * r));
+            names.push_back("mlp.experts." + std::to_string(e) + ".down_proj");
+            tensors.push_back(bits_slice(R.a2, e * r * I, r * I));
+            tensors.push_back(bits_slice(R.b2, e * H * r, H * r));
+        }
+        for (int e = 0; e < E; ++e) {
+            modules.push_back({0, &names[2 * e], &tensors[4 * e], &tensors[4 * e + 1], R.rank, H, 2 * I, R.scale});
+            modules.push_back({0, &names[2 * e + 1], &tensors[4 * e + 2], &tensors[4 * e + 3], R.rank, I, H, R.scale});
+        }
+        const auto staged = store.stage_modules(1, modules);
+        const DeviceRun still = replay(); // staging alone changes nothing
+        bad += still.out == before.out ? 0 : 1;
+        store.commit_staged(*staged);
+        const DeviceRun after = replay();
+        expect_peft(expected, R, 1);
+        upload_adapter(expected);
+        const ops::InklingMoeAdapters direct_swapped{static_cast<const ops::LoraBank*>(expected.d_table.p),
+                                                     static_cast<const std::int32_t*>(dslots.p), nullptr, kRank};
+        const DeviceRun direct_after = run_moe(l, x, kT, nullptr, &direct_swapped);
+        int base_changed = 0, kept_changed = 0, swapped_same = 0;
+        for (int t = 0; t < kT; ++t) {
+            if (slots[t] <= 0) { base_changed += !rows_equal(after, base, t); }
+            if (slots[t] == 2) { kept_changed += !rows_equal(after, before, t); }
+            if (slots[t] == 1) { swapped_same += rows_equal(after, before, t); }
+        }
+        bad += after.out == direct_after.out ? 0 : 1;
+        std::printf("  lora hot swap (graph): base rows changed %d, slot-2 rows changed %d, slot-1 rows unchanged %d, "
+                    "replay == eager with the new bytes %s\n", base_changed, kept_changed, swapped_same,
+                    after.out == direct_after.out ? "yes" : "NO");
+        failures += report("LoRA store: hot swap between graph replays (base / other slots bit-exact, new adapter live)",
+                           bad + base_changed + kept_changed + swapped_same);
+        // unload: slot 1's rows return to base (clear_slot's memsets run on the legacy stream; the graph's
+        // stream is non-blocking -- the engine drains before an unload, the test synchronises)
+        store.clear_slot(1);
+        cuda_check(cudaDeviceSynchronize(), "clear");
+        const DeviceRun cleared = replay();
+        int clear_bad = 0;
+        for (int t = 0; t < kT; ++t) {
+            if (slots[t] <= 1) { clear_bad += !rows_equal(cleared, base, t); }
+            if (slots[t] == 2) { clear_bad += !rows_equal(cleared, before, t); }
+        }
+        failures += report("LoRA store: clear_slot -> the slot's rows == base (bit-exact)", clear_bad);
+        cudaGraphExecDestroy(exec);
+        cudaGraphDestroy(graph);
+        cudaStreamDestroy(stream);
+    }
+
+    // 5. The round helper the target calls per visit.
+    {
+        int bad = 0;
+        ops::InklingMoeAdapters storage;
+        bad += family::inkling_moe_round_adapters(l.view, storage) != nullptr; // no round published
+        Tensor slot_tensor(dslots.p, DType::I32, {kT});
+        ops::LoraRound round;
+        round.slots        = &slot_tensor;
+        round.scratch      = store.scratch(kT);
+        round.uniform_cell = store.uniform_cell();
+        ops::lora_set_round(round);
+        const auto* got = family::inkling_moe_round_adapters(l.view, storage, 5);
+        bad += got == nullptr || got->table != table || got->max_rank != kRank || got->uniform_slot != nullptr ||
+               got->token_slot != static_cast<const std::int32_t*>(dslots.p) + 5;
+        {
+            ops::ScopedLoraBaseRound base_round(true);
+            bad += family::inkling_moe_round_adapters(l.view, storage) != nullptr;
+        }
+        round.slots   = nullptr;
+        round.uniform = true;
+        ops::lora_set_round(round);
+        got = family::inkling_moe_round_adapters(l.view, storage);
+        bad += got == nullptr || got->uniform_slot != store.uniform_cell() || got->token_slot != nullptr;
+        ops::InklingMoeWeights other = l.view;
+        other.router = dslots.p; // a layer without a table
+        bad += family::inkling_moe_round_adapters(other, storage) != nullptr;
+        ops::lora_clear_round();
+        failures += report("LoRA store: round helper (token / uniform / base round / no table)", bad);
+    }
+
+    // 6. Refusals.
+    {
+        int bad = 0;
+        const auto throws = [](auto&& f) {
+            try { f(); } catch (const std::exception&) { return true; }
+            return false;
+        };
+        bad += !throws([&] { store.set_module_slot(0, "mlp.gate", 0, std::vector<std::uint16_t>(16 * H), std::vector<std::uint16_t>(E * 16), 16, H, E, 2.0F); });
+        bad += !throws([&] {
+            store.set_module_slot(0, "mlp.experts.3.down_proj", 0, std::vector<std::uint16_t>(16 * I), std::vector<std::uint16_t>(H * 16),
+                                  16, I, H, 2.0F, std::vector<float>(H, 1.0F));
+        });
+        bad += !throws([&] { store.set_module_slot(0, "mlp.experts.3.gate_up_proj", 0, std::vector<std::uint16_t>(16 * H), std::vector<std::uint16_t>(I * 16), 16, H, I, 2.0F); });
+        ops::LoraStore wide;
+        wide.configure(1, 128, 8);
+        bad += !throws([&] { family::bind_lora_inkling_moe(wide, 0, l.view); });
+        failures += report("LoRA store: refusals (router, DoRA magnitude, wrong gate_up shape, rank > 64)", bad);
+    }
+    return failures;
+}
+
 int test_moe(ops::InklingExpertFormat format) {
     const bool nv = format == ops::InklingExpertFormat::Nvfp4;
     std::printf("[%s layer]\n", nv ? "NVFP4" : "MXFP8");
@@ -740,6 +1143,8 @@ int test_moe(ops::InklingExpertFormat format) {
     // The delta is the difference of two bf16-rounded outputs: an indexing check (a wrong expert / slot / port gives
     // cos ~ 0), not a precision one.
     failures += report("LoRA: delta direction vs host (cos >= 0.99)", worst_delta_cos >= 0.99 ? 0 : 1);
+    failures += test_lora_store(l, x, base, ids, gammas, w13, w2);
+    failures += test_decode_units(l, nv ? "NVFP4 synthetic" : "MXFP8 synthetic");
     return failures;
 }
 
@@ -1026,6 +1431,8 @@ int run_capture(const char* path, const char* dump_dir) {
         failures += report("capture: down GEMM rows bit-exact", bad_down);
         failures += report("capture: combined output bit-exact", bad_out);
     }
+    // The trainer's dX operand decoded from the REAL bank (checkpoint scales / amax) vs the host decode.
+    failures += test_decode_units(l, nv ? "NVFP4 real layer" : "MXFP8 real layer");
     return failures;
 }
 

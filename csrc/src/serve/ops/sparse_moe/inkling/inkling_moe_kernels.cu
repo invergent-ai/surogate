@@ -719,6 +719,92 @@ __global__ __launch_bounds__(256) void lora_shrink_kernel(const __nv_bfloat16* _
     }
 }
 
+// ---- Unit-weight decode for the trainer's dX (api/ops/inkling_moe.h `inkling_decode_expert_units`) ----------
+/// e2m1 magnitude code m (3 bits) -> fp32 value: 0, 0.5, 1, 1.5, 2, 3, 4, 6 (exact).
+__device__ __forceinline__ float e2m1_value(std::uint32_t code) {
+    const std::uint32_t m = code & 7U, e = m >> 1, mant = m & 1U;
+    const std::uint32_t magnitude = e == 0U ? (mant != 0U ? 0x3F000000U : 0U) : (((e + 126U) << 23) | (mant << 22));
+    return __uint_as_float(magnitude | ((code & 8U) << 28));
+}
+
+/// One thread per 16-column block of one stacked weight row: its 8 code bytes (low nibble = even
+/// column) and its e4m3 scale in `blockscale-k16-m128x4-v1` (128-row x 4-group tiles of 512 bytes).
+/// unit = bf16(e2m1 * scale): the product has <= 6 significant bits, so both roundings are exact.
+__global__ __launch_bounds__(256) void decode_nvfp4_units_kernel(const std::uint8_t* __restrict__ codes,
+                                                                 const std::uint8_t* __restrict__ scales,
+                                                                 std::int32_t k, std::int64_t first_row,
+                                                                 std::int64_t rows, __nv_bfloat16* __restrict__ unit) {
+    pdl::wait_for_dependencies();
+    pdl::trigger_dependents();
+    const std::int64_t groups = k / 16;
+    const std::int64_t task   = static_cast<std::int64_t>(blockIdx.x) * 256 + threadIdx.x;
+    if (task >= rows * groups) { return; }
+    const std::int64_t local = task / groups;
+    const std::int64_t group = task - local * groups;
+    const std::int64_t row   = first_row + local;
+    const std::int64_t at    = ((row / 128) * (groups / 4) + group / 4) * 512 + (row % 32) * 16 +
+                            ((row % 128) / 32) * 4 + group % 4;
+    const float scale        = e4m3_to_f32(scales[at]);
+    const uint2 packed       = *reinterpret_cast<const uint2*>(codes + row * (k / 2) + group * 8);
+    const std::uint32_t words[2] = {packed.x, packed.y};
+    std::uint32_t out[8];
+#pragma unroll
+    for (int w = 0; w < 2; ++w) {
+#pragma unroll
+        for (int b = 0; b < 4; ++b) {
+            const std::uint32_t byte = (words[w] >> (8 * b)) & 0xFFU;
+            const __nv_bfloat162 pair = __floats2bfloat162_rn(__fmul_rn(e2m1_value(byte & 15U), scale),
+                                                              __fmul_rn(e2m1_value(byte >> 4), scale));
+            out[4 * w + b] = *reinterpret_cast<const std::uint32_t*>(&pair);
+        }
+    }
+    auto* destination = reinterpret_cast<uint4*>(unit + local * k + group * 16);
+    destination[0]    = make_uint4(out[0], out[1], out[2], out[3]);
+    destination[1]    = make_uint4(out[4], out[5], out[6], out[7]);
+}
+
+/// One thread per 16 columns of one stacked MXFP8 weight row: bf16(e4m3 * 2^(e - 127)) exactly as the
+/// GEMM's in-register dequantisation (`mxfp8_dequant_pair`).
+__global__ __launch_bounds__(256) void decode_mxfp8_units_kernel(const std::uint8_t* __restrict__ codes,
+                                                                 const std::uint8_t* __restrict__ exponents,
+                                                                 std::int32_t k, std::int64_t first_row,
+                                                                 std::int64_t rows, __nv_bfloat16* __restrict__ unit) {
+    pdl::wait_for_dependencies();
+    pdl::trigger_dependents();
+    const std::int64_t chunks = k / 16;
+    const std::int64_t task   = static_cast<std::int64_t>(blockIdx.x) * 256 + threadIdx.x;
+    if (task >= rows * chunks) { return; }
+    const std::int64_t local = task / chunks;
+    const std::int64_t chunk = task - local * chunks;
+    const std::int64_t row   = first_row + local;
+    const float scale        = e8m0_to_f32(exponents[row * (k / 32) + chunk / 2]);
+    const uint4 packed       = *reinterpret_cast<const uint4*>(codes + row * k + chunk * 16);
+    const std::uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
+    std::uint32_t out[8];
+#pragma unroll
+    for (int w = 0; w < 4; ++w) {
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const __nv_bfloat162 pair = mxfp8_dequant_pair(static_cast<std::uint16_t>(words[w] >> (16 * h)), scale);
+            out[2 * w + h] = *reinterpret_cast<const std::uint32_t*>(&pair);
+        }
+    }
+    auto* destination = reinterpret_cast<uint4*>(unit + local * k + chunk * 16);
+    destination[0]    = make_uint4(out[0], out[1], out[2], out[3]);
+    destination[1]    = make_uint4(out[4], out[5], out[6], out[7]);
+}
+
+/// factor[i] = amax[first + i] / den (NVFP4, div_rn: `inkling_ref.nvfp4_global`) or 1 (MXFP8).
+__global__ __launch_bounds__(128) void expert_factor_kernel(const float* __restrict__ amax,
+                                                            const float* __restrict__ den, std::int32_t first,
+                                                            std::int32_t count, float* __restrict__ factor) {
+    pdl::wait_for_dependencies();
+    pdl::trigger_dependents();
+    const int i = static_cast<int>(blockIdx.x) * 128 + static_cast<int>(threadIdx.x);
+    if (i >= count) { return; }
+    factor[i] = amax != nullptr ? __fdiv_rn(amax[first + i], *den) : 1.0F;
+}
+
 template <class... KernelArgs, class... CallArgs>
 void launch(const char* what, dim3 grid, dim3 block, cudaStream_t stream,
             void (*kernel)(KernelArgs...), CallArgs&&... args) {
@@ -840,6 +926,26 @@ void launch_lora_shrink(const __nv_bfloat16* source, std::int32_t source_k, bool
     const std::int64_t tasks = static_cast<std::int64_t>(live.tokens) * kTopK * (gate_up ? 2 : 1);
     launch("lora shrink", dim3(static_cast<unsigned>((tasks + 7) / 8)), dim3(256), stream,
            lora_shrink_kernel, source, source_k, gate_up, ids, live, lora);
+}
+
+void launch_decode_expert_units(const InklingExpertBank& bank, bool nvfp4, std::int32_t k, std::int32_t first,
+                                std::int32_t count, __nv_bfloat16* unit, float* factor, cudaStream_t stream) {
+    const std::int64_t first_row = static_cast<std::int64_t>(first) * kGateUpRows;
+    const std::int64_t rows      = static_cast<std::int64_t>(count) * kGateUpRows;
+    const std::int64_t tasks     = rows * (k / 16);
+    const dim3 grid(static_cast<unsigned>((tasks + 255) / 256));
+    if (nvfp4) {
+        launch("decode nvfp4 units", grid, dim3(256), stream, decode_nvfp4_units_kernel, bank.codes, bank.scales, k,
+               first_row, rows, unit);
+    } else {
+        launch("decode mxfp8 units", grid, dim3(256), stream, decode_mxfp8_units_kernel, bank.codes, bank.scales, k,
+               first_row, rows, unit);
+    }
+    if (factor != nullptr) {
+        launch("expert factor", dim3(static_cast<unsigned>((count + 127) / 128)), dim3(128), stream,
+               expert_factor_kernel, nvfp4 ? bank.amax : nullptr, nvfp4 ? bank.outer_den : nullptr, first, count,
+               factor);
+    }
 }
 
 } // namespace sinfer::ops::detail::inkling

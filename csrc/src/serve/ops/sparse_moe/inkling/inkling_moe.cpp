@@ -358,4 +358,28 @@ void inkling_softcap_swiglu(const Tensor& gate_up, const Tensor& gamma, Tensor& 
                           static_cast<__nv_bfloat16*>(y.data), stream);
 }
 
+void inkling_decode_expert_units(const InklingExpertBank& bank, InklingExpertFormat format, std::int32_t k,
+                                 std::int32_t first_expert, std::int32_t count, Tensor& unit, Tensor& factor,
+                                 cudaStream_t stream) {
+    static_assert(kGateUpRows == kHidden, "both banks stack 2304 rows per expert");
+    const bool nvfp4 = format == InklingExpertFormat::Nvfp4;
+    if (k != kHidden && k != kIntermediate) {
+        throw std::invalid_argument("inkling_decode_expert_units: k must be 2304 (w13) or 1152 (w2)");
+    }
+    if (first_expert < 0 || count <= 0 || first_expert + count > kExperts) {
+        throw std::invalid_argument("inkling_decode_expert_units: experts outside [0, 128)");
+    }
+    if (bank.codes == nullptr || bank.scales == nullptr ||
+        (nvfp4 && (bank.amax == nullptr || bank.outer_den == nullptr))) {
+        throw std::invalid_argument("inkling_decode_expert_units: the bank needs codes, scales (and amax / den)");
+    }
+    require_tensor(unit, DType::BF16, k, count * kGateUpRows, "unit");
+    const bool with_factor = factor.data != nullptr;
+    if (with_factor && (factor.dtype != DType::FP32 || factor.numel() != count)) {
+        throw std::invalid_argument("inkling_decode_expert_units: factor must be FP32 [count]");
+    }
+    launch_decode_expert_units(bank, nvfp4, k, first_expert, count, static_cast<__nv_bfloat16*>(unit.data),
+                               with_factor ? static_cast<float*>(factor.data) : nullptr, stream);
+}
+
 } // namespace sinfer::ops

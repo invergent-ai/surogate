@@ -111,6 +111,11 @@ void launch_lora_shrink(const __nv_bfloat16* source, std::int32_t source_k, bool
                         const std::int32_t* ids, LiveTokens live, const LoraRound& lora,
                         cudaStream_t stream);
 
+/// Unit weights of experts [first, first + count) of `bank` (K = k) -> bf16 [count * 2304][k], and the
+/// per-expert factor [count] (null to skip). See `inkling_decode_expert_units`.
+void launch_decode_expert_units(const InklingExpertBank& bank, bool nvfp4, std::int32_t k, std::int32_t first,
+                                std::int32_t count, __nv_bfloat16* unit, float* factor, cudaStream_t stream);
+
 /// Grouped expert GEMM operands of one projection.
 struct GemmParams {
     // Activations (source row = slot >> a_row_shift).

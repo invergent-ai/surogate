@@ -199,4 +199,19 @@ void inkling_quant_mxfp8(const Tensor& x, Tensor& codes, Tensor& exponents, cuda
 void inkling_softcap_swiglu(const Tensor& gate_up, const Tensor& gamma, Tensor& y,
                             cudaStream_t stream);
 
+/// The trainer's dX operand for the straight-through backward, in the engine's split (the reference;
+/// a decode that folds the per-expert global into bf16 differs from it by up to 0.5 bf16 ulp per weight):
+///   unit: BF16 [k, count * 2304] = row-major [count * 2304][k], the UNIT weights of experts
+///         [first_expert, first_expert + count), expert-stacked rows as in the bank (w13 rows interleaved).
+///         Nvfp4: e2m1 x its e4m3 block scale (<= 6 significant bits: exact in bf16); Mxfp8: bf16(e4m3 x
+///         2^(e - 127)), the GEMM's in-register dequantisation (exact for the checkpoint's scale range).
+///   factor: FP32 [count], the per-expert factor the engine applies in fp32 AFTER the GEMM: Nvfp4
+///         amax[e] / den (div_rn: `inkling_ref.nvfp4_global`); Mxfp8 1. (The forward applies it fused with the
+///         activation's: (amax_x * amax_w[e]) * rcp_rn(1536 * den).) An empty tensor skips it.
+/// So dX[token] = sum over the token's slots of (dY[slot] . unit[e]) * factor[e], the GEMM accumulated in fp32.
+/// `k` is the bank's K: 2304 for w13, 1152 for w2.
+void inkling_decode_expert_units(const InklingExpertBank& bank, InklingExpertFormat format, std::int32_t k,
+                                 std::int32_t first_expert, std::int32_t count, Tensor& unit, Tensor& factor,
+                                 cudaStream_t stream);
+
 } // namespace sinfer::ops
