@@ -586,11 +586,24 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                 if (plane.spec.window > 0) { window_page_bytes += plane.storage.region.bytes / plane.storage.shape[3]; }
             }
             out.elastic_plane_bytes += window_page_bytes * text_pool.spec.window_floor_pages;
-            // The charge as the pool computes it (window bytes over full-context page bytes,
-            // rounded up): the capacity curve adds it per lane (make_sequence_planner_impl).
+            // The charge as the pool computes it (one page's stride summed over the window planes,
+            // over the same sum for the full-context planes, rounded up; PagedKVPool's
+            // window_page_bytes_ / main_page_bytes_): the capacity curve adds it per lane
+            // (make_sequence_planner_impl). Not from the region bytes: a plane's storage is
+            // rounded up to whole granules, so bytes / pages depends on the page count.
+            std::size_t window_stride = 0, main_stride = 0;
+            for (const auto& plane : text_pool.planes) {
+                if (plane.spec.leading_extent <= 0 || plane.spec.head_extent <= 0) { continue; }
+                const std::size_t stride = static_cast<std::size_t>(
+                    Tensor(nullptr, plane.spec.dtype,
+                           {plane.spec.leading_extent, static_cast<std::int32_t>(kPagedKVPageSize),
+                            plane.spec.head_extent, 1})
+                        .bytes());
+                (plane.spec.window > 0 ? window_stride : main_stride) += stride;
+            }
             out.kv_window_lane_charge_pages =
-                kv_window_main_equivalent(text_pool.spec.window_lane_charge, window_page_bytes, per_page);
-            out.kv_window_page_charge_pages = kv_window_main_equivalent(1, window_page_bytes, per_page);
+                kv_window_main_equivalent(text_pool.spec.window_lane_charge, window_stride, main_stride);
+            out.kv_window_page_charge_pages = kv_window_main_equivalent(1, window_stride, main_stride);
         }
     }
     return out;
