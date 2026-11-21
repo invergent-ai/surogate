@@ -423,18 +423,20 @@ class HeadLogprob(torch.autograd.Function):
         hidden, targets = ctx.saved_tensors
         head = ctx.W.head
         dh = torch.empty(hidden.shape, dtype=F32, device=hidden.device)
+        headf = head.float()  # 1.84 GB transient, once per backward
         rows = 256
         for a in range(0, hidden.shape[0], rows):
             h = hidden[a:a + rows].float()
-            raw = h @ head.float().T  # [n, V] fp32
+            raw = h @ headf.T  # [n, V] fp32
             th = torch.tanh(raw / 30.0)
             z = th * 30.0
             p = torch.softmax(z, -1)
             dz = -p * g[a:a + rows, None]
             dz.scatter_add_(1, targets[a:a + rows].long()[:, None], g[a:a + rows, None])
             draw = dz * (1.0 - th * th)
-            dh[a:a + rows] = draw @ head.float()
+            dh[a:a + rows] = draw @ headf
             del raw, th, z, p, dz, draw
+        del headf
         return None, None, dh, None
 
 
