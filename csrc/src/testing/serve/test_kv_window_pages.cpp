@@ -264,20 +264,33 @@ void test_images(std::uint32_t window) {
 /// Many lanes in engine-like rounds: one round's prefill budget is shared by the prefilling lanes
 /// (mixed rounds), the others decode or verify; lanes finish, stay retained, and take new
 /// requests as appends at their frontier, checkpoint restores or full resets.
-void test_many_lanes(std::uint32_t window, std::uint32_t rows, std::uint32_t chunk, std::uint32_t seed) {
-    const auto size = sinfer::plan_kv_window_class(window, rows, chunk, 0);
+void test_many_lanes(std::uint32_t window, std::uint32_t rows, std::uint32_t chunk, std::uint32_t seed,
+                     bool image_checkpoints = false) {
+    // image_checkpoints: M3 lever A -- a checkpoint's window is an image copy made when the prefill passes it, the
+    // lane pins nothing, and the class is sized without pins; the image region is small and may refuse a capture.
+    const std::uint32_t image_windows = image_checkpoints ? rows / 2 + 2 : 0;
+    const auto size = sinfer::plan_kv_window_class(window, rows, chunk, image_windows, 1, !image_checkpoints);
     Store store(size.lane_pages);
+    Store images(std::max(size.image_pages, 1U));
+    std::uint32_t captured = 0, refused = 0, restored = 0;
     std::mt19937 rng(seed);
     struct Lane {
         Seq seq;
         std::uint32_t prompt = 0, remaining = 0;
         std::uint32_t checkpoint = 0; // pinned frontier, 0 = none
         bool active = false;
+        std::vector<KvWindowSlot> image; // image_checkpoints: the window behind `checkpoint`, empty = none
+        std::vector<std::int64_t> image_truth;
     };
     std::vector<Lane> lanes(rows);
     for (auto& lane : lanes) { lane.seq = Seq{KvWindowPages(window)}; }
-    const auto pins_of = [](const Lane& lane) {
-        return lane.checkpoint ? std::vector<std::uint32_t>{lane.checkpoint} : std::vector<std::uint32_t>{};
+    const auto pins_of = [&](const Lane& lane) {
+        return lane.checkpoint && !image_checkpoints ? std::vector<std::uint32_t>{lane.checkpoint}
+                                                     : std::vector<std::uint32_t>{};
+    };
+    const auto drop_image = [&](Lane& lane) {
+        for (const auto& slot : lane.image) { images.give_back_window_page(slot.physical); }
+        lane.image.clear();
     };
     const auto start = [&](Lane& lane) {
         const std::uint32_t choice = rng() % 3;
@@ -285,14 +298,20 @@ void test_many_lanes(std::uint32_t window, std::uint32_t rows, std::uint32_t chu
             lane.seq.pages.release_all(store);
             lane.seq.truth.clear();
             lane.seq.committed = 0;
-        } else if (choice == 1 && lane.checkpoint && lane.seq.pages.covers(lane.checkpoint)) {
+        } else if (choice == 1 && lane.checkpoint && !image_checkpoints && lane.seq.pages.covers(lane.checkpoint)) {
             rewind(store, lane.seq, lane.checkpoint);
+        } else if (choice == 1 && lane.checkpoint && image_checkpoints && !lane.image.empty()) {
+            // Restore at the checkpoint from its image: the lane's own window pages go, the image's come back.
+            lane.seq.pages.release_all(store);
+            restore_image(store, lane.seq, images, lane.image, lane.image_truth, lane.checkpoint);
+            ++restored;
         } else {
             rewind(store, lane.seq, lane.seq.committed); // append at the frontier
         }
         ++lane.seq.epoch;
         (void)lane.seq.pages.prepare(lane.seq.committed, lane.seq.committed, size.forward_tokens, pins_of(lane), store);
         lane.prompt    = lane.seq.committed + 100 + rng() % (4 * window + 3000);
+        drop_image(lane);
         lane.checkpoint = (rng() % 2) ? lane.prompt - rng() % 50 : 0;
         lane.remaining = 50 + rng() % 400;
         lane.active    = true;
@@ -312,6 +331,18 @@ void test_many_lanes(std::uint32_t window, std::uint32_t rows, std::uint32_t chu
                 forward(store, seq, seq.committed, n, reach, size.forward_tokens, pins_of(lane));
                 seq.committed += n;
                 (void)seq.pages.settle(seq.committed, pins_of(lane), store);
+                if (image_checkpoints && lane.checkpoint && seq.committed == lane.checkpoint) {
+                    // The prefill stops at the checkpoint: copy its window if the image region has room.
+                    const std::uint32_t need = KvWindowPages::pages_for(lane.checkpoint) -
+                                               KvWindowPages::keep_first_page(lane.checkpoint, window);
+                    if (images.free.size() >= need) {
+                        lane.image       = capture_image(store, seq, images, lane.checkpoint);
+                        lane.image_truth = seq.truth;
+                        ++captured;
+                    } else {
+                        ++refused; // the checkpoint keeps its state but not its window: no restore there
+                    }
+                }
             } else {
                 const std::uint32_t width = 1 + rng() % 6;
                 forward(store, seq, seq.committed, width, width, size.forward_tokens, pins_of(lane));
@@ -322,10 +353,16 @@ void test_many_lanes(std::uint32_t window, std::uint32_t rows, std::uint32_t chu
             }
         }
     }
-    for (auto& lane : lanes) { lane.seq.pages.release_all(store); }
-    expect(store.in_use() == 0, "many lanes give every page back");
-    std::printf("  window %u rows %u chunk %u: class %u lane pages, peak %u\n", window, rows, chunk,
-                size.lane_pages, store.peak);
+    for (auto& lane : lanes) { lane.seq.pages.release_all(store); drop_image(lane); }
+    expect(store.in_use() == 0 && images.in_use() == 0, "many lanes give every page back");
+    std::printf("  window %u rows %u chunk %u%s: class %u lane pages, peak %u", window, rows, chunk,
+                image_checkpoints ? " (checkpoints as images)" : "", size.lane_pages, store.peak);
+    if (image_checkpoints) {
+        std::printf(", images %u pages: %u captured, %u refused, %u restores", size.image_pages, captured, refused,
+                    restored);
+        expect(restored > 0, "checkpoint restores from images happened");
+    }
+    std::printf("\n");
 }
 
 } // namespace
@@ -341,6 +378,10 @@ int main() try {
     test_many_lanes(1024, 16, 8192, 2);
     test_many_lanes(512, 4, 1024, 3);
     test_many_lanes(1000, 6, 4096, 4); // a window that is no multiple of the page
+    // M3 lever A: checkpoint windows as image copies, the class sized without pins.
+    test_many_lanes(1024, 8, 2048, 5, true);
+    test_many_lanes(1024, 16, 8192, 6, true);
+    test_many_lanes(512, 4, 1024, 7, true);
     if (g_failures != 0) {
         std::fprintf(stderr, "test_kv_window_pages: %d failures\n", g_failures);
         return 1;
