@@ -48,6 +48,9 @@ struct Schedule {
 
 // The shared kernel's three tiles (measured there on an RTX 5090); the choice follows speed only.
 using Tile16x8  = Schedule<16, 8, 16, 8, 6>;
+// Decode widths with few row tiles (wo_ud: 144 one-warp CTAs on 170 SMs walked k = 3072 at ~0.84 TB/s, lane h's nsys
+// 14:49): the same tile with twice the copies in flight. The pipeline depth moves no product: same bits.
+using Tile16x8Deep = Schedule<16, 8, 16, 8, 12>;
 using Tile32x32 = Schedule<32, 32, 16, 16, 4>;
 using Tile64x64 = Schedule<64, 64, 32, 32, 3>;
 
@@ -77,6 +80,7 @@ __device__ __forceinline__ int swizzled_col(int row, int col) {
 template <class S, Store kStore>
 __global__ __launch_bounds__(S::kThreads) void gemm_inv_kernel(const __grid_constant__ Args a) {
     pdl::wait_for_dependencies(); // PDL: every read / write after the producer grid completes
+    pdl::trigger_dependents(); // PDL: the next kernel may launch now (it waits for this grid before any read)
     constexpr int BM = S::kBlockRows, BN = S::kBlockCols, BK = kBlockK;
     constexpr int WM = S::kWarpRows, WN = S::kWarpCols, MT = S::kMmaRows, NT = S::kMmaCols;
     constexpr int KSUB = BK / 16, STAGES = S::kStages, WARPS_N = S::kWarpsN, THREADS = S::kThreads;
@@ -208,6 +212,7 @@ __global__ void __launch_bounds__(256) reduce_kernel(const float* __restrict__ p
                                                      std::int32_t rows, std::int32_t tokens, std::int32_t batch,
                                                      std::int32_t splits, std::int32_t ldc, std::int64_t out_stride) {
     pdl::wait_for_dependencies();
+    pdl::trigger_dependents(); // PDL: the next kernel may launch now (it waits for this grid before any read)
     const std::int64_t total = static_cast<std::int64_t>(batch) * tokens * rows;
     const std::int64_t i     = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= total) { return; }
@@ -249,8 +254,23 @@ void dispatch(const Args& a, std::int32_t splits, cudaStream_t stream) {
     // gives a wave of CTAs, 32 x 32 otherwise. Counted over the whole launch (batch x splits). Speed only.
     const std::int64_t wide_tiles = static_cast<std::int64_t>((a.rows + 63) / 64) * ((a.tokens + 63) / 64) * a.batch * splits;
     const int tile                = a.tokens <= 8 ? 1 : (a.tokens > 32 && wide_tiles >= 128 ? 3 : 2);
+    static const int sms          = [] {
+        int device = 0, count = 0;
+        if (cudaGetDevice(&device) != cudaSuccess ||
+            cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) {
+            return 0;
+        }
+        return count;
+    }();
+    const std::int64_t narrow_ctas = static_cast<std::int64_t>((a.rows + 15) / 16) * a.batch * splits;
     switch (tile) {
-    case 1: launch<Tile16x8, kStore>(a, splits, stream); return;
+    case 1:
+        if (narrow_ctas < 2LL * sms) {
+            launch<Tile16x8Deep, kStore>(a, splits, stream);
+        } else {
+            launch<Tile16x8, kStore>(a, splits, stream);
+        }
+        return;
     case 2: launch<Tile32x32, kStore>(a, splits, stream); return;
     default: launch<Tile64x64, kStore>(a, splits, stream); return;
     }

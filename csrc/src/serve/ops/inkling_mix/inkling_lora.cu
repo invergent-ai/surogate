@@ -42,6 +42,7 @@ __device__ __forceinline__ int slot_of(const LoraDeltaArgs& a, int t) {
 // fixed xor tree over the 32 lane sums. Independent of every other token.
 __global__ void __launch_bounds__(kShrinkThreads) lora_shrink_kernel(const __grid_constant__ LoraDeltaArgs a) {
     pdl::wait_for_dependencies();
+    pdl::trigger_dependents(); // PDL: the next kernel may launch now (it waits for this grid before any read)
     const int t    = blockIdx.x;
     const int s    = blockIdx.y;
     const int slot = slot_of(a, t);
@@ -68,6 +69,7 @@ __global__ void __launch_bounds__(kShrinkThreads) lora_shrink_kernel(const __gri
 // becomes bf16_rn(out + delta) where delta != 0.
 __global__ void __launch_bounds__(kExpandThreads) lora_expand_kernel(const __grid_constant__ LoraDeltaArgs a) {
     pdl::wait_for_dependencies();
+    pdl::trigger_dependents(); // PDL: the next kernel may launch now (it waits for this grid before any read)
     const int t    = blockIdx.y;
     const int s    = blockIdx.z;
     const int slot = slot_of(a, t);
