@@ -64,6 +64,13 @@ void launch_router_logits(const __nv_bfloat16* x, const __nv_bfloat16* router, f
 void launch_router_select(const float* logits, const float* bias, LiveTokens live,
                           const RouteOutputs& out, cudaStream_t stream);
 
+/// Narrow rounds: router logits (as launch_router_logits) and the x quantisation (NVFP4: codes /
+/// scales / amax; MXFP8: the dequantised bf16 rows) in one grid.
+void launch_route_quant_narrow(const __nv_bfloat16* x, const __nv_bfloat16* router, float* logits,
+                               std::int32_t tokens, std::int32_t* zero, std::int32_t zero_words, LiveTokens live,
+                               bool nvfp4, std::uint8_t* x_codes, std::uint8_t* x_scales, float* x_amax,
+                               __nv_bfloat16* x_dequantised, cudaStream_t stream);
+
 /// sorted[offsets[ids[i]] + ranks[i]] = i for every routed slot i (after the select kernel).
 void launch_router_place(const RouteOutputs& out, std::int32_t tokens, cudaStream_t stream);
 

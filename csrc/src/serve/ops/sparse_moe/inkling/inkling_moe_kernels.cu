@@ -59,24 +59,21 @@ __device__ __forceinline__ void load16(const __nv_bfloat16* source, float* x) {
 // ---------------------------------------------------------------------------------------------
 // Router logits: grid (16 expert tiles of 8, ceil(T / 16)), 3 warps = the 3 K groups.
 // ---------------------------------------------------------------------------------------------
-__global__ __launch_bounds__(96) void router_logits_kernel(const __nv_bfloat16* __restrict__ x,
-                                                           const __nv_bfloat16* __restrict__ router,
-                                                           float* __restrict__ logits,
-                                                           std::int32_t tokens,
-                                                           std::int32_t* __restrict__ zero,
-                                                           std::int32_t zero_words) {
-    pdl::wait_for_dependencies();
-    pdl::trigger_dependents();
+__device__ __forceinline__ void router_logits_tile(const __nv_bfloat16* __restrict__ x,
+                                                   const __nv_bfloat16* __restrict__ router,
+                                                   float* __restrict__ logits, std::int32_t tokens,
+                                                   std::int32_t* __restrict__ zero, std::int32_t zero_words,
+                                                   int e_tile, int m_tile) {
     const int thread = static_cast<int>(threadIdx.x);
-    if (zero != nullptr && blockIdx.x == 0 && blockIdx.y == 0) {
+    if (zero != nullptr && e_tile == 0 && m_tile == 0) {
         for (int i = thread; i < zero_words; i += 96) { zero[i] = 0; }
     }
     const int warp     = thread >> 5;
     const int lane     = thread & 31;
     const int group_id = lane >> 2;
     const int quad     = lane & 3;
-    const int e0       = static_cast<int>(blockIdx.x) * 8;
-    const int m0       = static_cast<int>(blockIdx.y) * 16;
+    const int e0       = e_tile * 8;
+    const int m0       = m_tile * 16;
     const int k_begin  = warp * kRouterGroup;
     const int k_end    = min(k_begin + kRouterGroup, kHidden);
     const int row0     = m0 + group_id;
@@ -115,6 +112,18 @@ __global__ __launch_bounds__(96) void router_logits_kernel(const __nv_bfloat16* 
                 __fadd_rn(__fadd_rn(partial[0][row][col], partial[1][row][col]), partial[2][row][col]);
         }
     }
+}
+
+__global__ __launch_bounds__(96) void router_logits_kernel(const __nv_bfloat16* __restrict__ x,
+                                                           const __nv_bfloat16* __restrict__ router,
+                                                           float* __restrict__ logits,
+                                                           std::int32_t tokens,
+                                                           std::int32_t* __restrict__ zero,
+                                                           std::int32_t zero_words) {
+    pdl::wait_for_dependencies();
+    pdl::trigger_dependents();
+    router_logits_tile(x, router, logits, tokens, zero, zero_words, static_cast<int>(blockIdx.x),
+                       static_cast<int>(blockIdx.y));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -386,17 +395,13 @@ __device__ __forceinline__ bool row_is_live(int row, const std::int32_t* row_ids
     return row < live_count(live);
 }
 
-__global__ __launch_bounds__(256) void quant_nvfp4_kernel(const __nv_bfloat16* __restrict__ input,
-                                                          std::int32_t rows, std::int32_t k,
-                                                          const std::int32_t* __restrict__ row_ids,
-                                                          LiveTokens live,
-                                                          std::uint8_t* __restrict__ codes,
-                                                          std::uint8_t* __restrict__ scales,
-                                                          float* __restrict__ amax_out) {
-    pdl::wait_for_dependencies();
-    pdl::trigger_dependents();
+/// One row's NVFP4 four-over-six by one warp.
+__device__ __forceinline__ void quant_nvfp4_row(const __nv_bfloat16* __restrict__ input, std::int32_t rows,
+                                                std::int32_t k, const std::int32_t* __restrict__ row_ids,
+                                                LiveTokens live, std::uint8_t* __restrict__ codes,
+                                                std::uint8_t* __restrict__ scales, float* __restrict__ amax_out,
+                                                int row) {
     const int lane = static_cast<int>(threadIdx.x) & 31;
-    const int row  = static_cast<int>(blockIdx.x) * 8 + (static_cast<int>(threadIdx.x) >> 5);
     if (row >= rows || !row_is_live(row, row_ids, live)) { return; }
     const __nv_bfloat16* source = input + static_cast<std::int64_t>(row) * k;
     const int blocks            = k / 16;
@@ -421,17 +426,26 @@ __global__ __launch_bounds__(256) void quant_nvfp4_kernel(const __nv_bfloat16* _
     if (lane == 0) { amax_out[row] = amax; }
 }
 
-__global__ __launch_bounds__(256) void quant_mxfp8_kernel(const __nv_bfloat16* __restrict__ input,
+__global__ __launch_bounds__(256) void quant_nvfp4_kernel(const __nv_bfloat16* __restrict__ input,
                                                           std::int32_t rows, std::int32_t k,
                                                           const std::int32_t* __restrict__ row_ids,
                                                           LiveTokens live,
                                                           std::uint8_t* __restrict__ codes,
-                                                          std::uint8_t* __restrict__ exponents,
-                                                          __nv_bfloat16* __restrict__ dequantised) {
+                                                          std::uint8_t* __restrict__ scales,
+                                                          float* __restrict__ amax_out) {
     pdl::wait_for_dependencies();
     pdl::trigger_dependents();
+    quant_nvfp4_row(input, rows, k, row_ids, live, codes, scales, amax_out,
+                    static_cast<int>(blockIdx.x) * 8 + (static_cast<int>(threadIdx.x) >> 5));
+}
+
+/// One row's MXFP8 quantisation by one warp.
+__device__ __forceinline__ void quant_mxfp8_row(const __nv_bfloat16* __restrict__ input, std::int32_t rows,
+                                                std::int32_t k, const std::int32_t* __restrict__ row_ids,
+                                                LiveTokens live, std::uint8_t* __restrict__ codes,
+                                                std::uint8_t* __restrict__ exponents,
+                                                __nv_bfloat16* __restrict__ dequantised, int row) {
     const int lane = static_cast<int>(threadIdx.x) & 31;
-    const int row  = static_cast<int>(blockIdx.x) * 8 + (static_cast<int>(threadIdx.x) >> 5);
     if (row >= rows || !row_is_live(row, row_ids, live)) { return; }
     const __nv_bfloat16* source = input + static_cast<std::int64_t>(row) * k;
     const int blocks            = k / 32;
@@ -478,6 +492,55 @@ __global__ __launch_bounds__(256) void quant_mxfp8_kernel(const __nv_bfloat16* _
                 destination[q] = make_uint4(deq[4 * q], deq[4 * q + 1], deq[4 * q + 2], deq[4 * q + 3]);
             }
         }
+    }
+}
+
+__global__ __launch_bounds__(256) void quant_mxfp8_kernel(const __nv_bfloat16* __restrict__ input,
+                                                          std::int32_t rows, std::int32_t k,
+                                                          const std::int32_t* __restrict__ row_ids,
+                                                          LiveTokens live,
+                                                          std::uint8_t* __restrict__ codes,
+                                                          std::uint8_t* __restrict__ exponents,
+                                                          __nv_bfloat16* __restrict__ dequantised) {
+    pdl::wait_for_dependencies();
+    pdl::trigger_dependents();
+    quant_mxfp8_row(input, rows, k, row_ids, live, codes, exponents, dequantised,
+                    static_cast<int>(blockIdx.x) * 8 + (static_cast<int>(threadIdx.x) >> 5));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Narrow rounds (decode / verify): router logits tiles and the x quantisation in ONE grid
+// (DESIGN-moe 2.1; one launch fewer). Blocks [0, 16 * ceil(T / 16)) are router tiles, the rest
+// quantise x rows, a warp per row. Each part runs the same code as its standalone kernel.
+// ---------------------------------------------------------------------------------------------
+struct XQuantOutputs {
+    std::uint8_t* codes      = nullptr; ///< NVFP4
+    std::uint8_t* scales     = nullptr; ///< NVFP4
+    float* amax              = nullptr; ///< NVFP4
+    __nv_bfloat16* dequantised = nullptr; ///< MXFP8
+};
+
+template <bool Nvfp4>
+__global__ __launch_bounds__(96) void route_quant_narrow_kernel(const __nv_bfloat16* __restrict__ x,
+                                                                const __nv_bfloat16* __restrict__ router,
+                                                                float* __restrict__ logits, std::int32_t tokens,
+                                                                std::int32_t* __restrict__ zero,
+                                                                std::int32_t zero_words, LiveTokens live,
+                                                                XQuantOutputs q) {
+    pdl::wait_for_dependencies();
+    pdl::trigger_dependents();
+    const int block        = static_cast<int>(blockIdx.x);
+    const int router_tiles = (kExperts / 8) * ((tokens + 15) / 16);
+    if (block < router_tiles) {
+        router_logits_tile(x, router, logits, tokens, zero, zero_words, block % (kExperts / 8),
+                           block / (kExperts / 8));
+        return;
+    }
+    const int row = (block - router_tiles) * 3 + (static_cast<int>(threadIdx.x) >> 5);
+    if constexpr (Nvfp4) {
+        quant_nvfp4_row(x, tokens, kHidden, nullptr, live, q.codes, q.scales, q.amax, row);
+    } else {
+        quant_mxfp8_row(x, tokens, kHidden, nullptr, live, nullptr, nullptr, q.dequantised, row);
     }
 }
 
@@ -639,6 +702,25 @@ void launch_router_select(const float* logits, const float* bias, LiveTokens liv
                           const RouteOutputs& out, cudaStream_t stream) {
     launch("router select", dim3(static_cast<unsigned>((live.tokens + 3) / 4)), dim3(128), stream,
            router_select_kernel, logits, bias, live, out);
+}
+
+void launch_route_quant_narrow(const __nv_bfloat16* x, const __nv_bfloat16* router, float* logits,
+                               std::int32_t tokens, std::int32_t* zero, std::int32_t zero_words, LiveTokens live,
+                               bool nvfp4, std::uint8_t* x_codes, std::uint8_t* x_scales, float* x_amax,
+                               __nv_bfloat16* x_dequantised, cudaStream_t stream) {
+    XQuantOutputs q;
+    q.codes       = x_codes;
+    q.scales      = x_scales;
+    q.amax        = x_amax;
+    q.dequantised = x_dequantised;
+    const int blocks = (kExperts / 8) * ((tokens + 15) / 16) + (tokens + 2) / 3;
+    if (nvfp4) {
+        launch("route + x quant (narrow)", dim3(static_cast<unsigned>(blocks)), dim3(96), stream,
+               route_quant_narrow_kernel<true>, x, router, logits, tokens, zero, zero_words, live, q);
+    } else {
+        launch("route + x quant (narrow)", dim3(static_cast<unsigned>(blocks)), dim3(96), stream,
+               route_quant_narrow_kernel<false>, x, router, logits, tokens, zero, zero_words, live, q);
+    }
 }
 
 void launch_router_place(const RouteOutputs& out, std::int32_t tokens, cudaStream_t stream) {

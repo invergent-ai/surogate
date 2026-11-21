@@ -163,14 +163,20 @@ void inkling_moe(const Tensor& x, const InklingMoeWeights& weights, Tensor& out,
     const auto* input = as_bf16(x.data);
     const std::int32_t slots = tokens * kTopK;
 
-    // Router logits; the same launch zeroes the expert counters the selection counts into.
-    launch_router_logits(input, as_bf16(weights.router), b.logits, tokens, b.counters, kCounterWords, stream);
-
-    // x quantised once per token (the reference writes it once per routed row; the bits are equal).
-    if (nvfp4) {
-        launch_quant_nvfp4(input, tokens, kHidden, nullptr, live, b.x_codes, b.x_scales, b.x_amax, stream);
+    // Router logits (the same launch zeroes the expert counters the selection counts into) and x
+    // quantised once per token (the reference writes it once per routed row; the bits are equal).
+    // Narrow rounds run both in one grid.
+    const bool narrow = tokens <= kNarrowMaxTokens;
+    if (narrow) {
+        launch_route_quant_narrow(input, as_bf16(weights.router), b.logits, tokens, b.counters, kCounterWords, live,
+                                  nvfp4, b.x_codes, b.x_scales, b.x_amax, b.x_bf16, stream);
     } else {
-        launch_quant_mxfp8(input, tokens, kHidden, nullptr, live, nullptr, nullptr, b.x_bf16, stream);
+        launch_router_logits(input, as_bf16(weights.router), b.logits, tokens, b.counters, kCounterWords, stream);
+        if (nvfp4) {
+            launch_quant_nvfp4(input, tokens, kHidden, nullptr, live, b.x_codes, b.x_scales, b.x_amax, stream);
+        } else {
+            launch_quant_mxfp8(input, tokens, kHidden, nullptr, live, nullptr, nullptr, b.x_bf16, stream);
+        }
     }
 
     RouteOutputs route;
@@ -199,7 +205,6 @@ void inkling_moe(const Tensor& x, const InklingMoeWeights& weights, Tensor& out,
         route.capture_first    = 0;
         route.capture_stride   = kTopK;
     }
-    const bool narrow = tokens <= kNarrowMaxTokens;
     route.last_cta_places = narrow ? 1 : 0;
     launch_router_select(b.logits, weights.router_bias, live, route, stream);
     if (!narrow) { launch_router_place(route, tokens, stream); }
