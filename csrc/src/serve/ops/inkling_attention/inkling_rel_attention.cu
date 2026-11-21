@@ -676,7 +676,8 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
         }
         // Ask L2 for the first two blocks of this worker whose keys all precede the round (written by earlier steps),
         // so their loads after the wait hit L2: the position -> table -> page -> code chain overlaps the prologue.
-        if (Raw == 0 && g_start < g_stop && (tid == 0 || tid == 32)) {
+        // (Skipped only on the decode raw ring, whose leading old blocks are already in flight; review R4 minor 6.)
+        if (!(Decode && Raw > 0) && g_start < g_stop && (tid == 0 || tid == 32)) {
             const int kb0 = max(group_begin(gs, g_start), lo) >> 6;
             for (int kb = kb0; kb < kb0 + 2 && kb * kBn + kBn - 1 < pmin; ++kb) {
                 const std::int64_t off = kv_page_offset(table_row[(kb * kBn) >> kPageShift], kvh, 0);

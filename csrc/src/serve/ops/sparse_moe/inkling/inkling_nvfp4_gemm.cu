@@ -186,6 +186,11 @@ __device__ __forceinline__ void load16_bf16(const __nv_bfloat16* source, float* 
 /// `PreWaitWeights` (the plain narrow down, kPlainDownMinTokens): the weight stages are requested before the
 /// dependency wait -- the routing they need was complete before the gate_up's wait returned and is read through L2,
 /// as in the fused-y down -- the token rows (y quantised by the standalone kernel) after it.
+/// SAFETY CONDITION (review R4 of M9, minor 4): the pre-wait reads of the routing (`offsets` / `sorted`, ld.cg) are
+/// safe only because EVERY kernel between the selection and this one waits for its predecessor BEFORE it triggers its
+/// dependents (quant_nvfp4_kernel and lora_shrink_kernel: `wait; trigger`), so the selection grid has completed before
+/// this grid can launch. A future kernel placed between gate_up and this down that triggers before its own wait breaks
+/// that, and these reads must then move after the wait.
 /// `RowLoad` (fused-y down only): the y rows' test-only load mode (load_row16); serving launches 0.
 template <class Schedule, int K, bool GateUp, bool FusedYQuant = false, bool PreWaitWeights = false, int RowLoad = 0>
 __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_expert_gemm_kernel(
