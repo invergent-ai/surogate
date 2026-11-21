@@ -509,12 +509,11 @@ int device_sms() {
     return sms;
 }
 
+// SUROGATE_INKLING_ATTN_SPLITS=N forces N splits (tests and measurement only; read per call so a test
+// can compare split counts in one process).
 int forced_splits() {
-    static const int forced = [] {
-        const char* raw = std::getenv("SUROGATE_INKLING_ATTN_SPLITS"); // tests and measurement only
-        return raw == nullptr ? 0 : std::max(0, std::atoi(raw));
-    }();
-    return forced;
+    const char* raw = std::getenv("SUROGATE_INKLING_ATTN_SPLITS");
+    return raw == nullptr ? 0 : std::max(0, std::atoi(raw));
 }
 
 Plan make_plan(InklingLayerKind kind, std::int32_t width, std::int32_t batch, std::int32_t max_keys) {

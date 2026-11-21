@@ -877,3 +877,14 @@ if(_sinfer_serve_test_targets)
   list(LENGTH _sinfer_serve_test_targets _sinfer_serve_test_count)
   message(STATUS "serve tests: ${_sinfer_serve_test_count} targets under `serve-tests`")
 endif()
+
+# ENGINE-INKLING lane c: the Inkling attention op test links its own archive and sinfer_core directly
+# (libsinfer does not hold the archive yet). Not in the SINFER_SERVE_TEST_TARGETS aggregate.
+add_executable(sinfer_inkling_attention_test EXCLUDE_FROM_ALL ops/test_inkling_attention.cpp)
+target_include_directories(sinfer_inkling_attention_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR} ${SERVE_ROOT} ${CUDAToolkit_INCLUDE_DIRS})
+target_link_libraries(sinfer_inkling_attention_test PRIVATE sinfer_inkling_attention)
+target_compile_options(sinfer_inkling_attention_test PRIVATE
+  $<$<COMPILE_LANGUAGE:CXX>:-fno-fast-math> $<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off> -UNDEBUG)
+add_test(NAME sinfer_inkling_attention_test COMMAND sinfer_inkling_attention_test)
+set_tests_properties(sinfer_inkling_attention_test PROPERTIES SKIP_RETURN_CODE 77)
