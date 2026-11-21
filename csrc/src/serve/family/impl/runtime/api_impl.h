@@ -231,6 +231,11 @@ void Program<Variant>::evict_retained_lane(std::uint32_t lane) noexcept {
 }
 
 template <>
+void Program<Variant>::drop_shared_prefixes() noexcept {
+    impl_->drop_shared_prefixes();
+}
+
+template <>
 void Program<Variant>::spill_retained_lane(std::uint32_t lane) noexcept {
     impl_->spill_retained_lane(lane);
 }

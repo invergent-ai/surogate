@@ -402,6 +402,14 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     };
     decoder = std::make_unique<family::DecoderState>(backing, plan.persistent.decoder, &elastic_kv);
     decoder->configure_checkpoints(plan.persistent.checkpoints, elastic_kv);
+    // Lane f1 M3-C: the capacity curve counted this charge per lane (layouts_impl.h); the pool
+    // must book the same, or a context-length request could fit the curve and not the ledger.
+    if (plan.persistent.kv_window_lane_charge_pages != decoder->text_kv.pool().window_lane_charge_pages()) {
+        throw std::logic_error("planned KV window lane charge " +
+                               std::to_string(plan.persistent.kv_window_lane_charge_pages) +
+                               " differs from the pool's " +
+                               std::to_string(decoder->text_kv.pool().window_lane_charge_pages()));
+    }
     if (plan.persistent.replay_records) {
         replay_records.emplace(backing, *plan.persistent.replay_records);
         if (speculative_backend == SpeculativeBackend::DFlash) {

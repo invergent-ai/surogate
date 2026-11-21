@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #include "core/limits.h"
 #include <deque>
@@ -81,6 +82,60 @@ public:
             instance_.program->evict_retained_lane(lane);
         }
     }
+
+    /// Lane f1: SUROGATE_SERVE_KV_IDLE_RELEASE=0 turns the two idle-KV releases below off (the
+    /// behaviour before them: a short head with nothing running is refused, one whose second pass
+    /// counted only shared prefixes is retried until it expires). A test / rollback switch.
+    static bool idle_kv_release_enabled() noexcept {
+        static const bool enabled = [] {
+            const char* raw = std::getenv("SUROGATE_SERVE_KV_IDLE_RELEASE");
+            return raw == nullptr || std::strcmp(raw, "0") != 0;
+        }();
+        return enabled;
+    }
+
+    /// Lane f1: the shared-prefix cache's entries go (pages a running or retained fork borrows stay
+    /// with it), and every lane re-plans: a plan that forks a dropped entry would keep its pages.
+    /// Returns false when this program has no shared-prefix cache.
+    bool drop_shared_prefixes_for_admission() noexcept {
+        if (!idle_kv_release_enabled()) { return false; }
+        if constexpr (requires(typename Package::Program& p) { p.drop_shared_prefixes(); }) {
+            instance_.program->drop_shared_prefixes();
+            for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) { invalidate_lane_plans(lane); }
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    /// Lane f1: nothing runs (or nothing is active) and the queue head fits on no lane, not even
+    /// after the other retained lanes go -- the second pass of find_admission_lane keeps the lane
+    /// it would take with everything that lane borrows, and only evicting another lane dropped the
+    /// shared prefixes. What still holds pages is idle KV: the shared prefixes and the retained
+    /// lanes, the head's own candidate lane included (--max-num-seqs 1 refused every request that
+    /// needed the pages its own retained conversation held). Gives back one piece -- the shared
+    /// prefixes once per head, then the retained lane released longest ago, to the host tier
+    /// where there is one -- and returns true; the head re-plans and tries again. False when
+    /// nothing idle is left, and only then is the head refused.
+    bool release_idle_kv_for_head(const std::shared_ptr<Request>& head) {
+        if (!idle_kv_release_enabled()) { return false; }
+        if (idle_release_head_ != head->id) {
+            idle_release_head_ = head->id;
+            if (drop_shared_prefixes_for_admission()) { return true; }
+        }
+        std::optional<std::uint32_t> oldest;
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            if (slots_[lane] == nullptr && instance_.program->has_retained_lane(lane) &&
+                (!oldest || lane_released_at_[lane] < lane_released_at_[*oldest])) {
+                oldest = lane;
+            }
+        }
+        if (!oldest) { return false; }
+        take_back_retained_lane(*oldest);
+        invalidate_lane_plans(*oldest);
+        return true;
+    }
+    std::uint64_t idle_release_head_ = ~std::uint64_t{0}; ///< the head the shared prefixes last went for
 
     ConcurrentExecutor(Instance& instance, const EngineOptions& options)
         : instance_(instance), max_concurrency_(options.max_concurrency),
@@ -1471,6 +1526,49 @@ private:
         }
     }
 
+    /// Lane f1 (SUROGATE_SERVE_KV_BLOCK_TRACE=1, diagnostics only): why the queue head is not
+    /// admitted, one line each time the head, the pool's entitled pages or the running count
+    /// changes -- the pool, and for each lane its plan's reuse and pages and the two lane tests --
+    /// so a head that waits until it expires names what held it.
+    void trace_blocked_head(const std::shared_ptr<Request>& head, const char* why) {
+        static const bool enabled = std::getenv("SUROGATE_SERVE_KV_BLOCK_TRACE") != nullptr;
+        if (!enabled || !head || !head->base_plan) { return; }
+        const auto kv = instance_.program->kv_occupancy();
+        std::uint32_t running = 0;
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) { running += slots_[lane] != nullptr ? 1U : 0U; }
+        const std::array<std::uint64_t, 3> key{head->id, kv.entitled_pages, running};
+        if (key == last_block_trace_) { return; }
+        last_block_trace_ = key;
+        std::string lanes;
+        char item[160];
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            if (slots_[lane] != nullptr) {
+                std::snprintf(item, sizeof(item), " L%u:busy", lane);
+            } else if (!head->lane_plans[lane]) {
+                std::snprintf(item, sizeof(item), " L%u:%s,noplan", lane,
+                              instance_.program->has_retained_lane(lane) ? "ret" : "free");
+            } else {
+                const auto& plan = *head->lane_plans[lane];
+                std::snprintf(item, sizeof(item), " L%u:%s,reuse=%u%s,pages=%u,admit=%d,evict=%d", lane,
+                              instance_.program->has_retained_lane(lane) ? "ret" : "free",
+                              plan.summary().reusable_prompt_tokens, plan.summary().host_restore ? "(host)" : "",
+                              plan.summary().admission.main_kv_pages,
+                              int(instance_.program->can_admit_lane(lane, plan)),
+                              int(instance_.program->can_admit_lane_after_retained_eviction(lane, plan)));
+            }
+            lanes += item;
+        }
+        std::fprintf(stderr,
+                     "kv-block: head %llu %s: prompt %u reserve %u admission %u | pool entitled %u in_use %u "
+                     "mapped %u capacity %u | running %u pressure %d transient %zu |%s\n",
+                     static_cast<unsigned long long>(head->id), why, head->base_plan->summary().prompt_tokens,
+                     head->base_plan->summary().reservation.main_kv_pages,
+                     head->base_plan->summary().admission.main_kv_pages, kv.entitled_pages, kv.pages_in_use,
+                     kv.mapped_pages, kv.capacity_pages, running, int(instance_.program->kv_under_pressure()),
+                     instance_.request_memory.summary().used_bytes, lanes.c_str());
+    }
+    std::array<std::uint64_t, 3> last_block_trace_{};
+
     /// Among free lanes that reuse equally much of a request, the one whose loss costs least:
     /// a lane holding no retained prefix first, then the retained prefix released longest
     /// ago. Picking the lowest index instead handed a new conversation the lane another
@@ -1585,6 +1683,19 @@ private:
                 }
             }
             admit_trace_step("evict retained lanes", request->id, evict_started);
+            // Lane f1: the second pass counted the shared prefixes no kept holder borrows as
+            // reclaimable, but only evicting a lane dropped them (evict_retained_lane). With no
+            // other lane retained -- every other lane running -- nothing went, and the head was
+            // retried until it expired (lane h, card 3 14:4x: 8 x 64k, one stream never admitted).
+            // Once per head, so a second pass that still disagrees cannot spin the admission loop.
+            if (!evicted && idle_release_head_ != request->id &&
+                !instance_.program->can_admit_lane(lane, *request->lane_plans[lane])) {
+                idle_release_head_ = request->id;
+                if (drop_shared_prefixes_for_admission()) {
+                    trace_blocked_head(request, "dropped the shared prefixes, re-plans");
+                    return AdmissionProgress::ControlProgress;
+                }
+            }
             if (!instance_.program->can_admit_lane(lane, *request->lane_plans[lane])) {
                 // `can_admit_lane_after_retained_eviction` chose this lane by summing every
                 // `sequences[other].retained && sequences[other].kv`, with no test on the
@@ -1612,6 +1723,7 @@ private:
                 // stays alive, which is the point, but the request is not refused early. Claim
                 // control progress only when something was actually evicted, so a
                 // disagreement that frees nothing cannot spin the admission loop.
+                trace_blocked_head(request, evicted ? "evicted retained lanes, still short" : "eviction freed nothing");
                 invalidate_lane_plans(lane);
                 return evicted ? AdmissionProgress::ControlProgress : AdmissionProgress::None;
             }
@@ -1816,6 +1928,7 @@ private:
             // The frozen media buffer is also outside the lane/page protection accounting.
             // Owners release their regions when prefill finishes; retry admission at that boundary.
             if (instance_.program->kv_under_pressure() || instance_.request_memory.summary().used_bytes != 0) {
+                trace_blocked_head(head, "waits for device memory");
                 static const bool pack_trace = std::getenv("SUROGATE_SERVE_PACK_TRACE") != nullptr;
                 if (pack_trace) {
                     std::fprintf(stderr, "pack-trace: head %llu waits: kv_pressure=%d transient_bytes=%zu\n",
@@ -1835,17 +1948,30 @@ private:
                 for (std::uint32_t lane = 0; lane < max_concurrency_ && !running; ++lane) {
                     running = slots_[lane] != nullptr;
                 }
+                if (!running && release_idle_kv_for_head(head)) {
+                    trace_blocked_head(head, "released idle KV (on demand, nothing running), re-plans");
+                    control_progress = true;
+                    continue;
+                }
                 if (!running) {
+                    trace_blocked_head(head, "refused (on demand, nothing running)");
                     (void)remove_pending_error(head, std::make_exception_ptr(RequestError(
                         RequestErrorKind::Overloaded, "insufficient KV capacity while GPU prefixes are retained")));
                     control_progress = true;
                     continue;
                 }
+                trace_blocked_head(head, "waits for running lanes (on demand)");
                 protection_.reset();
                 return control_progress ? AdmissionProgress::ControlProgress : AdmissionProgress::None;
             }
             const ActiveAdmissionSet active = active_admission_set();
+            if (active.size == 0 && release_idle_kv_for_head(head)) {
+                trace_blocked_head(head, "released idle KV (reserve, nothing active), re-plans");
+                control_progress = true;
+                continue;
+            }
             if (active.size == 0) {
+                trace_blocked_head(head, "refused (reserve, nothing active)");
                 (void)remove_pending_error(head, std::make_exception_ptr(RequestError(
                     RequestErrorKind::Overloaded, "insufficient KV capacity while GPU prefixes are retained")));
                 control_progress = true;

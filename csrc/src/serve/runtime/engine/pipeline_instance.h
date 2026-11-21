@@ -346,6 +346,12 @@ public:
             stages_[s]->program->evict_retained_lane(lane);
         }
     }
+    void drop_shared_prefixes() noexcept {
+        for (std::size_t s = 0; s < stages_.size(); ++s) {
+            select(s);
+            stages_[s]->program->drop_shared_prefixes();
+        }
+    }
     /// Every stage keeps its own part of the conversation; a stage that could not keep it makes
     /// the next plan disagree, which drops the archives everywhere (plan_request_for_lane).
     void spill_retained_lane(std::uint32_t lane) noexcept {
