@@ -801,7 +801,8 @@ void test_invariance(const std::function<bool(const std::string&)>& want) {
     };
     std::uint32_t seed = 7000;
     for (const auto& c : cases) {
-        for (const char* groups : {"p1", "p2", "p3"}) {
+        for (const char* groups : {"p1", "p2", "p3", "p4"}) {
+            if (std::string(groups) == "p4" && c.kind != InklingLayerKind::Local) { continue; } // p4 = p3 on global layers
             if (want("invariance " + c.name + " " + groups)) { run_invariance_case(c, groups, seed); }
         }
         seed += 31;
@@ -1915,6 +1916,12 @@ void run_bench_ab() {
         bench_attention(("verify W8 local 1x8k" + tag).c_str(), K::Local, 8, 1, 8184);
     }
     unsetenv("BENCH_META_STATIC");
+    setenv("SUROGATE_INKLING_ATTN_GROUPS", "p4", 1);
+    bench_attention("decode local 1x8k [p4]", K::Local, 1, 1, 8191);
+    bench_attention("decode local 8x8k [p4]", K::Local, 1, 8, 8191);
+    bench_attention("verify W8 local 1x8k [p4]", K::Local, 8, 1, 8184);
+    bench_attention("prefill local W8192 past 8k [p4]", K::Local, 8192, 1, 8192);
+    setenv("SUROGATE_INKLING_ATTN_GROUPS", "p3", 1);
     for (const char* l2 : {"0", "4"}) {
         setenv("SUROGATE_INKLING_ATTN_L2AHEAD", l2, 1);
         const std::string tag = std::string(" [p3 l2=") + l2 + "]";
