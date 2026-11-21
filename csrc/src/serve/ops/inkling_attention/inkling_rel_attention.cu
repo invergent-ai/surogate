@@ -8,7 +8,7 @@
 // never on the batch, the width W, the envelope, the chunk cut, the split count or the other rows of a tile:
 // - Keys go in fixed GROUPS whose boundaries depend only on the absolute key position (GroupSpec, chosen at run time
 //   by SUROGATE_INKLING_ATTN_GROUPS: p1 = 512 global / 128 local, p2 = 2,048 global growing to 8,192 from key 65,536
-//   / 256 local). Inside a group: 64-key blocks aligned at key 0, in key order, one running softmax state per row
+//   / 256 local, p3 = 512 below key 65,536, 2,048 to 131,072, 8,192 beyond / 128 local). Inside a group: 64-key blocks aligned at key 0, in key order, one running softmax state per row
 //   (log2 domain; P rounded to bf16 against the running maximum; P V as k16 MMA steps in key order). A group's
 //   state (m, l, acc) is folded into the row's total in group order by ONE sequential formula (fold_*), in
 //   registers / shared memory (in-kernel route) or by fold_kernel over per-group partials (split route): the same
@@ -51,20 +51,26 @@ inline constexpr int kL2Ahead     = 4;                  // blocks whose K / V pa
 
 enum Mode : int { kGated = 0, kOutLse = 1, kPartial = 2 };
 
-/// Key groups, a function of the absolute key position only: keys below `threshold` in groups of 1 << shift1,
-/// keys from `threshold` in groups of 1 << shift2 (threshold a multiple of both sizes).
+/// Key groups, a function of the absolute key position only, in three tiers: keys below t1 in groups of 1 << s1,
+/// keys in [t1, t2) in groups of 1 << s2, keys from t2 in groups of 1 << s3 (t1 a multiple of 1 << s1, t2 - t1 of
+/// 1 << s2).
 struct GroupSpec {
-    int shift1    = 9;
-    int shift2    = 9;
-    int threshold = 1 << 30;
+    int s1 = 9, s2 = 9, s3 = 9;
+    int t1 = 1 << 30, t2 = 1 << 30;
 };
 
 __host__ __device__ __forceinline__ int group_of(const GroupSpec& g, int key) {
-    return key < g.threshold ? key >> g.shift1 : (g.threshold >> g.shift1) + ((key - g.threshold) >> g.shift2);
+    if (key < g.t1) { return key >> g.s1; }
+    const int b1 = g.t1 >> g.s1;
+    if (key < g.t2) { return b1 + ((key - g.t1) >> g.s2); }
+    return b1 + ((g.t2 - g.t1) >> g.s2) + ((key - g.t2) >> g.s3);
 }
 __host__ __device__ __forceinline__ int group_begin(const GroupSpec& g, int group) {
-    const int below = g.threshold >> g.shift1;
-    return group < below ? group << g.shift1 : g.threshold + ((group - below) << g.shift2);
+    const int b1 = g.t1 >> g.s1;
+    if (group < b1) { return group << g.s1; }
+    const int b2 = b1 + ((g.t2 - g.t1) >> g.s2);
+    if (group < b2) { return g.t1 + ((group - b1) << g.s2); }
+    return g.t2 + ((group - b2) << g.s3);
 }
 
 struct AttnParams {
@@ -174,6 +180,9 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
     extern __shared__ __align__(16) unsigned char attn_smem_raw[];
     Smem& sm = *reinterpret_cast<Smem*>(attn_smem_raw);
     pdl::wait_for_dependencies();
+    // Dependents (the fold, or the next op: the wo projection streams its weights before its own wait) may launch now;
+    // they read nothing of ours before their wait, which waits for this grid to finish.
+    pdl::trigger_dependents();
 
     const int tid  = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
@@ -730,6 +739,7 @@ __global__ __launch_bounds__(128) void fold_kernel(const AttnParams p) {
     extern __shared__ float fold_smem[]; // [4][max_slots]: m, l, a, c
     __shared__ float seg_max[128];
     pdl::wait_for_dependencies();
+    pdl::trigger_dependents(); // as in rel_attention_kernel
     const std::int64_t n         = blockIdx.x;
     const int h                  = static_cast<int>(blockIdx.y);
     const int d                  = static_cast<int>(threadIdx.x);
@@ -853,21 +863,35 @@ int env_int(const char* name, int fallback) {
 }
 
 /// SUROGATE_INKLING_ATTN_GROUPS: "p1" (default: 512 global / 128 local), "p2" (2,048 global, 8,192 from key 65,536 /
-/// 256 local). Read per call, so one process can compare both (measurement and tests; frozen by agent-EN later).
+/// 256 local), "p3" (graded, agent-EN 11:1x: 512 below key 65,536, 2,048 to 131,072, 8,192 beyond / 128 local). Read
+/// per call, so one process can compare them (measurement and tests; frozen by agent-EN later).
 GroupSpec group_spec(InklingLayerKind kind) {
     const char* raw = std::getenv("SUROGATE_INKLING_ATTN_GROUPS");
-    const bool p2   = raw != nullptr && std::strcmp(raw, "p2") == 0;
-    if (raw != nullptr && raw[0] != '\0' && !p2 && std::strcmp(raw, "p1") != 0) {
-        throw std::invalid_argument("SUROGATE_INKLING_ATTN_GROUPS must be p1 or p2");
+    int which       = 1;
+    if (raw != nullptr && raw[0] != '\0') {
+        if (std::strcmp(raw, "p1") == 0) {
+            which = 1;
+        } else if (std::strcmp(raw, "p2") == 0) {
+            which = 2;
+        } else if (std::strcmp(raw, "p3") == 0) {
+            which = 3;
+        } else {
+            throw std::invalid_argument("SUROGATE_INKLING_ATTN_GROUPS must be p1, p2 or p3");
+        }
     }
-    GroupSpec g;
-    if (kind == InklingLayerKind::Global) {
-        g.shift1    = p2 ? 11 : 9;
-        g.shift2    = p2 ? 13 : 9;
-        g.threshold = p2 ? 65536 : (1 << 30);
-    } else {
-        g.shift1 = g.shift2 = p2 ? 8 : 7;
-        g.threshold         = 1 << 30;
+    GroupSpec g; // p1
+    if (kind == InklingLayerKind::Local) {
+        g.s1 = g.s2 = g.s3 = which == 2 ? 8 : 7;
+    } else if (which == 2) {
+        g.s1 = 11;
+        g.s2 = g.s3 = 13;
+        g.t1 = 65536;
+    } else if (which == 3) {
+        g.s1 = 9;
+        g.s2 = 11;
+        g.s3 = 13;
+        g.t1 = 65536;
+        g.t2 = 131072;
     }
     return g;
 }
@@ -883,7 +907,7 @@ struct Plan {
 
 /// Slots a row needs at most: global = groups up to the envelope's key count; local = groups a window touches.
 int max_slots_for(InklingLayerKind kind, const GroupSpec& gs, std::int32_t max_keys) {
-    if (kind == InklingLayerKind::Local) { return ((Geo::kWindow - 1) >> gs.shift1) + 2; }
+    if (kind == InklingLayerKind::Local) { return ((Geo::kWindow - 1) >> gs.s1) + 2; }
     return group_of(gs, std::max(max_keys, 1) - 1) + 1;
 }
 

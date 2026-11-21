@@ -775,10 +775,12 @@ void test_invariance(const std::function<bool(const std::string&)>& want) {
         {"local short", K::Local, 5000, 0, {1, 100, 1023, 1024, 1025, 1100, 2000, 4000, 4990},
          {0, 127, 128, 1023, 1024, 1100, 4999}, {0, 1020, 4992}},
         {"local long", K::Local, 70000, 68000, {68100, 69000, 69990}, {68000, 69999}, {69000}},
+        {"global 140k", K::Global, 140000, 130000, {131000, 131071, 131072, 131073, 135000}, {130000, 131071, 131072, 139999},
+         {131068}},
     };
     std::uint32_t seed = 7000;
     for (const auto& c : cases) {
-        for (const char* groups : {"p1", "p2"}) {
+        for (const char* groups : {"p1", "p2", "p3"}) {
             if (want("invariance " + c.name + " " + groups)) { run_invariance_case(c, groups, seed); }
         }
         seed += 31;
@@ -1786,12 +1788,54 @@ void bench_linear(const char* name, int k, int k_per, int columns) {
     }
 }
 
+// Decode attention (1 x 8k global, gated) followed by the wo projection (N = 1, 1x128) in ONE CUDA graph with PDL edges:
+// the wo kernel streams its weights while attention runs. Reported per pair, next to the two kernels' separate times.
+void bench_attention_wo(const char* name, InklingLayerKind kind, int first) {
+    const Layer layer(kind, 13);
+    const int keys = first + 1;
+    const double row_bytes = (kind == InklingLayerKind::Global ? keys : std::min(keys, 1088)) * 2048.0;
+    const int R = std::max(1, static_cast<int>(std::ceil(256e6 / (row_bytes + 2304.0 * 3072))));
+    std::vector<Rows> rot;
+    for (int r = 0; r < R; ++r) {
+        rot.push_back(make_rows(1, 1, {first}, {}));
+        rot.back().set_table_rows(r);
+    }
+    BenchPlane plane(R, keys + 64);
+    Rng rng(5);
+    std::vector<float> q, r;
+    fill_qr(rng, rot[0], q, r);
+    std::vector<float> qside(6552, 0.25F);
+    DeviceBuffer dq = to_device_bf16(q), dr = to_device_bf16(r), dqs = to_device_bf16(qside);
+    ops::InklingAttentionInputs in{Tensor(dq.p, DType::BF16, {128, 24, 1}), Tensor(dr.p, DType::BF16, {16, 24, 1}),
+                                   strided_bf16(dqs.p, G::kRowsGate, {3072}, 1, 6552),
+                                   strided_bf16(dqs.p, G::kRowsSink, {24}, 1, 6552),
+                                   Tensor(layer.dtable.p, DType::BF16, {16, G::kRelTableRows})};
+    std::vector<ops::InklingAttentionRows> views;
+    for (const auto& rr : rot) { views.push_back(rr.view(keys)); }
+    WorkspaceArena work(ops::inkling_rel_attention_workspace_bytes(kind, 1, 1, views[0].envelope) + 4096);
+    DeviceBuffer dout(3072 * 2), dy(2304 * 2);
+    Tensor out(dout.p, DType::BF16, {3072, 1}), y(dy.p, DType::BF16, {2304, 1});
+    std::vector<std::unique_ptr<Fp8Weight>> ws;
+    for (int i = 0; i < R; ++i) { ws.push_back(std::make_unique<Fp8Weight>(2304, 3072, 128, 1, 31 + i, false)); }
+    const auto pv  = plane.view(R);
+    const auto att = [&](int i) { ops::inkling_rel_attention(in, kind, views[i % R], pv, work, out, g_stream); };
+    const auto wo  = [&](int i) {
+        const ops::InklingProjection pj{&out, &ws[i % R]->w, 0, &y};
+        ops::inkling_attn_linear(std::span<const ops::InklingProjection>(&pj, 1), nullptr, g_stream);
+    };
+    const double t_att  = time_graph_us(att, std::max(R, 16));
+    const double t_wo   = time_graph_us(wo, std::max(R, 16));
+    const double t_pair = time_graph_us([&](int i) { att(i); wo(i); }, std::max(R, 16));
+    std::printf("bench %-40s graph pair %8.1f us  (attention alone %.1f + wo alone %.1f = %.1f)\n", name, t_pair, t_att,
+                t_wo, t_att + t_wo);
+}
+
 void run_bench() {
     using K = InklingLayerKind;
     cuda_check(cudaStreamCreateWithFlags(&g_stream, cudaStreamNonBlocking), "stream");
-    // Key groups p1 / p2 (SUROGATE_INKLING_ATTN_GROUPS), same build; BENCH_GROUPS=p1 or p2 restricts.
+    // Key groups p1 / p2 / p3 (SUROGATE_INKLING_ATTN_GROUPS), same build; BENCH_GROUPS=p1|p2|p3 restricts.
     const char* only_groups = std::getenv("BENCH_GROUPS");
-    for (const char* groups : {"p1", "p2"}) {
+    for (const char* groups : {"p1", "p2", "p3"}) {
         if (only_groups != nullptr && std::string(only_groups) != groups) { continue; }
         setenv("SUROGATE_INKLING_ATTN_GROUPS", groups, 1);
         const auto name = [&](const char* what) { static std::string s; s = std::string(what) + " [" + groups + "]"; return s.c_str(); };
@@ -1824,6 +1868,8 @@ void run_bench() {
     bench_attention("attn prefill global W8192 past 64k [p1 KS1]", K::Global, 8192, 1, 65536);
     bench_attention("attn prefill local W8192 past 8k [p1 KS1]", K::Local, 8192, 1, 8192);
     unsetenv("SUROGATE_INKLING_PREFILL_KS");
+    bench_attention_wo("decode global 1x8k + wo N=1 1x128 [p1]", K::Global, 8191);
+    bench_attention_wo("decode local 1x8k + wo N=1 1x128 [p1]", K::Local, 8191);
     unsetenv("SUROGATE_INKLING_ATTN_GROUPS");
     if (std::getenv("BENCH_ATTN_ONLY") != nullptr) { return; }
     bench_prologue("prologue local 1x1", K::Local, 1, 1, 8191);
