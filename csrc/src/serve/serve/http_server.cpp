@@ -2419,7 +2419,7 @@ void HttpServer::attach(GenerationService& service) {
     device_                            = memory.device;
     attached_memory_.emplace(&service, memory);
     request_jsonl_.write_server_start(options_, service.sampling_defaults(), public_model_id_, load,
-                                      service.memory_summary());
+                                      service.memory_summary(), service.runtime_stats().kv_on_demand != 0);
 }
 
 bool HttpServer::listen() {
