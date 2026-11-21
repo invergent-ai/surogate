@@ -127,6 +127,15 @@ def relocated(engine):
     return total
 
 
+def keep(report, name, result):
+    """A relocate path counts only if its engine moved pages (an engine without lane f1's elastic window class, or a
+    model without windowed layers, ignores the knobs): otherwise it goes to report["skipped"], out of the verdict."""
+    if result.get("relocated_pages", 0) > 0:
+        report["paths"][name] = result
+    else:
+        report.setdefault("skipped", {})[name] = dict(result, reason="the engine relocated no window page")
+
+
 def tail(result, k):
     """The last k generated tokens: ids, chosen log-probs, top-k alternatives."""
     return {"ids": result["ids"][-k:], "logprobs": result["logprobs"][-k:], "top": result["top"][-k:],
@@ -282,7 +291,7 @@ def main():
             finally:
                 eng.close()
             result["relocated_pages"] = relocated(eng)
-            report["paths"][f"relocate@{cut}"] = result
+            keep(report, f"relocate@{cut}", result)
         if args.relocate_host_capacity > 0:
             cap = args.host_capacity
             for cut, text in cuts:
@@ -307,7 +316,7 @@ def main():
                 finally:
                     eng.close()
                 result["relocated_pages"] = relocated(eng)
-                report["paths"][f"relocate-host@{cut}"] = result
+                keep(report, f"relocate-host@{cut}", result)
         eng = Engine(args, "relocate-decode", extra_args=extra, env=shuffle)
         try:
             rdec = tail(eng.complete(p_text, nx + k), k)
@@ -316,12 +325,14 @@ def main():
         finally:
             eng.close()
         result["relocated_pages"] = relocated(eng)
-        report["paths"]["relocate-decode"] = result
+        keep(report, "relocate-decode", result)
 
     ok = all(path["equal"] for path in report["paths"].values())
     report["pass"] = ok
     json.dump(report, open(args.out, "w"), indent=1)
     print(f"S = {len(s_ids)} tokens, K = {k}")
+    for name in report.get("skipped", {}):
+        print(f"  {name:12s} SKIPPED (the engine relocated no window page: no elastic window class or no windowed layer)")
     for name, path in report["paths"].items():
         spilled = "" if "restored_from_host" not in path else f" host_restore={path['restored_from_host']}"
         if "relocated_pages" in path:
