@@ -9,13 +9,16 @@
 // attention,attention_sm90}.py). Rounding points and the reasons for every choice below:
 // rl/engine-inkling-2026-11-21/lanes/c/DESIGN-attention.md (section numbers cited as "D<n>").
 //
-// STATUS: M1 header for the integrator's approval. Nothing declared here is implemented yet.
+// STATUS: M1 header approved by agent-EN (7e7d4e1a); M2 revision aligns the rows / conv-state / call
+// shape with lane e1's VisitRound contract (lanes/e1/DESIGN-target.md section 4 c): one call per visit,
+// InPlace / Record conv modes on the visit's LinearAttentionStatePool slots, tau from positions inside.
 //
 // Layout convention (this engine's): the FIRST dimension is the fastest. "[128, 24, N]" is N columns
 // of 24 heads of 128 contiguous values. A batch of B rows of W columns each is N = W * B columns,
 // column n = j + W * b. Geometry is fixed (Inkling-2-Mini, both local and global layers): every
 // kernel is compiled for it and every entry point rejects other shapes.
 
+#include "api/ops/gqa_attention.h" // GqaExecutionEnvelope
 #include "core/arena.h"
 #include "core/paged_kv_cache.h"
 #include "core/tensor.h"
@@ -87,69 +90,111 @@ enum class InklingLayerKind : std::uint8_t {
  * empty Tensor meaning every row has W valid columns. `kv_table_rows` is contiguous I32 [B]: the row of
  * the plane's block-table matrix each sequence is on.
  *
- * `max_visible_keys` is a host promise, the maximum over rows of p_last + 1. Only the prefill route
- * (W > kMaxSmallColumns) and the workspace query read it: a decode / verify launch plans from (B, W,
- * kind) alone, so a CUDA graph captured for a bucket replays at any context length up to the promise.
+ * `envelope` is the same host promise gqa_attention takes (lane e1's VisitBlock carries it); only its
+ * `max_visible_keys` is read (the layer kind, not the envelope, decides the window), and only by the
+ * prefill route (W > kMaxSmallColumns) and the workspace query: a decode / verify launch plans from
+ * (B, W, kind) alone, so a CUDA graph captured for a bucket replays at any context length up to it.
  */
 struct InklingAttentionRows {
     Tensor positions;
     Tensor valid_columns;
     Tensor kv_table_rows;
-    std::int32_t max_visible_keys = 0;
+    GqaExecutionEnvelope envelope{};
+};
+
+/// InPlace (prefill, decode, the narrow MTP round): each row's slot is read, then replaced by the
+/// window after its last valid column. Record (speculative verify): the slot is only read; every valid
+/// column's raw K / V input is written to `records`, and lane e1's fold commits the accepted prefix.
+enum class InklingConvMode : std::uint8_t {
+    InPlace,
+    Record,
 };
 
 /**
- * The K / V short-convolution state of one visit (the attention's two of the visit's four streams).
+ * The K / V short-convolution state of one visit (lane e1's LinearAttentionStatePool, DESIGN-target.md
+ * section 2: per visit and slot BF16 [6656, 3], channels [K 0..1023 | V 1024..2047 | attn | mlp], oldest
+ * tap first, values = the bf16 conv INPUTS).
  *
- * `states` is BF16 with logical shape [2048, 3, S]: channel c (K channels 0..1023, then V channels
- * 1024..2047), tap j (oldest first), slot s. Dimension 0 is contiguous; nb[1] and nb[2] are any
- * multiples of 16 bytes, so the K|V part of a larger per-visit slot (e1's 4-stream [6656, 3]) is a view.
- * `initial_slots` (I32 [B]) names the window each row starts from; taps at positions below 0 read as
- * zero whatever the slot holds. `output_slots` (I32 [B]) receives the window after the row's last valid
- * column, or with `per_column` (verify rounds) slot `output_slots[b] + j` receives the window after
- * column j for every valid j -- the engine's short_conv_snapshot convention. A row's initial slot may
- * alias any of its output slots; reservations of different rows must not overlap. Idle rows touch
- * nothing.
+ * `states`: BF16 [C, 3, S] view of the visit's slots (C >= v_offset + 1024; dim 0 contiguous; nb[1],
+ * nb[2] multiples of 16 bytes). K channel c is state channel k_offset + c, V channel c is v_offset + c.
+ * `slots`: contiguous I32 [B], each row's slot. Taps at positions below 0 read as zero whatever the slot
+ * holds. Record mode: `records` is BF16 [C, W_max, B] (dim 0 contiguous, W_max >= W): column j of row b
+ * lands at (k_offset + c or v_offset + c, j, b); InPlace: `records` empty. `capture_column` >= 0 (InPlace,
+ * B = 1: a single-segment prefill's rewrite checkpoint) also writes the window BEFORE that column (the
+ * three inputs at columns capture_column - 3 .. - 1, from the slot where negative) to `capture_slot`.
+ * Every state read of a row happens before any state write of that row, so a slot is safely read and
+ * replaced by one call. Idle rows touch nothing.
  */
-struct InklingConvStateIO {
+struct InklingConvStateArgs {
     Tensor states;
-    Tensor initial_slots;
-    Tensor output_slots;
-    bool per_column = false;
+    Tensor slots;
+    InklingConvMode mode = InklingConvMode::InPlace;
+    Tensor records;
+    std::int32_t capture_column = -1;
+    std::int32_t capture_slot   = -1;
+    std::int32_t k_offset       = 0;
+    std::int32_t v_offset       = 1024;
 };
 
 /**
- * Prologue inputs: views into the attention projection's output (no copy), D3.
+ * One visit's attention inputs: views into its projection outputs (no copy), D3. A 1-input visit reads
+ * them all from one [8600, N] buffer; a 3-input visit from a [6552, N] query-side buffer (x_q) and two
+ * [1024, N] buffers (x_k, x_v).
  *
- * q: BF16 [128, 24, N], dims 0-1 contiguous, any 16-byte column stride (rows [kRowsQ, kRowsR) of the
- * projection). r: BF16 [16, 24, N] likewise (rows [kRowsR, kRowsGate)). k, v: BF16 [1024, N], dim 0
- * contiguous, any 16-byte column stride. Global layers: k_dyn, v_dyn = BF16 [4, 8, N] (tap lag fastest,
- * then KV head) = weight_proj(x_k), weight_proj(x_v) as bf16 projection outputs; tau = FP32 [W, B] from
- * inkling_log_tau of the same positions. Local layers: k_dyn, v_dyn and tau empty.
+ * q: BF16 [128, 24, N], dims 0-1 contiguous, column stride any multiple of 8 bytes (rows [kRowsQ, kRowsR)).
+ * r: BF16 [16, 24, N] likewise (rows [kRowsR, kRowsGate)). gate: BF16 [3072, N] (rows [kRowsGate,
+ * kRowsSink)), sink: BF16 [24, N] (rows [kRowsSink, kRowsK)). k, v: BF16 [1024, N]. Global layers only:
+ * k_dyn, v_dyn = BF16 [4, 8, N] (tap lag fastest, then KV head) = bf16 weight_proj(x_k), weight_proj(x_v);
+ * empty on local layers. tau is computed inside from the rows' positions (global layers).
  */
-struct InklingPrologueInputs {
+struct InklingProjections {
     Tensor q;
     Tensor r;
+    Tensor gate;
+    Tensor sink;
     Tensor k;
     Tensor v;
     Tensor k_dyn;
     Tensor v_dyn;
-    Tensor tau;
 };
 
 /**
- * Per-layer prologue weights, as the artifact stores them (ARTIFACT.md 4.2), all BF16 contiguous.
+ * Per-layer attention weights, as the artifact stores them (ARTIFACT.md 4.2), all BF16 contiguous.
  * q_scale: `attn/q_scale` [24 rows, 128] = [128, 24] here. r_scale: `attn/r_scale` = [16, 24].
  * Local: k_conv, v_conv = `attn/k_conv`, `attn/v_conv`, the artifact's [1024 rows, 4 taps] (a channel's
  * taps contiguous, oldest first) = [4, 1024] here. Global: `attn/k_conv_static`, `attn/v_conv_static`,
- * the artifact's [4 rows = lag 0 (current token) .. 3, 1024] = [1024, 4] here.
+ * the artifact's [4 rows = lag 0 (current token) .. 3, 1024] = [1024, 4] here. rel_table: the layer's
+ * inkling_rel_proj_table (built once at load from `attn/rel_proj`).
  */
-struct InklingPrologueWeights {
+struct InklingAttentionWeights {
     Tensor q_scale;
     Tensor r_scale;
     Tensor k_conv;
     Tensor v_conv;
+    Tensor rel_table;
 };
+
+/**
+ * THE call per visit (lane e1's contract, DESIGN-target.md 4 c): prologue + attention + gate and sink.
+ * Writes the visit's K / V to `cache`, updates or records the conv state, and writes `out` = contiguous
+ * BF16 [3072, N], the wo_ud input (invalid columns and idle rows exact zero). Forms as gqa_attention A1:
+ * a decode / verify block (B rows of W <= 16 columns) or a prefill segment (B = 1, W = its length).
+ * Transient q / r and split partials come from `workspace`
+ * (inkling_attention_workspace_capacity_bytes).
+ */
+void inkling_attention(const InklingProjections& projections, const InklingAttentionWeights& weights,
+                       InklingLayerKind kind, const InklingAttentionRows& rows,
+                       const InklingConvStateArgs& conv, const PagedKVBatchLayerView& cache,
+                       WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
+
+/// Workspace of inkling_attention for every W in [min_width, max_width] at B rows under `envelope`.
+[[nodiscard]] std::size_t inkling_attention_workspace_capacity_bytes(InklingLayerKind kind,
+                                                                     std::int32_t batch,
+                                                                     std::int32_t min_width,
+                                                                     std::int32_t max_width,
+                                                                     GqaExecutionEnvelope envelope);
+
+// ---- The component ops (op tests against lane a's vectors; also callable on their own). ------------
 
 /// Prologue outputs: q_out BF16 [128, 24, N] (clipped, tau-scaled) and r_out BF16 [16, 24, N]
 /// (clipped, tau-scaled), both contiguous. Read by inkling_rel_attention of the same visit.
@@ -166,15 +211,16 @@ struct InklingPrologueOutputs {
  * (conv state + earlier columns), rounded to bf16; K L2-clipped to kQkClip, V RMS-normalised without a
  * weight; both written to `cache` at the column's position as unit-scale e4m3 (RNE, satfinite, straight
  * from fp32). q_out = bf16(l2clip(q * q_scale, kQkClip)), r_out = bf16(l2clip(r * r_scale, kRelClip));
- * Global: each further bf16(value * tau). Conv windows written per InklingConvStateIO.
+ * Global: each further bf16(value * tau(position)). Conv state per InklingConvStateArgs. Reads q, r, k,
+ * v, k_dyn, v_dyn of `projections` (gate / sink unused) and q_scale, r_scale, k_conv, v_conv of `weights`.
  *
  * `cache` is the visit's plane (FP8 e4m3 K and V planes, no scale planes, head dim 128, 8 KV heads);
  * the op writes only the addressed slots. Launched with programmatic dependent launch: it triggers its
  * dependents at entry, so the attention that follows may prefetch the keys of earlier forwards.
  */
-void inkling_attention_prologue(const InklingPrologueInputs& inputs,
-                                const InklingPrologueWeights& weights, InklingLayerKind kind,
-                                const InklingAttentionRows& rows, const InklingConvStateIO& conv,
+void inkling_attention_prologue(const InklingProjections& projections,
+                                const InklingAttentionWeights& weights, InklingLayerKind kind,
+                                const InklingAttentionRows& rows, const InklingConvStateArgs& conv,
                                 const PagedKVBatchLayerView& cache, InklingPrologueOutputs& outputs,
                                 cudaStream_t stream);
 
@@ -191,12 +237,12 @@ struct InklingAttentionInputs {
     Tensor rel_table;
 };
 
-/// Workspace for inkling_rel_attention / _out_lse at B rows of W columns (split partials, merge
-/// counters); zero when the call plans a single split. Throws outside the supported domain.
+/// Workspace for inkling_rel_attention / _out_lse at B rows of W columns (split partials); zero when
+/// the call plans a single split. Throws outside the supported domain.
 [[nodiscard]] std::size_t inkling_rel_attention_workspace_bytes(InklingLayerKind kind,
                                                                 std::int32_t width,
                                                                 std::int32_t batch,
-                                                                std::int32_t max_visible_keys);
+                                                                GqaExecutionEnvelope envelope);
 
 /**
  * Op inkling_rel_attention, production route (ref `inkling_rel_attention` + `inkling_gate_sink`; D1

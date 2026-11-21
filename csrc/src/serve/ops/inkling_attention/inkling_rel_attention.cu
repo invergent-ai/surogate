@@ -627,7 +627,7 @@ void run(const InklingAttentionInputs& in, InklingLayerKind kind, const InklingA
         p.out_f32 = static_cast<float*>(out_f32->data);
         p.lse     = static_cast<float*>(lse->data);
     }
-    const Plan plan = make_plan(kind, rs.width, rs.batch, rows.max_visible_keys);
+    const Plan plan = make_plan(kind, rs.width, rs.batch, static_cast<std::int32_t>(rows.envelope.max_visible_keys));
     p.splits        = plan.splits;
     if (plan.splits == 1) {
         dispatch(kind, final_mode, plan, p, stream);
@@ -651,13 +651,47 @@ void run(const InklingAttentionInputs& in, InklingLayerKind kind, const InklingA
 } // namespace inkling_detail
 
 std::size_t inkling_rel_attention_workspace_bytes(InklingLayerKind kind, std::int32_t width,
-                                                  std::int32_t batch, std::int32_t max_visible_keys) {
+                                                  std::int32_t batch, GqaExecutionEnvelope envelope) {
     using namespace inkling_detail;
-    if (width <= 0 || batch <= 0 || max_visible_keys < 0 || max_visible_keys > (1 << 20)) {
+    if (width <= 0 || batch <= 0 || envelope.max_visible_keys > static_cast<std::uint32_t>(1 << 20)) {
         throw std::invalid_argument("inkling_rel_attention_workspace_bytes: outside the supported domain");
     }
-    const Plan plan = make_plan(kind, width, batch, max_visible_keys);
+    const Plan plan = make_plan(kind, width, batch, static_cast<std::int32_t>(envelope.max_visible_keys));
     return partial_bytes(plan, static_cast<std::int64_t>(width) * batch);
+}
+
+std::size_t inkling_attention_workspace_capacity_bytes(InklingLayerKind kind, std::int32_t batch,
+                                                       std::int32_t min_width, std::int32_t max_width,
+                                                       GqaExecutionEnvelope envelope) {
+    using namespace inkling_detail;
+    if (batch <= 0 || min_width <= 0 || max_width < min_width) {
+        throw std::invalid_argument("inkling_attention_workspace_capacity_bytes: outside the supported domain");
+    }
+    std::size_t most = 0;
+    for (std::int32_t w = min_width; w <= max_width; ++w) {
+        const std::int64_t n   = static_cast<std::int64_t>(w) * batch;
+        const std::size_t qr   = static_cast<std::size_t>(n * Geo::kQHeads * (Geo::kHeadDim + Geo::kRelDim) * 2) + 512;
+        most                   = std::max(most, qr + inkling_rel_attention_workspace_bytes(kind, w, batch, envelope));
+    }
+    return most;
+}
+
+void inkling_attention(const InklingProjections& projections, const InklingAttentionWeights& weights,
+                       InklingLayerKind kind, const InklingAttentionRows& rows,
+                       const InklingConvStateArgs& conv, const PagedKVBatchLayerView& cache,
+                       WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
+    using namespace inkling_detail;
+    const RowsShape rs   = check_rows(rows, "inkling_attention");
+    const std::int64_t n = rs.columns;
+    auto scope           = workspace.scope();
+    InklingPrologueOutputs qr;
+    qr.q = Tensor(workspace.alloc_bytes(static_cast<std::size_t>(n * Geo::kQHeads * Geo::kHeadDim * 2)).data,
+                  DType::BF16, {Geo::kHeadDim, Geo::kQHeads, static_cast<std::int32_t>(n)});
+    qr.r = Tensor(workspace.alloc_bytes(static_cast<std::size_t>(n * Geo::kQHeads * Geo::kRelDim * 2)).data,
+                  DType::BF16, {Geo::kRelDim, Geo::kQHeads, static_cast<std::int32_t>(n)});
+    inkling_attention_prologue(projections, weights, kind, rows, conv, cache, qr, stream);
+    const InklingAttentionInputs in{qr.q, qr.r, projections.gate, projections.sink, weights.rel_table};
+    inkling_rel_attention(in, kind, rows, cache, workspace, out, stream);
 }
 
 void inkling_rel_attention(const InklingAttentionInputs& inputs, InklingLayerKind kind,

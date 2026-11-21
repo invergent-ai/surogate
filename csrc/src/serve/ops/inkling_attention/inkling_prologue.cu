@@ -26,7 +26,6 @@ struct PrologueParams {
     const __nv_bfloat16* v;
     const __nv_bfloat16* k_dyn;
     const __nv_bfloat16* v_dyn;
-    const float* tau;
     std::int64_t q_stride, r_stride, k_stride, v_stride, k_dyn_stride, v_dyn_stride; // elements per column
 
     const __nv_bfloat16* q_scale; // [128, 24]
@@ -42,9 +41,12 @@ struct PrologueParams {
 
     __nv_bfloat16* states; // conv state: (c, tap, slot)
     std::int64_t state_tap_stride, state_slot_stride; // elements
-    const std::int32_t* initial_slots;
-    const std::int32_t* output_slots;
-    bool per_column;
+    std::int32_t k_offset, v_offset;                  // state channel of K / V channel 0
+    const std::int32_t* slots;                        // [B]
+    bool record;
+    __nv_bfloat16* records;                           // Record: (c, column, row)
+    std::int64_t record_col_stride, record_row_stride; // elements
+    std::int32_t capture_column, capture_slot;        // capture_column < 0: none
 
     std::uint8_t* k_pages;
     std::uint8_t* v_pages;
@@ -80,10 +82,19 @@ __device__ __forceinline__ void store_bf16x4(__nv_bfloat16* dst, const float (&x
     store_vec(dst, make_uint2(pack_bf16x2(x[0], x[1]), pack_bf16x2(x[2], x[3])));
 }
 
+// ops/attention.py `_log_scaling_tau_kernel` (fusion off): ratio = max((pos + 1) * (1 / FLOOR), 1);
+// tau = 1 + ALPHA * log(ratio), libdevice logf (this archive is built without fast math).
+__device__ __forceinline__ float log_tau(std::int32_t position) {
+    const float ratio = fmaxf(__fmul_rn(static_cast<float>(position + 1),
+                                        1.0F / static_cast<float>(Geo::kTauFloor)),
+                              1.0F);
+    return __fadd_rn(1.0F, __fmul_rn(Geo::kTauAlpha, logf(ratio)));
+}
+
 // One warp: K or V (kv 0 / 1) of one KV head, columns [chunk * kv_chunk, ...) of row b, in order.
-// Lane l owns channels head * 128 + 4 l .. + 3. Only chunk 0 touches the conv state: it reads the initial
-// window first and writes every output window afterwards (DESIGN section 2), so an initial slot may alias
-// an output slot.
+// Lane l owns channels head * 128 + 4 l .. + 3. Only chunk 0 reads or writes the row's slot (and the capture
+// slot): it reads the initial window first and writes afterwards, so one call reads and replaces a slot.
+// Record mode: each unit writes its own columns' raw inputs to the records; the slot is never written.
 template <bool Global>
 __device__ void kv_unit(const PrologueParams& p, std::int64_t unit) {
     const int lane  = static_cast<int>(threadIdx.x) & 31;
@@ -100,7 +111,8 @@ __device__ void kv_unit(const PrologueParams& p, std::int64_t unit) {
     const int j_end = min(j_begin + p.kv_chunk, valid);
 
     const int ch                  = head * Geo::kHeadDim + lane * 4; // channel within the stream
-    const int state_ch            = kv * 1024 + ch;
+    const int state_ch            = (kv ? p.v_offset : p.k_offset) + ch;
+    const std::int64_t row_slot   = p.slots[b];
     const __nv_bfloat16* x        = kv ? p.v : p.k;
     const std::int64_t x_stride   = kv ? p.v_stride : p.k_stride;
     const __nv_bfloat16* conv     = kv ? p.v_conv : p.k_conv;
@@ -121,12 +133,29 @@ __device__ void kv_unit(const PrologueParams& p, std::int64_t unit) {
         if (col >= 0) {
             load_bf16x4(x + static_cast<std::int64_t>(col) * x_stride + ch, u[tap]);
         } else if (p0 + col >= 0) {
-            const std::int64_t slot = p.initial_slots[b];
             load_bf16x4(p.states + state_ch + static_cast<std::int64_t>(3 + col) * p.state_tap_stride +
-                            slot * p.state_slot_stride,
+                            row_slot * p.state_slot_stride,
                         u[tap]);
         } else {
             u[tap][0] = u[tap][1] = u[tap][2] = u[tap][3] = 0.0F;
+        }
+    }
+
+    // Rewrite checkpoint (B = 1 prefill): the window before capture_column, from the inputs or the slot.
+    if (chunk == 0 && p.capture_column >= 0) {
+        __nv_bfloat16* dst = p.states + state_ch + static_cast<std::int64_t>(p.capture_slot) * p.state_slot_stride;
+#pragma unroll
+        for (int tap = 0; tap < 3; ++tap) {
+            const int col = p.capture_column - 3 + tap;
+            float t4[4]   = {0.0F, 0.0F, 0.0F, 0.0F};
+            if (col >= 0) {
+                load_bf16x4(x + static_cast<std::int64_t>(col) * x_stride + ch, t4);
+            } else if (p0 + col >= 0) {
+                load_bf16x4(p.states + state_ch + static_cast<std::int64_t>(3 + col) * p.state_tap_stride +
+                                row_slot * p.state_slot_stride,
+                            t4);
+            }
+            store_bf16x4(dst + tap * p.state_tap_stride, t4);
         }
     }
 
@@ -184,12 +213,10 @@ __device__ void kv_unit(const PrologueParams& p, std::int64_t unit) {
         store_vec(pages + kv_page_offset(page, head, pos & (kPageTokens - 1)) + lane * 4,
                   e4m3x4(z[0], z[1], z[2], z[3]));
 
-        if (p.per_column && chunk == 0) {
-            const std::int64_t slot = static_cast<std::int64_t>(p.output_slots[b]) + j;
-            __nv_bfloat16* dst      = p.states + state_ch + slot * p.state_slot_stride;
-            store_bf16x4(dst, u[1]);
-            store_bf16x4(dst + p.state_tap_stride, u[2]);
-            store_bf16x4(dst + 2 * p.state_tap_stride, cur);
+        if (p.record) {
+            store_bf16x4(p.records + state_ch + static_cast<std::int64_t>(j) * p.record_col_stride +
+                             static_cast<std::int64_t>(b) * p.record_row_stride,
+                         cur);
         }
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
@@ -199,7 +226,7 @@ __device__ void kv_unit(const PrologueParams& p, std::int64_t unit) {
         }
     }
 
-    if (!p.per_column && chunk == 0) {
+    if (!p.record && chunk == 0) {
         // The window after the row's last valid column: still in registers when this unit ran every
         // column, else the raw inputs of the last three columns (all at columns >= kv_chunk >= 4).
         if (valid > j_end) {
@@ -208,8 +235,7 @@ __device__ void kv_unit(const PrologueParams& p, std::int64_t unit) {
                 load_bf16x4(x + static_cast<std::int64_t>(valid - 3 + tap) * x_stride + ch, u[tap]);
             }
         }
-        __nv_bfloat16* dst = p.states + state_ch +
-                             static_cast<std::int64_t>(p.output_slots[b]) * p.state_slot_stride;
+        __nv_bfloat16* dst = p.states + state_ch + row_slot * p.state_slot_stride;
 #pragma unroll
         for (int tap = 0; tap < 3; ++tap) { store_bf16x4(dst + tap * p.state_tap_stride, u[tap]); }
     }
@@ -240,7 +266,7 @@ __device__ void q_unit(const PrologueParams& p, std::int64_t unit) {
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         y[i] = __fmul_rn(x[i], f);
-        if constexpr (Global) { y[i] = __fmul_rn(round_bf16(y[i]), p.tau[n]); }
+        if constexpr (Global) { y[i] = __fmul_rn(round_bf16(y[i]), log_tau(p.positions[n])); }
     }
     store_bf16x4(dst, y);
 }
@@ -265,7 +291,7 @@ __device__ void r_unit(const PrologueParams& p, std::int64_t unit) {
                      __bfloat162float(p.r_scale[h * Geo::kRelDim + d]));
     const float f = l2_clip_factor(sum_squares<16, 1>(x), Geo::kRelClip);
     float y       = __fmul_rn(x[0], f);
-    if constexpr (Global) { y = __fmul_rn(round_bf16(y), p.tau[n]); }
+    if constexpr (Global) { y = __fmul_rn(round_bf16(y), log_tau(p.positions[n])); }
     *dst = __float2bfloat16_rn(y);
 }
 
@@ -292,12 +318,7 @@ __global__ __launch_bounds__(kPrologueThreads) void prologue_kernel(ProloguePara
 __global__ void log_tau_kernel(const std::int32_t* positions, float* tau, std::int64_t n) {
     const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= n) { return; }
-    // ops/attention.py `_log_scaling_tau_kernel` (fusion off): ratio = max((pos + 1) * (1 / FLOOR), 1);
-    // tau = 1 + ALPHA * log(ratio), libdevice logf.
-    const float ratio = fmaxf(__fmul_rn(static_cast<float>(positions[i] + 1),
-                                        1.0F / static_cast<float>(Geo::kTauFloor)),
-                              1.0F);
-    tau[i] = __fadd_rn(1.0F, __fmul_rn(Geo::kTauAlpha, logf(ratio)));
+    tau[i] = log_tau(positions[i]);
 }
 
 __global__ void rel_table_kernel(const __nv_bfloat16* rel_proj, __nv_bfloat16* table) {
@@ -340,9 +361,9 @@ __global__ void rel_logits_kernel(const __nv_bfloat16* r_out, const __nv_bfloat1
 
 using inkling_detail::Geo;
 
-void inkling_attention_prologue(const InklingPrologueInputs& in, const InklingPrologueWeights& wt,
+void inkling_attention_prologue(const InklingProjections& in, const InklingAttentionWeights& wt,
                                 InklingLayerKind kind, const InklingAttentionRows& rows,
-                                const InklingConvStateIO& conv, const PagedKVBatchLayerView& cache,
+                                const InklingConvStateArgs& conv, const PagedKVBatchLayerView& cache,
                                 InklingPrologueOutputs& out, cudaStream_t stream) {
     using namespace inkling_detail;
     const char* op       = "inkling_attention_prologue";
@@ -355,7 +376,7 @@ void inkling_attention_prologue(const InklingPrologueInputs& in, const InklingPr
     p.q        = static_cast<const __nv_bfloat16*>(in.q.data);
     p.q_stride = column_stride_elements(in.q, DType::BF16, {Geo::kHeadDim, Geo::kQHeads}, n, 2, op, "q");
     p.r        = static_cast<const __nv_bfloat16*>(in.r.data);
-    p.r_stride = column_stride_elements(in.r, DType::BF16, {Geo::kRelDim, Geo::kQHeads}, n, 2, op, "r");
+    p.r_stride = column_stride_elements(in.r, DType::BF16, {Geo::kRelDim, Geo::kQHeads}, n, 2, op, "r", 2);
     p.k        = static_cast<const __nv_bfloat16*>(in.k.data);
     p.k_stride = column_stride_elements(in.k, DType::BF16, {1024}, n, 1, op, "k");
     p.v        = static_cast<const __nv_bfloat16*>(in.v.data);
@@ -365,20 +386,18 @@ void inkling_attention_prologue(const InklingPrologueInputs& in, const InklingPr
         p.k_dyn_stride = column_stride_elements(in.k_dyn, DType::BF16, {4, Geo::kKvHeads}, n, 2, op, "k_dyn");
         p.v_dyn        = static_cast<const __nv_bfloat16*>(in.v_dyn.data);
         p.v_dyn_stride = column_stride_elements(in.v_dyn, DType::BF16, {4, Geo::kKvHeads}, n, 2, op, "v_dyn");
-        require_contiguous(in.tau, DType::FP32, n, op, "tau");
-        p.tau = static_cast<const float*>(in.tau.data);
-    } else if (in.k_dyn.data != nullptr || in.v_dyn.data != nullptr || in.tau.data != nullptr) {
-        throw std::invalid_argument(std::string(op) + ": a local layer takes no dynamic taps and no tau");
+    } else if (in.k_dyn.data != nullptr || in.v_dyn.data != nullptr) {
+        fail(op, "a local layer takes no dynamic conv taps");
     }
 
     require_contiguous(wt.q_scale, DType::BF16, Geo::kQHeads * Geo::kHeadDim, op, "q_scale");
     require_contiguous(wt.r_scale, DType::BF16, Geo::kQHeads * Geo::kRelDim, op, "r_scale");
     require_contiguous(wt.k_conv, DType::BF16, 4 * 1024, op, "k_conv");
     require_contiguous(wt.v_conv, DType::BF16, 4 * 1024, op, "v_conv");
-    if (global ? (wt.k_conv.ne[0] != 1024 || wt.k_conv.ne[1] != 4)
-               : (wt.k_conv.ne[0] != 4 || wt.k_conv.ne[1] != 1024)) {
-        throw std::invalid_argument(std::string(op) +
-                                    ": conv weights are [4, 1024] (local) or [1024, 4] (global static)");
+    for (const Tensor* w : {&wt.k_conv, &wt.v_conv}) {
+        if (global ? (w->ne[0] != 1024 || w->ne[1] != 4) : (w->ne[0] != 4 || w->ne[1] != 1024)) {
+            fail(op, "conv weights are [4, 1024] (local attn/k_conv) or [1024, 4] (global attn/k_conv_static)");
+        }
     }
     p.q_scale = static_cast<const __nv_bfloat16*>(wt.q_scale.data);
     p.r_scale = static_cast<const __nv_bfloat16*>(wt.r_scale.data);
@@ -391,20 +410,43 @@ void inkling_attention_prologue(const InklingPrologueInputs& in, const InklingPr
     p.block_tables  = static_cast<const std::int32_t*>(cache.block_tables.data);
     p.table_stride  = cache.block_tables.ne[0];
 
-    if (conv.states.dtype != DType::BF16 || conv.states.ne[0] != 2048 || conv.states.ne[1] != 3 ||
-        conv.states.nb[0] != 2 || conv.states.nb[1] % 16 != 0 || conv.states.nb[2] % 16 != 0 ||
-        reinterpret_cast<std::uintptr_t>(conv.states.data) % 16 != 0) {
-        throw std::invalid_argument(std::string(op) +
-                                    ": conv states are BF16 [2048, 3, S], dim 0 contiguous, 16-byte strides");
+    // Conv state: the visit's slots [C, 3, S]; K at k_offset, V at v_offset, 4 channels a lane (8-byte loads).
+    const std::int32_t channels_needed = std::max(conv.k_offset, conv.v_offset) + 1024;
+    if (conv.states.data == nullptr || conv.states.dtype != DType::BF16 || conv.states.ne[0] < channels_needed ||
+        conv.states.ne[1] != 3 || conv.states.nb[0] != 2 || conv.states.nb[1] % 16 != 0 ||
+        conv.states.nb[2] % 16 != 0 || reinterpret_cast<std::uintptr_t>(conv.states.data) % 16 != 0 ||
+        conv.k_offset < 0 || conv.v_offset < 0 || conv.k_offset % 4 != 0 || conv.v_offset % 4 != 0) {
+        fail(op, "conv states are BF16 [C, 3, S] (dim 0 contiguous, 16-byte strides) holding K at k_offset and "
+                 "V at v_offset (multiples of 4)");
     }
-    require_contiguous(conv.initial_slots, DType::I32, rs.batch, op, "initial_slots");
-    require_contiguous(conv.output_slots, DType::I32, rs.batch, op, "output_slots");
+    require_contiguous(conv.slots, DType::I32, rs.batch, op, "conv slots");
     p.states            = static_cast<__nv_bfloat16*>(conv.states.data);
     p.state_tap_stride  = conv.states.nb[1] / 2;
     p.state_slot_stride = conv.states.nb[2] / 2;
-    p.initial_slots     = static_cast<const std::int32_t*>(conv.initial_slots.data);
-    p.output_slots      = static_cast<const std::int32_t*>(conv.output_slots.data);
-    p.per_column        = conv.per_column;
+    p.k_offset          = conv.k_offset;
+    p.v_offset          = conv.v_offset;
+    p.slots             = static_cast<const std::int32_t*>(conv.slots.data);
+    p.record            = conv.mode == InklingConvMode::Record;
+    p.capture_column    = -1;
+    if (p.record) {
+        const Tensor& rec = conv.records;
+        if (rec.data == nullptr || rec.dtype != DType::BF16 || rec.ne[0] < channels_needed ||
+            rec.ne[1] < rs.width || rec.ne[2] < rs.batch || rec.nb[0] != 2 || rec.nb[1] % 8 != 0 ||
+            rec.nb[2] % 8 != 0 || reinterpret_cast<std::uintptr_t>(rec.data) % 8 != 0) {
+            fail(op, "Record mode needs records BF16 [C, W_max >= W, >= B], dim 0 contiguous, 8-byte strides");
+        }
+        p.records           = static_cast<__nv_bfloat16*>(rec.data);
+        p.record_col_stride = rec.nb[1] / 2;
+        p.record_row_stride = rec.nb[2] / 2;
+        if (conv.capture_column >= 0) { fail(op, "a rewrite checkpoint capture runs in InPlace mode only"); }
+    } else if (conv.capture_column >= 0) {
+        if (rs.batch != 1 || conv.capture_column > rs.width || conv.capture_slot < 0 ||
+            conv.capture_slot >= conv.states.ne[2]) {
+            fail(op, "a capture needs B = 1, capture_column in [0, W] and a capture slot of the pool");
+        }
+        p.capture_column = conv.capture_column;
+        p.capture_slot   = conv.capture_slot;
+    }
 
     p.k_pages = static_cast<std::uint8_t*>(cache.k_pages.data);
     p.v_pages = static_cast<std::uint8_t*>(cache.v_pages.data);
@@ -414,15 +456,11 @@ void inkling_attention_prologue(const InklingPrologueInputs& in, const InklingPr
     p.q_out = static_cast<__nv_bfloat16*>(out.q.data);
     p.r_out = static_cast<__nv_bfloat16*>(out.r.data);
 
-    p.width  = rs.width;
-    p.batch  = rs.batch;
-    // A row runs in one K/V unit up to kMaxSmallColumns columns (verify snapshots need it); a prompt row is
-    // cut into 16-column units (>= 4, so only unit 0 reads the initial window).
-    const bool one_unit = rs.width <= Geo::kMaxSmallColumns;
-    if (conv.per_column && !one_unit) {
-        throw std::invalid_argument(std::string(op) + ": per-column conv snapshots need W <= 16");
-    }
-    p.kv_chunk  = one_unit ? rs.width : 16;
+    p.width = rs.width;
+    p.batch = rs.batch;
+    // Decode / verify rows run in one K/V unit; a prompt row is cut into 16-column units (>= 4 columns, so
+    // only unit 0 reaches back into the slot).
+    p.kv_chunk  = rs.width <= Geo::kMaxSmallColumns ? rs.width : 16;
     p.kv_chunks = (rs.width + p.kv_chunk - 1) / p.kv_chunk;
     p.kv_units  = static_cast<std::int64_t>(rs.batch) * Geo::kKvHeads * 2 * p.kv_chunks;
     p.q_units   = n * Geo::kQHeads;

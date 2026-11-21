@@ -76,8 +76,8 @@ inline RowsShape check_rows(const InklingAttentionRows& rows, const char* op) {
     if (tr.data == nullptr || tr.dtype != DType::I32 || !tr.is_contiguous() || tr.numel() != s.batch) {
         fail(op, "kv_table_rows must be contiguous I32 [B]");
     }
-    if (rows.max_visible_keys < 0 || rows.max_visible_keys > (1 << 20)) {
-        fail(op, "max_visible_keys must lie in [0, 1048576]");
+    if (rows.envelope.max_visible_keys > static_cast<std::uint32_t>(1 << 20)) {
+        fail(op, "the envelope's max_visible_keys must lie in [0, 1048576]");
     }
     return s;
 }
