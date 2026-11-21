@@ -127,6 +127,10 @@ void require_weights(const InklingMoeWeights& w) {
 
 } // namespace
 
+std::size_t inkling_moe_state_bytes() {
+    return aligned(static_cast<std::size_t>(kStateWords) * sizeof(std::int32_t));
+}
+
 std::size_t inkling_moe_workspace_bytes(InklingExpertFormat format, std::int32_t max_tokens, bool adapters) {
     if (max_tokens <= 0) { throw std::invalid_argument("inkling_moe_workspace_bytes: max_tokens must be positive"); }
     std::size_t total = kAlignment; // the arena's offset may be unaligned when the call starts
@@ -167,10 +171,12 @@ void inkling_moe(const Tensor& x, const InklingMoeWeights& weights, Tensor& out,
     // quantised once per token (the reference writes it once per routed row; the bits are equal).
     // Narrow rounds run both in one grid.
     const bool narrow = tokens <= kNarrowMaxTokens;
-    if (narrow) {
+    static_assert(kNarrowMaxTokens <= kNarrowStateMaxTokens);
+    const bool fused_select = narrow && options.state != nullptr;
+    if (narrow && !fused_select) {
         launch_route_quant_narrow(input, as_bf16(weights.router), b.logits, tokens, b.counters, kCounterWords, live,
                                   nvfp4, b.x_codes, b.x_scales, b.x_amax, b.x_bf16, stream);
-    } else {
+    } else if (!narrow) {
         launch_router_logits(input, as_bf16(weights.router), b.logits, tokens, b.counters, kCounterWords, stream);
         if (nvfp4) {
             launch_quant_nvfp4(input, tokens, kHidden, nullptr, live, b.x_codes, b.x_scales, b.x_amax, stream);
@@ -206,7 +212,15 @@ void inkling_moe(const Tensor& x, const InklingMoeWeights& weights, Tensor& out,
         route.capture_stride   = kTopK;
     }
     route.last_cta_places = narrow ? 1 : 0;
-    launch_router_select(b.logits, weights.router_bias, live, route, stream);
+    if (fused_select) {
+        route.counts = options.state + kStateCountsWord;
+        route.ticket = options.state + kStateTicketWord;
+        launch_route_select_narrow(input, as_bf16(weights.router), weights.router_bias, b.logits, live, nvfp4,
+                                   b.x_codes, b.x_scales, b.x_amax, b.x_bf16, route, options.state + kStateTileWord,
+                                   stream);
+    } else {
+        launch_router_select(b.logits, weights.router_bias, live, route, stream);
+    }
     if (!narrow) { launch_router_place(route, tokens, stream); }
 
     LoraRound lora;
@@ -356,6 +370,30 @@ void inkling_softcap_swiglu(const Tensor& gate_up, const Tensor& gamma, Tensor& 
     }
     launch_softcap_swiglu(as_bf16(gate_up.data), static_cast<const float*>(gamma.data), rows,
                           static_cast<__nv_bfloat16*>(y.data), stream);
+}
+
+void inkling_decode_expert_units(const InklingExpertBank& bank, InklingExpertFormat format, std::int32_t k,
+                                 std::int32_t first_expert, std::int32_t count, Tensor& unit, Tensor& factor,
+                                 cudaStream_t stream) {
+    static_assert(kGateUpRows == kHidden, "both banks stack 2304 rows per expert");
+    const bool nvfp4 = format == InklingExpertFormat::Nvfp4;
+    if (k != kHidden && k != kIntermediate) {
+        throw std::invalid_argument("inkling_decode_expert_units: k must be 2304 (w13) or 1152 (w2)");
+    }
+    if (first_expert < 0 || count <= 0 || first_expert + count > kExperts) {
+        throw std::invalid_argument("inkling_decode_expert_units: experts outside [0, 128)");
+    }
+    if (bank.codes == nullptr || bank.scales == nullptr ||
+        (nvfp4 && (bank.amax == nullptr || bank.outer_den == nullptr))) {
+        throw std::invalid_argument("inkling_decode_expert_units: the bank needs codes, scales (and amax / den)");
+    }
+    require_tensor(unit, DType::BF16, k, count * kGateUpRows, "unit");
+    const bool with_factor = factor.data != nullptr;
+    if (with_factor && (factor.dtype != DType::FP32 || factor.numel() != count)) {
+        throw std::invalid_argument("inkling_decode_expert_units: factor must be FP32 [count]");
+    }
+    launch_decode_expert_units(bank, nvfp4, k, first_expert, count, static_cast<__nv_bfloat16*>(unit.data),
+                               with_factor ? static_cast<float*>(factor.data) : nullptr, stream);
 }
 
 } // namespace sinfer::ops

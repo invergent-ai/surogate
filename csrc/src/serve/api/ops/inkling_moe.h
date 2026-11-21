@@ -145,7 +145,19 @@ struct InklingMoeOptions {
     const InklingMoeCapture* capture = nullptr;
     /// Test / debug only (see InklingMoeTaps).
     const InklingMoeTaps* taps = nullptr;
+    /// Optional persistent state: device memory of `inkling_moe_state_bytes()` bytes, ZEROED ONCE by the
+    /// caller when it is allocated, written by nothing else, and never shared by two calls in flight (one per
+    /// stream; calls on one stream are ordered). Not the transient workspace: other ops reuse that between
+    /// calls. With it, narrow rounds (T <= 64) fold the selection into the router grid -- the last router CTA
+    /// of a token tile selects its tokens, the last selector lays out the rows -- and that CTA returns every
+    /// counter to zero before the grid ends (no per-call memset; a captured graph replays from zeros). The
+    /// counters choose only WHICH CTA selects / places, never the order of any sum: the bits are those of
+    /// the call without state. Null = the separate select kernel.
+    std::int32_t* state = nullptr;
 };
+
+/// Bytes of `InklingMoeOptions::state`.
+[[nodiscard]] std::size_t inkling_moe_state_bytes();
 
 /// Transient workspace one `inkling_moe` call of up to `max_tokens` tokens needs (graph-stable,
 /// caller-owned, no state across calls). `adapters` adds the LoRA low-rank buffers.
@@ -198,5 +210,20 @@ void inkling_quant_mxfp8(const Tensor& x, Tensor& codes, Tensor& exponents, cuda
 /// [2304, R] interleaved (column 2j = gate j, 2j + 1 = up j), gamma FP32 [R] -> y BF16 [1152, R].
 void inkling_softcap_swiglu(const Tensor& gate_up, const Tensor& gamma, Tensor& y,
                             cudaStream_t stream);
+
+/// The trainer's dX operand for the straight-through backward, in the engine's split (the reference;
+/// a decode that folds the per-expert global into bf16 differs from it by up to 0.5 bf16 ulp per weight):
+///   unit: BF16 [k, count * 2304] = row-major [count * 2304][k], the UNIT weights of experts
+///         [first_expert, first_expert + count), expert-stacked rows as in the bank (w13 rows interleaved).
+///         Nvfp4: e2m1 x its e4m3 block scale (<= 6 significant bits: exact in bf16); Mxfp8: bf16(e4m3 x
+///         2^(e - 127)), the GEMM's in-register dequantisation (exact for the checkpoint's scale range).
+///   factor: FP32 [count], the per-expert factor the engine applies in fp32 AFTER the GEMM: Nvfp4
+///         amax[e] / den (div_rn: `inkling_ref.nvfp4_global`); Mxfp8 1. (The forward applies it fused with the
+///         activation's: (amax_x * amax_w[e]) * rcp_rn(1536 * den).) An empty tensor skips it.
+/// So dX[token] = sum over the token's slots of (dY[slot] . unit[e]) * factor[e], the GEMM accumulated in fp32.
+/// `k` is the bank's K: 2304 for w13, 1152 for w2.
+void inkling_decode_expert_units(const InklingExpertBank& bank, InklingExpertFormat format, std::int32_t k,
+                                 std::int32_t first_expert, std::int32_t count, Tensor& unit, Tensor& factor,
+                                 cudaStream_t stream);
 
 } // namespace sinfer::ops

@@ -13,6 +13,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 
 namespace sinfer::ops::detail::inkling {
 
@@ -71,6 +72,22 @@ void launch_route_quant_narrow(const __nv_bfloat16* x, const __nv_bfloat16* rout
                                bool nvfp4, std::uint8_t* x_codes, std::uint8_t* x_scales, float* x_amax,
                                __nv_bfloat16* x_dequantised, cudaStream_t stream);
 
+/// Persistent state words (InklingMoeOptions::state): [0, 128) expert counts, [128] ticket, [129, 137) the
+/// arrival counter of each 8-token router tile. Zero between calls (each call returns them to zero).
+inline constexpr int kStateCountsWord   = 0;
+inline constexpr int kStateTicketWord   = kExperts;
+inline constexpr int kStateTileWord     = kExperts + 1;
+inline constexpr int kNarrowStateMaxTokens = 64;
+inline constexpr int kStateWords        = kStateTileWord + kNarrowStateMaxTokens / 8;
+
+/// Narrow rounds with the persistent state: router logits, x quantisation and the selection (+ offsets and
+/// placement by the last selector) in one grid; `out.counts` / `out.ticket` and `tile_arrivals` point into
+/// the state and are zero on entry and on exit.
+void launch_route_select_narrow(const __nv_bfloat16* x, const __nv_bfloat16* router, const float* bias,
+                                float* logits, LiveTokens live, bool nvfp4, std::uint8_t* x_codes,
+                                std::uint8_t* x_scales, float* x_amax, __nv_bfloat16* x_dequantised,
+                                const RouteOutputs& out, std::int32_t* tile_arrivals, cudaStream_t stream);
+
 /// sorted[offsets[ids[i]] + ranks[i]] = i for every routed slot i (after the select kernel).
 void launch_router_place(const RouteOutputs& out, std::int32_t tokens, cudaStream_t stream);
 
@@ -111,6 +128,11 @@ void launch_lora_shrink(const __nv_bfloat16* source, std::int32_t source_k, bool
                         const std::int32_t* ids, LiveTokens live, const LoraRound& lora,
                         cudaStream_t stream);
 
+/// Unit weights of experts [first, first + count) of `bank` (K = k) -> bf16 [count * 2304][k], and the
+/// per-expert factor [count] (null to skip). See `inkling_decode_expert_units`.
+void launch_decode_expert_units(const InklingExpertBank& bank, bool nvfp4, std::int32_t k, std::int32_t first,
+                                std::int32_t count, __nv_bfloat16* unit, float* factor, cudaStream_t stream);
+
 /// Grouped expert GEMM operands of one projection.
 struct GemmParams {
     // Activations (source row = slot >> a_row_shift).
@@ -135,7 +157,23 @@ struct GemmParams {
     __nv_bfloat16* combined    = nullptr;
     // Adapter (table null = none).
     LoraRound lora;
+    /// L2 prefetch-size hint for the weight-code loads (0 none, 128, 256): same bytes (with_l2_prefetch).
+    std::int32_t l2_prefetch = 0;
 };
+
+/// The weight loads' L2 prefetch hint (`GemmParams::l2_prefetch`): 128 bytes. Measured 12:54 (card 7, cold,
+/// layer 0 NVFP4): T = 8 151.6 -> 131.0 us, T = 64 336.9 -> 291.1, T = 1 36.9 -> 35.7; 256 B the same; T = 4,096
+/// and MXFP8 unchanged. SUROGATE_INKLING_L2_PREFETCH = 0 | 256 overrides it (A/B only). Same bytes, same bits.
+inline GemmParams with_l2_prefetch(GemmParams params) {
+    static const int value = [] {
+        const char* text = std::getenv("SUROGATE_INKLING_L2_PREFETCH");
+        if (text == nullptr) { return 128; }
+        const int v = std::atoi(text);
+        return v == 128 || v == 256 ? v : 0;
+    }();
+    params.l2_prefetch = value;
+    return params;
+}
 
 /// Tile schedules: Narrow for decode / verify widths, Wide for prefill. Same arithmetic.
 enum class GemmSchedule : std::uint8_t { Narrow, Wide };
