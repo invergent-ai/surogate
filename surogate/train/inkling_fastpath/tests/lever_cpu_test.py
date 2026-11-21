@@ -59,8 +59,8 @@ def skewed_ids(T, nexp, gen):
     return torch.multinomial(p.expand(T, -1), TOPK, replacement=False, generator=gen).to(torch.int32)
 
 
-def moe_grads(w, ids, x0, g, lora0, fast, rows):
-    LG.MOE_FAST, LG.MOE_ROWS = fast, rows
+def moe_grads(w, ids, x0, g, lora0, fast, rows, det=False):
+    LG.MOE_FAST, LG.MOE_ROWS, LG.MOE_DET = fast, rows, det
     x = x0.clone().requires_grad_()
     lt = [t.clone().requires_grad_() for t in lora0]
     out = LG.MoEGM.apply(w, ids, 2.0, x, *lt)
@@ -110,7 +110,11 @@ def test_moe():
         ref = moe_grads(w, ids, x, g, lora, False, rows)
         new = moe_grads(w, ids, x, g, lora, True, rows)
         res[f"rows_{rows}"] = {n: {"rel": rel(a, b)[0], "cos": rel(a, b)[1]} for n, a, b in zip(names, new, ref)}
-    LG.MOE_FAST, LG.MOE_ROWS = False, 8192
+        for fast in (False, True):  # MOE_DET on both MoE paths
+            new = moe_grads(w, ids, x, g, lora, fast, rows, det=True)
+            res[f"rows_{rows}_det_fast{int(fast)}"] = {n: {"rel": rel(a, b)[0], "cos": rel(a, b)[1]}
+                                                       for n, a, b in zip(names, new, ref)}
+    LG.MOE_FAST, LG.MOE_ROWS, LG.MOE_DET = False, 8192, False
     worst = max(v["rel"] for r in res.values() for v in r.values())
     res["worst_rel"] = worst
     res["pass"] = worst < 2e-4

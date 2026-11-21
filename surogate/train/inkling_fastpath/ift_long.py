@@ -455,6 +455,11 @@ def _moe_rows(xr, gr, eg, pg, cap, ng, u13, f13, u2, f2, lo, scale):
 # ---------------------------------------------------------------------------------------------------------------
 MOE_FAST = os.environ.get("IFT_MOE_FAST", "0") == "1"
 MOE_BATCHES = int(os.environ.get("IFT_MOE_BATCHES", "3"))
+# MOE_DET (default OFF until its card check): lev-all-1 found the path before MoEGM repeats bit for bit (A/A rel err 0.0) and
+# every MoEGM arm does not (0.36-0.92 % at 1k). A token routed to two experts of one block repeats in index_add_'s index, and
+# the card adds repeats in arbitrary order in fp32; the backward's bf16 roundings then amplify the ulp differences. With
+# MOE_DET the rows' dX are summed in fp64 (order-independent for these few terms) and rounded once to fp32 per visit.
+MOE_DET = os.environ.get("IFT_MOE_DET", "0") == "1"
 
 
 def _h2d(t, dev):
@@ -565,10 +570,16 @@ def _moe_fast_batch(items, r0, x, g, tok, gam_r, u13, f13, u2, f2, lora, scale, 
         dB13 = torch.bmm(pc.transpose(1, 2), la13)
         dA13 = torch.bmm(dla13.transpose(1, 2), xp)
         dxp = dxp + torch.bmm(dla13, A13)
-        for j, t in enumerate((dA13, dB13, dA2, dB2)):  # B.LORA_KEYS order; an expert cut into items repeats in eix
-            if lgr[j] is not None:
+        repeats = len(set(es.tolist())) < nb  # an expert cut into items: add its parts in a fixed order, not by atomics
+        for j, t in enumerate((dA13, dB13, dA2, dB2)):  # B.LORA_KEYS order
+            if lgr[j] is None:
+                continue
+            if repeats and MOE_DET:
+                for k, e in enumerate(es.tolist()):
+                    lgr[j][g0 + e] += t[k]
+            else:
                 lgr[j][g0:g1].index_add_(0, eix, t)
-    dx.index_add_(0, tb, unpad(dxp))
+    dx.index_add_(0, tb, unpad(dxp).to(dx.dtype))
     dgam_r[rel] = dgm
 
 
@@ -624,7 +635,7 @@ class MoEGM(torch.autograd.Function):
         starts = starts_d.tolist()  # the visit's one host sync: every group's rows and padding are known from here
         cnt = counts.tolist()
         gam_r = gam[tok, slot]
-        dx = torch.zeros(T, H, dtype=F32, device=dev)
+        dx = torch.zeros(T, H, dtype=torch.float64 if MOE_DET else F32, device=dev)
         dgam_r = torch.zeros_like(gam_r)
         lgr = [torch.zeros_like(t) if (lora is not None and nd) else None for t, nd in zip(lt, need)] if lora else []
         for g0 in range(0, B.E, B.EG):
@@ -667,12 +678,14 @@ class MoEGM(torch.autograd.Function):
                         dn = _moe_rows(xr, grr, eb, pb, cap, g1 - g0, u13, f13, u2, f2, lo, ctx.scale)
                     with B._tick("bwd.moe.rows_bwd"):
                         grads = torch.autograd.grad(dn, [xr, grr] + leaves, g[tb])
-                dx.index_add_(0, tb, grads[0])
+                dx.index_add_(0, tb, grads[0].to(dx.dtype))
                 dgam_r[b0:b1] = grads[1]
                 for j, gj in enumerate(grads[2:]):
                     if lgr[j] is not None:
                         lgr[j][g0:g1] += gj
             del u13, u2
+        if MOE_DET:
+            dx = dx.float()
         # the routing weights' path back into x (router logits from x, ids fixed)
         dgam = torch.zeros(T, topk, dtype=F32, device=dev)
         dgam[tok, slot] = dgam_r
