@@ -295,6 +295,9 @@ public:
     /// `plane_count()` when the pool has no window class.
     [[nodiscard]] std::size_t full_plane_count() const noexcept { return full_planes_.size(); }
     [[nodiscard]] std::size_t window_plane_count() const noexcept { return window_planes_.size(); }
+    /// The `k`-th full-context plane (= `plane(k)` without a window class) / windowed plane.
+    [[nodiscard]] const Tensor& full_plane(std::size_t k) const { return planes_.at(full_planes_.at(k)); }
+    [[nodiscard]] const Tensor& window_plane(std::size_t k) const { return planes_.at(window_planes_.at(k)); }
     [[nodiscard]] const Tensor& window_block_tables() const noexcept { return window_block_tables_; }
     [[nodiscard]] Tensor window_block_table_row(std::int32_t row) const;
     [[nodiscard]] std::int32_t window_sentinel_page() const noexcept { return window_sentinel_; }

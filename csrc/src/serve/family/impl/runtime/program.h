@@ -377,6 +377,10 @@ struct HostSnapshot {
     bool has_checkpoint = false;
     std::vector<Piece> tail_text, tail_backend; ///< one per plane: the tail pages' image
     std::vector<Piece> state, checkpoint_state; ///< one per state tensor
+    // Window-bounded KV: the window pages behind the frontier (boundary object) and behind the
+    // rewrite checkpoint (checkpoint object): their logical page numbers, one piece per window plane.
+    std::vector<std::uint32_t> window_logical, checkpoint_window_logical;
+    std::vector<Piece> window, checkpoint_window;
     std::uint64_t bytes = 0;                    ///< bytes this snapshot wrote (new objects only)
     ~HostSnapshot() {
         if (pool && entry != 0) { pool->drop_entry(entry); }
