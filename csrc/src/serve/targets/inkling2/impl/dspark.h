@@ -72,6 +72,10 @@ void derive_dspark(const load::InklingWeights& w, DSparkDerived& out, bool fp8_w
 [[nodiscard]] bool dspark_bf16_weights_forced();
 /// The FP8 drafter weights (default; SUROGATE_SERVE_DSPARK_BF16_WEIGHTS=1 keeps BF16).
 [[nodiscard]] bool dspark_fp8_weights_requested();
+/// Device bytes derive_dspark allocates beside the materialized weights (storage + FP8 fold + FP8 linears), resident for
+/// the engine's life; the registry books them before the KV is sized (Package::extra_derived_residency_bytes).
+/// derive_dspark checks its own allocations against this.
+[[nodiscard]] std::size_t dspark_derived_device_bytes(bool fp8_weights, bool fp8_fold);
 
 /// The draft KV: planes of draft layers 0 / 1 / 2 (text-pool layers 48 / 49 / 50).
 struct DSparkKv {

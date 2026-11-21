@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <stdexcept>
 #include <vector>
 
@@ -135,6 +136,44 @@ bool dspark_fp8_fold_requested() {
     return !bf16;
 }
 
+namespace {
+// The derived storage block of derive_dspark: alpha, mix norms, rnn_proj split, (BF16 fold), fold bias, inv_freq.
+std::size_t dspark_storage_bytes(bool fp8_fold) {
+    constexpr std::int64_t D = G::kHidden, V = G::kVocabPadded, R = G::kRank;
+    const std::size_t o_norms = align256(16 * sizeof(float));
+    const std::size_t o_sp    = align256(o_norms + D * 4 * 2);
+    const std::size_t o_hf    = align256(o_sp + G::kRnnRows * G::kRnnStateCols * 2);
+    const std::size_t o_fw    = align256(o_hf + G::kRnnRows * G::kRnnContextCols * 2);
+    const std::size_t o_fb    = align256(o_fw + (fp8_fold ? 0 : V * R * 2));
+    const std::size_t o_freq  = align256(o_fb + V * 2);
+    return align256(o_freq + 64 * sizeof(float));
+}
+std::size_t dspark_fold_storage_bytes() {
+    return align256(static_cast<std::size_t>(G::kVocabPadded) * G::kRank) +
+           align256(static_cast<std::size_t>(G::kVocabPadded) * 4);
+}
+// The FP8 linears of one drafter layer, (rows n, columns k): q k v o k_ctx v_ctx gate up down.
+constexpr std::int64_t kDraftLinearShapes[9][2] = {
+    {G::kQRows, G::kHidden}, {G::kKvRows, G::kHidden}, {G::kKvRows, G::kHidden}, {G::kHidden, G::kQRows},
+    {G::kKvRows, G::kHidden}, {G::kKvRows, G::kHidden}, {G::kIntermediate, G::kHidden},
+    {G::kIntermediate, G::kHidden}, {G::kHidden, G::kIntermediate}};
+} // namespace
+
+std::size_t dspark_derived_device_bytes(bool fp8_weights, bool fp8_fold) {
+    std::size_t total = dspark_storage_bytes(fp8_fold) + (fp8_fold ? dspark_fold_storage_bytes() : 0);
+    if (fp8_weights) {
+        std::size_t w8 = 0;
+        for (int l = 0; l < G::kLayers; ++l) {
+            for (const auto& nk : kDraftLinearShapes) {
+                w8 = align256(w8 + static_cast<std::size_t>(nk[0]) * static_cast<std::size_t>(nk[1]));
+                w8 = align256(w8 + static_cast<std::size_t>(nk[0]) * sizeof(float));
+            }
+        }
+        total += w8;
+    }
+    return total;
+}
+
 void derive_dspark(const load::InklingWeights& w, DSparkDerived& out, bool fp8_weights, bool fp8_fold) {
     if (!w.has_draft) { throw std::logic_error("inkling2 DSpark: the artifact's drafter is not bound"); }
     const load::InklingDraftWeights& d = w.draft;
@@ -252,6 +291,12 @@ void derive_dspark(const load::InklingWeights& w, DSparkDerived& out, bool fp8_w
         }
         CUDA_CHECK(cudaDeviceSynchronize());
         out.fp8 = true;
+    }
+    // The registry booked dspark_derived_device_bytes before the KV was sized: the allocations must be exactly that.
+    const std::size_t allocated = out.storage.bytes + out.fold_storage.bytes + out.w8_storage.bytes;
+    if (allocated != dspark_derived_device_bytes(fp8_weights, fp8_fold)) {
+        throw std::logic_error("inkling2 DSpark: derived bytes " + std::to_string(allocated) + " != booked " +
+                               std::to_string(dspark_derived_device_bytes(fp8_weights, fp8_fold)));
     }
     out.ready     = true;
 }

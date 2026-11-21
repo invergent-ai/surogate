@@ -244,6 +244,19 @@ constexpr ops::LinearPolicy target_linear_policy() {
     }
 }
 
+/// Device bytes a target derives at load beside its materialized weights that projected_derived_residency_bytes cannot
+/// see (inkling2: the DSpark drafter's derived buffers under --speculative dflash; M7 review). 0 for a target that
+/// declares nothing -- every other target's sizing is unchanged.
+template <class Target>
+std::size_t target_extra_derived_bytes(const EngineOptions& options) {
+    if constexpr (requires { Target::extra_derived_residency_bytes(options); }) {
+        return Target::extra_derived_residency_bytes(options);
+    } else {
+        (void)options;
+        return 0;
+    }
+}
+
 } // namespace
 
 namespace {
@@ -398,7 +411,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
                     runtime_bytes_after_planned_weights(plan.materialization().device_capacity_bytes),
                     projected_derived_residency_bytes(probe, plan.materialization(),
                                                        target_linear_policy<Target>()) +
-                        family::ExpertCache::pool_floor());
+                        target_extra_derived_bytes<Target>(candidate) + family::ExpertCache::pool_floor());
                 if (candidate.max_context == 0) {
                     candidate.max_context = std::min<std::uint32_t>(geometry.max_context,
                         candidate.kv_capacity.mode == KvCapacityMode::Explicit
@@ -425,7 +438,8 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     auto load_plan = Target::plan_load(binder, options, weights_profile);
     const std::size_t derived_residency_bytes =
         projected_derived_residency_bytes(binder, load_plan.materialization(),
-                                          target_linear_policy<Target>());
+                                          target_linear_policy<Target>()) +
+        target_extra_derived_bytes<Target>(options);
     const std::size_t startup_host_bytes = startup_host_growth_bytes(device.device, options.kv_capacity);
     if (startup_host_bytes != 0) {
         std::fprintf(stderr,

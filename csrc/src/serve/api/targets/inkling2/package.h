@@ -83,6 +83,9 @@ struct Package {
                                             WeightsProfile weights_profile);
     [[nodiscard]] static std::unique_ptr<LoadedModel>
     construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&& materialized);
+    /// Device bytes derived at load beside the materialized weights (the DSpark drafter's buffers under
+    /// --speculative dflash; lane e2), booked by the registry before the KV is sized.
+    [[nodiscard]] static std::size_t extra_derived_residency_bytes(const EngineOptions& options);
     [[nodiscard]] static Frontend make_frontend(const LoadedModel& model, const EngineOptions& options);
     [[nodiscard]] static SequencePlanner make_sequence_planner(DeviceContext& device,
                                                                const EngineOptions& options,
