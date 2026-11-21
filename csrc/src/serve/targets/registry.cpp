@@ -889,6 +889,10 @@ ConstructedTarget construct_pipeline(const EngineOptions& options, artifact::Rea
         // Zero until the preflight below has run, and then the shared values every stage --
         // stage 0 included -- is built with.
         if (resolved_kv != 0) {
+            // Lane f1: the preflight sized the shared pool under auto (elastic window class);
+            // the stage keeps that planning (EngineOptions::kv_capacity_resolved_automatically).
+            stage_options.kv_capacity_resolved_automatically =
+                options.kv_capacity.mode == KvCapacityMode::Automatic;
             stage_options.kv_capacity   = KvCapacityPolicy::explicit_capacity(resolved_kv);
             stage_options.max_context   = resolved_context;
             stage_options.prefill_chunk   = context_prefill(pipeline_prefill, resolved_context);

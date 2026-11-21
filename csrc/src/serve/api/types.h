@@ -324,6 +324,11 @@ struct EngineOptions {
     // under automatic sizing) and every page past it is admitted through a device-wide gate
     // on free memory, so co-resident engines share the device's idle KV.
     bool elastic_kv_overcommit         = false;
+    // Lane f1: set by the pipeline on each stage when its explicit kv_capacity is the shared
+    // resolution of `--kv-capacity auto` (construct_pipeline). The stage then plans as under auto
+    // where that matters -- an elastic window class (layouts_impl.h kv_window_elastic) -- which is
+    // what the preflight that resolved the shared capacity assumed. False everywhere else.
+    bool kv_capacity_resolved_automatically = false;
     // Everything this process may hold on each of its devices -- weights, cache, workspaces
     // and the CUDA context -- in bytes; 0 = the whole card. Automatic sizing (KV capacity,
     // context, expert slots) reads free memory within this budget, and the elastic KV cache,

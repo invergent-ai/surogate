@@ -1472,7 +1472,10 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
             // Lane f1 M3-C: the window class follows demand when the cache is sized to the device.
             const char* raw = std::getenv("SUROGATE_SERVE_KV_WINDOW_ELASTIC");
             if (raw != nullptr && *raw != '\0') { return options.elastic_kv && std::strcmp(raw, "0") != 0; }
-            return options.elastic_kv && options.kv_capacity.mode == KvCapacityMode::Automatic;
+            // A pipeline stage's explicit capacity that is the shared resolution of auto counts as
+            // auto (EngineOptions::kv_capacity_resolved_automatically; the preflight assumed it).
+            return options.elastic_kv && (options.kv_capacity.mode == KvCapacityMode::Automatic ||
+                                          options.kv_capacity_resolved_automatically);
         }(),
         .proposal_head             = options.speculative.proposal_head,
         .features                  = family::startup_features(options),
