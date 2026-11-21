@@ -185,6 +185,10 @@ def main():
                     help="1: add the relocate@b / relocate-decode paths (window pages moved at every round boundary)")
     ap.add_argument("--relocate-capacity", type=int, default=131072,
                     help="--kv-capacity of the relocate engines (an elastic window class charges its pages there)")
+    ap.add_argument("--relocate-host-capacity", type=int, default=0,
+                    help="> 0: also relocate-host@b, the host@b path on an engine with an elastic window class whose pages "
+                         "move every round (its --kv-capacity: room for the filler and the window charges, but not also "
+                         "the retained prefix; Gemma 3 270M: 12288)")
     ap.add_argument("--workdir", default=".")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
@@ -279,6 +283,31 @@ def main():
                 eng.close()
             result["relocated_pages"] = relocated(eng)
             report["paths"][f"relocate@{cut}"] = result
+        if args.relocate_host_capacity > 0:
+            cap = args.host_capacity
+            for cut, text in cuts:
+                eng = Engine(args, f"relocate-host{cut}", host_gb=1, max_model_len=cap,
+                             extra_args=f"--kv-capacity {args.relocate_host_capacity}", env=shuffle)
+                try:
+                    eng.complete(text, 1)
+                    chars_per_token = len(s_text) / max(1, len(s_ids))
+                    long_text = (material * (2 + int(4 * cap * chars_per_token) // max(1, len(material))))[777:]
+                    length = int((cap - 300) * chars_per_token)
+                    def fits(n):
+                        try:
+                            return len(eng.tokenize(long_text[:n])[0]) <= cap - 300
+                        except urllib.error.HTTPError:
+                            return False
+                    while length > 0 and not fits(length):
+                        length = int(length * 0.9)
+                    eng.complete(long_text[:length], 1)
+                    before = eng.host_restores()
+                    result = compare(ref, tail(eng.complete(s_text, k), k))
+                    result["restored_from_host"] = eng.host_restores() > before
+                finally:
+                    eng.close()
+                result["relocated_pages"] = relocated(eng)
+                report["paths"][f"relocate-host@{cut}"] = result
         eng = Engine(args, "relocate-decode", extra_args=extra, env=shuffle)
         try:
             rdec = tail(eng.complete(p_text, nx + k), k)
