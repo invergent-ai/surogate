@@ -592,13 +592,16 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     // The shared-prefix cache cuts a capturing prompt at the prefix boundary, which a fixed
     // batch-invariant cut schedule forbids. An MTP head's KV and the boundary's hidden go with
     // the prefix (PATCHES #150); a DFlash drafter keeps context it does not copy.
+    // A visit-schedule target's conv state is not in the prefix images until lane f1's prefix_state_tensors
+    // branch lands (lanes/e1/NOTES.md): no shared prefixes and no host tier for it until then.
     if ((speculative_backend == SpeculativeBackend::None || speculative_backend == SpeculativeBackend::Mtp) &&
-        !pipeline_stage() && !ops::batch_invariant()) {
+        !pipeline_stage() && !ops::batch_invariant() && !family::visit_schedule<Variant>()) {
         const char* raw = std::getenv("SUROGATE_SERVE_SHARED_PREFIX_SLOTS");
         shared_prefix_slots = raw ? static_cast<std::uint32_t>(std::strtoul(raw, nullptr, 10)) : 4U;
         shared_prefix_page_budget = decoder->text_kv.pool().capacity_pages() / 8;
     }
-    configure_host_tier(plan.prefix_cache_host_bytes, plan.weights_identity);
+    configure_host_tier(family::visit_schedule<Variant>() ? std::optional<std::size_t>{} : plan.prefix_cache_host_bytes,
+                        plan.weights_identity);
 }
 
 bool ProgramImplCore::base_round_for(std::span<const std::uint32_t> lanes,
