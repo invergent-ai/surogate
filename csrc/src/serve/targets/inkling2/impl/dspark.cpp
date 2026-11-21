@@ -2,6 +2,7 @@
 
 #include "targets/inkling2/impl/dspark.h"
 #include "targets/inkling2/impl/variant.h"
+#include "targets/inkling2/impl/visits.h"
 
 #include "api/ops/inkling_mix.h"
 #include "api/ops/inkling_attention.h"
@@ -92,7 +93,12 @@ family::DFlashGeometry dspark_dflash_geometry(const load::ArtifactConfig& config
     g.rms_epsilon     = G::kEps;
     g.rope_theta      = G::kRopeTheta;
     g.attention_scale = G::kScale;
-    for (int f = 0; f < G::kFeatures; ++f) { g.target_feature_layers[static_cast<std::size_t>(f)] = f; }
+    // Features named by the visit that produces them (visits.h kFeatureLabels): on one card a label only names its row;
+    // on the 2-card split the family's feature sink uses it to tell which stage captures a feature and which imports it.
+    static_assert(G::kFeatures == static_cast<int>(kFeatureLabels.size()));
+    for (int f = 0; f < G::kFeatures; ++f) {
+        g.target_feature_layers[static_cast<std::size_t>(f)] = kFeatureLabels[static_cast<std::size_t>(f)];
+    }
     return g;
 }
 
@@ -527,7 +533,9 @@ const InklingModel& dspark_model(const RuntimeModelView& model) {
 }
 
 DSparkKv dspark_kv(const family::DSparkRuntime& rt) {
-    if (rt.text_kv == nullptr || rt.text_kv->layers() < Variant::dspark_first_plane + G::kLayers) {
+    // On the 2-card split the last stage's pool holds the planes of visits 30..47 then 48..50 (layers() counts the
+    // stage's planes, not the global index): batch_layer_view checks the global plane against the stage's range.
+    if (rt.text_kv == nullptr || rt.text_kv->layers() < static_cast<std::uint32_t>(G::kLayers)) {
         throw std::logic_error("inkling2 DSpark: the text pool carries no draft planes (48..50)");
     }
     DSparkKv kv;

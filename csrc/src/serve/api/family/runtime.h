@@ -296,6 +296,14 @@ public:
                                           std::uint32_t tokens, std::int32_t mixed_base = -1);
     void adopt_pipeline_decode_features(std::span<const std::uint32_t> lanes,
                                          std::span<const std::byte> packet);
+    /// DSpark on a pipeline (ENGINE-INKLING lane e1): true on the stage with the head when it proposes each round's
+    /// drafts ahead of the first stage (false for every other target); that stage's proposal for the round the driver
+    /// is about to launch; the first stage's pinned draft import the driver copies it into (null elsewhere).
+    [[nodiscard]] bool pipeline_drafts_on_head() const noexcept;
+    [[nodiscard]] std::span<const std::byte> prepare_pipeline_drafts(std::span<const std::uint32_t> lanes,
+                                                                     std::span<const runtime::RoundBudget> budgets,
+                                                                     std::uint32_t window);
+    [[nodiscard]] void* pipeline_draft_import_buffer() const noexcept;
 
 
 private:

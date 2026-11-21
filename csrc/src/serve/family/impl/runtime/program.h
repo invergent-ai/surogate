@@ -664,6 +664,9 @@ public:
         void* data = nullptr;
         ~PinnedBoundary() { if (data != nullptr) { cudaFreeHost(data); } }
     } stage_export, stage_import;
+    // DSpark on a pipeline (ENGINE-INKLING lane e1): the drafter stage's verify ids / positions for the round
+    // (export, on the stage with the head) and their copy on the first stage (import). Empty for every other target.
+    PinnedBoundary dspark_draft_export, dspark_draft_import;
     std::size_t stage_boundary_bytes_ = 0;
     [[nodiscard]] const void* stage_export_buffer() const noexcept { return stage_export.data; }
     [[nodiscard]] void* stage_import_buffer() const noexcept { return stage_import.data; }
@@ -680,6 +683,17 @@ public:
     }
     /// The pipeline chooses one draft count and applies it to every stage of the flight.
     [[nodiscard]] std::uint32_t select_dflash_draft_window(std::span<const std::uint32_t> lanes);
+    /// DSpark on a pipeline: the stage with the head holds the drafter and proposes each round's drafts before the
+    /// round's first stage launches (prepare_pipeline_drafts); the first stage takes them through its draft import.
+    /// False for every other target and for a whole-model program.
+    [[nodiscard]] bool pipeline_drafts_on_head() const noexcept;
+    [[nodiscard]] void* pipeline_draft_import_buffer() const noexcept { return dspark_draft_import.data; }
+    /// On the drafter stage: append the lanes' pending context and propose `window` drafts for the round the driver
+    /// is about to launch (its lanes, budgets and draft window); returns the verify ids and positions as the first
+    /// stage's draft import takes them (kDSparkDraftImportStride layout). Valid until the next call.
+    [[nodiscard]] std::span<const std::byte> prepare_pipeline_drafts(std::span<const std::uint32_t> lanes,
+                                                                     std::span<const runtime::RoundBudget> budgets,
+                                                                     std::uint32_t window);
 
     void set_dflash_draft_window(std::uint32_t drafts) { pipeline_dflash_window = drafts; }
     /// Maximum columns per lane; pipeline storage remains sized for the configured ceiling.
