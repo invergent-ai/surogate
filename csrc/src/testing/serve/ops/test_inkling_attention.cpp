@@ -518,6 +518,269 @@ void run_attention_case(const AttnCase& c, std::uint32_t seed) {
     check(invalid_zero, c.name + " invalid columns zero");
 }
 
+// ---- path / batch invariance (bitwise; agent-EN decision 10:2x) -------------------------------------------------
+// One plane of 8 sequences (finite random codes). The target sequence's rows [P0, L0) run as ONE prefill segment (the
+// reference) and then through every other route: chunked prefill at several cuts, decode (B = 1, 4, 8 with other
+// sequences' rows present), MTP verify W = 8 / 3 (with other rows, with invalid columns), other worker counts and CTA
+// targets. Every route's gated bf16 output, fp32 out and lse of the target's columns must equal the reference BIT FOR
+// BIT. Inputs per (sequence, position) are generated deterministically, so any route sees the same q / r / gate / sink.
+
+struct InvPlane {
+    static constexpr int kSeqs = 8;
+    std::vector<int> len;
+    std::unique_ptr<Plane> plane;
+};
+
+std::uint32_t mix32(std::uint32_t x) {
+    x ^= x >> 16;
+    x *= 0x7feb352dU;
+    x ^= x >> 15;
+    x *= 0x846ca68bU;
+    x ^= x >> 16;
+    return x;
+}
+
+InvPlane make_inv_plane(int target_len, std::uint32_t seed) {
+    InvPlane ip;
+    std::mt19937 g(seed);
+    ip.len.push_back(target_len);
+    for (int s = 1; s < InvPlane::kSeqs; ++s) { ip.len.push_back(std::uniform_int_distribution<int>(50, std::min(target_len, 9000))(g)); }
+    const int maxlen = *std::max_element(ip.len.begin(), ip.len.end());
+    ip.plane = std::make_unique<Plane>(InvPlane::kSeqs, maxlen + 64, 0x7F, seed + 1);
+    // Codes with |value| in [2^-6, 3.75] (exponent field 1..8), random sign and mantissa: finite everywhere a key exists.
+    for (int s = 0; s < InvPlane::kSeqs; ++s) {
+        for (int x = 0; x < ip.len[s]; ++x) {
+            for (int h = 0; h < 8; ++h) {
+                std::uint8_t* kc = &ip.plane->hk[ip.plane->offset(s, x, h)];
+                std::uint8_t* vc = &ip.plane->hv[ip.plane->offset(s, x, h)];
+                std::uint32_t st = mix32(seed ^ (static_cast<std::uint32_t>(s) << 24) ^ (static_cast<std::uint32_t>(x) * 9u + h));
+                for (int d = 0; d < 128; d += 2) {
+                    st                = mix32(st + 0x9e3779b9U);
+                    const auto code = [](std::uint32_t r) {
+                        return static_cast<std::uint8_t>(((r & 1U) << 7) | ((1U + ((r >> 1) & 7U)) << 3) | ((r >> 4) & 7U));
+                    };
+                    kc[d]     = code(st);
+                    kc[d + 1] = code(st >> 7);
+                    vc[d]     = code(st >> 14);
+                    vc[d + 1] = code(st >> 21);
+                }
+            }
+        }
+    }
+    ip.plane->upload();
+    return ip;
+}
+
+// q / r (clipped like the prologue's outputs), gate, sink of (sequence, position).
+void inv_inputs(int seq, int pos, float* q, float* r, float* gate, float* sink) {
+    Rng rng(mix32(0x51ed27u ^ (static_cast<std::uint32_t>(seq) << 26) ^ static_cast<std::uint32_t>(pos)));
+    for (int h = 0; h < 24; ++h) {
+        const float a = rng.uni(0.5F, 3.5F);
+        float* qh     = q + h * 128;
+        double ss     = 0.0;
+        for (int d = 0; d < 128; ++d) { qh[d] = rng.uni(-a, a); ss += qh[d] * qh[d]; }
+        const double f = std::min(1.0, 22.627 / std::sqrt(ss));
+        for (int d = 0; d < 128; ++d) { qh[d] = bf(static_cast<float>(qh[d] * f)); }
+        float* rh = r + h * 16;
+        ss        = 0.0;
+        for (int d = 0; d < 16; ++d) { rh[d] = rng.uni(-a, a); ss += rh[d] * rh[d]; }
+        const double fr = std::min(1.0, 8.0 / std::sqrt(ss));
+        for (int d = 0; d < 16; ++d) { rh[d] = bf(static_cast<float>(rh[d] * fr)); }
+        sink[h] = bf(rng.uni(-2.0F, 6.0F));
+    }
+    for (int i = 0; i < 3072; ++i) { gate[i] = bf(rng.uni(-3.0F, 3.0F)); }
+}
+
+struct InvRow {
+    int seq, first, valid;
+};
+
+// Outputs of one route, per column: gated bf16 bits [N][3072], out fp32 bits [N][3072], lse fp32 bits [N][24].
+struct InvOut {
+    int W = 0;
+    std::vector<InvRow> rows;
+    std::vector<std::uint16_t> gated;
+    std::vector<std::uint32_t> out, lse;
+};
+
+InvOut run_inv_route(InklingLayerKind kind, const InvPlane& ip, const Layer& layer, int W, const std::vector<InvRow>& rws) {
+    const int B = static_cast<int>(rws.size()), N = W * B;
+    Rows rows;
+    rows.W = W;
+    rows.B = B;
+    rows.pos.resize(static_cast<std::size_t>(N));
+    rows.valid.resize(B);
+    rows.masked = false;
+    std::vector<int> table_rows(B);
+    std::vector<float> q(static_cast<std::size_t>(N) * 3072, 0.0F), r(static_cast<std::size_t>(N) * 384, 0.0F),
+        gate(static_cast<std::size_t>(N) * 3072, 0.0F), sink(static_cast<std::size_t>(N) * 24, 0.0F);
+    for (int b = 0; b < B; ++b) {
+        rows.valid[b] = rws[b].valid;
+        rows.masked   = rows.masked || rws[b].valid != W;
+        table_rows[b] = rws[b].seq;
+        for (int j = 0; j < W; ++j) {
+            const int jj = std::min(j, std::max(rws[b].valid - 1, 0));
+            rows.pos[b * W + j] = rws[b].first + jj;
+            const std::size_t n = static_cast<std::size_t>(j + W * b);
+            if (j < rws[b].valid) {
+                inv_inputs(rws[b].seq, rws[b].first + j, &q[n * 3072], &r[n * 384], &gate[n * 3072], &sink[n * 24]);
+            }
+        }
+    }
+    rows.upload();
+    rows.dtables = to_device_i32(table_rows);
+    DeviceBuffer dq = to_device_bf16(q), dr = to_device_bf16(r), dg = to_device_bf16(gate), ds = to_device_bf16(sink);
+    ops::InklingAttentionInputs in;
+    in.q         = Tensor(dq.p, DType::BF16, {128, 24, N});
+    in.r         = Tensor(dr.p, DType::BF16, {16, 24, N});
+    in.gate      = Tensor(dg.p, DType::BF16, {3072, N});
+    in.sink      = Tensor(ds.p, DType::BF16, {24, N});
+    in.rel_table = Tensor(layer.dtable.p, DType::BF16, {16, G::kRelTableRows});
+    const auto view = rows.view(rows.max_keys());
+    WorkspaceArena work(ops::inkling_rel_attention_workspace_bytes(kind, W, B, view.envelope) + 4096);
+    DeviceBuffer dy(static_cast<std::size_t>(N) * 3072 * 2), dof(static_cast<std::size_t>(N) * 3072 * 4),
+        dl(static_cast<std::size_t>(N) * 24 * 4);
+    cudaMemset(dy.p, 0x7f, dy.bytes);
+    cudaMemset(dof.p, 0x7f, dof.bytes);
+    Tensor y(dy.p, DType::BF16, {3072, N}), of(dof.p, DType::FP32, {128, 24, N}), lse(dl.p, DType::FP32, {24, N});
+    ops::inkling_rel_attention(in, kind, view, ip.plane->view(), work, y, nullptr);
+    ops::inkling_rel_attention_out_lse(in, kind, view, ip.plane->view(), work, of, lse, nullptr);
+    cuda_synchronize();
+    InvOut o;
+    o.W     = W;
+    o.rows  = rws;
+    o.gated = from_device<std::uint16_t>(dy, static_cast<std::size_t>(N) * 3072);
+    o.out   = from_device<std::uint32_t>(dof, static_cast<std::size_t>(N) * 3072);
+    o.lse   = from_device<std::uint32_t>(dl, static_cast<std::size_t>(N) * 24);
+    return o;
+}
+
+struct InvCase {
+    std::string name;
+    InklingLayerKind kind;
+    int L0, P0;
+    std::vector<int> cuts, decode, verify;
+};
+
+void run_invariance_case(const InvCase& c, const char* groups, std::uint32_t seed) {
+    setenv("SUROGATE_INKLING_ATTN_GROUPS", groups, 1);
+    const std::string tag = "invariance " + c.name + " " + groups;
+    const InvPlane ip = make_inv_plane(c.L0, seed);
+    const Layer layer(c.kind, seed + 7);
+    const InvOut ref = run_inv_route(c.kind, ip, layer, c.L0 - c.P0, {{0, c.P0, c.L0 - c.P0}});
+    std::mt19937 g(seed + 3);
+    const auto others = [&](int count) {
+        std::vector<InvRow> v;
+        for (int i = 0; i < count; ++i) {
+            const int s = 1 + i % (InvPlane::kSeqs - 1);
+            v.push_back({s, std::uniform_int_distribution<int>(0, ip.len[s] - 1)(g), 1});
+        }
+        return v;
+    };
+    std::size_t routes = 0, columns = 0, bad_columns = 0;
+    std::string first_bad;
+    const auto compare = [&](const std::string& route, const InvOut& o) {
+        ++routes;
+        for (std::size_t b = 0; b < o.rows.size(); ++b) {
+            if (o.rows[b].seq != 0) { continue; }
+            for (int j = 0; j < o.rows[b].valid; ++j) {
+                const int p = o.rows[b].first + j;
+                if (p < c.P0 || p >= c.L0) { continue; }
+                const std::size_t n = static_cast<std::size_t>(j) + static_cast<std::size_t>(o.W) * b;
+                const std::size_t m = static_cast<std::size_t>(p - c.P0);
+                const bool same =
+                    std::memcmp(&o.gated[n * 3072], &ref.gated[m * 3072], 3072 * 2) == 0 &&
+                    std::memcmp(&o.out[n * 3072], &ref.out[m * 3072], 3072 * 4) == 0 &&
+                    std::memcmp(&o.lse[n * 24], &ref.lse[m * 24], 24 * 4) == 0;
+                ++columns;
+                if (!same) {
+                    ++bad_columns;
+                    if (first_bad.empty()) { first_bad = route + " position " + std::to_string(p); }
+                }
+            }
+        }
+    };
+    // Chunked prefill at the cuts (segments of <= 16 columns run the decode / verify kernel: they must agree too).
+    {
+        std::vector<int> edges = {c.P0};
+        for (const int x : c.cuts) {
+            if (x > c.P0 && x < c.L0) { edges.push_back(x); }
+        }
+        edges.push_back(c.L0);
+        for (std::size_t i = 0; i + 1 < edges.size(); ++i) {
+            const int w = edges[i + 1] - edges[i];
+            compare("chunk [" + std::to_string(edges[i]) + ", " + std::to_string(edges[i + 1]) + ")",
+                    run_inv_route(c.kind, ip, layer, w, {{0, edges[i], w}}));
+        }
+    }
+    for (const int p : c.decode) {
+        compare("decode B1", run_inv_route(c.kind, ip, layer, 1, {{0, p, 1}}));
+        auto r4 = others(3);
+        r4.insert(r4.begin() + 1, InvRow{0, p, 1});
+        compare("decode B4", run_inv_route(c.kind, ip, layer, 1, r4));
+        auto r8 = others(7);
+        r8.insert(r8.begin() + 5, InvRow{0, p, 1});
+        compare("decode B8", run_inv_route(c.kind, ip, layer, 1, r8));
+        r8.back().valid = 0; // an idle padding row
+        compare("decode B8 idle row", run_inv_route(c.kind, ip, layer, 1, r8));
+        for (const char* splits : {"1", "3", "64"}) {
+            setenv("SUROGATE_INKLING_ATTN_SPLITS", splits, 1);
+            compare(std::string("decode B1 workers ") + splits, run_inv_route(c.kind, ip, layer, 1, {{0, p, 1}}));
+        }
+        unsetenv("SUROGATE_INKLING_ATTN_SPLITS");
+        setenv("SUROGATE_INKLING_ATTN_CTAS", "20", 1);
+        compare("decode B4 cta target 20", run_inv_route(c.kind, ip, layer, 1, r4));
+        unsetenv("SUROGATE_INKLING_ATTN_CTAS");
+    }
+    for (const int v : c.verify) {
+        const int w = std::min(8, c.L0 - v);
+        compare("verify W8 B1", run_inv_route(c.kind, ip, layer, 8, {{0, v, w}}));
+        std::vector<InvRow> r4;
+        for (const auto& o : others(3)) { r4.push_back({o.seq, std::max(0, std::min(o.first, ip.len[o.seq] - 8)), std::min(8, ip.len[o.seq])}); }
+        r4.insert(r4.begin() + 2, InvRow{0, v, w});
+        compare("verify W8 B4", run_inv_route(c.kind, ip, layer, 8, r4));
+        compare("verify W8 B1 valid 5", run_inv_route(c.kind, ip, layer, 8, {{0, v, std::min(5, w)}}));
+        compare("verify W3 B2", run_inv_route(c.kind, ip, layer, 3, {{r4[0].seq, r4[0].first, std::min(3, r4[0].valid)}, {0, v, std::min(3, w)}}));
+        compare("verify W16 B1", run_inv_route(c.kind, ip, layer, 16, {{0, std::max(c.P0, std::min(v, c.L0 - 16)), 16}}));
+        setenv("SUROGATE_INKLING_ATTN_SPLITS", "1", 1);
+        compare("verify W8 B4 workers 1", run_inv_route(c.kind, ip, layer, 8, r4));
+        unsetenv("SUROGATE_INKLING_ATTN_SPLITS");
+    }
+    // A short prefill segment forced through the split route (partials + fold kernel) and through 1 worker.
+    {
+        const int s0 = std::max(c.P0, c.L0 - 40);
+        for (const char* splits : {"1", "3"}) {
+            setenv("SUROGATE_INKLING_ATTN_SPLITS", splits, 1);
+            compare(std::string("prefill W40 workers ") + splits, run_inv_route(c.kind, ip, layer, c.L0 - s0, {{0, s0, c.L0 - s0}}));
+        }
+        unsetenv("SUROGATE_INKLING_ATTN_SPLITS");
+    }
+    std::printf("%-44s routes %zu, target columns compared %zu, bit-different %zu%s%s\n", tag.c_str(), routes, columns,
+                bad_columns, first_bad.empty() ? "" : "  first: ", first_bad.c_str());
+    check(bad_columns == 0 && columns > 0, tag);
+    unsetenv("SUROGATE_INKLING_ATTN_GROUPS");
+}
+
+void test_invariance(const std::function<bool(const std::string&)>& want) {
+    using K = InklingLayerKind;
+    const std::vector<InvCase> cases = {
+        {"global short", K::Global, 4700, 0, {1, 17, 64, 100, 511, 512, 513, 1024, 2047, 2048, 2049, 3000},
+         {0, 1, 63, 64, 511, 512, 1000, 2047, 2048, 4699}, {0, 505, 2044, 4692}},
+        {"global long", K::Global, 70000, 64000, {65535, 65536, 65537, 66000, 68000, 69990},
+         {64000, 65535, 65536, 65537, 69999}, {65530, 69992}},
+        {"local short", K::Local, 5000, 0, {1, 100, 1023, 1024, 1025, 1100, 2000, 4000, 4990},
+         {0, 127, 128, 1023, 1024, 1100, 4999}, {0, 1020, 4992}},
+        {"local long", K::Local, 70000, 68000, {68100, 69000, 69990}, {68000, 69999}, {69000}},
+    };
+    std::uint32_t seed = 7000;
+    for (const auto& c : cases) {
+        for (const char* groups : {"p1", "p2"}) {
+            if (want("invariance " + c.name + " " + groups)) { run_invariance_case(c, groups, seed); }
+        }
+        seed += 31;
+    }
+}
+
 // ---- the prologue oracle and cases --------------------------------------------------------------------
 
 struct ProCase {
@@ -984,7 +1247,75 @@ void run_linear_case(const std::string& name, int k, int k_per, int rows_per, in
     }
 }
 
+// Width invariance (bitwise): the first n columns of an N = 8,192 call (GEMM) equal a call with only those n columns,
+// n = 1, 2, 8, 9, 16 (narrow kernel), 17, 64 (GEMM), for every projection of a 1- or 3-input launch.
+void run_linear_width_case(const std::string& name, int k, int k_per, int rows_per,
+                           const std::vector<std::pair<int, int>>& ranges, std::uint32_t seed) {
+    const int n_rows = k == 2304 ? 8600 : 2304;
+    const int nmax   = 8192;
+    const Fp8Weight fw(n_rows, k, k_per, rows_per, seed, false);
+    std::vector<DeviceBuffer> dxs;
+    for (std::size_t i = 0; i < ranges.size(); ++i) {
+        std::vector<std::uint16_t> x(static_cast<std::size_t>(k) * nmax);
+        std::uint32_t st = mix32(seed * 31u + static_cast<std::uint32_t>(i));
+        for (auto& v : x) {
+            st = mix32(st + 0x9e3779b9U);
+            v  = f32_to_bf16(static_cast<float>(static_cast<int>(st % 60001U) - 30000) * 1e-4F);
+        }
+        dxs.push_back(to_device(x));
+    }
+    const auto run = [&](int n) {
+        std::vector<DeviceBuffer> douts;
+        std::vector<Tensor> xt, ot;
+        std::vector<ops::InklingProjection> pj(ranges.size());
+        xt.reserve(ranges.size());
+        ot.reserve(ranges.size());
+        for (std::size_t i = 0; i < ranges.size(); ++i) {
+            douts.emplace_back(static_cast<std::size_t>(ranges[i].second) * n * 2);
+            xt.emplace_back(dxs[i].p, DType::BF16, std::initializer_list<std::int32_t>{k, n});
+            ot.emplace_back(douts[i].p, DType::BF16, std::initializer_list<std::int32_t>{ranges[i].second, n});
+            pj[i] = {&xt[i], &fw.w, ranges[i].first, &ot[i]};
+        }
+        ops::inkling_attn_linear(pj, nullptr, nullptr);
+        cuda_synchronize();
+        std::vector<std::vector<std::uint16_t>> res;
+        for (std::size_t i = 0; i < ranges.size(); ++i) {
+            res.push_back(from_device<std::uint16_t>(douts[i], static_cast<std::size_t>(ranges[i].second) * n));
+        }
+        return res;
+    };
+    const auto ref = run(nmax);
+    std::size_t bad = 0, total = 0;
+    std::string first;
+    for (const int n : {1, 2, 8, 9, 16, 17, 64}) {
+        const auto got = run(n);
+        for (std::size_t i = 0; i < ranges.size(); ++i) {
+            const std::size_t count = static_cast<std::size_t>(ranges[i].second) * n; // columns are contiguous
+            total += count;
+            for (std::size_t e = 0; e < count; ++e) {
+                if (got[i][e] != ref[i][e]) {
+                    ++bad;
+                    if (first.empty()) { first = "N=" + std::to_string(n) + " segment " + std::to_string(i); }
+                }
+            }
+        }
+    }
+    std::printf("%-44s widths 1 2 8 9 16 17 64 vs 8192: %zu / %zu outputs bit-different%s%s\n", name.c_str(), bad, total,
+                first.empty() ? "" : "  first: ", first.c_str());
+    check(bad == 0, name);
+}
+
 void test_attn_linear() {
+    {
+        const std::vector<std::pair<int, int>> three = {{0, G::kRowsK}, {G::kRowsK, 1024}, {G::kRowsV, 1024}};
+        std::uint32_t wseed = 4500;
+        run_linear_width_case("attn_linear width qkvr 1x128", 2304, 128, 1, {{0, 8600}}, wseed++);
+        run_linear_width_case("attn_linear width qkvr channel", 2304, 2304, 1, {{0, 8600}}, wseed++);
+        run_linear_width_case("attn_linear width qkvr 128x128", 2304, 128, 128, {{0, 8600}}, wseed++);
+        run_linear_width_case("attn_linear width 3-input 1x128", 2304, 128, 1, three, wseed++);
+        run_linear_width_case("attn_linear width wo 1x128", 3072, 128, 1, {{0, 2304}}, wseed++);
+        run_linear_width_case("attn_linear width wo channel", 3072, 3072, 1, {{0, 2304}}, wseed++);
+    }
     const int K = 2304;
     const std::vector<std::pair<int, int>> one   = {{0, 8600}};
     const std::vector<std::pair<int, int>> three = {{0, G::kRowsK}, {G::kRowsK, 1024}, {G::kRowsV, 1024}};
@@ -1224,7 +1555,7 @@ void run_capture(const std::string& dir) {
             struct Score { int variant; double out_eq, lse_eq; };
             std::vector<Score> scores;
             for (int variant = 0; variant < 64; ++variant) {
-                if ((variant & 6) == 6) { continue; } // P V modes are 0, 2, 4
+                if ((variant & 6) != 0) { continue; } // bits 2 / 4 (old P V modes) are gone
                 setenv("SUROGATE_INKLING_ATTN_VARIANT", std::to_string(variant).c_str(), 1);
                 ops::inkling_rel_attention_out_lse(vin, kind, view, plane.view(), work, of, lse, nullptr);
                 cuda_synchronize();
@@ -1427,7 +1758,7 @@ void bench_prologue(const char* name, InklingLayerKind kind, int W, int B, int f
 void bench_linear(const char* name, int k, int k_per, int columns) {
     const int n = k == 2304 ? 8600 : 2304;
     // R weight copies (> 256 MB), one per timed call in turn: the codes come from DRAM, not L2.
-    const int R = columns <= 8 ? static_cast<int>(std::ceil(256e6 / (static_cast<double>(n) * k))) : 1;
+    const int R = columns <= 16 ? static_cast<int>(std::ceil(256e6 / (static_cast<double>(n) * k))) : 1;
     std::vector<std::unique_ptr<Fp8Weight>> ws;
     for (int r = 0; r < R; ++r) { ws.push_back(std::make_unique<Fp8Weight>(n, k, k_per, 1, 21 + r, false)); }
     std::vector<float> x(static_cast<std::size_t>(k) * columns, 0.5F);
@@ -1440,9 +1771,9 @@ void bench_linear(const char* name, int k, int k_per, int columns) {
     };
     int turn = 0;
     const double eager = time_us([&] { call(turn++); }, std::max(20, 2 * R));
-    const double us    = time_graph_us(call, std::max(R, columns <= 8 ? 16 : 4));
+    const double us    = time_graph_us(call, std::max(R, columns <= 16 ? 16 : 4));
     const double gb = static_cast<double>(n) * k / 1e9, tf = 2.0 * n * k * columns / 1e12;
-    if (columns <= 8) {
+    if (columns <= 16) {
         std::printf("bench %-40s graph %8.1f us  %7.1f GB/s  %5.1f %% of %.0f GB/s   (eager %.1f us)\n", name, us,
                     gb / (us * 1e-6), 100.0 * gb / (us * 1e-6) / kBwGBs, kBwGBs, eager);
     } else {
@@ -1454,23 +1785,35 @@ void bench_linear(const char* name, int k, int k_per, int columns) {
 void run_bench() {
     using K = InklingLayerKind;
     cuda_check(cudaStreamCreateWithFlags(&g_stream, cudaStreamNonBlocking), "stream");
-    bench_attention("attn decode global 1x8k", K::Global, 1, 1, 8191);
-    bench_attention("attn decode global 1x64k", K::Global, 1, 1, 65535);
-    bench_attention("attn decode global 1x262k", K::Global, 1, 1, 262143);
-    bench_attention("attn decode local 1x8k (window)", K::Local, 1, 1, 8191);
-    bench_attention("attn decode global 8x8k", K::Global, 1, 8, 8191);
-    bench_attention("attn decode local 8x8k", K::Local, 1, 8, 8191);
-    bench_attention("attn verify W8 global 1x8k", K::Global, 8, 1, 8184);
-    bench_attention("attn prefill global W8192 from 0", K::Global, 8192, 1, 0);
-    bench_attention("attn prefill global W8192 past 64k", K::Global, 8192, 1, 65536);
-    bench_attention("attn prefill local W8192 past 8k", K::Local, 8192, 1, 8192);
+    // Key groups p1 / p2 (SUROGATE_INKLING_ATTN_GROUPS), same build; BENCH_GROUPS=p1 or p2 restricts.
+    const char* only_groups = std::getenv("BENCH_GROUPS");
+    for (const char* groups : {"p1", "p2"}) {
+        if (only_groups != nullptr && std::string(only_groups) != groups) { continue; }
+        setenv("SUROGATE_INKLING_ATTN_GROUPS", groups, 1);
+        const auto name = [&](const char* what) { static std::string s; s = std::string(what) + " [" + groups + "]"; return s.c_str(); };
+        bench_attention(name("attn decode global 1x8k"), K::Global, 1, 1, 8191);
+        bench_attention(name("attn decode global 1x64k"), K::Global, 1, 1, 65535);
+        bench_attention(name("attn decode global 1x262k"), K::Global, 1, 1, 262143);
+        bench_attention(name("attn decode local 1x8k (window)"), K::Local, 1, 1, 8191);
+        bench_attention(name("attn decode global 8x8k"), K::Global, 1, 8, 8191);
+        bench_attention(name("attn decode local 8x8k"), K::Local, 1, 8, 8191);
+        bench_attention(name("attn verify W8 global 1x8k"), K::Global, 8, 1, 8184);
+        bench_attention(name("attn verify W8 global 1x64k"), K::Global, 8, 1, 65528);
+        bench_attention(name("attn prefill global W8192 from 0"), K::Global, 8192, 1, 0);
+        bench_attention(name("attn prefill global W8192 past 64k"), K::Global, 8192, 1, 65536);
+        bench_attention(name("attn prefill local W8192 past 8k"), K::Local, 8192, 1, 8192);
+    }
+    unsetenv("SUROGATE_INKLING_ATTN_GROUPS");
+    if (std::getenv("BENCH_ATTN_ONLY") != nullptr) { return; }
     bench_prologue("prologue local 1x1", K::Local, 1, 1, 8191);
     bench_prologue("prologue global 8x1", K::Global, 1, 8, 8191);
     bench_prologue("prologue local W8192", K::Local, 8192, 1, 0);
-    bench_linear("attn_linear qkvr GEMV N=1 channel", 2304, 2304, 1);
-    bench_linear("attn_linear qkvr GEMV N=1 1x128", 2304, 128, 1);
-    bench_linear("attn_linear qkvr GEMV N=8 1x128", 2304, 128, 8);
-    bench_linear("attn_linear wo GEMV N=1 1x128", 3072, 128, 1);
+    bench_linear("attn_linear qkvr narrow N=1 channel", 2304, 2304, 1);
+    bench_linear("attn_linear qkvr narrow N=1 1x128", 2304, 128, 1);
+    bench_linear("attn_linear qkvr narrow N=8 1x128", 2304, 128, 8);
+    bench_linear("attn_linear qkvr narrow N=16 1x128", 2304, 128, 16);
+    bench_linear("attn_linear wo narrow N=1 1x128", 3072, 128, 1);
+    bench_linear("attn_linear wo narrow N=1 channel", 3072, 3072, 1);
     bench_linear("attn_linear qkvr GEMM N=8192 1x128", 2304, 128, 8192);
     bench_linear("attn_linear qkvr GEMM N=8192 channel", 2304, 2304, 8192);
 }
@@ -1553,6 +1896,7 @@ int main(int argc, char** argv) {
             if (want(c.name)) { run_attention_case(c, seed); }
             seed += 17;
         }
+        test_invariance(want);
     } catch (const std::exception& e) {
         std::cerr << "EXCEPTION " << e.what() << '\n';
         return 1;

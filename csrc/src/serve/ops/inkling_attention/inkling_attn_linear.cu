@@ -7,10 +7,10 @@
 // dot products accumulate in fp32 and each 128-column cell's partial is multiplied by its scale in fp32 before it
 // joins the row total (one multiply after the whole row for a per-channel cell). Output rounded once to bf16.
 //
-// Two kernels, chosen by the column count N of the call: a GEMV for N <= 8 (decode, verify: bytes-bound, every
-// code read once and converted once) and a tensor-core GEMM beyond (codes widened to bf16 in shared memory, bf16
-// m16n8k16 MMA). One launch covers up to four projections that share K and N (a 3-input visit's q-side, K and V
-// row ranges, each from its own input). M2 form, untuned.
+// Two kernels, chosen by the column count N of the call: a narrow MMA kernel for N <= 16 (decode, verify: bytes-bound,
+// every code read once and widened once) and a tile GEMM beyond; both issue the same per-element MMA chain, so the
+// output bits do not depend on N (agent-EN 10:2x). One launch covers up to four projections that share K and N (a
+// 3-input visit's q-side, K and V row ranges, each from its own input).
 
 #include "ops/inkling_attention/inkling_attention_common.h"
 #include "ops/inkling_attention/inkling_attention_device.cuh"
@@ -56,117 +56,110 @@ __device__ __forceinline__ int segment_of(const LinearParams& p, int block) {
     return s;
 }
 
-__device__ __forceinline__ void codes8_to_float(uint2 raw, float (&w)[8]) {
-    const std::uint32_t words[2] = {raw.x, raw.y};
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const std::uint16_t pair = static_cast<std::uint16_t>(words[i >> 1] >> ((i & 1) * 16));
-        const __half2_raw h      = __nv_cvt_fp8x2_to_halfraw2(pair, __NV_E4M3);
-        const __half2 hv         = *reinterpret_cast<const __half2*>(&h);
-        w[2 * i]                 = __low2float(hv);
-        w[2 * i + 1]             = __high2float(hv);
-    }
+// ---- the ONE per-element arithmetic (both kernels; agent-EN decision 10:2x: width-invariant attn_linear) -----------
+// Output (token t, weight row r) is a chain of bf16 m16n8k16 MMA steps with fp32 accumulation, x as operand A (m =
+// tokens) and the exactly widened codes as operand B (n = weight rows). K is walked in 32-column chunks in order; a
+// chunk is two steps: step A puts K offsets 8 l + {0, 1} at k slots 2 l + {0, 1} and 8 l + {2, 3} at 2 l + 8 + {0, 1}
+// (l = 0..3), step B likewise 8 l + {4, 5} and 8 l + {6, 7}. So lane (g, l) of a fragment holds the 8 consecutive K
+// values [8 l, 8 l + 8) of its token / row: one 16-byte load of x and one 8-byte load of codes per chunk. A 128-column
+// cell's steps chain into `part` from zero; at the cell's end acc = fmaf(scale, part, acc) (cells in order); a
+// per-channel row chains every step into acc and is multiplied by its scale once. Output rounded once to bf16. The
+// narrow kernel (N <= 16, one m16 tile) and the GEMM (N > 16) issue exactly this chain per element, so a column's
+// bits do not depend on N (test: attn_linear width invariance).
+
+/// One chunk's two MMA steps into c: a token fragment pair (u: token gid, v: token gid + 8) and a code fragment w.
+__device__ __forceinline__ void chunk_steps(float (&c)[4], const uint4& u, const uint4& v, const int4& w) {
+    mma_bf16(c[0], c[1], c[2], c[3], u.x, v.x, u.y, v.y, static_cast<unsigned>(w.x), static_cast<unsigned>(w.y));
+    mma_bf16(c[0], c[1], c[2], c[3], u.z, v.z, u.w, v.w, static_cast<unsigned>(w.z), static_cast<unsigned>(w.w));
 }
 
-// ---- GEMV: N <= 8 columns --------------------------------------------------------------------------------
-// A CTA of 4 warps owns 8 rows of one segment, 2 a warp. Lane l reads codes [256 s + 8 l, + 8) of each row for
-// every step s (all steps issued before any arithmetic: the whole row pair is in flight at once); 8 codes never
-// straddle a 128-column cell.
-inline constexpr int kGemvWarps       = 4;
-inline constexpr int kGemvRowsPerWarp = 2;
-inline constexpr int kGemvRowsPerCta  = kGemvWarps * kGemvRowsPerWarp;
+/// Cell end: acc = fmaf(scale, part, acc) per element (rows 2 lid, 2 lid + 1 of the n8 tile = elements 0 / 2, 1 / 3).
+__device__ __forceinline__ void cell_end(float (&acc)[4], float (&part)[4], float s0, float s1) {
+    acc[0]  = fmaf(s0, part[0], acc[0]);
+    acc[1]  = fmaf(s1, part[1], acc[1]);
+    acc[2]  = fmaf(s0, part[2], acc[2]);
+    acc[3]  = fmaf(s1, part[3], acc[3]);
+    part[0] = part[1] = part[2] = part[3] = 0.0F;
+}
 
-template <int Steps, int Tokens>
-__global__ __launch_bounds__(kGemvWarps * 32) void gemv_kernel(const LinearParams p) {
-    constexpr int K = Steps * 256;
+__device__ __forceinline__ float cell_scale(const LinearSegment& s, int local, int cell) {
+    const int row = s.row_begin + min(local, s.rows - 1);
+    return s.scales[static_cast<std::int64_t>(row / s.rows_per) * s.kcells + cell];
+}
+
+// ---- narrow: N <= 16 columns (decode, verify) ------------------------------------------------------------------------
+// A warp owns 8 weight rows (one n8 tile) and all N tokens (one m16 tile). Lane (gid, lid) streams row gid's codes,
+// 8 a chunk, through a register ring 16 chunks deep (issued before the PDL wait: weights never depend on the previous
+// kernel), and reads tokens gid / gid + 8 of x (L1 / L2 resident) after it.
+inline constexpr int kNarrowWarps = 2;
+inline constexpr int kNarrowRows  = kNarrowWarps * 8;
+inline constexpr int kNarrowDepth = 16;
+
+template <int K, bool PerRow>
+__global__ __launch_bounds__(kNarrowWarps * 32) void narrow_kernel(const LinearParams p) {
+    constexpr int Chunks   = K / 32;
     const int block        = static_cast<int>(blockIdx.x);
     const LinearSegment& s = p.seg[segment_of(p, block)];
     const int warp         = static_cast<int>(threadIdx.x) >> 5;
     const int lane         = static_cast<int>(threadIdx.x) & 31;
-    const int local0       = (block - s.block_begin) * kGemvRowsPerCta + warp * kGemvRowsPerWarp;
+    const int gid          = lane >> 2;
+    const int lid          = lane & 3;
+    const int local0       = (block - s.block_begin) * kNarrowRows + warp * 8;
+    // A row past the end re-reads the last row and writes nothing.
+    const std::uint8_t* row = s.codes + static_cast<std::int64_t>(s.row_begin + min(local0 + gid, s.rows - 1)) * K + 8 * lid;
 
-    uint2 raw[kGemvRowsPerWarp][Steps];
+    uint2 ring[kNarrowDepth];
 #pragma unroll
-    for (int r = 0; r < kGemvRowsPerWarp; ++r) {
-        const int local = min(local0 + r, s.rows - 1); // a row past the end re-reads the last row, writes nothing
-        const std::uint8_t* row = s.codes + static_cast<std::int64_t>(s.row_begin + local) * K + lane * 8;
-#pragma unroll
-        for (int st = 0; st < Steps; ++st) { raw[r][st] = load_ldg<uint2>(row + st * 256); }
-    }
-    // The weight codes never depend on the kernel before this one: they are in flight before the PDL wait,
-    // which guards only the activations (lane h 11-21: a 7 MB GEMV reaches 80 % of DRAM bandwidth in a graph
-    // without it, >= 98 % with it).
+    for (int i = 0; i < kNarrowDepth; ++i) { ring[i] = load_ldg<uint2>(row + 32 * i); }
     pdl::wait_for_dependencies();
 
-    const bool per_row = s.k_per >= K;
-    float acc[kGemvRowsPerWarp][Tokens];
+    const int n_tok              = p.columns;
+    const bool t0                = gid < n_tok;
+    const bool t1                = gid + 8 < n_tok;
+    const __nv_bfloat16* x0      = s.x + static_cast<std::int64_t>(gid) * K + 8 * lid;
+    const __nv_bfloat16* x1      = s.x + static_cast<std::int64_t>(gid + 8) * K + 8 * lid;
+    float acc[4]  = {0.0F, 0.0F, 0.0F, 0.0F};
+    float part[4] = {0.0F, 0.0F, 0.0F, 0.0F};
 #pragma unroll
-    for (int r = 0; r < kGemvRowsPerWarp; ++r) {
-#pragma unroll
-        for (int t = 0; t < Tokens; ++t) { acc[r][t] = 0.0F; }
-    }
-#pragma unroll
-    for (int st = 0; st < Steps; ++st) {
-        const int k0 = st * 256 + lane * 8;
-        float xv[Tokens][8];
-#pragma unroll
-        for (int t = 0; t < Tokens; ++t) {
-            const uint4 xr = load_ldg<uint4>(s.x + static_cast<std::int64_t>(t) * K + k0);
-            const std::uint32_t xw[4] = {xr.x, xr.y, xr.z, xr.w};
-#pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                const float2 f = bf16x2_bits_to_float2(xw[i]);
-                xv[t][2 * i]     = f.x;
-                xv[t][2 * i + 1] = f.y;
-            }
-        }
-#pragma unroll
-        for (int r = 0; r < kGemvRowsPerWarp; ++r) {
-            float w[8];
-            codes8_to_float(raw[r][st], w);
-            float cell_scale = 1.0F;
-            if (!per_row) {
-                const int row = s.row_begin + min(local0 + r, s.rows - 1);
-                cell_scale    = s.scales[static_cast<std::int64_t>(row / s.rows_per) * s.kcells + k0 / s.k_per];
-            }
-#pragma unroll
-            for (int t = 0; t < Tokens; ++t) {
-                float d = 0.0F;
-#pragma unroll
-                for (int i = 0; i < 8; ++i) { d = fmaf(w[i], xv[t][i], d); }
-                acc[r][t] = per_row ? __fadd_rn(acc[r][t], d) : fmaf(cell_scale, d, acc[r][t]);
+    for (int ch = 0; ch < Chunks; ++ch) {
+        const uint2 cw = ring[ch % kNarrowDepth];
+        if (ch + kNarrowDepth < Chunks) { ring[ch % kNarrowDepth] = load_ldg<uint2>(row + 32 * (ch + kNarrowDepth)); }
+        const int4 w  = e4m3x8_to_bf16x8(make_int2(static_cast<int>(cw.x), static_cast<int>(cw.y)));
+        const uint4 u = t0 ? load_ldg<uint4>(x0 + 32 * ch) : make_uint4(0, 0, 0, 0);
+        const uint4 v = t1 ? load_ldg<uint4>(x1 + 32 * ch) : make_uint4(0, 0, 0, 0);
+        if constexpr (PerRow) {
+            chunk_steps(acc, u, v, w);
+        } else {
+            chunk_steps(part, u, v, w);
+            if ((ch & 3) == 3) {
+                cell_end(acc, part, cell_scale(s, local0 + 2 * lid, ch >> 2), cell_scale(s, local0 + 2 * lid + 1, ch >> 2));
             }
         }
     }
 #pragma unroll
-    for (int r = 0; r < kGemvRowsPerWarp; ++r) {
-        const int local = local0 + r;
-#pragma unroll
-        for (int t = 0; t < Tokens; ++t) {
-            const float total = warp_sum(acc[r][t]);
-            if (lane == 0 && local < s.rows) {
-                const int row = s.row_begin + local;
-                const float y = per_row ? __fmul_rn(total, s.scales[row / s.rows_per]) : total;
-                s.out[static_cast<std::int64_t>(t) * s.out_stride + local] = __float2bfloat16_rn(y);
-            }
-        }
+    for (int e = 0; e < 4; ++e) {
+        const int local = local0 + 2 * lid + (e & 1);
+        const int tok   = gid + 8 * (e >> 1);
+        if (local >= s.rows || tok >= n_tok) { continue; }
+        const float y = PerRow ? __fmul_rn(acc[e], s.scales[(s.row_begin + local) / s.rows_per]) : acc[e];
+        s.out[static_cast<std::int64_t>(tok) * s.out_stride + local] = __float2bfloat16_rn(y);
     }
 }
 
-// ---- GEMM: N > 8 columns ---------------------------------------------------------------------------------
-// CTA tile 64 weight rows x 64 columns, K in steps of 64 (two per 128-column cell). 4 warps in a 2 x 2 grid,
-// each 32 rows x 32 columns (2 m16 x 4 n8 tiles). Codes and activations land with cp.async (two stages); the
-// codes are widened into a swizzled bf16 tile; A = widened codes (row-major), B = activations ([n][k] = col-major
-// k x n). A cell's fp32 partial is scaled into the accumulator when the cell ends.
+// ---- GEMM: N > 16 columns ------------------------------------------------------------------------------------------
+// CTA tile 64 tokens x 64 weight rows, K in steps of 64 (two chunks; two steps per 128-column cell). 4 warps in a 2 x 2
+// grid, each 32 tokens (2 m16) x 32 rows (4 n8). Codes and activations land with cp.async (two stages); the codes are
+// widened into a bf16 tile. Both tiles keep K contiguous per token / row with 16-byte chunk c of line q stored at
+// c ^ ((q & 1) << 2): the fragment loads (lane (gid, lid): chunk 4 c + lid of lines gid) are conflict-free.
 inline constexpr int kTm = 64, kTn = 64, kTk = 64;
 
 struct GemmSmem {
-    std::uint8_t codes[2][kTm * kTk];      // 2 x 4 KiB
-    __nv_bfloat16 x[2][kTn * kTk];         // 2 x 8 KiB, swizzled
-    __nv_bfloat16 a[kTm * kTk];            // 8 KiB, swizzled
+    std::uint8_t codes[2][kTn * kTk];      // 2 x 4 KiB, [row][k]
+    __nv_bfloat16 x[2][kTm * kTk];         // 2 x 8 KiB, [token][k], swizzled
+    __nv_bfloat16 w[kTn * kTk];            // 8 KiB, [row][k], swizzled
 };
 
-__device__ __forceinline__ int swz64(int row, int chunk) { return row * kTk + ((chunk ^ (row & 7)) << 3); }
+__device__ __forceinline__ int swz64(int line, int chunk) { return line * kTk + ((chunk ^ ((line & 1) << 2)) << 3); }
 
 template <int K, bool PerRow>
 __global__ __launch_bounds__(128) void gemm_kernel(const LinearParams p) {
@@ -178,13 +171,13 @@ __global__ __launch_bounds__(128) void gemm_kernel(const LinearParams p) {
     const int lane         = tid & 31;
     const int gid          = lane >> 2;
     const int lid          = lane & 3;
-    const int wm           = warp >> 1; // warp row (32 rows)
-    const int wn           = warp & 1;  // warp column (32 columns)
-    const int local0       = (block - s.block_begin) * kTm;
-    const int col0         = static_cast<int>(blockIdx.y) * kTn;
+    const int wm           = warp >> 1; // warp token block (32 tokens)
+    const int wn           = warp & 1;  // warp row block (32 rows)
+    const int local0       = (block - s.block_begin) * kTn;
+    const int col0         = static_cast<int>(blockIdx.y) * kTm;
     constexpr int Steps    = K / kTk;
 
-    // codes: 64 rows x 64 B = 256 chunks of 16 B; activations: 64 columns x 128 B = 512 chunks.
+    // codes: 64 rows x 64 B = 256 chunks of 16 B; activations: 64 tokens x 128 B = 512 chunks.
     const auto stage_codes = [&](int step, int slot) {
         const int k0 = step * kTk;
         for (int c = tid; c < 256; c += 128) {
@@ -199,10 +192,10 @@ __global__ __launch_bounds__(128) void gemm_kernel(const LinearParams p) {
     const auto stage_x = [&](int step, int slot) {
         const int k0 = step * kTk;
         for (int c = tid; c < 512; c += 128) {
-            const int col = c >> 3, chunk = c & 7;
-            const bool ok = col0 + col < p.columns;
-            const __nv_bfloat16* src = s.x + static_cast<std::int64_t>(ok ? col0 + col : 0) * K + k0 + chunk * 8;
-            cp_async_zfill<16>(&sm.x[slot][swz64(col, chunk)], src, ok ? 16 : 0);
+            const int tok = c >> 3, chunk = c & 7;
+            const bool ok = col0 + tok < p.columns;
+            const __nv_bfloat16* src = s.x + static_cast<std::int64_t>(ok ? col0 + tok : 0) * K + k0 + chunk * 8;
+            cp_async_zfill<16>(&sm.x[slot][swz64(tok, chunk)], src, ok ? 16 : 0);
         }
     };
 
@@ -215,8 +208,8 @@ __global__ __launch_bounds__(128) void gemm_kernel(const LinearParams p) {
             for (int e = 0; e < 4; ++e) { acc[mt][nt][e] = part[mt][nt][e] = 0.0F; }
         }
     }
-    // The four weight rows this thread's fragments touch (m tile mt, half h): local0 + 32 wm + 16 mt + gid + 8 h.
-    const auto frag_row = [&](int mt, int h) { return local0 + 32 * wm + 16 * mt + gid + 8 * h; };
+    // Weight rows of this thread's accumulator elements: tile nt, element parity e -> local0 + 32 wn + 8 nt + 2 lid + e.
+    const auto out_row = [&](int nt, int e) { return local0 + 32 * wn + 8 * nt + 2 * lid + e; };
 
     // The first two steps' weight codes go out before the PDL wait (weights never depend on the previous
     // kernel); the activations after it. Group 0 = codes 0 + codes 1 + x 0, group 1 = x 1.
@@ -227,86 +220,68 @@ __global__ __launch_bounds__(128) void gemm_kernel(const LinearParams p) {
     cp_commit();
     if (Steps > 1) { stage_x(1, 1); }
     cp_commit();
-    const unsigned a_base = smem_addr(sm.a);
     for (int st = 0; st < Steps; ++st) {
         const int slot = st & 1;
         cp_wait<1>();
         __syncthreads();
-        // Widen this step's codes: 64 x 64 codes, 8 a chunk = 512 chunks.
+        // Widen this step's codes: 64 rows x 64 codes, 8 a chunk = 512 chunks.
         for (int c = tid; c < 512; c += 128) {
             const int row = c >> 3, chunk = c & 7;
-            store_vec(&sm.a[swz64(row, chunk)], e4m3x8_to_bf16x8(load_vec<int2>(&sm.codes[slot][row * kTk + chunk * 8])));
+            store_vec(&sm.w[swz64(row, chunk)], e4m3x8_to_bf16x8(load_vec<int2>(&sm.codes[slot][row * kTk + chunk * 8])));
         }
         __syncthreads();
-        const unsigned x_base = smem_addr(sm.x[slot]);
 #pragma unroll
-        for (int ks = 0; ks < kTk / 16; ++ks) {
-            unsigned af[2][4];
+        for (int c = 0; c < 2; ++c) {
+            uint4 u[2], v[2];
+            int4 w[4];
 #pragma unroll
             for (int mt = 0; mt < 2; ++mt) {
-                const int row   = 32 * wm + 16 * mt + (lane & 7) + (((lane >> 3) & 1) << 3);
-                const int chunk = 2 * ks + (lane >> 4);
-                ldmatrix_x4(af[mt][0], af[mt][1], af[mt][2], af[mt][3],
-                            a_base + static_cast<unsigned>(swz64(row, chunk) * 2));
+                const int tok = 32 * wm + 16 * mt + gid;
+                u[mt]         = load_vec<uint4>(&sm.x[slot][swz64(tok, 4 * c + lid)]);
+                v[mt]         = load_vec<uint4>(&sm.x[slot][swz64(tok + 8, 4 * c + lid)]);
             }
 #pragma unroll
-            for (int nt2 = 0; nt2 < 4; nt2 += 2) {
-                const int col   = 32 * wn + nt2 * 8 + (lane & 7) + ((lane >> 4) << 3);
-                const int chunk = 2 * ks + ((lane >> 3) & 1);
-                unsigned b0, b1, b2, b3;
-                ldmatrix_x4(b0, b1, b2, b3, x_base + static_cast<unsigned>(swz64(col, chunk) * 2));
+            for (int nt = 0; nt < 4; ++nt) { w[nt] = load_vec<int4>(&sm.w[swz64(32 * wn + 8 * nt + gid, 4 * c + lid)]); }
 #pragma unroll
-                for (int mt = 0; mt < 2; ++mt) {
-                    float(&c0)[4] = PerRow ? acc[mt][nt2] : part[mt][nt2];
-                    float(&c1)[4] = PerRow ? acc[mt][nt2 + 1] : part[mt][nt2 + 1];
-                    mma_bf16(c0[0], c0[1], c0[2], c0[3], af[mt][0], af[mt][1], af[mt][2], af[mt][3], b0, b1);
-                    mma_bf16(c1[0], c1[1], c1[2], c1[3], af[mt][0], af[mt][1], af[mt][2], af[mt][3], b2, b3);
-                }
+            for (int mt = 0; mt < 2; ++mt) {
+#pragma unroll
+                for (int nt = 0; nt < 4; ++nt) { chunk_steps(PerRow ? acc[mt][nt] : part[mt][nt], u[mt], v[mt], w[nt]); }
             }
         }
-        __syncthreads(); // the a tile and this stage's slots are free
+        __syncthreads(); // the w tile and this stage's slots are free
         if (st + 2 < Steps) {
             stage_codes(st + 2, slot);
             stage_x(st + 2, slot);
         }
         cp_commit();
-        // A cell ends every k_per columns (1x128: every two steps): scale its partial into the total.
-        if (!PerRow && ((st + 1) * kTk) % s.k_per == 0) {
-            const int kb = (st * kTk) / s.k_per;
+        // A cell ends every 128 columns (two steps): scale its partial into the total.
+        if (!PerRow && (st & 1) == 1) {
+            const int cell = st >> 1;
 #pragma unroll
-            for (int mt = 0; mt < 2; ++mt) {
+            for (int nt = 0; nt < 4; ++nt) {
+                const float s0 = cell_scale(s, out_row(nt, 0), cell), s1 = cell_scale(s, out_row(nt, 1), cell);
 #pragma unroll
-                for (int h = 0; h < 2; ++h) {
-                    const int local = min(frag_row(mt, h), s.rows - 1);
-                    const float sc =
-                        s.scales[static_cast<std::int64_t>((s.row_begin + local) / s.rows_per) * s.kcells + kb];
-#pragma unroll
-                    for (int nt = 0; nt < 4; ++nt) {
-                        acc[mt][nt][2 * h]     = fmaf(sc, part[mt][nt][2 * h], acc[mt][nt][2 * h]);
-                        acc[mt][nt][2 * h + 1] = fmaf(sc, part[mt][nt][2 * h + 1], acc[mt][nt][2 * h + 1]);
-                        part[mt][nt][2 * h] = part[mt][nt][2 * h + 1] = 0.0F;
-                    }
-                }
+                for (int mt = 0; mt < 2; ++mt) { cell_end(acc[mt][nt], part[mt][nt], s0, s1); }
             }
         }
     }
     cp_wait<0>();
 
 #pragma unroll
-    for (int mt = 0; mt < 2; ++mt) {
+    for (int nt = 0; nt < 4; ++nt) {
 #pragma unroll
-        for (int h = 0; h < 2; ++h) {
-            const int local = frag_row(mt, h);
+        for (int e = 0; e < 2; ++e) {
+            const int local = out_row(nt, e);
             if (local >= s.rows) { continue; }
             const float sc = PerRow ? s.scales[(s.row_begin + local) / s.rows_per] : 1.0F;
 #pragma unroll
-            for (int nt = 0; nt < 4; ++nt) {
+            for (int mt = 0; mt < 2; ++mt) {
 #pragma unroll
-                for (int e = 0; e < 2; ++e) {
-                    const int col = col0 + 32 * wn + 8 * nt + 2 * lid + e;
-                    if (col >= p.columns) { continue; }
+                for (int h = 0; h < 2; ++h) {
+                    const int tok = col0 + 32 * wm + 16 * mt + gid + 8 * h;
+                    if (tok >= p.columns) { continue; }
                     const float v = acc[mt][nt][2 * h + e];
-                    s.out[static_cast<std::int64_t>(col) * s.out_stride + local] =
+                    s.out[static_cast<std::int64_t>(tok) * s.out_stride + local] =
                         __float2bfloat16_rn(PerRow ? __fmul_rn(v, sc) : v);
                 }
             }
@@ -368,28 +343,12 @@ Prepared prepare(std::span<const InklingProjection> projections, bool gemm, cons
         s.rows_per       = rows_per;
         s.kcells         = w.k / k_per;
         s.block_begin    = blocks;
-        blocks += gemm ? (rows + kTm - 1) / kTm : (rows + kGemvRowsPerCta - 1) / kGemvRowsPerCta;
+        blocks += gemm ? (rows + kTn - 1) / kTn : (rows + kNarrowRows - 1) / kNarrowRows;
     }
     pr.params.segments = static_cast<std::int32_t>(projections.size());
     pr.params.columns  = static_cast<std::int32_t>(columns);
     pr.blocks          = blocks;
     return pr;
-}
-
-template <int Steps>
-void launch_gemv(const Prepared& pr, cudaStream_t stream) {
-    const pdl::LaunchConfig launch{dim3(static_cast<unsigned>(pr.blocks)), dim3(kGemvWarps * 32), 0, stream};
-    switch (pr.params.columns) {
-    case 1: CUDA_CHECK(pdl::launch_dependent(launch, gemv_kernel<Steps, 1>, pr.params)); break;
-    case 2: CUDA_CHECK(pdl::launch_dependent(launch, gemv_kernel<Steps, 2>, pr.params)); break;
-    case 3: CUDA_CHECK(pdl::launch_dependent(launch, gemv_kernel<Steps, 3>, pr.params)); break;
-    case 4: CUDA_CHECK(pdl::launch_dependent(launch, gemv_kernel<Steps, 4>, pr.params)); break;
-    case 5: CUDA_CHECK(pdl::launch_dependent(launch, gemv_kernel<Steps, 5>, pr.params)); break;
-    case 6: CUDA_CHECK(pdl::launch_dependent(launch, gemv_kernel<Steps, 6>, pr.params)); break;
-    case 7: CUDA_CHECK(pdl::launch_dependent(launch, gemv_kernel<Steps, 7>, pr.params)); break;
-    case 8: CUDA_CHECK(pdl::launch_dependent(launch, gemv_kernel<Steps, 8>, pr.params)); break;
-    default: throw std::logic_error("inkling_attn_linear: GEMV past 8 columns");
-    }
 }
 
 } // namespace
@@ -404,21 +363,28 @@ void inkling_attn_linear(std::span<const InklingProjection> projections, Workspa
     const char* op = "inkling_attn_linear";
     if (projections.empty() || projections[0].x == nullptr) { fail(op, "no projections"); }
     const std::int64_t n = projections[0].x->numel() / std::max<std::int64_t>(projections[0].x->ne[0], 1);
-    const bool gemm      = n > 8;
+    const bool gemm      = n > 16;
     const Prepared pr    = prepare(projections, gemm, op);
     if (pr.params.columns <= 0) { return; }
-    if (!gemm) {
-        if (pr.k == 2304) { launch_gemv<9>(pr, stream); } else { launch_gemv<12>(pr, stream); }
-        return;
-    }
-    const pdl::LaunchConfig launch{
-        dim3(static_cast<unsigned>(pr.blocks), static_cast<unsigned>((pr.params.columns + kTn - 1) / kTn)),
-        dim3(128), 0, stream};
-    // One cell kind per launch: the accumulator layout is fixed at compile time.
+    // One cell kind per launch: the accumulator chain is fixed at compile time.
     const bool per_row = pr.params.seg[0].k_per == pr.k;
     for (int i = 1; i < pr.params.segments; ++i) {
         if ((pr.params.seg[i].k_per == pr.k) != per_row) { fail(op, "projections of one call share their scale cell kind"); }
     }
+    if (!gemm) {
+        const pdl::LaunchConfig launch{dim3(static_cast<unsigned>(pr.blocks)), dim3(kNarrowWarps * 32), 0, stream};
+        if (pr.k == 2304) {
+            CUDA_CHECK(per_row ? pdl::launch_dependent(launch, narrow_kernel<2304, true>, pr.params)
+                               : pdl::launch_dependent(launch, narrow_kernel<2304, false>, pr.params));
+        } else {
+            CUDA_CHECK(per_row ? pdl::launch_dependent(launch, narrow_kernel<3072, true>, pr.params)
+                               : pdl::launch_dependent(launch, narrow_kernel<3072, false>, pr.params));
+        }
+        return;
+    }
+    const pdl::LaunchConfig launch{
+        dim3(static_cast<unsigned>(pr.blocks), static_cast<unsigned>((pr.params.columns + kTm - 1) / kTm)),
+        dim3(128), 0, stream};
     if (pr.k == 2304) {
         CUDA_CHECK(per_row ? pdl::launch_dependent(launch, gemm_kernel<2304, true>, pr.params)
                            : pdl::launch_dependent(launch, gemm_kernel<2304, false>, pr.params));

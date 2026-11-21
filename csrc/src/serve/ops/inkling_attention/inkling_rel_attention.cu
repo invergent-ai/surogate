@@ -138,8 +138,8 @@ struct AttnSmem {
     static constexpr int kStripCols   = kKeysW + 16;      // distances a warp's strip covers (row spread <= 15)
     static constexpr int kStripStride = kStripCols + 8;
     static constexpr int kDtw         = 16 / KS;          // output dim n-tiles of a warp
-    static constexpr int kX           = KS > 1 ? MTiles : 0;
-    static constexpr int kF           = Fold ? kWarps : 0;
+    static constexpr int kX           = KS > 1 ? MTiles : 1; // (zero-length arrays are not C++)
+    static constexpr int kF           = Fold ? kWarps : 1;
     std::uint8_t raw[Raw][2][kBn * Geo::kHeadDim];
     __nv_bfloat16 k[kBn * Geo::kHeadDim];
     __nv_bfloat16 v[kBn * Geo::kHeadDim];
@@ -301,10 +301,10 @@ __global__ __launch_bounds__(MTiles * KS * 32) void rel_attention_kernel(const A
             const int cc    = c - which * (kBn * 8);
             const int key   = cc >> 3;
             const int part  = cc & 7;
-            const int abs   = k0 + key;
+            const int kabs  = k0 + key;
             std::uint8_t* dst = sm.raw[slot][which] + key * Geo::kHeadDim + part * 16;
             const std::uint8_t* src = (which ? p.v_pages : p.k_pages) + off + key * Geo::kHeadDim + part * 16;
-            cp_async_zfill<16>(dst, src, (abs >= lo && abs < hi) ? 16 : 0);
+            cp_async_zfill<16>(dst, src, (kabs >= lo && kabs < hi) ? 16 : 0);
         }
     };
     // Widen raw slot `slot` into the swizzled bf16 tiles (16-byte chunk c of key row k at c ^ (k & 7)).
