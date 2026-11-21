@@ -70,7 +70,7 @@ __device__ __forceinline__ std::int64_t nvfp4_scale_index(std::int64_t row, int 
 }
 
 /// Dequantised weight (without the NVFP4 per-expert global) of bank row `row`, column `c`.
-__device__ __forceinline__ float weight_value(const load::ExpertBank& w, int nvfp4, std::int64_t row, int c) {
+__device__ __forceinline__ float weight_value(const ExpertBankView& w, int nvfp4, std::int64_t row, int c) {
     if (nvfp4) {
         const std::uint8_t byte = w.codes[row * (w.columns / 2) + c / 2];
         const int code          = (c & 1) ? (byte >> 4) : (byte & 15);
@@ -207,7 +207,7 @@ struct GemmArgs {
     const float* a_amax;     // [rows_a]
     int a_per_token;         // 1: activation row = token (w13); 0: = token-slot (w2)
     const std::int32_t* ids; // [T][8]
-    load::ExpertBank w;
+    ExpertBankView w;
     int nvfp4;
     int k;
     int rows;                // output rows per expert
@@ -233,7 +233,7 @@ __global__ void __launch_bounds__(256) expert_gemm_kernel(const __grid_constant_
     if (lane != 0) { return; }
     float y = acc;
     if (g.nvfp4) {
-        const float rcp   = 1.0F / (1536.0F * g.w.outer_scale_denominator_value);
+        const float rcp   = 1.0F / (1536.0F * g.w.outer_scale_denominator);
         const float scale = (g.a_amax[arow] * g.w.amax[e]) * rcp;
         y                 = acc * scale;
     }
@@ -275,14 +275,11 @@ std::size_t moe_workspace_bytes(std::int32_t tokens) {
 }
 
 void moe(const MoeCall& call, WorkspaceArena& workspace, cudaStream_t stream) {
-    if (call.x == nullptr || call.layer == nullptr || call.out == nullptr || call.tokens <= 0) {
+    if (call.x == nullptr || call.layer.router == nullptr || call.out == nullptr || call.tokens <= 0) {
         throw std::invalid_argument("naive inkling moe: incomplete call");
     }
-    const auto& L   = *call.layer;
-    const int nvfp4 = L.w13.format == load::ExpertFormat::Nvfp4 ? 1 : 0;
-    if (!L.w13.gate_up_interleaved) {
-        throw std::invalid_argument("naive inkling moe: only the interleaved w13 row order is implemented");
-    }
+    const MoeLayer& L = call.layer;
+    const int nvfp4   = L.w13.nvfp4 ? 1 : 0;
     auto scope = workspace.scope();
     const int tile = std::min(call.tokens, kTile);
     auto alloc = [&](DType dtype, std::int32_t n0, std::int32_t n1) { return workspace.alloc(dtype, {n0, n1}); };
@@ -298,7 +295,7 @@ void moe(const MoeCall& call, WorkspaceArena& workspace, cudaStream_t stream) {
     for (int t0 = 0; t0 < call.tokens; t0 += tile) {
         const int n = std::min(tile, call.tokens - t0);
         const bf16* x = static_cast<const bf16*>(call.x) + static_cast<std::int64_t>(t0) * kD;
-        route_kernel<<<n, kE, 0, stream>>>(x, static_cast<const bf16*>(L.router.qdata), L.router_bias,
+        route_kernel<<<n, kE, 0, stream>>>(x, static_cast<const bf16*>(L.router), L.router_bias,
                                            static_cast<std::int32_t*>(ids.data), static_cast<float*>(gammas.data),
                                            call.capture ? call.capture + static_cast<std::int64_t>(t0) * kTopK : nullptr);
         CUDA_CHECK(cudaGetLastError());

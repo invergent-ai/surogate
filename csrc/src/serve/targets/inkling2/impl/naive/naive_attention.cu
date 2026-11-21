@@ -286,12 +286,12 @@ __global__ void fill_i32_kernel(std::int32_t* data, std::int32_t count, std::int
 } // namespace
 
 void attention(const AttentionCall& c, cudaStream_t stream) {
-    if (c.qkvr == nullptr || c.layer == nullptr || c.width <= 0 || c.batch <= 0 || c.positions == nullptr ||
+    if (c.qkvr == nullptr || c.layer.q_scale == nullptr || c.width <= 0 || c.batch <= 0 || c.positions == nullptr ||
         c.table_rows == nullptr || c.block_tables == nullptr || c.k_pages == nullptr || c.v_pages == nullptr ||
         c.state == nullptr || c.slots == nullptr || c.q_out == nullptr || c.r_out == nullptr || c.out == nullptr) {
         throw std::invalid_argument("naive inkling attention: incomplete call");
     }
-    const auto& L = *c.layer;
+    const AttentionLayer& L = c.layer;
     Args a{};
     a.qkvr         = static_cast<const bf16*>(c.qkvr);
     a.qkvr_stride  = c.qkvr_stride;
@@ -306,21 +306,21 @@ void attention(const AttentionCall& c, cudaStream_t stream) {
     a.v_pages      = c.v_pages;
     a.fp8          = c.fp8 ? 1 : 0;
     a.global       = L.global ? 1 : 0;
-    a.q_scale      = static_cast<const bf16*>(L.q_scale.data);
-    a.r_scale      = static_cast<const bf16*>(L.r_scale.data);
-    a.rel_proj     = static_cast<const bf16*>(L.rel_proj.data);
+    a.q_scale      = static_cast<const bf16*>(L.q_scale);
+    a.r_scale      = static_cast<const bf16*>(L.r_scale);
+    a.rel_proj     = static_cast<const bf16*>(L.rel_proj);
     if (L.global) {
-        if (c.k_dyn == nullptr || c.v_dyn == nullptr) {
-            throw std::invalid_argument("naive inkling attention: a global layer needs the dynamic taps");
+        if (c.k_dyn == nullptr || c.v_dyn == nullptr || L.k_static == nullptr || L.v_static == nullptr) {
+            throw std::invalid_argument("naive inkling attention: a global layer needs static taps and dynamic taps");
         }
-        a.k_static   = static_cast<const bf16*>(L.k_conv_static.data);
-        a.v_static   = static_cast<const bf16*>(L.v_conv_static.data);
+        a.k_static   = static_cast<const bf16*>(L.k_static);
+        a.v_static   = static_cast<const bf16*>(L.v_static);
         a.k_dyn      = static_cast<const bf16*>(c.k_dyn);
         a.v_dyn      = static_cast<const bf16*>(c.v_dyn);
         a.dyn_stride = c.dyn_stride;
     } else {
-        a.k_conv = static_cast<const bf16*>(L.k_conv.data);
-        a.v_conv = static_cast<const bf16*>(L.v_conv.data);
+        a.k_conv = static_cast<const bf16*>(L.k_conv);
+        a.v_conv = static_cast<const bf16*>(L.v_conv);
     }
     a.state       = static_cast<const bf16*>(c.state);
     a.slot_stride = c.slot_stride;

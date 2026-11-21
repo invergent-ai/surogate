@@ -232,6 +232,44 @@ PlaneView plane_view(const Round& rd, int visit) {
     return out;
 }
 
+naive::AttentionLayer attention_layer(const load::InklingLayerWeights& L) {
+    naive::AttentionLayer out;
+    out.global   = L.global;
+    out.q_scale  = L.q_scale.data;
+    out.r_scale  = L.r_scale.data;
+    out.rel_proj = L.rel_proj.data;
+    out.k_conv   = L.k_conv.data;
+    out.v_conv   = L.v_conv.data;
+    out.k_static = L.k_conv_static.data;
+    out.v_static = L.v_conv_static.data;
+    return out;
+}
+
+naive::ExpertBankView bank_view(const load::ExpertBank& b) {
+    if (!b.gate_up_interleaved) {
+        throw std::logic_error("inkling2: the naive MoE reads the interleaved w13 row order only");
+    }
+    naive::ExpertBankView out;
+    out.nvfp4                   = b.format == load::ExpertFormat::Nvfp4;
+    out.experts                 = b.experts;
+    out.rows_per_expert         = b.rows_per_expert;
+    out.columns                 = b.columns;
+    out.codes                   = b.codes;
+    out.scales                  = b.scales;
+    out.amax                    = b.amax;
+    out.outer_scale_denominator = b.outer_scale_denominator_value;
+    return out;
+}
+
+naive::MoeLayer moe_layer(const load::InklingLayerWeights& L) {
+    naive::MoeLayer out;
+    out.router      = L.router.qdata;
+    out.router_bias = L.router_bias;
+    out.w13         = bank_view(L.w13);
+    out.w2          = bank_view(L.w2);
+    return out;
+}
+
 void run_visit(Round& rd, int v) {
     const VisitInfo& vi                 = kVisits[static_cast<std::size_t>(v)];
     const load::InklingLayerWeights& L  = *rd.model.full_layers.at(static_cast<std::size_t>(v)).projection.layer;
@@ -296,7 +334,7 @@ void run_visit(Round& rd, int v) {
         call.k_pages      = plane.k_pages;
         call.v_pages      = plane.v_pages;
         call.fp8          = plane.fp8;
-        call.layer        = &L;
+        call.layer        = attention_layer(L);
         if (vi.global) {
             call.k_dyn      = bf16_ptr(k_dyn) + static_cast<std::int64_t>(g.column) * 32;
             call.v_dyn      = bf16_ptr(v_dyn) + static_cast<std::int64_t>(g.column) * 32;
@@ -347,7 +385,7 @@ void run_visit(Round& rd, int v) {
     naive::MoeCall moe;
     moe.x      = mlp_in.data;
     moe.tokens = T;
-    moe.layer  = &L;
+    moe.layer  = moe_layer(L);
     moe.out    = moe_out.data;
     if (rd.r.routing.ids != nullptr && T <= rd.r.routing.columns) {
         moe.capture = rd.r.routing.ids + static_cast<std::int64_t>(v) * rd.r.routing.columns * rd.r.routing.top_k;

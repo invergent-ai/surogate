@@ -8,7 +8,6 @@
 
 #include "core/arena.h"
 #include "core/tensor.h"
-#include "targets/inkling2/impl/load/bindings.h"
 
 #include <cuda_runtime.h>
 
@@ -16,6 +15,34 @@
 #include <cstdint>
 
 namespace sinfer::targets::inkling2::naive {
+
+/// The layer tensors the naive attention reads (device pointers, BF16; layouts as lane b binds them).
+struct AttentionLayer {
+    bool global             = false;
+    const void* q_scale     = nullptr; ///< ne {128, 24}
+    const void* r_scale     = nullptr; ///< ne {16, 24}
+    const void* rel_proj    = nullptr; ///< ne {1024, 16}
+    const void* k_conv      = nullptr; ///< local: ne {4, 1024} (a channel's taps contiguous, oldest first)
+    const void* v_conv      = nullptr;
+    const void* k_static    = nullptr; ///< global: ne {1024, 4} (lag-major)
+    const void* v_static    = nullptr;
+};
+
+/// One routed bank as lane b binds it (load::ExpertBank without the artifact types).
+struct ExpertBankView {
+    bool nvfp4                 = true;
+    std::int32_t experts = 0, rows_per_expert = 0, columns = 0;
+    const std::uint8_t* codes  = nullptr;
+    const std::uint8_t* scales = nullptr;
+    const float* amax          = nullptr; ///< NVFP4: device FP32 [experts]
+    float outer_scale_denominator = 0.0F; ///< NVFP4: the host word
+};
+
+struct MoeLayer {
+    const void* router       = nullptr; ///< BF16 [128, 2304]
+    const float* router_bias = nullptr; ///< FP32 [128]
+    ExpertBankView w13, w2;
+};
 
 /// One attention call of a visit: B rows of W columns (column n = j + W * b; a prompt segment is B = 1).
 struct AttentionCall {
@@ -33,7 +60,7 @@ struct AttentionCall {
     void* v_pages = nullptr;
     bool fp8      = true; ///< unit-scale e4m3 planes (else bf16)
     // the layer
-    const load::InklingLayerWeights* layer = nullptr;
+    AttentionLayer layer;
     const void* k_dyn = nullptr; ///< global: BF16 [32, N] = k_conv_proj(x_k)
     const void* v_dyn = nullptr;
     std::int64_t dyn_stride = 32;
@@ -57,7 +84,7 @@ void attention(const AttentionCall& call, cudaStream_t stream);
 struct MoeCall {
     const void* x                       = nullptr;
     std::int32_t tokens                 = 0;
-    const load::InklingLayerWeights* layer = nullptr;
+    MoeLayer layer;
     std::int32_t* capture               = nullptr;
     void* out                           = nullptr;
 };

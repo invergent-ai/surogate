@@ -35,7 +35,9 @@ std::int64_t numel_allow_zero(const Tensor& t, const char* label) {
 } // namespace
 
 void argmax(const Tensor& logits, Tensor& out, std::int32_t valid_rows, cudaStream_t stream) {
-    if (logits.dtype != DType::BF16) { throw std::invalid_argument("argmax: logits must be BF16"); }
+    if (logits.dtype != DType::BF16 && logits.dtype != DType::FP32) {
+        throw std::invalid_argument("argmax: logits must be BF16 or FP32");
+    }
     if (out.dtype != DType::I32) { throw std::invalid_argument("argmax: out must be I32"); }
 
     const std::int64_t logits_n = numel_allow_zero(logits, "logits");

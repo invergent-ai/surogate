@@ -13,8 +13,8 @@ namespace sinfer::ops {
  *
  *   out[t] = min argmax_{0 <= v < valid_rows} float(logits[v,t]).
  *
- * `logits` is contiguous BF16 [physical_rows,T], `out` is contiguous I32 [T], and
- * 1 <= valid_rows <= physical_rows. Physical rows [valid_rows,physical_rows) do not
+ * `logits` is contiguous BF16 or FP32 [physical_rows,T] (float(x) is exact for both), `out`
+ * is contiguous I32 [T], and 1 <= valid_rows <= physical_rows. Physical rows [valid_rows,physical_rows) do not
  * participate. Equal maxima select the lowest row index. `out` must not overlap `logits`.
  * The Op has no workspace and changes no state other than writing all of `out`.
  */
