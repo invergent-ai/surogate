@@ -1396,6 +1396,23 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             impl->request_transient_capacity_bytes, "request transient reservation"),
         checked_add(impl->graph_allowance_bytes, impl->persistent.checkpoints.reservation_bytes(),
                     "conversation snapshot allowance"), "sequence graph allowance");
+    // Lane f1 (diagnostics, SUROGATE_SERVE_PLAN_DUMP=1): the device reservation by part, one line per candidate.
+    static const bool plan_dump = std::getenv("SUROGATE_SERVE_PLAN_DUMP") != nullptr;
+    if (plan_dump) {
+        const auto mib = [](std::size_t bytes) { return static_cast<double>(bytes) / (1024.0 * 1024.0); };
+        const WorkspacePlan& w = impl->workspace;
+        std::fprintf(stderr,
+                     "plan-dump: pages %u | persistent %.1f MiB (kv payload %.1f) elastic planes %.1f | workspace %.1f "
+                     "(text_prefill %.1f ordinary_round %.1f mtp_prefill %.1f mtp_round %.1f dflash_context %.1f "
+                     "dflash_round %.1f vision %.1f) | request transient %.1f | graphs %.1f | checkpoints %.1f | "
+                     "total %.1f MiB\n",
+                     main_page_groups, mib(impl->persistent.bytes), mib(impl->persistent.kv_payload_bytes),
+                     mib(impl->persistent.elastic_plane_bytes), mib(w.capacity), mib(w.text_prefill),
+                     mib(w.ordinary_round), mib(w.mtp_prefill), mib(w.mtp_round), mib(w.dflash_context),
+                     mib(w.dflash_round), mib(w.vision_encode), mib(impl->request_transient_capacity_bytes),
+                     mib(impl->graph_allowance_bytes), mib(impl->persistent.checkpoints.reservation_bytes()),
+                     mib(impl->device_reservation_bytes));
+    }
     return impl;
 }
 
