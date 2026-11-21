@@ -122,7 +122,10 @@ family::TextGeometry visit_geometry(const artifact::Reader& reader) {
 }
 
 LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized)
-    : backing(std::move(materialized)) {
+    : backing(std::move(materialized)),
+      host_bank(plan.host_bank.objects.empty() ? nullptr : family::HostBank::shared(plan.host_bank)) {
+    // HostBank objects (the FP8 drafter's BF16 sources) resolve to their pinned host bytes from here on.
+    if (host_bank) { host_bank->attach(backing); }
     // Lane b binds the text-only set (no pixel configs): take exactly that set.
     frontend = family::take_text_only_frontend_resources(backing, plan.plan.frontend);
     // The release's chat_template.jinja is for HF tooling: vLLM renders Inkling prompts natively from the request

@@ -8,6 +8,7 @@
 #include "targets/inkling2/impl/config.h"
 #include "targets/inkling2/impl/load/bindings.h"
 #include "targets/inkling2/impl/dspark.h"
+#include "family/impl/load/host_bank.h"
 
 #include "artifact/materializer.h"
 #include "core/arena.h"
@@ -71,6 +72,8 @@ struct BindingPlan {
     load::BindingPlan plan;
     family::TextGeometry geometry; ///< the served (48-visit) geometry
     family::StartupFeatures features;
+    /// Objects bound HostBank (today only the DSpark dense linears under FP8 drafter weights, lane e2).
+    family::HostBankPlan host_bank;
 };
 
 struct ArtifactLoadPlan {
@@ -91,6 +94,7 @@ public:
     LoadedModelData& operator=(LoadedModelData&&)      = delete;
 
     artifact::MaterializedArtifact backing;
+    std::shared_ptr<family::HostBank> host_bank; ///< pinned host objects, attached to `backing` before weights load
     family::FrontendResources frontend;
     load::InklingWeights weights;
     DerivedQueries queries;
