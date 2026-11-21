@@ -1497,6 +1497,7 @@ std::uint32_t PagedKVPool::compact_window_class(std::span<const PagedKVAllocatio
             ++moved;
         }
         window_moved_pages_ += moved;
+        if (moved != 0) { std::fprintf(stderr, "kv-window: shuffle moved %u pages\n", moved); }
         return moved;
     }
     std::uint32_t granules = 0;

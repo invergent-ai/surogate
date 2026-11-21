@@ -16,6 +16,11 @@ Paths
   host@b    as cut@b on an engine with a host tier and a KV capacity of --host-capacity tokens, with one long
             unrelated prompt in between that needs the retained lane's pages: the prefix spills to the host tier and
             S restores it from there (checked: GET /kv_stats host "restores" grows across S's request)
+  relocate@b  as cut@b on an engine whose window pages are relocated at EVERY round boundary (elastic window class,
+            SUROGATE_SERVE_KV_WINDOW_ELASTIC=1 + SUROGATE_SERVE_KV_WINDOW_SHUFFLE=1, lane f1 M3-C): S's suffix reads
+            windows from pages moved between all of its rounds (--relocate, on by default for windowed models)
+  relocate-decode  the decode path on that engine, compared with the decode path (not the reference): relocation
+            between decode rounds must not change a bit
 Exit status 0 iff every path equals the reference bitwise; the JSON report has the per-path detail.
 
 Example (gpubox2, Gemma 3 270M fixture):
@@ -44,7 +49,7 @@ def post(port, path, body, timeout=900):
 
 
 class Engine:
-    def __init__(self, args, tag, extra_args="", lanes=None, host_gb=None, max_model_len=None):
+    def __init__(self, args, tag, extra_args="", lanes=None, host_gb=None, max_model_len=None, env=None):
         self.port = args.port
         self.log_path = os.path.join(args.workdir, f"engine-{tag}.log")
         cmd = [args.engine, args.artifact, "--port", str(args.port), "--served-model-name", "m",
@@ -52,11 +57,13 @@ class Engine:
         if host_gb is not None:
             cmd += ["--prefix-cache-host-gb", str(host_gb)]
         cmd += shlex.split(args.engine_args) + shlex.split(extra_args)
+        extra_env = env
         env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(args.card),
                    LD_LIBRARY_PATH=os.path.dirname(os.path.abspath(args.engine)))
         for item in args.env:
             key, _, value = item.partition("=")
             env[key] = value
+        env.update(extra_env or {})
         self.log = open(self.log_path, "w")
         self.proc = subprocess.Popen(cmd, env=env, stdout=self.log, stderr=subprocess.STDOUT)
         for _ in range(300):
@@ -107,6 +114,17 @@ class Engine:
         except subprocess.TimeoutExpired:
             self.proc.kill()
         self.log.close()
+
+
+def relocated(engine):
+    """Window pages the engine relocated (its "kv-window: shuffle moved N pages" lines): a relocate path whose engine
+    moved nothing proves nothing."""
+    total = 0
+    with open(engine.log_path, encoding="utf-8", errors="replace") as log:
+        for line in log:
+            if "kv-window: shuffle moved" in line:
+                total += int(line.split("moved")[1].split()[0])
+    return total
 
 
 def tail(result, k):
@@ -163,6 +181,10 @@ def main():
                     help="prefix-hit cut points b (tokens); 'last' = |S| - 1 (only the last prompt token is computed)")
     ap.add_argument("--host-capacity", type=int, default=4096,
                     help="max-model-len = kv-capacity of the host-path engine (small, so the evicting prompt spills)")
+    ap.add_argument("--relocate", type=int, default=1,
+                    help="1: add the relocate@b / relocate-decode paths (window pages moved at every round boundary)")
+    ap.add_argument("--relocate-capacity", type=int, default=131072,
+                    help="--kv-capacity of the relocate engines (an elastic window class charges its pages there)")
     ap.add_argument("--workdir", default=".")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
@@ -245,12 +267,36 @@ def main():
         finally:
             eng.close()
 
+    if args.relocate:
+        shuffle = {"SUROGATE_SERVE_KV_WINDOW_ELASTIC": "1", "SUROGATE_SERVE_KV_WINDOW_SHUFFLE": "1"}
+        extra = f"--kv-capacity {args.relocate_capacity}"
+        for cut, text in cuts:
+            eng = Engine(args, f"relocate{cut}", extra_args=extra, env=shuffle)
+            try:
+                eng.complete(text, 1)
+                result = compare(ref, tail(eng.complete(s_text, k), k))
+            finally:
+                eng.close()
+            result["relocated_pages"] = relocated(eng)
+            report["paths"][f"relocate@{cut}"] = result
+        eng = Engine(args, "relocate-decode", extra_args=extra, env=shuffle)
+        try:
+            rdec = tail(eng.complete(p_text, nx + k), k)
+            result = compare(decode, rdec)
+            result["versus"] = "decode"
+        finally:
+            eng.close()
+        result["relocated_pages"] = relocated(eng)
+        report["paths"]["relocate-decode"] = result
+
     ok = all(path["equal"] for path in report["paths"].values())
     report["pass"] = ok
     json.dump(report, open(args.out, "w"), indent=1)
     print(f"S = {len(s_ids)} tokens, K = {k}")
     for name, path in report["paths"].items():
         spilled = "" if "restored_from_host" not in path else f" host_restore={path['restored_from_host']}"
+        if "relocated_pages" in path:
+            spilled += f" relocated={path['relocated_pages']}"
         print(f"  {name:12s} {'EQUAL' if path['equal'] else 'DIFF '} cached={path['cached']}{spilled} "
               f"first_mismatch={path['first_logprob_mismatch']} max|d|={path['max_abs_logprob_diff']:.3g}")
     print("PASS" if ok else "FAIL")
