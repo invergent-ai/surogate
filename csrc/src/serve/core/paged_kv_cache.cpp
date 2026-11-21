@@ -267,6 +267,15 @@ PagedKVPool::PagedKVPool(DeviceSpan backing, const PagedKVPoolLayout& layout,
         // it must hold finite bytes (zeros), and nothing ever writes it.
         zero_window_page(window_sentinel_, nullptr);
         CUDA_CHECK(cudaStreamSynchronize(nullptr));
+        const PagedKVWindowOccupancy size = window_occupancy();
+        std::fprintf(stderr,
+                     "kv-window: window class of %zu planes, window %u tokens: %u lane + %u image pages "
+                     "of %zu bytes (%.1f MiB), forward reach %u tokens\n",
+                     window_planes_.size(), window_tokens_, window_lane_pages_, window_image_pages_,
+                     size.page_bytes,
+                     static_cast<double>(size.page_bytes) * (window_lane_pages_ + window_image_pages_ + 1U) /
+                         (1024.0 * 1024.0),
+                     window_forward_tokens_);
     }
 }
 

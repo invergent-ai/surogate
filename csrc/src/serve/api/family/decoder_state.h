@@ -62,6 +62,13 @@ struct DecoderStateSpec {
     // device's free memory at admission (core/elastic_kv_region.h).
     bool elastic_kv_overcommit              = false;
     std::uint32_t mtp_physical_page_groups  = 0;
+    // Window-bounded KV (DESIGN-window-kv.md, lane f1): the sliding window of each full-attention
+    // layer, in the numbering above, 0 for a layer that reads the whole context. A layer with a
+    // window keeps its planes in the text pool's window class, sized by `window_class`. Empty
+    // (every family without windowed layers, or SUROGATE_SERVE_KV_WINDOW_PAGING=0) leaves the
+    // pool exactly as it was.
+    std::vector<std::int32_t> layer_windows;
+    KvWindowClassSize window_class;
     LinearAttentionStatePoolSpec linear_attention;
     // Per-slot state of a layer prologue (n-gram memory); absent for targets without one.
     std::optional<NgramPleStatePoolSpec> ple;
@@ -87,6 +94,8 @@ struct PagedKVCacheLayout {
     // Empty means homogeneous, which is what every family but Gemma 4 leaves it.
     std::vector<std::int32_t> layer_kv_heads;
     std::vector<std::int32_t> layer_head_dim;
+    // Sliding window per layer of this pool (window class), empty when none has one.
+    std::vector<std::int32_t> layer_windows;
 
     [[nodiscard]] std::size_t payload_bytes() const noexcept { return pool.payload_bytes(); }
 };
@@ -104,10 +113,11 @@ public:
 
 private:
     friend class PagedKVCache;
-    PagedKVCacheView(const PagedKVCache& cache, Tensor block_table) noexcept;
+    PagedKVCacheView(const PagedKVCache& cache, Tensor block_table, Tensor window_block_table) noexcept;
 
     const PagedKVCache* cache_ = nullptr;
     Tensor block_table_;
+    Tensor window_block_table_; ///< the sequence's window-class row; empty without a window class
 };
 
 class PagedKVCache {
@@ -132,9 +142,16 @@ public:
 
     [[nodiscard]] PagedKVBatchLayerView batch_layer_view(std::uint32_t layer) const;
 
+    /// Does this layer keep its planes in the window class (only the pages its window reads)?
+    [[nodiscard]] bool layer_windowed(std::uint32_t layer) const noexcept {
+        return layer >= first_layer_ && layer - first_layer_ < layer_windows_.size() &&
+               layer_windows_[layer - first_layer_] > 0;
+    }
+
 private:
     friend class PagedKVCacheView;
-    [[nodiscard]] PagedKVLayerView layer_view(std::uint32_t layer, Tensor block_table) const;
+    [[nodiscard]] PagedKVLayerView layer_view(std::uint32_t layer, Tensor block_table,
+                                              Tensor window_block_table) const;
 
     PagedKVPool pool_;
     std::uint32_t first_layer_ = 0;
@@ -148,6 +165,7 @@ private:
     std::vector<DType> layer_dtypes_;
     std::vector<std::int32_t> layer_kv_heads_;
     std::vector<std::int32_t> layer_head_dim_;
+    std::vector<std::int32_t> layer_windows_;
 
     [[nodiscard]] DType layer_dtype(std::uint32_t layer) const noexcept {
         return layer < layer_dtypes_.size() ? layer_dtypes_[layer] : dtype_;

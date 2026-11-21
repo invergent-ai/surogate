@@ -26,7 +26,9 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
                               std::int32_t global_head_dim = 0,
                               const std::vector<std::uint32_t>& global_layers = {},
                               DType indexer_dtype = DType::BF16,
-                              std::optional<KvLayerRange> owned_layers = std::nullopt) {
+                              std::optional<KvLayerRange> owned_layers = std::nullopt,
+                              const std::vector<std::int32_t>& layer_windows = {},
+                              KvWindowClassSize window_class = {}) {
     if (layers == 0 ||
         layers > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
         kv_heads <= 0 || head_dim <= 0 || table_rows <= 0) {
@@ -100,21 +102,35 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
         layer_kv_heads[global] = global_kv_heads;
         layer_head_dim[global] = global_head_dim;
     }
+    if (!layer_windows.empty() && layer_windows.size() != layers) {
+        throw std::invalid_argument("Paged KV layer windows do not cover every full-attention layer");
+    }
+    bool any_window = false;
     for (std::uint32_t layer = owned.first; layer < owned.last; ++layer) {
         const DType layer_dtype = layer_dtypes[layer];
         const std::int32_t heads = layer_kv_heads[layer];
         const std::int32_t width = layer_head_dim[layer];
-        pool_spec.planes.push_back({layer_dtype, width, heads, 256});
-        pool_spec.planes.push_back({layer_dtype, width, heads, 256});
+        // Every plane of a windowed layer (scales and indexer included) shares its window class
+        // pages: the layer's views read them through one block table.
+        const std::int32_t window = layer_windows.empty() ? 0 : layer_windows[layer];
+        if (window < 0) { throw std::invalid_argument("Paged KV layer window must not be negative"); }
+        any_window = any_window || window > 0;
+        pool_spec.planes.push_back({layer_dtype, width, heads, 256, window});
+        pool_spec.planes.push_back({layer_dtype, width, heads, 256, window});
         if (grouped) {
-            pool_spec.planes.push_back({DType::FP16, width / quant_group, heads, 256});
-            pool_spec.planes.push_back({DType::FP16, width / quant_group, heads, 256});
+            pool_spec.planes.push_back({DType::FP16, width / quant_group, heads, 256, window});
+            pool_spec.planes.push_back({DType::FP16, width / quant_group, heads, 256, window});
         }
         // Indexer precision is independent of K/V quantization: rounding selection
         // controls can change which tokens the model attends to.
         if (indexer_head_dim > 0) {
-            pool_spec.planes.push_back({indexer_dtype, indexer_head_dim, 1, 256});
+            pool_spec.planes.push_back({indexer_dtype, indexer_head_dim, 1, 256, window});
         }
+    }
+    if (any_window) {
+        pool_spec.window_lane_pages     = window_class.lane_pages;
+        pool_spec.window_image_pages    = window_class.image_pages;
+        pool_spec.window_forward_tokens = window_class.forward_tokens;
     }
     return PagedKVCacheLayout{
         .pool        = plan_paged_kv_pool(builder, pool_spec),
@@ -135,6 +151,9 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
                                               layer_head_dim.begin() + owned.first,
                                               layer_head_dim.begin() + owned.last}
                                           : std::vector<std::int32_t>{},
+        .layer_windows = any_window ? std::vector<std::int32_t>{layer_windows.begin() + owned.first,
+                                                                layer_windows.begin() + owned.last}
+                                    : std::vector<std::int32_t>{},
     };
 }
 
@@ -187,7 +206,8 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
                                 spec.kv_skip_layers, spec.indexer_head_dim, spec.elastic_kv,
                                 spec.text_physical_page_cap, spec.elastic_kv_overcommit,
                                 spec.global_kv_heads, spec.global_attention_head_dim,
-                                spec.global_geometry_layers, spec.indexer_dtype, spec.text_kv_layers);
+                                spec.global_geometry_layers, spec.indexer_dtype, spec.text_kv_layers,
+                                spec.layer_windows, spec.window_class);
     if (spec.enable_mtp) {
         layout.mtp_kv = plan_cache(builder, spec.mtp_layers, spec.capacity, spec.kv_heads,
                                    spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,
@@ -207,10 +227,11 @@ PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout,
       kv_heads_(layout.kv_heads), head_dim_(layout.head_dim), dtype_(layout.dtype),
       quant_group_(layout.quant_group), indexer_head_dim_(layout.indexer_head_dim),
       layer_dtypes_(layout.layer_dtypes), layer_kv_heads_(layout.layer_kv_heads),
-      layer_head_dim_(layout.layer_head_dim) {}
+      layer_head_dim_(layout.layer_head_dim), layer_windows_(layout.layer_windows) {}
 
-PagedKVCacheView::PagedKVCacheView(const PagedKVCache& cache, Tensor block_table) noexcept
-    : cache_(&cache), block_table_(block_table) {}
+PagedKVCacheView::PagedKVCacheView(const PagedKVCache& cache, Tensor block_table,
+                                   Tensor window_block_table) noexcept
+    : cache_(&cache), block_table_(block_table), window_block_table_(window_block_table) {}
 
 std::uint32_t PagedKVCacheView::max_context() const noexcept {
     return cache_ == nullptr ? 0 : cache_->max_context();
@@ -218,20 +239,24 @@ std::uint32_t PagedKVCacheView::max_context() const noexcept {
 
 PagedKVLayerView PagedKVCacheView::layer_view(std::uint32_t layer) const {
     if (cache_ == nullptr) { throw std::logic_error("Paged KV execution view is empty"); }
-    return cache_->layer_view(layer, block_table_);
+    return cache_->layer_view(layer, block_table_, window_block_table_);
 }
 
 PagedKVCacheView PagedKVCache::execution_view(const PagedKVAllocation& allocation) const {
     if (!allocation.belongs_to(pool_)) {
         throw std::invalid_argument("Paged KV allocation belongs to another cache pool");
     }
-    return PagedKVCacheView(*this, allocation.block_table());
+    return PagedKVCacheView(*this, allocation.block_table(),
+                            pool_.has_window_class() ? allocation.window_block_table() : Tensor());
 }
 
-PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_table) const {
+PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_table,
+                                          Tensor window_block_table) const {
     if (layer < first_layer_ || layer - first_layer_ >= layers_) {
         throw std::out_of_range("Paged KV layer is outside this stage");
     }
+    // A windowed layer's planes are addressed through the window class's table.
+    if (layer_windowed(layer)) { block_table = window_block_table; }
     layer -= first_layer_;
     // Only the int8 cache adds scale planes, so it alone widens the stride; an
     // fp8 layer occupies the same two planes a bf16 layer does, which is what
@@ -258,6 +283,7 @@ PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const 
     if (layer < first_layer_ || layer - first_layer_ >= layers_) {
         throw std::out_of_range("Paged KV layer is outside this stage");
     }
+    const bool windowed = layer_windowed(layer);
     layer -= first_layer_;
     // Only the int8 cache adds scale planes, so it alone widens the stride; an
     // fp8 layer occupies the same two planes a bf16 layer does, which is what
@@ -272,7 +298,7 @@ PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const 
         .k_scale_pages = grouped ? pool_.plane(base + 2) : Tensor(),
         .v_scale_pages = grouped ? pool_.plane(base + 3) : Tensor(),
         .indexer_pages = indexer_head_dim_ > 0 ? pool_.plane(base + (grouped ? 4ULL : 2ULL)) : Tensor(),
-        .block_tables  = pool_.block_tables(),
+        .block_tables  = windowed ? pool_.window_block_tables() : pool_.block_tables(),
         .head_dim      = layer_head_dim(layer),
         .num_kv_heads  = layer_kv_heads(layer),
         .dtype         = layer_dtype(layer),

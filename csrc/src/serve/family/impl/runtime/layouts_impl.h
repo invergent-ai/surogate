@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
@@ -84,6 +85,38 @@ geometry_global_geometry_layers(const family::TextGeometry& g) {
         ++kv_layer;
     }
     return out;
+}
+
+/// Window-bounded KV pages (lane f1, rl/engine-inkling-2026-11-21/lanes/f1/DESIGN-window-kv.md):
+/// on unless SUROGATE_SERVE_KV_WINDOW_PAGING=0, which keeps every windowed layer on full-context
+/// pages as before (the A/B for token identity).
+[[nodiscard]] inline bool kv_window_paging_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SUROGATE_SERVE_KV_WINDOW_PAGING");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+/// The sliding window of each KV-owning attention layer, in the pool's numbering (0 = whole
+/// context), or empty when no layer has one -- which leaves the pool exactly as it was. The
+/// window is the one attention runs with (layer_sliding_window, residual_policy.h), so a page the
+/// kernels can read is never released. A target whose KV planes are not one per layer (Inkling's
+/// per-visit planes) states them itself: `static std::vector<std::int32_t> kv_layer_windows(g)`.
+template <class V>
+[[nodiscard]] std::vector<std::int32_t> variant_kv_layer_windows(const family::TextGeometry& g) {
+    if (!kv_window_paging_enabled()) { return {}; }
+    std::vector<std::int32_t> out;
+    if constexpr (requires { V::kv_layer_windows(g); }) {
+        out = V::kv_layer_windows(g);
+    } else {
+        for (std::int32_t layer = 0; layer < g.layers; ++layer) {
+            if (!g.layer_attends(layer) || !g.layer_owns_kv(layer)) { continue; }
+            out.push_back(layer_sliding_window(layer, g));
+        }
+    }
+    const bool any = std::any_of(out.begin(), out.end(), [](std::int32_t w) { return w > 0; });
+    return any ? out : std::vector<std::int32_t>{};
 }
 
 } // namespace
@@ -252,6 +285,21 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     const std::uint32_t mtp_physical_pages = static_cast<std::uint32_t>(
         checked_i32(static_cast<std::uint64_t>(plan.main_page_groups) + mtp_extra_pages,
                     "MTP Paged KV physical pages exceed int32"));
+    // Window class of the text pool: a constant, so the capacity curve stays affine in the
+    // full-context pages, and its stride counts only the planes that keep the whole context.
+    std::vector<std::int32_t> layer_windows = variant_kv_layer_windows<Variant>(plan.geometry);
+    KvWindowClassSize window_class;
+    if (!layer_windows.empty()) {
+        const auto window_tokens =
+            static_cast<std::uint32_t>(*std::max_element(layer_windows.begin(), layer_windows.end()));
+        static const std::uint32_t image_windows = [] {
+            const char* raw = std::getenv("SUROGATE_SERVE_KV_WINDOW_IMAGES");
+            return raw ? static_cast<std::uint32_t>(std::strtoul(raw, nullptr, 10)) : 8U;
+        }();
+        window_class = plan_kv_window_class(window_tokens, plan.max_concurrency,
+                                            static_cast<std::uint32_t>(effective_prefill_chunk),
+                                            image_windows);
+    }
     LayoutBuilder builder;
     PersistentLayout out;
     out.decoder = family::plan_decoder_state(
@@ -282,6 +330,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .text_physical_page_cap    = plan.elastic_kv ? plan.main_page_groups : 0U,
                      .elastic_kv_overcommit     = plan.elastic_kv && plan.elastic_kv_overcommit,
                      .mtp_physical_page_groups  = mtp_physical_pages,
+                     .layer_windows             = std::move(layer_windows),
+                     .window_class              = window_class,
                      .linear_attention =
                          {
                              .layers         = geometry_gdn_layers(plan.geometry),
