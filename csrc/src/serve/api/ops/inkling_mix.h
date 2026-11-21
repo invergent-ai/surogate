@@ -167,6 +167,14 @@ struct InklingConvRows {
  * valid column (in place). `capture_slot` >= 0 (B == 1 only) also writes the window that precedes
  * column `capture_column` to that slot (a rewrite checkpoint inside the segment).
  */
+/// (d) fusion, decode form (every row W = 1, InPlace, no capture): inkling_short_conv of the D = 2304 channels of
+/// `x` into `conv_out` (no residual / addend; window updated in place) and then inkling_attn_res over `sources`, which
+/// must read `conv_out` as `last` or `addend` -- one launch, one CTA per row, bit-identical to the two ops.
+void inkling_conv_attn_res(const InklingPlane& x, const Tensor& conv_weight, const InklingConvRows& rows,
+                           const InklingConvStateView& state, std::int32_t channel_offset, const InklingPlane& conv_out,
+                           const InklingAttnResSources& sources, const Tensor& queries, const Tensor* norm_weight,
+                           float norm_eps, Tensor& out, cudaStream_t stream);
+
 void inkling_short_conv(const InklingPlane& x, std::int32_t channels, const Tensor& weight,
                         const InklingConvRows& rows, const InklingConvStateView& state,
                         std::int32_t channel_offset, const InklingPlane* residual,

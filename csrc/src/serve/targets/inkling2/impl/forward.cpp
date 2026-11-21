@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace sinfer::targets::inkling2::detail {
@@ -268,6 +269,30 @@ void attention_inputs(Round& rd, int v, const VisitInfo& vi, const load::Inkling
     }
     (void)v;
     blended_inputs(rd, vi, L, src, queries, 0, 3, L.attn_input_norm, attn_in);
+}
+
+/// The MLP input mix's sources (stack..., partial, attn_out as `last` on a block's first visit, else as `addend`).
+ops::InklingAttnResSources mlp_sources(const Round& rd, const VisitInfo& vi, const Tensor& attn_out) {
+    ops::InklingAttnResSources src;
+    src.stack_count = vi.stack_count;
+    for (int i = 0; i < vi.stack_count; ++i) { src.stack[i] = slot_plane(rd.r.x, vi.stack[i]); }
+    if (vi.first) {
+        src.stack[src.stack_count++] = slot_plane(rd.r.x, vi.partial);
+        src.last                     = packed(attn_out);
+    } else {
+        src.last   = slot_plane(rd.r.x, vi.partial);
+        src.addend = packed(attn_out);
+    }
+    return src;
+}
+
+/// SUROGATE_SERVE_INKLING_NO_FUSE=1: the unfused kernels of the (d) fusions (A/B; same bits either way).
+bool fusions_off() {
+    static const bool off = [] {
+        const char* v = std::getenv("SUROGATE_SERVE_INKLING_NO_FUSE");
+        return v != nullptr && std::string_view(v) == "1";
+    }();
+    return off;
 }
 
 void mlp_input(Round& rd, const VisitInfo& vi, const load::InklingLayerWeights& L, const Tensor& attn_out,
@@ -695,9 +720,22 @@ void run_visit(Round& rd, int v) {
         const ops::InklingLoraSlice wo[] = {{0, D, gated.data, C::attn_width, attn_partial.data, D}};
         apply_attn_lora(rd.work, sel, wo, 1, T, s);
     }
-    // 5. attention-output conv
+    // 5. attention-output conv (+ 6. the MLP input mix: one fused launch on a decode round of a non-looped visit)
     Tensor attn_out = rd.work.alloc(DType::BF16, {D, T});
+    Tensor mlp_in   = rd.work.alloc(DType::BF16, {D, T, 1});
+    const bool fuse_conv_mix = !fusions_off() && !vi.looped && rd.groups.size() == 1 &&
+                               rd.groups[0].segment == nullptr && !rd.groups[0].record && rd.groups[0].width == 1 &&
+                               rd.groups[0].column == 0 && rd.groups[0].batch == T;
+    if (fuse_conv_mix) {
+        const Group& g                         = rd.groups[0];
+        const ops::InklingAttnResSources src   = mlp_sources(rd, vi, attn_out);
+        const Tensor& queries                  = rd.q.mlp.at(static_cast<std::size_t>(vi.layer));
+        const Tensor norm                      = vector_as_rows(L.moe_input_norm, 1);
+        ops::inkling_conv_attn_res(packed(attn_partial, 0), L.attn_out_conv, g.rows(), state, G::kStreamAttn,
+                                   packed(attn_out, 0), src, queries, &norm, C::rms_epsilon, mlp_in, s);
+    }
     for (const Group& g : rd.groups) {
+        if (fuse_conv_mix) { break; }
         const family::VisitSegment* seg = g.segment;
         if (g.record) {
             ops::inkling_conv_record(packed(attn_partial, g.column), D, g.width, g.batch, v, G::kStreamAttn, rd.records, s);
@@ -711,8 +749,7 @@ void run_visit(Round& rd, int v) {
     }
     dump("attn_out", v, attn_out.data, DType::BF16, D, D, T, 1, s);
     // 6. MLP input
-    Tensor mlp_in = rd.work.alloc(DType::BF16, {D, T, 1});
-    mlp_input(rd, vi, L, attn_out, mlp_in);
+    if (!fuse_conv_mix) { mlp_input(rd, vi, L, attn_out, mlp_in); }
     dump("mlp_in", v, mlp_in.data, DType::BF16, D, D, T, 1, s);
     // 7. MoE: lane d's op (routing, NVFP4 four-over-six / MXFP8 activations, experts, combine); routed experts
     //    captured per VISIT

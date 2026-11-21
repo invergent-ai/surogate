@@ -161,12 +161,9 @@ __device__ __forceinline__ void mix_query(const float (&x)[N][kPer], const float
     }
 }
 
+/// One column of inkling_attn_res (shared by attn_res_kernel and the fused conv + attn_res kernel: same bits).
 template <int N>
-__global__ void __launch_bounds__(kThreads) attn_res_kernel(const __grid_constant__ AttnResArgs a) {
-    pdl::wait_for_dependencies(); // PDL: every read / write after the producer grid completes
-    pdl::trigger_dependents(); // PDL: the next kernel may launch now (it waits for this grid before any read)
-    __shared__ float scratch[(kThreads / 32) * (N > 2 ? N : 2)];
-    const std::int64_t t = blockIdx.x;
+__device__ __forceinline__ void attn_res_column(const AttnResArgs& a, std::int64_t t, float* scratch) {
     float x[N][kPer];
     load_sources<N>(a.src, a.addend, a.has_addend, t, x);
     float rstd[N];
@@ -194,6 +191,14 @@ __global__ void __launch_bounds__(kThreads) attn_res_kernel(const __grid_constan
             for (int i = 0; i < kPer; ++i) { out[threadIdx.x + i * kThreads] = mix[i]; }
         }
     }
+}
+
+template <int N>
+__global__ void __launch_bounds__(kThreads) attn_res_kernel(const __grid_constant__ AttnResArgs a) {
+    pdl::wait_for_dependencies(); // PDL: every read / write after the producer grid completes
+    pdl::trigger_dependents(); // PDL: the next kernel may launch now (it waits for this grid before any read)
+    __shared__ float scratch[(kThreads / 32) * (N > 2 ? N : 2)];
+    attn_res_column<N>(a, blockIdx.x, scratch);
 }
 
 // ------------------------------------------------------------------- blend inputs (fused attn_res x 2 + pair norm)
@@ -610,6 +615,50 @@ __global__ void __launch_bounds__(kConvChannelTile)
     }
 }
 
+/// (d) fusion, decode form: short_conv_kernel for every row of W = 1 (no residual / addend, window in place) and then
+/// the attn_res column that reads the conv's output, one CTA per row. The conv writes its output plane and the window
+/// exactly as short_conv_kernel; after the barrier the mix reads that plane as attn_res_kernel does: same bits.
+struct ConvAttnResArgs {
+    ConvArgs conv;
+    AttnResArgs mix;
+};
+
+template <int N>
+__global__ void __launch_bounds__(kThreads) conv_attn_res_kernel(const __grid_constant__ ConvAttnResArgs f) {
+    pdl::wait_for_dependencies(); // PDL: every read / write after the producer grid completes
+    pdl::trigger_dependents(); // PDL: the next kernel may launch now (it waits for this grid before any read)
+    __shared__ float scratch[(kThreads / 32) * (N > 2 ? N : 2)];
+    const ConvArgs& a = f.conv;
+    const int b       = blockIdx.x;
+    const int valid   = a.valid != nullptr ? a.valid[b] : 1;
+    if (valid > 0) {
+        const std::int64_t slot = a.slots[b];
+        const int pos           = a.positions[b];
+        const float scale       = 0.44721359549995793F; // fp32(5 ** -0.5)
+        for (int c = threadIdx.x; c < a.channels; c += kThreads) {
+            float w[4];
+#pragma unroll
+            for (int k = 0; k < 4; ++k) { w[k] = __bfloat162float(a.weight[static_cast<std::int64_t>(c) * 4 + k]); }
+            float acc = 0.0F;
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const int lag = 3 - k;
+                const float v = (pos - lag >= 0) ? conv_seq(a, b, slot, k, c) : 0.0F;
+                acc           = fmaf(v, w[k], acc);
+            }
+            const float cur = __bfloat162float(a.x[static_cast<std::int64_t>(b) * a.x_stride + c]);
+            a.out[static_cast<std::int64_t>(b) * a.out_stride + c] = __float2bfloat16_rn((acc + cur) * scale);
+            float upd[3];
+#pragma unroll
+            for (int i = 0; i < 3; ++i) { upd[i] = conv_seq(a, b, slot, 1 + i, c); }
+#pragma unroll
+            for (int i = 0; i < 3; ++i) { a.state[slot * a.slot_stride + i * a.tap_stride + c] = __float2bfloat16_rn(upd[i]); }
+        }
+    }
+    __syncthreads(); // the conv output of this row is visible to the whole CTA
+    attn_res_column<N>(f.mix, b, scratch);
+}
+
 /// New windows after the conv: per row, the 3 inputs before index `valid` of S go to the row's
 /// slot (in place); with a capture, the 3 before `capture_column` go to `capture_slot` first. Each
 /// thread reads every value it needs before it writes.
@@ -791,10 +840,10 @@ ConvArgs conv_args(const InklingPlane& x, std::int32_t channels, const Tensor* w
 
 } // namespace
 
-void inkling_attn_res(const InklingAttnResSources& sources, std::int32_t columns,
-                      const Tensor& queries, const Tensor* norm_weight, float norm_eps, Tensor& out,
-                      cudaStream_t stream) {
-    constexpr const char* op = "inkling_attn_res";
+namespace {
+
+AttnResArgs attn_res_args(const InklingAttnResSources& sources, std::int32_t columns, const Tensor& queries,
+                          const Tensor* norm_weight, float norm_eps, Tensor& out, const char* op) {
     require(columns > 0, op, "columns must be positive");
     require(sources.stack_count >= 0 && sources.stack_count <= G::kMaxStack, op,
             "stack_count must be in [0, 5]");
@@ -826,6 +875,16 @@ void inkling_attn_res(const InklingAttnResSources& sources, std::int32_t columns
     }
     a.out     = out.data;
     a.columns = columns;
+    return a;
+}
+
+} // namespace
+
+void inkling_attn_res(const InklingAttnResSources& sources, std::int32_t columns,
+                      const Tensor& queries, const Tensor* norm_weight, float norm_eps, Tensor& out,
+                      cudaStream_t stream) {
+    constexpr const char* op = "inkling_attn_res";
+    const AttnResArgs a = attn_res_args(sources, columns, queries, norm_weight, norm_eps, out, op);
     const dim3 grid(static_cast<unsigned>(columns));
     switch (sources.stack_count + 1) {
     case 1: CUDA_CHECK(pdl::launch_dependent({grid, dim3(kThreads), 0, stream}, attn_res_kernel<1>, a)); break;
@@ -1006,6 +1065,34 @@ void inkling_blend_rms_norm(const Tensor& dest, const Tensor& message, const Ten
         static_cast<const float*>(dest.data), dest_stream, static_cast<const float*>(message.data),
         static_cast<const float*>(gain_forget.data), static_cast<const bf16*>(norm_weight.data), w_stream, eps,
         static_cast<bf16*>(out.data), static_cast<std::int64_t>(t)));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void inkling_conv_attn_res(const InklingPlane& x, const Tensor& conv_weight, const InklingConvRows& rows,
+                           const InklingConvStateView& state, std::int32_t channel_offset, const InklingPlane& conv_out,
+                           const InklingAttnResSources& sources, const Tensor& queries, const Tensor* norm_weight,
+                           float norm_eps, Tensor& out, cudaStream_t stream) {
+    constexpr const char* op = "inkling_conv_attn_res";
+    require(rows.width == 1, op, "the fused decode form takes rows of one column (W = 1)");
+    ConvAttnResArgs f;
+    f.conv = conv_args(x, kD, &conv_weight, rows, state, channel_offset, op);
+    require(conv_out.data != nullptr && conv_out.dtype == DType::BF16 && conv_out.column_stride >= kD, op,
+            "conv_out must be a BF16 plane");
+    require(sources.last.data == conv_out.data || sources.addend.data == conv_out.data, op,
+            "the mix must read the conv output (as last or addend)");
+    f.conv.out        = static_cast<bf16*>(conv_out.data);
+    f.conv.out_stride = conv_out.column_stride;
+    f.mix             = attn_res_args(sources, rows.batch, queries, norm_weight, norm_eps, out, op);
+    const dim3 grid(static_cast<unsigned>(rows.batch));
+    switch (sources.stack_count + 1) {
+    case 1: CUDA_CHECK(pdl::launch_dependent({grid, dim3(kThreads), 0, stream}, conv_attn_res_kernel<1>, f)); break;
+    case 2: CUDA_CHECK(pdl::launch_dependent({grid, dim3(kThreads), 0, stream}, conv_attn_res_kernel<2>, f)); break;
+    case 3: CUDA_CHECK(pdl::launch_dependent({grid, dim3(kThreads), 0, stream}, conv_attn_res_kernel<3>, f)); break;
+    case 4: CUDA_CHECK(pdl::launch_dependent({grid, dim3(kThreads), 0, stream}, conv_attn_res_kernel<4>, f)); break;
+    case 5: CUDA_CHECK(pdl::launch_dependent({grid, dim3(kThreads), 0, stream}, conv_attn_res_kernel<5>, f)); break;
+    case 6: CUDA_CHECK(pdl::launch_dependent({grid, dim3(kThreads), 0, stream}, conv_attn_res_kernel<6>, f)); break;
+    default: fail(op, "unsupported source count");
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

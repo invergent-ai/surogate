@@ -758,6 +758,75 @@ int test_lora_delta(std::uint32_t seed) {
     return failures;
 }
 
+// ------------------------------------------------------------------------------------- I8 fused conv + attn_res
+
+/// inkling_conv_attn_res (decode rows, W = 1) == inkling_short_conv + inkling_attn_res, bitwise: the conv output
+/// plane, the conv windows and the mix output; rows with positions 0 / 1 / 2, idle rows (valid 0), conv output as
+/// `last` (stack + partial) and as `addend`.
+int test_conv_attn_res(std::uint32_t seed, int B, bool as_last) {
+    constexpr int kSlotsN = 40;
+    const int stack = as_last ? 3 : 2; // + the partial and conv_out (last) / + partial last with conv_out addend
+    const std::size_t slot_elems = static_cast<std::size_t>(G::kConvChannels) * 3;
+    const auto w      = randn_bf16(static_cast<std::size_t>(kD) * 4, seed, 0.4F);
+    const auto x      = randn_bf16(static_cast<std::size_t>(B) * kD, seed + 1, 1.0F);
+    const auto init   = randn_bf16(slot_elems * kSlotsN, seed + 2, 1.0F);
+    const auto planes = randn_bf16(static_cast<std::size_t>(stack + 1) * B * kD, seed + 3, 1.0F);
+    const auto qv     = randn_f32(kD, seed + 4, 0.05F);
+    const auto nw     = randn_bf16(kD, seed + 5, 1.0F);
+    std::vector<int> pos(B), valid(B), slots(B);
+    for (int b = 0; b < B; ++b) {
+        pos[b]   = b < 3 ? b : 100 + 7 * b;
+        valid[b] = (b % 5 == 4) ? 0 : 1;
+        slots[b] = (3 * b + 1) % kSlotsN;
+    }
+    DeviceBuffer d_w = dev_bf16(w), d_x = dev_bf16(x), d_planes = dev_bf16(planes), d_q = to_device(qv),
+                 d_nw = dev_bf16(nw), d_pos = to_device(pos), d_valid = to_device(valid), d_slots = to_device(slots);
+    const Tensor w_t(d_w.p, DType::BF16, {4, kD}), q_t(d_q.p, DType::FP32, {kD, 1}), nw_t(d_nw.p, DType::BF16, {kD, 1});
+    const ops::InklingConvRows rows{1, B, Tensor(d_pos.p, DType::I32, {1, B}), Tensor(d_valid.p, DType::I32, {B}),
+                                    Tensor(d_slots.p, DType::I32, {B})};
+    const auto plane = [&](void* p, int i) {
+        return ops::InklingPlane{static_cast<std::uint16_t*>(p) + static_cast<std::size_t>(i) * B * kD, DType::BF16, kD};
+    };
+    struct Run {
+        std::vector<std::uint8_t> conv, state, out;
+    };
+    const auto run = [&](bool fused) {
+        DeviceBuffer d_pool = dev_bf16(init), d_conv(static_cast<std::size_t>(B) * kD * 2),
+                     d_out(static_cast<std::size_t>(B) * kD * 2);
+        d_conv.fill(0);
+        const ops::InklingConvStateView view{d_pool.p, static_cast<std::int64_t>(slot_elems), G::kConvChannels};
+        const ops::InklingPlane conv_out{d_conv.p, DType::BF16, kD};
+        ops::InklingAttnResSources src;
+        src.stack_count = stack;
+        for (int i = 0; i < stack; ++i) { src.stack[i] = plane(d_planes.p, i); }
+        if (as_last) {
+            src.stack[src.stack_count++] = plane(d_planes.p, stack);
+            src.last                     = conv_out;
+        } else {
+            src.last   = plane(d_planes.p, stack);
+            src.addend = conv_out;
+        }
+        Tensor out(d_out.p, DType::BF16, {kD, B, 1});
+        const ops::InklingPlane xin{d_x.p, DType::BF16, kD};
+        if (fused) {
+            ops::inkling_conv_attn_res(xin, w_t, rows, view, G::kStreamAttn, conv_out, src, q_t, &nw_t, 1e-6F, out,
+                                       nullptr);
+        } else {
+            ops::inkling_short_conv(xin, kD, w_t, rows, view, G::kStreamAttn, nullptr, nullptr, conv_out, nullptr);
+            ops::inkling_attn_res(src, B, q_t, &nw_t, 1e-6F, out, nullptr);
+        }
+        cuda_synchronize();
+        return Run{raw(d_conv.p, d_conv.bytes), raw(d_pool.p, d_pool.bytes), raw(d_out.p, d_out.bytes)};
+    };
+    const Run u = run(false), f = run(true);
+    const std::string tag = "I8 conv + attn_res fused, B=" + std::to_string(B) + (as_last ? " (last)" : " (addend)");
+    int failures = 0;
+    failures += same_bits(tag + ": conv output", f.conv, u.conv, 2);
+    failures += same_bits(tag + ": conv windows", f.state, u.state, 2);
+    failures += same_bits(tag + ": mix output", f.out, u.out, 2);
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -785,6 +854,10 @@ int main() {
     failures += test_conv_paths(3003);
     failures += test_head_logprob(3201);
     failures += test_lora_delta(3601);
+    for (const int B : {1, 5, 32}) {
+        failures += test_conv_attn_res(3700 + B, B, true);
+        failures += test_conv_attn_res(3800 + B, B, false);
+    }
     for (const int n : {1, 5, 8, 13, 32}) {
         failures += test_controller_tail(3300 + n, 3, 1, n);
         failures += test_controller_tail(3400 + n, 3, 3, n);
