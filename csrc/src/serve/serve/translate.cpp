@@ -260,6 +260,7 @@ sinfer::PromptInput to_prompt_input(const GenerationRequest& request,
     input.options.preserve_thinking     = semantics.preserve_thinking;
     input.options.add_vision_id         = false;
     input.options.tool_jsons            = effective_tool_jsons(request);
+    input.options.raw_chat_request      = request.raw_chat_body;
     return input;
 }
 

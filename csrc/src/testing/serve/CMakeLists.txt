@@ -325,6 +325,14 @@ sinfer_add_test(sinfer_prompt_parity_test
 target_include_directories(sinfer_prompt_parity_test PRIVATE
   ${SERVE_ROOT}/family/export
   ${SERVE_ROOT}/family/impl)
+# ENGINE-INKLING lane f2: the Inkling-2 path through the serving layer (raw-chat parse, translate, Frontend detection,
+# render, count, reply bytes) against vLLM's vectors. CPU; skips (77) without INKLING_MODEL_DIR / INKLING_VECTORS.
+sinfer_add_test(sinfer_inkling_wiring_test
+  SOURCES inkling/test_inkling_wiring.cpp
+  LIBRARIES sinfer_serve sinfer_engine sinfer_core)
+target_include_directories(sinfer_inkling_wiring_test PRIVATE
+  ${SERVE_ROOT}/family/export
+  ${SERVE_ROOT}/family/impl)
 # The tokenizer_config.json chat-template contract: three JSON strings and no
 # tokenizer, so it runs where sinfer_family_frontend_test skips.
 sinfer_add_test(sinfer_family_pretokenizer_digits_test

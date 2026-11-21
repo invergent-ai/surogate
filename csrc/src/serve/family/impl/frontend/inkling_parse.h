@@ -54,6 +54,8 @@ struct ParserVocabulary {
 /// at the end; an invalid sequence becomes U+FFFD). `token_bytes(id)` = the token's raw bytes.
 [[nodiscard]] std::string detokenize_output(std::span<const int> output_ids, bool stop_terminated,
                                             const std::function<std::string(int)>& token_bytes);
+/// The same for the generated tokens' bytes given one string per token, in order.
+[[nodiscard]] std::string detokenize_output(std::span<const std::string> per_token_bytes, bool stop_terminated);
 
 /// The parsed response message for a complete generation.
 [[nodiscard]] ParsedOutput parse_output(std::string_view output_text, const ChatRequest& request,

@@ -11,6 +11,7 @@
 #include "serve/request.h"
 #include "serve/serve_options.h"
 #include "serve/vllm_qwen3_parser.h"
+#include "family/impl/frontend/inkling_parse.h"
 
 #include <chrono>
 #include <cstddef>
@@ -88,6 +89,10 @@ struct GenerationOutcome {
     /// belongs to. Filled only alongside `token_logprobs`.
     std::vector<std::string> token_texts;
     sinfer::FinishReason finish_reason = sinfer::FinishReason::OutputLimit;
+    /// Chat Completions' finish_reason when a parser decided it itself, as vLLM's serving layer does for Inkling-2
+    /// ("tool_calls" only for a reply that stopped with calls and no named tool_choice); empty = derived from
+    /// finish_reason and tool_calls.
+    std::string finish_reason_wire;
     std::string stop_sequence;
     GenerationMetrics metrics;
 };
@@ -193,6 +198,9 @@ struct PreparedRequest {
     std::vector<sinfer::TokenId> prompt_token_ids;
     /// Set when the thinking guard is armed for this request (GenerationService::prepare says when).
     std::shared_ptr<ThinkingGuardContinuation> thinking_guard;
+    /// Inkling-2: the request as vLLM's request model holds it (PromptCapabilities::inkling2_chat), for reading the
+    /// reply back with vLLM's Inkling parser.
+    std::shared_ptr<const sinfer::family::frontend_internal::inkling::ChatRequest> inkling_request;
     std::shared_ptr<RequestLifetime> lifetime;
 };
 
@@ -201,6 +209,9 @@ public:
     explicit GenerationService(ServeOptions options, LoadProgress load_progress = {});
 
     [[nodiscard]] const ServeOptions& options() const noexcept { return options_; }
+    /// The model renders its prompt from the chat-completions body itself (Inkling-2): the HTTP layer hands the body
+    /// over whole and leaves its conversation fields unparsed (RequestLimits::raw_chat).
+    [[nodiscard]] bool renders_raw_chat() const noexcept { return prompt_capabilities_.inkling2_chat; }
     /// The bank slot for an adapter name, or -1 for the base model.
     [[nodiscard]] std::int32_t lora_slot(const std::string& name) const {
         return lora_slots_.find(name);
@@ -383,6 +394,9 @@ private:
     sinfer::PromptCapabilities prompt_capabilities_;
     /// --tool-call-parser qwen3_coder (serve/vllm_qwen3_parser.h): the tokenizer facts the parser needs.
     std::optional<vllm_qwen3::Vocabulary> qwen3_vocabulary_;
+    /// Inkling-2 (PromptCapabilities::inkling2_chat): the framing tokens and the special tokens vLLM's Inkling parser
+    /// drops, for reading every reply back (family/impl/frontend/inkling_parse.h).
+    std::optional<sinfer::family::frontend_internal::inkling::ParserVocabulary> inkling_vocabulary_;
     /// --thinking-loop-guard / --thinking-answer-reserve: the tokens that close a thought the guard ended -- a line
     /// saying the answer follows (thinking_guard_note_, which the stream shows as reasoning), the model's reasoning
     /// close marker and the answer separator -- and how many of them are still thought (all but the separator).

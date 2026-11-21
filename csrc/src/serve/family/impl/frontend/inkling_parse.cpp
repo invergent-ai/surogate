@@ -695,12 +695,19 @@ ParserVocabulary ParserVocabulary::from(const SpecialTokens& tokens, const std::
 
 std::string detokenize_output(std::span<const int> output_ids, bool stop_terminated,
                               const std::function<std::string(int)>& token_bytes) {
-    std::size_t n = output_ids.size();
+    std::vector<std::string> bytes;
+    bytes.reserve(output_ids.size());
+    for (const int id : output_ids) { bytes.push_back(token_bytes(id)); }
+    return detokenize_output(std::span<const std::string>(bytes), stop_terminated);
+}
+
+std::string detokenize_output(std::span<const std::string> per_token_bytes, bool stop_terminated) {
+    std::size_t n = per_token_bytes.size();
     if (stop_terminated && n > 0) { --n; }
     std::string out;
     std::string pending;
     for (std::size_t k = 0; k < n; ++k) {
-        pending += token_bytes(output_ids[k]);
+        pending += per_token_bytes[k];
         // Lossy-decode the pending bytes (maximal invalid subparts -> U+FFFD); hold them while the result ends in U+FFFD.
         std::string decoded;
         bool ends_replacement = false;

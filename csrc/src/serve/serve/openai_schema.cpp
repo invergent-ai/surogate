@@ -813,10 +813,12 @@ GenerationRequest parse_chat_completion_request(const OJson& body, const Request
     }
     out.model = body.at("model").get<std::string>();
 
-    parse_tools(body, out);
-    parse_tool_choice(body, out);
-    out.parallel_tool_calls = get_bool(body, "parallel_tool_calls", true);
-    parse_messages(body, out);
+    if (!limits.raw_chat) {
+        parse_tools(body, out);
+        parse_tool_choice(body, out);
+        out.parallel_tool_calls = get_bool(body, "parallel_tool_calls", true);
+        parse_messages(body, out);
+    }
     parse_stop(body, out, limits);
     parse_sampling(body, out);
 
@@ -827,13 +829,15 @@ GenerationRequest parse_chat_completion_request(const OJson& body, const Request
         }
         out.include_usage = get_bool(body.at("stream_options"), "include_usage", false);
     }
-    parse_openai_enable_thinking(body, out);
-    if (body.contains("enable_thinking") && !body.at("enable_thinking").is_null()) {
-        out.enable_thinking       = get_bool(body, "enable_thinking", false);
-        out.enable_thinking_param = "enable_thinking";
+    if (!limits.raw_chat) {
+        parse_openai_enable_thinking(body, out);
+        if (body.contains("enable_thinking") && !body.at("enable_thinking").is_null()) {
+            out.enable_thinking       = get_bool(body, "enable_thinking", false);
+            out.enable_thinking_param = "enable_thinking";
+        }
+        parse_openai_reasoning_effort(body, out);
+        out.preserve_thinking = parse_openai_preserve_thinking(body);
     }
-    parse_openai_reasoning_effort(body, out);
-    out.preserve_thinking = parse_openai_preserve_thinking(body);
 
     parse_max_tokens(body, "max_completion_tokens", limits, out);
     if (!out.max_tokens_set) { parse_max_tokens(body, "max_tokens", limits, out); }
@@ -940,8 +944,9 @@ std::string make_chat_completion_tool_response(const std::string& id, const std:
                                                std::int64_t created, const std::string& content,
                                                const std::string& reasoning,
                                                const std::vector<ToolCall>& tool_calls,
-                                               const CompletionUsage& usage, const TokenDetail& detail) {
-    Json payload = chat_completion_payload(id, model, created, content, reasoning, "tool_calls", usage, detail);
+                                               const CompletionUsage& usage, const TokenDetail& detail,
+                                               const char* finish_reason) {
+    Json payload = chat_completion_payload(id, model, created, content, reasoning, finish_reason, usage, detail);
     Json& message = payload["choices"][0]["message"];
     if (content.empty()) { message["content"] = nullptr; }
     message["tool_calls"] = tool_calls_json(tool_calls, false);
