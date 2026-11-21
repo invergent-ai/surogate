@@ -328,6 +328,18 @@ __device__ __forceinline__ std::uint64_t warp_max_u64(std::uint64_t value) {
     return value;
 }
 
+/// The warp's largest router key (`router_key`: 48 bits) with two `redux.sync.max.u32` (deep_gemm's
+/// ptx/utils.cuh uses the f32 form): the high 32 bits (the selection score) first, then the low 16 (E -
+/// expert) among the lanes that hold that score. The same maximum as warp_max_u64 (the keys are totally
+/// ordered and fit in 48 bits); 2 warp instructions instead of 5 dependent shuffle rounds.
+__device__ __forceinline__ std::uint64_t warp_max_key48(std::uint64_t key) {
+    const std::uint32_t high      = static_cast<std::uint32_t>(key >> 16);
+    const std::uint32_t best_high = __reduce_max_sync(0xFFFFFFFFU, high);
+    const std::uint32_t low       = high == best_high ? static_cast<std::uint32_t>(key & 0xFFFFU) : 0U;
+    const std::uint32_t best_low  = __reduce_max_sync(0xFFFFFFFFU, low);
+    return (static_cast<std::uint64_t>(best_high) << 16) | static_cast<std::uint64_t>(best_low);
+}
+
 /// Fixed-tree warp sum (xor butterfly): the same association on every call.
 __device__ __forceinline__ float warp_sum(float value) {
 #pragma unroll

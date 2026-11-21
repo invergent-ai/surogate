@@ -294,7 +294,7 @@ __device__ __forceinline__ void select_token(const float* __restrict__ logits, c
                 std::uint64_t local = keys[0];
 #pragma unroll
                 for (int i = 1; i < 4; ++i) { local = keys[i] > local ? keys[i] : local; }
-                const std::uint64_t best = warp_max_u64(local);
+                const std::uint64_t best = warp_max_key48(local);
 #pragma unroll
                 for (int i = 0; i < 4; ++i) {
                     if (keys[i] == best) { keys[i] = 0; }
