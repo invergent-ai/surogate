@@ -103,6 +103,14 @@ bool dspark_bf16_weights_forced() {
     return forced;
 }
 
+bool dspark_fp8_weights_requested() {
+    static const bool requested = [] {
+        const char* raw = std::getenv("SUROGATE_SERVE_DSPARK_FP8_WEIGHTS");
+        return raw != nullptr && raw[0] == '1';
+    }();
+    return requested && !dspark_bf16_weights_forced();
+}
+
 namespace {
 
 /// out [n, tokens] (ldc) = W . x: the FP8 route (ops::dspark_gemm_w8) or the BF16 invariant GEMM.

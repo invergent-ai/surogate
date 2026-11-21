@@ -62,6 +62,8 @@ void derive_dspark(const load::InklingWeights& w, DSparkDerived& out, bool fp8_w
 
 /// SUROGATE_SERVE_DSPARK_BF16_WEIGHTS=1 (read once): keep the drafter's dense linears BF16 on the device (A/B).
 [[nodiscard]] bool dspark_bf16_weights_forced();
+/// SUROGATE_SERVE_DSPARK_FP8_WEIGHTS=1 (read once) and not forced BF16: the FP8 drafter weights (opt-in for now).
+[[nodiscard]] bool dspark_fp8_weights_requested();
 
 /// The draft KV: planes of draft layers 0 / 1 / 2 (text-pool layers 48 / 49 / 50).
 struct DSparkKv {
