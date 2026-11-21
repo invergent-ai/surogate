@@ -180,6 +180,25 @@ struct InklingAttentionKnobs {
     // fold_kernel: rows of <= 32 slots take the scan-free path (SUROGATE_INKLING_ATTN_FOLD_FAST=0 = always the scan).
     // Same bits either way.
     bool fold_fast = true;
+    // inkling_attn_linear, N > 16 (SUROGATE_INKLING_LINEAR_GEMM): 0 = gemm_kernel (x = MMA operand A), 1 = gemm_t_kernel
+    // (codes = operand A in fragment order from a shared widen pass, x = operand B), 2 = gemm_t_kernel widening each
+    // warp's own A fragments (no widened tile). Same bits on every route (test attn_linear width: 0 bit-different).
+    // Default 2 by measurement (gemm2, gpubox1 card 0, graph, us, gemm 0 / 1 / 2): qkvr N=8192 channel 1718 / 1607 /
+    // 1496, 1x128 1874 / 1771 / 1658; qkvr N=4096 channel 863 / 809 / 754; wo N=8192 channel 618 / 592 / 549.
+    int linear_gemm = 2;
+    // Decode / verify with one row tile (W <= 5), not the in-kernel prologue (SUROGATE_INKLING_ATTN_DECODE_RAW): 0 =
+    // register-staged blocks (one block's codes in flight), 1 = the cp.async raw ring (two blocks in flight, a worker's
+    // old blocks staged before the PDL wait under metadata_static; ~72 KB smem: one CTA an SM) when workers x 8 x B <=
+    // SMs, 2 = the ring always. Same bits either way.
+    // Measured SLOWER (raw1, gpubox1 card 0, meta 1, us, raw 0 / 2): local 1x8k 6.4 / 7.4, global 1x8k 18.4 / 19.1, local
+    // 8x8k 15.6 / 21.0, global 1x64k 94.5 / 106.0, verify W3 local 6.3 / 7.0 -> default 0 (kept, tested bitwise).
+    int decode_raw = 0;
+    // Fused fold arrival (fused_fold_max > 0 only; SUROGATE_INKLING_ATTN_FOLD_FENCE_LIGHT): fence.acq_rel.gpu + a relaxed
+    // atomic (Marlin's barrier pattern) instead of __threadfence (MEMBAR.SC.GPU + CCTL.IVALL) + atomicAdd. Same bits.
+    bool fold_fence_light = true;
+    // TEST-ONLY negative control: the narrow attn_linear kernels read x with ld.global.nc (the pre-17:5x form that
+    // decoded garbage on the FP8 route in the engine). Production: false (x through L2, ld.cg).
+    bool linear_x_nc = false;
 };
 [[nodiscard]] InklingAttentionKnobs& inkling_attention_knobs();
 

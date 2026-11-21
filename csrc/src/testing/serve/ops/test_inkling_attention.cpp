@@ -17,6 +17,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -786,11 +787,32 @@ void run_invariance_case(const InvCase& c, const char* groups, std::uint32_t see
         compare("decode B8 idle row fused fold", run_inv_route(c.kind, ip, layer, 1, r8));
         compare("decode B4 persistent state", run_inv_route(c.kind, ip, layer, 1, r4, false, true));
         compare("decode B8 idle row persistent state", run_inv_route(c.kind, ip, layer, 1, r8, true, true));
+        const bool fence_saved = ops::inkling_attention_knobs().fold_fence_light;
+        ops::inkling_attention_knobs().fold_fence_light = false; // the __threadfence arrival
+        compare("decode B4 fused fold heavy fence", run_inv_route(c.kind, ip, layer, 1, r4));
+        ops::inkling_attention_knobs().fold_fence_light = fence_saved;
         ops::inkling_attention_knobs().fused_fold_max = 0;
         ops::inkling_attention_knobs().fold_fast = false; // fold_kernel's scan path for every row
         compare("decode B4 scan fold", run_inv_route(c.kind, ip, layer, 1, r4));
         compare("decode B8 idle row scan fold", run_inv_route(c.kind, ip, layer, 1, r8));
         ops::inkling_attention_knobs().fold_fast = true;
+        // Decode with the cp.async raw ring (decode_raw 2: both blocks of a group in flight, old blocks staged before the
+        // PDL wait under static metadata) and with register staging (0), whatever the default is; the default restored.
+        const int raw_saved = ops::inkling_attention_knobs().decode_raw;
+        for (const int raw : {0, 2}) {
+            ops::inkling_attention_knobs().decode_raw = raw;
+            const std::string t = " decode_raw " + std::to_string(raw);
+            compare("decode B1" + t, run_inv_route(c.kind, ip, layer, 1, {{0, p, 1}}));
+            compare("decode B1 static metadata" + t, run_inv_route(c.kind, ip, layer, 1, {{0, p, 1}}, true));
+            compare("decode B4 static metadata" + t, run_inv_route(c.kind, ip, layer, 1, r4, true));
+            compare("decode B8 idle row static metadata" + t, run_inv_route(c.kind, ip, layer, 1, r8, true));
+            ops::inkling_attention_knobs().splits = 3;
+            compare("decode B1 workers 3 static metadata" + t, run_inv_route(c.kind, ip, layer, 1, {{0, p, 1}}, true));
+            ops::inkling_attention_knobs().splits = 1;
+            compare("decode B4 workers 1 static metadata" + t, run_inv_route(c.kind, ip, layer, 1, r4, true));
+            ops::inkling_attention_knobs().splits = 0;
+        }
+        ops::inkling_attention_knobs().decode_raw = raw_saved;
         if (std::string(groups) == "p3" && std::getenv("SUROGATE_INKLING_ATTN_GROUPS") == nullptr) {
             g_key_groups = ops::InklingKeyGroups::Default; // the compiled default must be P3
             compare("decode B4 default key groups", run_inv_route(c.kind, ip, layer, 1, r4));
@@ -819,6 +841,15 @@ void run_invariance_case(const InvCase& c, const char* groups, std::uint32_t see
         ops::inkling_attention_knobs().splits = 1;
         compare("verify W8 B4 workers 1", run_inv_route(c.kind, ip, layer, 8, r4));
         ops::inkling_attention_knobs().splits = 0;
+        const int raw_saved = ops::inkling_attention_knobs().decode_raw;
+        for (const int raw : {0, 2}) { // one-row-tile verify (W3) through both decode staging forms
+            ops::inkling_attention_knobs().decode_raw = raw;
+            const std::string t = " decode_raw " + std::to_string(raw);
+            const std::vector<InvRow> r2 = {{r4[0].seq, r4[0].first, std::min(3, r4[0].valid)}, {0, v, std::min(3, w)}};
+            compare("verify W3 B2" + t, run_inv_route(c.kind, ip, layer, 3, r2));
+            compare("verify W3 B2 static metadata" + t, run_inv_route(c.kind, ip, layer, 3, r2, true));
+        }
+        ops::inkling_attention_knobs().decode_raw = raw_saved;
     }
     // The whole segment again with the 4-warp prefill kernel (KS = 1; the default is KS = 2).
     ops::inkling_attention_knobs().prefill_ks = 1;
@@ -1595,24 +1626,35 @@ void run_linear_width_case(const std::string& name, int k, int k_per, int rows_p
     std::string first;
     // Widths 1 .. 64 (narrow: the cell-split kernel), then 1 / 9 / 16 through the one-warp-per-tile narrow kernel.
     // (split mode: 1 = default (wo split, qkvr one-warp), 2 = both split, 0 = both one-warp)
-    const std::vector<std::pair<int, int>> widths = {{1, 1}, {2, 1}, {8, 1}, {9, 1}, {16, 1}, {17, 1}, {64, 1},
-                                                     {1, 2}, {9, 2}, {16, 2}, {1, 0}, {9, 0}, {16, 0}};
-    for (const auto& [n, split] : widths) {
+    // GEMM routes (linear_gemm, N > 16): the reference runs the default; 8,192 / 17 / 64 also through the other two
+    // (0 = gemm_kernel, x = operand A; 1 = gemm_t_kernel shared widen; 2 = gemm_t_kernel direct widen).
+    const int gemm_default = ops::inkling_attention_knobs().linear_gemm;
+    const std::vector<std::array<int, 3>> widths = {
+        {1, 1, gemm_default}, {2, 1, gemm_default}, {8, 1, gemm_default}, {9, 1, gemm_default}, {16, 1, gemm_default},
+        {17, 1, gemm_default}, {64, 1, gemm_default}, {1, 2, gemm_default}, {9, 2, gemm_default}, {16, 2, gemm_default},
+        {1, 0, gemm_default}, {9, 0, gemm_default}, {16, 0, gemm_default},
+        {8192, 1, 0}, {17, 1, 0}, {64, 1, 0}, {8192, 1, 1}, {17, 1, 1}, {64, 1, 1}, {8192, 1, 2}, {17, 1, 2}, {64, 1, 2}};
+    for (const auto& [n, split, gemm] : widths) {
         ops::inkling_attention_knobs().linear_split = split;
+        ops::inkling_attention_knobs().linear_gemm  = gemm;
         const auto got = run(n);
         ops::inkling_attention_knobs().linear_split = 1;
+        ops::inkling_attention_knobs().linear_gemm  = gemm_default;
         for (std::size_t i = 0; i < ranges.size(); ++i) {
             const std::size_t count = static_cast<std::size_t>(ranges[i].second) * n; // columns are contiguous
             total += count;
             for (std::size_t e = 0; e < count; ++e) {
                 if (got[i][e] != ref[i][e]) {
                     ++bad;
-                    if (first.empty()) { first = "N=" + std::to_string(n) + " segment " + std::to_string(i); }
+                    if (first.empty()) {
+                        first = "N=" + std::to_string(n) + " split " + std::to_string(split) + " gemm " +
+                                std::to_string(gemm) + " segment " + std::to_string(i);
+                    }
                 }
             }
         }
     }
-    std::printf("%-44s widths 1 2 8 9 16 17 64 (+ 1 9 16 split / one-warp) vs 8192: %zu / %zu outputs bit-different%s%s\n",
+    std::printf("%-44s widths 1 2 8 9 16 17 64 (+ 1 9 16 split / one-warp; 8192 17 64 x gemm 0 / 1 / 2) vs 8192: %zu / %zu outputs bit-different%s%s\n",
                 name.c_str(), bad, total,
                 first.empty() ? "" : "  first: ", first.c_str());
     check(bad == 0, name);
@@ -2306,13 +2348,168 @@ void run_bench_ab() {
     bench_linear("attn_linear wo narrow N=8 1x128", 3072, 128, 8);
 }
 
+// PDL-chain regression (agent-EN 17:4x: the FP8 route decoded garbage in the engine, prefill fine). The engine's decode
+// sequence per visit -- attention (gated) -> wo_ud (narrow attn_linear) -> qkvr (narrow attn_linear) -- with ONE gated
+// buffer and ONE wo buffer reused by every visit (as the visit arena does), launched back to back with PDL, eager and as
+// a CUDA graph; each visit's qkvr output (distinct buffers) vs a reference that gives every visit fresh buffers and
+// synchronises between ops. A stale read of the reused buffers shows up as bit differences.
+void test_pdl_chain() {
+    using K = InklingLayerKind;
+    if (g_stream == nullptr) { cuda_check(cudaStreamCreateWithFlags(&g_stream, cudaStreamNonBlocking), "stream"); }
+    const K kind = K::Local;
+    const int W = 1, B = 8, N = W * B, first = 8191, keys = first + W, R = 4, visits = 24;
+    const Layer layer(kind, 11);
+    const Rows rows = make_rows(W, B, std::vector<int>(B, first), {});
+    BenchPlane plane(B, keys + 64);
+    const auto pv = plane.view(B);
+    std::vector<DeviceBuffer> dq, dr, dqs;
+    for (int r = 0; r < R; ++r) {
+        Rng rng(700 + r);
+        std::vector<float> q, rr;
+        fill_qr(rng, rows, q, rr);
+        std::vector<float> qside(static_cast<std::size_t>(N) * 6552);
+        for (auto& v : qside) { v = rng.uni(-3.0F, 3.0F); }
+        dq.push_back(to_device_bf16(q));
+        dr.push_back(to_device_bf16(rr));
+        dqs.push_back(to_device_bf16(qside));
+    }
+    const auto inputs = [&](int r) {
+        return ops::InklingAttentionInputs{Tensor(dq[r].p, DType::BF16, {128, 24, N}), Tensor(dr[r].p, DType::BF16, {16, 24, N}),
+                                           strided_bf16(dqs[r].p, G::kRowsGate, {3072}, N, 6552),
+                                           strided_bf16(dqs[r].p, G::kRowsSink, {24}, N, 6552),
+                                           Tensor(layer.dtable.p, DType::BF16, {16, G::kRelTableRows})};
+    };
+    ops::InklingAttentionRows view = rows.view(keys);
+    view.metadata_static           = true;
+    WorkspaceArena work(ops::inkling_rel_attention_workspace_bytes(kind, W, B, view.envelope, view.key_groups) + 4096);
+    const Fp8Weight wo(2304, 3072, 3072, 1, 41, false), qkvr(8600, 2304, 2304, 1, 42, false);
+    DeviceBuffer gated(static_cast<std::size_t>(N) * 3072 * 2), wout(static_cast<std::size_t>(N) * 2304 * 2);
+    std::vector<DeviceBuffer> outs, ref_gated, ref_wo, refs;
+    for (int i = 0; i < visits; ++i) {
+        outs.emplace_back(static_cast<std::size_t>(N) * 8600 * 2);
+        ref_gated.emplace_back(static_cast<std::size_t>(N) * 3072 * 2);
+        ref_wo.emplace_back(static_cast<std::size_t>(N) * 2304 * 2);
+        refs.emplace_back(static_cast<std::size_t>(N) * 8600 * 2);
+    }
+    const auto visit = [&](int i, void* g, void* w, void* o, bool sync) {
+        const auto in = inputs(i % R);
+        Tensor gt(g, DType::BF16, {3072, N}), wt(w, DType::BF16, {2304, N}), ot(o, DType::BF16, {8600, N});
+        ops::inkling_rel_attention(in, kind, view, pv, work, gt, g_stream);
+        if (sync) { cuda_check(cudaStreamSynchronize(g_stream), "sync"); }
+        const ops::InklingProjection p1{&gt, &wo.w, 0, &wt};
+        ops::inkling_attn_linear(std::span<const ops::InklingProjection>(&p1, 1), nullptr, g_stream);
+        if (sync) { cuda_check(cudaStreamSynchronize(g_stream), "sync"); }
+        const ops::InklingProjection p2{&wt, &qkvr.w, 0, &ot};
+        ops::inkling_attn_linear(std::span<const ops::InklingProjection>(&p2, 1), nullptr, g_stream);
+        if (sync) { cuda_check(cudaStreamSynchronize(g_stream), "sync"); }
+    };
+    for (int i = 0; i < visits; ++i) { visit(i, ref_gated[i].p, ref_wo[i].p, refs[i].p, true); }
+    bool control = false; // linear_x_nc on: the old ld.global.nc x loads (negative control, reported, not checked)
+    const auto compare_all = [&](const char* route_in) {
+        const std::string route = std::string(route_in) + (control ? " [x ld.nc control]" : "");
+        cuda_check(cudaStreamSynchronize(g_stream), "sync");
+        std::size_t bad = 0, total = 0;
+        int first_bad = -1;
+        for (int i = 0; i < visits; ++i) {
+            const auto a = from_device<std::uint16_t>(outs[i], static_cast<std::size_t>(N) * 8600);
+            const auto b = from_device<std::uint16_t>(refs[i], static_cast<std::size_t>(N) * 8600);
+            for (std::size_t e = 0; e < a.size(); ++e) {
+                if (a[e] != b[e]) {
+                    ++bad;
+                    if (first_bad < 0) { first_bad = i; }
+                }
+            }
+            total += a.size();
+            cuda_check(cudaMemset(outs[i].p, 0xff, outs[i].bytes), "poison");
+        }
+        std::printf("pdl chain %-36s attention -> wo -> qkvr x %d visits, reused buffers: %zu / %zu outputs bit-different%s\n",
+                    route.c_str(), visits, bad, total,
+                    first_bad >= 0 ? (" (first visit " + std::to_string(first_bad) + ")").c_str() : "");
+        if (!control) { check(bad == 0, "pdl chain " + route); }
+    };
+    const bool xnc_saved = ops::inkling_attention_knobs().linear_x_nc;
+    for (const bool ctl : {false, true}) {
+        control                                     = ctl;
+        ops::inkling_attention_knobs().linear_x_nc = ctl;
+        for (int rep = 0; rep < 3; ++rep) {
+            for (int i = 0; i < visits; ++i) { visit(i, gated.p, wout.p, outs[i].p, false); }
+            compare_all("eager");
+        }
+        cudaGraph_t graph;
+        cudaGraphExec_t exec;
+        cuda_check(cudaStreamBeginCapture(g_stream, cudaStreamCaptureModeThreadLocal), "capture");
+        for (int i = 0; i < visits; ++i) { visit(i, gated.p, wout.p, outs[i].p, false); }
+        cuda_check(cudaStreamEndCapture(g_stream, &graph), "end capture");
+        cuda_check(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
+        for (int rep = 0; rep < 3; ++rep) {
+            cuda_check(cudaGraphLaunch(exec, g_stream), "graph launch");
+            compare_all("graph");
+        }
+        cudaGraphExecDestroy(exec);
+        cudaGraphDestroy(graph);
+    }
+    ops::inkling_attention_knobs().linear_x_nc = xnc_saved;
+}
+
+// Decode staging A/B (agent-EN-c4): register staging (decode_raw 0) vs the cp.async raw ring (2) vs the auto rule (1),
+// static metadata off / on; then the engine's fused call (separate prologue + fold kernel) on the decode rows.
+void run_bench_raw() {
+    using K = InklingLayerKind;
+    cuda_check(cudaStreamCreateWithFlags(&g_stream, cudaStreamNonBlocking), "stream");
+    g_key_groups = ops::InklingKeyGroups::Default;
+    const int raw_saved = ops::inkling_attention_knobs().decode_raw;
+    for (const char* meta : {"1", "0"}) {
+        if (meta[0] == '1') { setenv("BENCH_META_STATIC", "1", 1); } else { unsetenv("BENCH_META_STATIC"); }
+        for (const int raw : {0, 2, 1}) {
+            ops::inkling_attention_knobs().decode_raw = raw;
+            const std::string tag = " [raw " + std::to_string(raw) + " meta=" + meta + "]";
+            const auto nm = [&](const char* w) { static std::string x; x = std::string(w) + tag; return x.c_str(); };
+            bench_attention(nm("decode local 1x8k"), K::Local, 1, 1, 8191);
+            bench_attention(nm("decode global 1x8k"), K::Global, 1, 1, 8191);
+            bench_attention(nm("decode local 2x8k"), K::Local, 1, 2, 8191);
+            bench_attention(nm("decode local 8x8k"), K::Local, 1, 8, 8191);
+            bench_attention(nm("decode global 8x8k"), K::Global, 1, 8, 8191);
+            bench_attention(nm("decode global 1x64k"), K::Global, 1, 1, 65535);
+            bench_attention(nm("decode global 1x262k"), K::Global, 1, 1, 262143);
+            bench_attention(nm("verify W3 local 1x8k"), K::Local, 3, 1, 8189);
+            bench_attention(nm("verify W3 global 1x8k"), K::Global, 3, 1, 8189);
+        }
+    }
+    setenv("BENCH_META_STATIC", "1", 1);
+    for (const int raw : {0, 2, 1}) {
+        ops::inkling_attention_knobs().decode_raw = raw;
+        const std::string tag = " [raw " + std::to_string(raw) + " meta=1]";
+        const auto nm = [&](const char* w) { static std::string x; x = std::string(w) + tag; return x.c_str(); };
+        bench_fused_call(nm("call decode local 1x8k"), K::Local, 1, 1, 8191);
+        bench_fused_call(nm("call decode global 1x8k"), K::Global, 1, 1, 8191);
+        bench_fused_call(nm("call decode local 8x8k"), K::Local, 1, 8, 8191);
+    }
+    ops::inkling_attention_knobs().decode_raw = raw_saved;
+    unsetenv("BENCH_META_STATIC");
+}
+
 // The "GEMM 6 %" question (agent-EN): the qkvr GEMM rows, interleaved three times (pair with the BASE binary's bench).
 void run_bench_gemm() {
     cuda_check(cudaStreamCreateWithFlags(&g_stream, cudaStreamNonBlocking), "stream");
+    // Arms of linear_gemm interleaved (0 = gemm_kernel, 1 = gemm_t shared widen, 2 = gemm_t direct widen), three rounds.
+    const int gemm_default = ops::inkling_attention_knobs().linear_gemm;
     for (int rep = 0; rep < 3; ++rep) {
-        bench_linear("attn_linear qkvr GEMM N=8192 1x128", 2304, 128, 8192);
-        bench_linear("attn_linear qkvr GEMM N=8192 channel", 2304, 2304, 8192);
+        for (const int g : {0, 1, 2}) {
+            ops::inkling_attention_knobs().linear_gemm = g;
+            const std::string a = "attn_linear qkvr GEMM N=8192 1x128 gemm" + std::to_string(g);
+            const std::string b = "attn_linear qkvr GEMM N=8192 channel gemm" + std::to_string(g);
+            bench_linear(a.c_str(), 2304, 128, 8192);
+            bench_linear(b.c_str(), 2304, 2304, 8192);
+        }
     }
+    for (const int g : {0, 1, 2}) { // wo at N = 8,192 and the qkvr GEMM at a 4,096 chunk (the serving default, DESIGN 11.3)
+        ops::inkling_attention_knobs().linear_gemm = g;
+        const std::string a = "attn_linear wo GEMM N=8192 channel gemm" + std::to_string(g);
+        const std::string b = "attn_linear qkvr GEMM N=4096 channel gemm" + std::to_string(g);
+        bench_linear(a.c_str(), 3072, 3072, 8192);
+        bench_linear(b.c_str(), 2304, 2304, 4096);
+    }
+    ops::inkling_attention_knobs().linear_gemm = gemm_default;
 }
 
 // For nsys (per-kernel durations inside the graphs): a few decode probes and the wo projection, p1.
@@ -2404,6 +2601,10 @@ int main(int argc, char** argv) {
                 run_bench_fold();
                 return 0;
             }
+            if (argc > 2 && std::string(argv[2]) == "raw") {
+                run_bench_raw();
+                return 0;
+            }
             if (argc > 2 && std::string(argv[2]) == "gemm") {
                 run_bench_gemm();
                 return 0;
@@ -2491,6 +2692,7 @@ int main(int argc, char** argv) {
         }
         test_invariance(want);
         test_draft(want);
+        if (want("pdl chain")) { test_pdl_chain(); }
     } catch (const std::exception& e) {
         std::cerr << "EXCEPTION " << e.what() << '\n';
         return 1;
