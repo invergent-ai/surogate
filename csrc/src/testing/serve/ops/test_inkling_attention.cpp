@@ -2404,9 +2404,10 @@ void test_pdl_chain() {
         if (sync) { cuda_check(cudaStreamSynchronize(g_stream), "sync"); }
     };
     for (int i = 0; i < visits; ++i) { visit(i, ref_gated[i].p, ref_wo[i].p, refs[i].p, true); }
-    bool control = false; // linear_x_nc on: the old ld.global.nc x loads (negative control, reported, not checked)
+    int xmode    = 0;     // linear_x_nc: 0 plain (production), 2 ld.cg (checked); 1 = the old ld.nc (negative control, reported)
+    bool control = false;
     const auto compare_all = [&](const char* route_in) {
-        const std::string route = std::string(route_in) + (control ? " [x ld.nc control]" : "");
+        const std::string route = std::string(route_in) + (control ? " [x ld.nc control]" : xmode == 2 ? " [x ld.cg]" : "");
         cuda_check(cudaStreamSynchronize(g_stream), "sync");
         std::size_t bad = 0, total = 0;
         int first_bad = -1;
@@ -2427,10 +2428,11 @@ void test_pdl_chain() {
                     first_bad >= 0 ? (" (first visit " + std::to_string(first_bad) + ")").c_str() : "");
         if (!control) { check(bad == 0, "pdl chain " + route); }
     };
-    const bool xnc_saved = ops::inkling_attention_knobs().linear_x_nc;
-    for (const bool ctl : {false, true}) {
-        control                                     = ctl;
-        ops::inkling_attention_knobs().linear_x_nc = ctl;
+    const int xnc_saved = ops::inkling_attention_knobs().linear_x_nc;
+    for (const int mode : {0, 2, 1}) {
+        xmode                                       = mode;
+        control                                     = mode == 1;
+        ops::inkling_attention_knobs().linear_x_nc = mode;
         for (int rep = 0; rep < 3; ++rep) {
             for (int i = 0; i < visits; ++i) { visit(i, gated.p, wout.p, outs[i].p, false); }
             compare_all("eager");
@@ -2449,6 +2451,24 @@ void test_pdl_chain() {
         cudaGraphDestroy(graph);
     }
     ops::inkling_attention_knobs().linear_x_nc = xnc_saved;
+}
+
+// Narrow attn_linear rows (decode / verify widths), x via plain ld.global (production), ld.cg, and the old ld.nc
+// (linear_x_nc 1, which the compiler hoisted above the PDL wait in the cell-split kernel: incorrect, timed for reference).
+void run_bench_linear() {
+    cuda_check(cudaStreamCreateWithFlags(&g_stream, cudaStreamNonBlocking), "stream");
+    const int saved = ops::inkling_attention_knobs().linear_x_nc;
+    for (const int nc : {0, 2, 1}) {
+        ops::inkling_attention_knobs().linear_x_nc = nc;
+        const std::string t = nc == 1 ? " [x ld.nc, old]" : nc == 2 ? " [x ld.cg]" : " [x ld.global]";
+        const auto nm = [&](const char* w) { static std::string x; x = std::string(w) + t; return x.c_str(); };
+        bench_linear(nm("attn_linear qkvr N=1 channel"), 2304, 2304, 1);
+        bench_linear(nm("attn_linear qkvr N=8 channel"), 2304, 2304, 8);
+        bench_linear(nm("attn_linear wo N=1 channel"), 3072, 3072, 1);
+        bench_linear(nm("attn_linear wo N=8 channel"), 3072, 3072, 8);
+        bench_linear(nm("attn_linear wo N=1 1x128"), 3072, 128, 1);
+    }
+    ops::inkling_attention_knobs().linear_x_nc = saved;
 }
 
 // Decode staging A/B (agent-EN-c4): register staging (decode_raw 0) vs the cp.async raw ring (2) vs the auto rule (1),
@@ -2599,6 +2619,10 @@ int main(int argc, char** argv) {
             }
             if (argc > 2 && std::string(argv[2]) == "fold") {
                 run_bench_fold();
+                return 0;
+            }
+            if (argc > 2 && std::string(argv[2]) == "linear") {
+                run_bench_linear();
                 return 0;
             }
             if (argc > 2 && std::string(argv[2]) == "raw") {

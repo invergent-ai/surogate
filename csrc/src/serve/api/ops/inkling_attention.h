@@ -196,9 +196,10 @@ struct InklingAttentionKnobs {
     // Fused fold arrival (fused_fold_max > 0 only; SUROGATE_INKLING_ATTN_FOLD_FENCE_LIGHT): fence.acq_rel.gpu + a relaxed
     // atomic (Marlin's barrier pattern) instead of __threadfence (MEMBAR.SC.GPU + CCTL.IVALL) + atomicAdd. Same bits.
     bool fold_fence_light = true;
-    // TEST-ONLY negative control: the narrow attn_linear kernels read x with ld.global.nc (the pre-17:5x form that
-    // decoded garbage on the FP8 route in the engine). Production: false (x through L2, ld.cg).
-    bool linear_x_nc = false;
+    // Narrow attn_linear x loads (SUROGATE_INKLING_LINEAR_X): 0 = plain ld.global (production), 1 = ld.global.nc (the
+    // pre-17:5x form the compiler hoisted above the PDL wait: FP8-route decode garbage; TEST-ONLY negative control),
+    // 2 = ld.global.cg (correct, measured 1.4-2.4x slower).
+    int linear_x_nc = 0;
 };
 [[nodiscard]] InklingAttentionKnobs& inkling_attention_knobs();
 

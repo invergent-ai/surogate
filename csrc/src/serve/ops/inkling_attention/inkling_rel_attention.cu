@@ -1525,6 +1525,7 @@ InklingAttentionKnobs& knobs() {
         x.linear_gemm       = std::clamp(env_int("SUROGATE_INKLING_LINEAR_GEMM", x.linear_gemm), 0, 2);
         x.decode_raw        = std::clamp(env_int("SUROGATE_INKLING_ATTN_DECODE_RAW", x.decode_raw), 0, 2);
         x.fold_fence_light  = env_int("SUROGATE_INKLING_ATTN_FOLD_FENCE_LIGHT", x.fold_fence_light ? 1 : 0) != 0;
+        x.linear_x_nc       = std::clamp(env_int("SUROGATE_INKLING_LINEAR_X", x.linear_x_nc), 0, 2);
         return x;
     }();
     return k;
