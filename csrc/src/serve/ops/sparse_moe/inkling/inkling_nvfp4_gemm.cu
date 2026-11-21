@@ -125,8 +125,6 @@ using NarrowStorage =
 // BlockK 128: 1152 is not a multiple of 256.
 using NarrowSchedule = Nvfp4W4a4MmaSchedule<16, 64, 128, 1, 4, 4, 4>;
 using ResidentDownSchedule = NarrowGemmSchedule<16, 64, 128, 1, 4, kIntermediate / 128, 1>;
-using NarrowDeep6Schedule  = NarrowGemmSchedule<16, 64, 128, 1, 4, 6, 2>; ///< timing knob (gate_up ring depth)
-using NarrowDeep8Schedule  = NarrowGemmSchedule<16, 64, 128, 1, 4, 8, 2>; ///< timing knob (gate_up ring depth)
 using WideSchedule   = Nvfp4W4a4MmaSchedule<64, 128, 128, 2, 4, 3, 2>;
 
 template <class Schedule, int K>
@@ -870,16 +868,6 @@ int resident_down_max_slots() {
     return value;
 }
 
-/// TIMING KNOB (removed once measured): SUROGATE_INKLING_GATE_UP_STAGES = 6 | 8: the narrow gate_up's cp.async ring
-/// depth (default 4). Same MMA chain per output.
-int narrow_gate_up_stages() {
-    static const int value = [] {
-        const char* text = std::getenv("SUROGATE_INKLING_GATE_UP_STAGES");
-        return text != nullptr ? std::atoi(text) : 4;
-    }();
-    return value;
-}
-
 void require(const GemmParams& params) {
     if (params.weights.codes == nullptr || params.weights.scales == nullptr ||
         params.weights.amax == nullptr || params.weights.outer_den == nullptr) {
@@ -894,11 +882,7 @@ void launch_nvfp4_gate_up(const GemmParams& params, std::int32_t slots, GemmSche
     require(params);
     const GemmParams p = with_l2_prefetch(params);
     if (schedule == GemmSchedule::Narrow) {
-        switch (narrow_gate_up_stages()) {
-        case 6: launch_schedule<NarrowDeep6Schedule, kHidden, true>(p, slots, stream); break;
-        case 8: launch_schedule<NarrowDeep8Schedule, kHidden, true>(p, slots, stream); break;
-        default: launch_schedule<NarrowSchedule, kHidden, true>(p, slots, stream); break;
-        }
+        launch_schedule<NarrowSchedule, kHidden, true>(p, slots, stream);
     } else {
         launch_prefill<kHidden, true>(p, slots, stream);
     }
