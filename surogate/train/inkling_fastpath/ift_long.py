@@ -424,6 +424,78 @@ class MoEGM(torch.autograd.Function):
         tick.__exit__(None, None, None)
         return (None, None, None, dx, *lgr)
 
+
+# ---------------------------------------------------------------------------------------------------------------
+# LEVEL-1 lever 2: tensor-core GEMMs in the recompute
+#   FAST_GEMM: x (bf16 values) @ W (bf16 weight) as a bf16 MMA with fp32 accumulation / output (the same products as
+#     the fp32 GEMM of those values; another summation order), dX = g @ W as TWO bf16 MMAs on g's hi / lo bf16 parts
+#     (g = hi + lo, relative error ~2^-16): replaces the fp32 GEMMs with per-call fp32 copies of the weights.
+#   TF32: the remaining fp32 GEMMs (attention, LoRA, controllers) on TF32 tensor cores.
+# ---------------------------------------------------------------------------------------------------------------
+FAST_GEMM = os.environ.get("IFT_FAST_GEMM", "1") == "1"
+TF32 = os.environ.get("IFT_TF32", "1") == "1"
+_RA_MM = RA.mm
+_RA_BMM = RA.bmm
+
+
+def _split_bf16(g):
+    hi = g.to(BF16)
+    return hi, (g - hi.float()).to(BF16)
+
+
+class MM16(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, w):
+        ctx.w = w
+        return B._mm_f32(x.to(BF16), w)
+
+    @staticmethod
+    def backward(ctx, g):
+        hi, lo = _split_bf16(g.contiguous())
+        wt = ctx.w.T  # [K, N] view: g [M, N] @ W [N, K]
+        return B._mm_f32(hi, wt) + B._mm_f32(lo, wt), None
+
+
+class BMM16(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, w):
+        ctx.w = w
+        return torch.bmm(x.to(BF16), w.transpose(1, 2), out_dtype=F32)
+
+    @staticmethod
+    def backward(ctx, g):
+        hi, lo = _split_bf16(g.contiguous())
+        return torch.bmm(hi, ctx.w, out_dtype=F32) + torch.bmm(lo, ctx.w, out_dtype=F32), None
+
+
+def _mm_fast(x, w):
+    if w.dtype == BF16 and w.dim() == 2 and torch.is_grad_enabled():
+        return MM16.apply(x.float(), w)
+    if w.dtype == BF16 and w.dim() == 2:
+        return B._mm_f32(x.to(BF16), w)
+    return _RA_MM(x, w)
+
+
+def _bmm_fast(x, w):
+    if w.dtype == BF16 and w.dim() == 3:
+        return BMM16.apply(x.float(), w) if torch.is_grad_enabled() else torch.bmm(
+            x.to(BF16), w.transpose(1, 2), out_dtype=F32)
+    return _RA_BMM(x, w)
+
+
+class _gemm_mode:
+    """Inside the recompute: FAST_GEMM patches the vendored reference's mm / bmm; TF32 enables TF32 matmuls."""
+
+    def __enter__(self):
+        self.tf32 = torch.backends.cuda.matmul.allow_tf32
+        if FAST_GEMM:
+            RA.mm, RA.bmm = _mm_fast, _bmm_fast
+        torch.backends.cuda.matmul.allow_tf32 = bool(TF32)
+
+    def __exit__(self, *a):
+        RA.mm, RA.bmm = _RA_MM, _RA_BMM
+        torch.backends.cuda.matmul.allow_tf32 = self.tf32
+
 # ---------------------------------------------------------------------------------------------------------------
 # a visit's recompute, staged
 # ---------------------------------------------------------------------------------------------------------------
@@ -749,6 +821,11 @@ class LongModel(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, g_lp):
+        with _gemm_mode():
+            return LongModel._backward(ctx, g_lp)
+
+    @staticmethod
+    def _backward(ctx, g_lp):
         tf, ids, vals = ctx.tf, ctx.ids, ctx.vals
         eng, W = tf.eng, tf.W
         dev = g_lp.device
