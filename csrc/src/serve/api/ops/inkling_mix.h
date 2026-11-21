@@ -238,8 +238,9 @@ void inkling_gemm_f32_prepare(std::int32_t n, std::int32_t k, std::int32_t token
 /// contiguous, out has `ldc` elements per token column.
 ///
 /// Every output element is fixed by (n, k) alone, never by `tokens`, the batch, or the tile:
-/// - the k range is cut into `inkling_gemm_split(n, k)` equal chunks (one chunk unless n is small and k long: the
-///   controller `down` 64 x 4608 runs as 18 x 256, the dynamic taps 32 x 2304 as 9 x 256);
+/// - the k range is cut into `inkling_gemm_split(n, k)` equal chunks: k / 256 chunks of 256 when n <= 64, k >= 1024 and
+///   k % 256 == 0, else ONE chunk (in inkling2: the controller `down` 64 x 4608 = 18 x 256; every other projection,
+///   and every problem of inkling_gemm_inv_group -- the dynamic taps 32 x 2304 included -- runs as one chunk);
 /// - each chunk is ONE accumulator from zero running the m16n8k16 BF16 MMA over its k in increasing 16-wide steps
 ///   (k padded with zeros to a multiple of 64) -- the chain of ops/linear/bf16/bf16_invariant_gemm;
 /// - the chunks' FP32 partials are added in chunk order (p0 + p1 + ... ) and the sum is stored.
