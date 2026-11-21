@@ -5,6 +5,7 @@
 #include <cstdlib>
 
 #include "family/impl/runtime/schedule.h"
+#include "family/impl/runtime/dspark_round.h"
 
 #include <algorithm>
 #include <cmath>
@@ -211,13 +212,20 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     // 128-aligned, and a follow-up with a short output budget then killed the engine.
     const std::uint32_t graph_reach_tokens =
         PrefillGraphFamily::graph_prefill_reach(base->summary.prompt_tokens);
+    // DSpark (dspark_round.h) writes its draft block's own K / V at [frontier, frontier + 8) of its text-pool planes
+    // every round whatever k is: the reservation covers that block past the last output position. 0 elsewhere.
+    const std::uint32_t draft_block_tokens =
+        family::dspark_drafter<Variant>() && speculative_backend == SpeculativeBackend::DFlash
+            ? static_cast<std::uint32_t>(cfg.dflash.block_size)
+            : 0U;
     const std::uint32_t reserved_context_tokens = static_cast<std::uint32_t>(std::min<std::uint64_t>(
         capacity,
         std::max<std::uint64_t>(
             static_cast<std::uint64_t>(base->summary.prompt_tokens) +
                 (base->summary.effective_output_tokens == 0
                      ? 0U
-                     : base->summary.effective_output_tokens - 1U),
+                     : base->summary.effective_output_tokens - 1U) +
+                draft_block_tokens,
             graph_reach_tokens)));
     base->text_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
     if (speculative_backend == SpeculativeBackend::Mtp) {

@@ -2,6 +2,7 @@
 #include "family/impl/runtime/schedule.h"
 #include "api/ops/sampled_logprob.h"
 #include "family/impl/runtime/workspace_recipe.h"
+#include "family/impl/runtime/dspark_round.h"
 
 #include "api/ops/argmax.h"
 #include "api/ops/attn_input_proj.h"
@@ -76,6 +77,14 @@ DFlashPersistentState& dflash_state(DFlashBatchContext& state) { return state.df
 
 DFlashPersistentState& dflash_state(DFlashAppendContext& state) { return state.dflash; }
 
+/// A DSpark target's leaves get the text pool (its draft planes), the per-lane f_rnn and the round's workspace.
+template <class Context>
+family::DSparkRuntime dspark_runtime(Context& state) {
+    DFlashPersistentState& d = dflash_state(state);
+    return family::DSparkRuntime{&d.decoder.text_kv, d.dspark_f_rnn, &state.execution.work,
+                                 state.execution.device.stream};
+}
+
 template <class V>
 DFlashFeatureSink prefill_feature_sink_impl(PrefillContext& state,
                                             DFlashFeatureSink::PrefillConsumer consume_prefill) {
@@ -123,6 +132,14 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
     if constexpr (!V::supports_dflash) {
         throw std::logic_error("DFlash context append is unavailable for this target");
     } else {
+        if constexpr (family::dspark_drafter<V>()) {
+            // DSpark (dspark_round.h): the target's own context append into its draft planes.
+            family::dspark_append_if<V>(
+                state.execution.model, dspark_runtime(state),
+                family::DSparkAppendArgs{features, positions, commit_counts, lanes, table_rows,
+                                         envelope.min_count == static_cast<std::uint32_t>(features.ne[1])});
+            return;
+        }
         const auto& config = state.execution.model.geometry.dflash;
         const std::int32_t width   = features.ne[1];
         const std::int32_t batch   = features.ne[2];
@@ -246,6 +263,14 @@ void propose_batch_impl(DFlashBatchContext& state, family::DFlashDecodeState& fr
         state.execution.work.reset();
         ops::prepare_masked_block(anchors, frontiers, valid_columns, config.mask_token, ids,
                                   positions, state.execution.device.stream);
+        if constexpr (family::dspark_drafter<V>()) {
+            // DSpark (dspark_round.h): the block's positions above are the verify's cache positions; the target's
+            // own drafter runs from the anchor at its frontier and writes k drafts.
+            family::dspark_propose_if<V>(state.execution.model, dspark_runtime(state),
+                                         family::DSparkProposeArgs{anchors, frontiers, lanes, full_rows, drafts,
+                                                                   batch_size, static_cast<std::int32_t>(k)});
+            return;
+        }
         Tensor residual = state.execution.work.alloc(DType::BF16, {config.hidden, columns});
         ops::embedding(ids.view({columns}), state.execution.model.token_embedding, residual,
                        state.execution.device.stream);

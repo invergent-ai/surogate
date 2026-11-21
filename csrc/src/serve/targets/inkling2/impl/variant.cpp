@@ -56,8 +56,11 @@ std::vector<GraphExecutionProfile> Variant::ordinary_graph_profiles(std::uint32_
 
 std::vector<GraphExecutionProfile> Variant::mtp_graph_profiles(std::uint32_t, std::uint32_t) { return {}; }
 
-std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t, std::uint32_t, std::uint32_t) {
-    return {};
+std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t capacity, std::uint32_t,
+                                                                  std::uint32_t) {
+    // DSpark (lane e2): the verify's split follows the global visits' bands, as an ordinary round's; the drafter's
+    // own attention plans from the round shape alone.
+    return ordinary_graph_profiles(capacity);
 }
 
 LinearAttentionStatePoolSpec Variant::visit_state_spec(const family::TextGeometry& geometry, std::int32_t slots) {

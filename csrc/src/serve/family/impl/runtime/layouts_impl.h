@@ -7,6 +7,7 @@
 #include "family/impl/adaptive_dflash.h"
 #include "family/impl/runtime/residual_policy.h"
 #include "family/impl/runtime/visit_round.h"
+#include "family/impl/runtime/dspark_round.h"
 #include "api/ops/batch_invariant.h"
 #include "ops/linear/marlin/marlin_plane.h"
 #include "family/impl/runtime/linear_state_slots.h"
@@ -174,6 +175,18 @@ template <class V>
 
 
 constexpr std::size_t kMiB        = 1024ULL * 1024ULL;
+
+/// One DFlash graph topology class's memory allowance: the target's measured bound when it states one
+/// (`dflash_graph_allowance_per_class_bytes`, e.g. inkling2's DSpark rounds), else the family's 64 / 96 MiB.
+template <class V>
+[[nodiscard]] std::uint64_t dflash_graph_class_allowance_bytes(std::uint64_t final_visible) {
+    if constexpr (requires { V::dflash_graph_allowance_per_class_bytes; }) {
+        (void)final_visible;
+        return V::dflash_graph_allowance_per_class_bytes;
+    } else {
+        return (final_visible <= 4096 ? 64ULL : 96ULL) * kMiB;
+    }
+}
 constexpr std::size_t kArenaAlign = 256ULL;
 
 enum class GdnWorkspacePath : std::uint8_t {
@@ -291,6 +304,17 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     // Window class of the text pool: a constant, so the capacity curve stays affine in the
     // full-context pages, and its stride counts only the planes that keep the whole context.
     std::vector<std::int32_t> layer_windows = variant_kv_layer_windows<Variant>(plan.geometry);
+    // Extra text-pool planes a target appends after its own (DSpark's draft KV, family/impl/runtime/dspark_round.h),
+    // with their windows; empty for every other target, which leaves the pool exactly as it was.
+    // A pipeline puts them on the LAST stage only (the drafter runs beside the head; e1 / f1c 15:30, 2-card 1M).
+    const bool stage_holds_last_layer =
+        plan.pipeline_stage_last == 0 || plan.pipeline_stage_last >= static_cast<std::int32_t>(plan.geometry.layers);
+    const std::vector<std::int32_t> extra_kv_planes =
+        stage_holds_last_layer ? family::variant_extra_kv_planes<Variant>(plan.geometry, plan.features)
+                               : std::vector<std::int32_t>{};
+    if (!layer_windows.empty()) {
+        layer_windows.insert(layer_windows.end(), extra_kv_planes.begin(), extra_kv_planes.end());
+    }
     KvWindowClassSize window_class;
     if (!layer_windows.empty()) {
         const auto window_tokens =
@@ -326,9 +350,15 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     PersistentLayout out;
     out.decoder = family::plan_decoder_state(
         builder, family::DecoderStateSpec{
-                     .full_attention_layers     = geometry_full_attention_layers(plan.geometry),
-                     .text_kv_layers = family::detail::stage_kv_layers(
-                         plan.geometry, plan.pipeline_stage_first, plan.pipeline_stage_last),
+                     .full_attention_layers     = static_cast<std::uint32_t>(
+                         geometry_full_attention_layers(plan.geometry) +
+                         static_cast<std::int32_t>(extra_kv_planes.size())),
+                     .text_kv_layers = [&] {
+                         family::KvLayerRange range = family::detail::stage_kv_layers(
+                             plan.geometry, plan.pipeline_stage_first, plan.pipeline_stage_last);
+                         range.last += static_cast<std::uint32_t>(extra_kv_planes.size());
+                         return range;
+                     }(),
                      .mtp_layers                = plan.geometry.mtp_layers,
                      .capacity                  = plan.capacity,
                      .kv_heads                  = plan.geometry.kv_heads,
@@ -496,6 +526,13 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                                                    static_cast<std::int32_t>(plan.draft_window + 1U),
                                                    static_cast<std::int32_t>(plan.max_concurrency)},
                                                   "DFlash pending target features");
+            if constexpr (family::dspark_drafter<Variant>()) {
+                // DSpark: each lane's Markov feature (mix row 3 of its last committed column), read by the proposal.
+                dflash.dspark_f_rnn = add_tensor(builder, DType::BF16,
+                                                 {plan.geometry.dflash.hidden,
+                                                  static_cast<std::int32_t>(plan.max_concurrency)},
+                                                 "DSpark per-lane Markov feature");
+            }
         }
     }
 
@@ -1065,6 +1102,10 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 if (compact_input) {
                     matrix(layout, DType::BF16, plan.geometry.dflash.feature_rows, tokens);
                 }
+                if constexpr (family::dspark_drafter<Variant>()) {
+                    scratch(layout, family::dspark_append_workspace_bytes_if<Variant>(tokens));
+                    return finish(layout);
+                }
                 (void)workspace_recipe::dflash_context(layout, tokens, plan.geometry.dflash);
                 {
                     auto layer = layout.scope();
@@ -1074,6 +1115,11 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             };
             const auto dflash_proposal_capacity = [&](std::int32_t width, std::int32_t batch) {
                 WorkspaceLayoutBuilder layout;
+                if constexpr (family::dspark_drafter<Variant>()) {
+                    (void)width;
+                    scratch(layout, family::dspark_propose_workspace_bytes_if<Variant>(batch, plan.capacity));
+                    return finish(layout);
+                }
                 const std::int32_t tokens = width * batch;
                 matrix(layout, DType::BF16, plan.geometry.dflash.hidden, tokens);
                 {
@@ -1115,7 +1161,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             };
 
             out.dflash_context = dflash_context_capacity(chunk, false);
-            for (auto window : dflash_draft_windows(plan.draft_window, plan.adaptive_dflash)) {
+            for (auto window : dflash_draft_windows(plan.draft_window, plan.adaptive_dflash, family::dspark_drafter<Variant>())) {
                 const auto round_width = static_cast<std::int32_t>(window + 1);
                 for (std::int32_t batch = 1; batch <= batch_capacity; ++batch) {
                     const std::int32_t aggregate = round_width * batch;
@@ -1365,7 +1411,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                 checked_mul(per_batch_allowance, decode_batch_capacity(impl->max_concurrency, impl->speculative_backend),
                             "MTP exact-b graph allowance");
         } else {
-            for (auto window : dflash_draft_windows(impl->draft_window, impl->adaptive_dflash)) {
+            for (auto window : dflash_draft_windows(impl->draft_window, impl->adaptive_dflash, family::dspark_drafter<Variant>())) {
                 const auto class_allowance = [&](std::uint32_t batch_size) {
                     const auto profiles = dflash_graph_profiles(impl->capacity, window, batch_size);
                     return graph_topology_allowance(
@@ -1374,7 +1420,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                             const std::uint64_t final_visible = std::min<std::uint64_t>(
                                 impl->capacity,
                                 static_cast<std::uint64_t>(profile.max) + window + 1ULL);
-                            return (final_visible <= 4096 ? 64ULL : 96ULL) * kMiB;
+                            return dflash_graph_class_allowance_bytes<Variant>(final_visible);
                         },
                         "DFlash graph allowance");
                 };

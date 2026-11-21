@@ -12,11 +12,20 @@
 
 namespace sinfer::family {
 
-inline std::vector<std::uint32_t> dflash_draft_windows(std::uint32_t maximum, bool adaptive) {
+/// The draft windows the runtime captures and chooses from. `dspark` (a DSpark target, family/impl/runtime/
+/// dspark_round.h): {0, 1, 2, 3, max} -- the arms its acceptance by content kind asks for (lanes/e2/k_policy.py);
+/// every other drafter keeps {0, 1, 3, 7, 15, max}.
+inline std::vector<std::uint32_t> dflash_draft_windows(std::uint32_t maximum, bool adaptive, bool dspark = false) {
     if (!adaptive) { return {maximum}; }
     std::vector<std::uint32_t> windows{0};
-    for (auto width : {1U, 3U, 7U, 15U}) {
-        if (width < maximum) { windows.push_back(width); }
+    if (dspark) {
+        for (auto width : {1U, 2U, 3U}) {
+            if (width < maximum) { windows.push_back(width); }
+        }
+    } else {
+        for (auto width : {1U, 3U, 7U, 15U}) {
+            if (width < maximum) { windows.push_back(width); }
+        }
     }
     windows.push_back(maximum);
     return windows;
@@ -54,7 +63,8 @@ class AdaptiveDFlash {
         return histories_[batch - 1][band];
     }
 public:
-    explicit AdaptiveDFlash(std::uint32_t maximum) : windows_(dflash_draft_windows(maximum, true)) {
+    explicit AdaptiveDFlash(std::uint32_t maximum, bool dspark = false)
+        : windows_(dflash_draft_windows(maximum, true, dspark)) {
         if (maximum == 0 || maximum > 15) {
             throw std::invalid_argument("adaptive DFlash maximum must be in [1,15]");
         }

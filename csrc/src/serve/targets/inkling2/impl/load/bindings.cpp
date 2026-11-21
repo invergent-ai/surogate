@@ -366,6 +366,8 @@ BindingPlan bind_artifact(artifact::Binder& binder, const BindOptions& options) 
     if (out.has_draft) {
         const DraftConfig& d = *c.dspark;
         const TensorPlacement dp = options.draft ? gp : TensorPlacement::ValidateOnly;
+        // lane e2: the dense linears may live in a mapped host bank (re-quantised to FP8 on the device at load)
+        const TensorPlacement lp = options.draft && options.draft_linears_host ? TensorPlacement::HostBank : dp;
         const std::int32_t Dd = d.hidden, q = d.query_heads * d.head_dim, kv = d.kv_heads * d.head_dim;
         DraftPlan& m = out.draft;
         m.fuse_weight = b.tensor("mtp/fuse_weight", NumericFormat::BF16,
@@ -379,18 +381,18 @@ BindingPlan bind_artifact(artifact::Binder& binder, const BindOptions& options) 
             l.feature_norm        = b.tensor(p + "feature_norm", NumericFormat::BF16, {u64(Dd)}, dp);
             l.input_norm          = b.tensor(p + "input_norm", NumericFormat::BF16, {u64(Dd)}, dp);
             l.post_attention_norm = b.tensor(p + "post_attention_norm", NumericFormat::BF16, {u64(Dd)}, dp);
-            l.q     = b.linear(p + "attn/q", q, Dd, dp, NumericFormat::BF16);
-            l.k     = b.linear(p + "attn/k", kv, Dd, dp, NumericFormat::BF16);
-            l.v     = b.linear(p + "attn/v", kv, Dd, dp, NumericFormat::BF16);
-            l.o     = b.linear(p + "attn/o", Dd, q, dp, NumericFormat::BF16);
-            l.k_ctx = b.linear(p + "attn/k_ctx", kv, Dd, dp, NumericFormat::BF16);
-            l.v_ctx = b.linear(p + "attn/v_ctx", kv, Dd, dp, NumericFormat::BF16);
+            l.q     = b.linear(p + "attn/q", q, Dd, lp, NumericFormat::BF16);
+            l.k     = b.linear(p + "attn/k", kv, Dd, lp, NumericFormat::BF16);
+            l.v     = b.linear(p + "attn/v", kv, Dd, lp, NumericFormat::BF16);
+            l.o     = b.linear(p + "attn/o", Dd, q, lp, NumericFormat::BF16);
+            l.k_ctx = b.linear(p + "attn/k_ctx", kv, Dd, lp, NumericFormat::BF16);
+            l.v_ctx = b.linear(p + "attn/v_ctx", kv, Dd, lp, NumericFormat::BF16);
             l.q_norm     = b.tensor(p + "attn/q_norm", NumericFormat::BF16, {u64(d.head_dim)}, dp);
             l.k_norm     = b.tensor(p + "attn/k_norm", NumericFormat::BF16, {u64(d.head_dim)}, dp);
             l.k_ctx_norm = b.tensor(p + "attn/k_ctx_norm", NumericFormat::BF16, {u64(d.head_dim)}, dp);
-            l.gate = b.linear(p + "mlp/gate", d.intermediate, Dd, dp, NumericFormat::BF16);
-            l.up   = b.linear(p + "mlp/up", d.intermediate, Dd, dp, NumericFormat::BF16);
-            l.down = b.linear(p + "mlp/down", Dd, d.intermediate, dp, NumericFormat::BF16);
+            l.gate = b.linear(p + "mlp/gate", d.intermediate, Dd, lp, NumericFormat::BF16);
+            l.up   = b.linear(p + "mlp/up", d.intermediate, Dd, lp, NumericFormat::BF16);
+            l.down = b.linear(p + "mlp/down", Dd, d.intermediate, lp, NumericFormat::BF16);
         }
         const std::int32_t r = d.markov_rank;
         m.markov_feature_norm    = b.tensor("mtp/markov/feature_norm", NumericFormat::BF16, {u64(Dd)}, dp);
