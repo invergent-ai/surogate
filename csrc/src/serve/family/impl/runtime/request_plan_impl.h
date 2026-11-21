@@ -2,6 +2,7 @@
 #include "family/impl/runtime/prefill_graph.h"
 #include "family/impl/runtime/program.h"
 #include "runtime/generation/readout_policy.h"
+#include "runtime/engine/kv_admission_policy.h"
 #include <cstdlib>
 
 #include "family/impl/runtime/schedule.h"
@@ -11,6 +12,7 @@
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+#include <string_view>
 
 namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS {
 namespace {
@@ -254,10 +256,26 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
         throw std::invalid_argument("resumed request does not describe its generated tokens");
     }
     base->resume = options.resume;
+    // Lane f1: a DSpark row whose tokens depend on its drafts (top_p < 1, top_k > 0, min_p, one-hot verification) keeps
+    // its whole reservation and is never preempted, unless SUROGATE_SERVE_KV_TRUNCATED_ONDEMAND=1. true for other models.
+    const bool recompute_allowed = [&] {
+        if (!family::dspark_drafter<Variant>() || speculative_backend != SpeculativeBackend::DFlash) { return true; }
+        static const bool truncated_on_demand = [] {
+            const char* raw = std::getenv("SUROGATE_SERVE_KV_TRUNCATED_ONDEMAND");
+            return raw != nullptr && std::string_view(raw) == "1";
+        }();
+        static const bool coupled = [] { // install_sampling's switch
+            const char* raw = std::getenv("SUROGATE_SPEC_COUPLED");
+            return raw == nullptr || raw[0] == '\0' || std::atoi(raw) != 0;
+        }();
+        return truncated_on_demand ||
+               runtime::kv_dspark_row_recomputes_exactly(base->sampling.temperature, base->sampling.top_k,
+                                                         base->sampling.top_p, base->sampling.min_p, coupled);
+    }();
     base->summary.on_demand_kv = kv_on_demand_ && !base->target_only && !gpu_prefix_readout &&
                                  options.prompt_logprobs < 0 &&
                                  !(options.capture_routing && routing_capture_enabled) &&
-                                 options.next_token_candidates.empty() && !options.reserve_kv;
+                                 options.next_token_candidates.empty() && !options.reserve_kv && recompute_allowed;
     if (options.resume && !base->summary.on_demand_kv) {
         throw std::invalid_argument("a request that cannot be recomputed was preempted");
     }

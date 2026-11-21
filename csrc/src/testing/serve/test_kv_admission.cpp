@@ -205,6 +205,17 @@ void test_round_reach() {
         }
     }
     check(kv_round_reach(4, 3, 16) == 17, "a block wider than the burst and the window sets the reach");
+
+    // Which DSpark rows may be recomputed: the ones whose committed tokens do not depend on the drafts.
+    using sinfer::runtime::kv_dspark_row_recomputes_exactly;
+    check(kv_dspark_row_recomputes_exactly(0.0F, 20, 0.95F, 0.0F, true), "a greedy row, whatever its filters");
+    check(kv_dspark_row_recomputes_exactly(0.0F, 0, 1.0F, 0.0F, false), "a greedy row without coupling");
+    check(kv_dspark_row_recomputes_exactly(1.0F, -1, 1.0F, 0.0F, true), "an untruncated coupled row");
+    check(!kv_dspark_row_recomputes_exactly(1.0F, 20, 0.95F, 0.0F, true), "the RL kit's pins keep the reservation");
+    check(!kv_dspark_row_recomputes_exactly(1.0F, 20, 1.0F, 0.0F, true), "top_k alone keeps the reservation");
+    check(!kv_dspark_row_recomputes_exactly(1.0F, -1, 0.95F, 0.0F, true), "top_p alone keeps the reservation");
+    check(!kv_dspark_row_recomputes_exactly(1.0F, -1, 1.0F, 0.05F, true), "a min_p floor keeps the reservation");
+    check(!kv_dspark_row_recomputes_exactly(1.0F, -1, 1.0F, 0.0F, false), "one-hot verification keeps the reservation");
 }
 
 /// Lane f1 (review R5 minors 11 c, 12): what a pipeline stage counts against the run's need, and the page size the
