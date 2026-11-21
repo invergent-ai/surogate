@@ -25,7 +25,9 @@
 #include <functional>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <numeric>
+#include <sstream>
 #include <random>
 #include <string>
 #include <vector>
@@ -966,12 +968,223 @@ void test_attn_linear() {
     run_linear_case("attn_linear wo 128x128 N=70", 3072, 128, 128, 70, {{0, 2304}}, seed++);
 }
 
+// ---- replay of vLLM's own kernels (lane a's capture of p000[:256], exported by lanes/c/export_capture.py) ---
+
+struct CapTensor {
+    std::string dtype;
+    std::vector<std::int64_t> shape;
+    std::vector<std::uint8_t> bytes;
+    std::int64_t numel() const {
+        std::int64_t n = 1;
+        for (auto d : shape) { n *= d; }
+        return n;
+    }
+    std::vector<float> bf16_values() const {
+        std::vector<float> out(numel());
+        for (std::int64_t i = 0; i < numel(); ++i) {
+            std::uint16_t b;
+            std::memcpy(&b, &bytes[2 * i], 2);
+            out[i] = bf16_to_f32(b);
+        }
+        return out;
+    }
+    std::vector<float> f32_values() const {
+        std::vector<float> out(numel());
+        std::memcpy(out.data(), bytes.data(), out.size() * 4);
+        return out;
+    }
+};
+
+std::vector<std::uint8_t> read_file(const std::string& path) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (f == nullptr) { throw std::runtime_error("cannot open " + path); }
+    std::fseek(f, 0, SEEK_END);
+    const long n = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    std::vector<std::uint8_t> b(static_cast<std::size_t>(n));
+    if (n > 0 && std::fread(b.data(), 1, b.size(), f) != b.size()) { throw std::runtime_error("short read " + path); }
+    std::fclose(f);
+    return b;
+}
+
+void run_capture(const std::string& dir) {
+    std::map<int, std::map<std::string, CapTensor>> visits;
+    std::map<int, bool> global;
+    {
+        FILE* f = std::fopen((dir + "/MANIFEST.txt").c_str(), "r");
+        if (f == nullptr) { throw std::runtime_error("no " + dir + "/MANIFEST.txt"); }
+        char line[1024];
+        while (std::fgets(line, sizeof line, f) != nullptr) {
+            std::istringstream in(line);
+            int v;
+            std::string name;
+            in >> v >> name;
+            if (name == "meta") {
+                std::string tok;
+                while (in >> tok) {
+                    if (tok.rfind("global=", 0) == 0) { global[v] = tok.back() == '1'; }
+                }
+                continue;
+            }
+            CapTensor t;
+            std::string file;
+            in >> t.dtype >> file;
+            std::int64_t d;
+            while (in >> d) { t.shape.push_back(d); }
+            t.bytes = read_file(dir + "/" + file);
+            visits[v][name] = std::move(t);
+        }
+        std::fclose(f);
+    }
+    for (auto& [v, ts] : visits) {
+        const bool glob = global[v];
+        const InklingLayerKind kind = glob ? InklingLayerKind::Global : InklingLayerKind::Local;
+        const int T = static_cast<int>(ts.at("positions").numel());
+        const std::string tag = "capture v" + std::to_string(v) + (glob ? " global" : " local");
+        const auto dev = [&](const std::string& n) { return to_device(ts.at(n).bytes); };
+        std::vector<int> pos(T);
+        std::memcpy(pos.data(), ts.at("positions").bytes.data(), static_cast<std::size_t>(T) * 4);
+        bool consecutive = true;
+        for (int i = 0; i < T; ++i) { consecutive = consecutive && pos[i] == pos[0] + i; }
+        check(consecutive, tag + " positions consecutive");
+        Rows rows = make_rows(T, 1, {pos[0]}, {});
+
+        DeviceBuffer dq = dev("q"), dr = dev("r"), dk = dev("k"), dv = dev("v"), dg = dev("gate"), ds = dev("sink");
+        DeviceBuffer dqs = dev("q_scale"), drs = dev("r_scale"), dkc = dev("k_conv"), dvc = dev("v_conv"),
+                     dproj = dev("rel_proj");
+        DeviceBuffer dkd, dvd;
+        ops::InklingProjections in;
+        in.q    = Tensor(dq.p, DType::BF16, {128, 24, T});
+        in.r    = Tensor(dr.p, DType::BF16, {16, 24, T});
+        in.k    = Tensor(dk.p, DType::BF16, {1024, T});
+        in.v    = Tensor(dv.p, DType::BF16, {1024, T});
+        in.gate = Tensor(dg.p, DType::BF16, {3072, T});
+        in.sink = Tensor(ds.p, DType::BF16, {24, T});
+        if (glob) {
+            dkd      = dev("k_dyn");
+            dvd      = dev("v_dyn");
+            in.k_dyn = Tensor(dkd.p, DType::BF16, {4, 8, T});
+            in.v_dyn = Tensor(dvd.p, DType::BF16, {4, 8, T});
+        }
+        DeviceBuffer dtable(static_cast<std::size_t>(16) * G::kRelTableRows * 2);
+        ops::InklingAttentionWeights w;
+        w.q_scale   = Tensor(dqs.p, DType::BF16, {128, 24});
+        w.r_scale   = Tensor(drs.p, DType::BF16, {16, 24});
+        w.k_conv    = glob ? Tensor(dkc.p, DType::BF16, {1024, 4}) : Tensor(dkc.p, DType::BF16, {4, 1024});
+        w.v_conv    = glob ? Tensor(dvc.p, DType::BF16, {1024, 4}) : Tensor(dvc.p, DType::BF16, {4, 1024});
+        w.rel_table = Tensor(dtable.p, DType::BF16, {16, G::kRelTableRows});
+        {
+            Tensor proj(dproj.p, DType::BF16, {1024, 16});
+            ops::inkling_rel_proj_table(proj, w.rel_table, nullptr);
+        }
+        std::vector<std::uint16_t> zeros(static_cast<std::size_t>(kC) * 3, 0);
+        DeviceBuffer dstate = to_device(zeros), dslot = to_device_i32(std::vector<int>{0});
+        ops::InklingConvStateArgs conv;
+        conv.states = Tensor(dstate.p, DType::BF16, {kC, 3, 1});
+        conv.slots  = Tensor(dslot.p, DType::I32, {1});
+        Plane plane(1, pos[0] + T + 64, 0x7F, 99);
+        plane.upload();
+        DeviceBuffer dqo(static_cast<std::size_t>(T) * 3072 * 2), dro(static_cast<std::size_t>(T) * 384 * 2);
+        ops::InklingPrologueOutputs qr;
+        qr.q = Tensor(dqo.p, DType::BF16, {128, 24, T});
+        qr.r = Tensor(dro.p, DType::BF16, {16, 24, T});
+        const auto view = rows.view(pos[0] + T);
+        ops::inkling_attention_prologue(in, w, kind, view, conv, plane.view(), qr, nullptr);
+
+        WorkspaceArena work(ops::inkling_rel_attention_workspace_bytes(kind, T, 1, view.envelope) + 4096);
+        DeviceBuffer dof(static_cast<std::size_t>(T) * 3072 * 4), dl(static_cast<std::size_t>(T) * 24 * 4),
+            dy(static_cast<std::size_t>(T) * 3072 * 2), dgs(static_cast<std::size_t>(T) * 3072 * 2);
+        Tensor of(dof.p, DType::FP32, {128, 24, T}), lse(dl.p, DType::FP32, {24, T}), y(dy.p, DType::BF16, {3072, T});
+        const ops::InklingAttentionInputs ain{qr.q, qr.r, in.gate, in.sink, w.rel_table};
+        ops::inkling_rel_attention_out_lse(ain, kind, view, plane.view(), work, of, lse, nullptr);
+        ops::inkling_rel_attention(ain, kind, view, plane.view(), work, y, nullptr);
+        // gate_sink alone on vLLM's own out / lse: the same instructions, fusion off -> expected bit-exact.
+        DeviceBuffer dvo = dev("out"), dvl = dev("lse");
+        Tensor vo(dvo.p, DType::FP32, {128, 24, T}), vl(dvl.p, DType::FP32, {24, T}), gres(dgs.p, DType::BF16, {3072, T});
+        ops::inkling_gate_sink(vo, vl, in.gate, in.sink, gres, nullptr);
+        cuda_synchronize();
+        plane.download();
+
+        // q_out bits vs vLLM.
+        const auto bits_vs = [&](const char* what, const std::vector<std::uint16_t>& got, const CapTensor& ref,
+                                 double max_frac, bool exact) {
+            std::size_t off1 = 0, worse = 0;
+            for (std::size_t i = 0; i < got.size(); ++i) {
+                std::uint16_t r;
+                std::memcpy(&r, &ref.bytes[2 * i], 2);
+                const int d = ulp_distance_bf16(got[i], r);
+                off1 += d == 1;
+                worse += d > 1;
+            }
+            std::printf("%-44s %-10s vs vLLM: 1-ulp %zu / %zu, worse %zu\n", tag.c_str(), what, off1, got.size(), worse);
+            check(exact ? off1 + worse == 0 : (worse == 0 && off1 <= max_frac * static_cast<double>(got.size())),
+                  tag + " " + what);
+        };
+        bits_vs("q_out", from_device<std::uint16_t>(dqo, static_cast<std::size_t>(T) * 3072), ts.at("q_out"), 0.005, false);
+        bits_vs("gate_sink", from_device<std::uint16_t>(dgs, static_cast<std::size_t>(T) * 3072), ts.at("result"), 0.0, true);
+        bits_vs("gated", from_device<std::uint16_t>(dy, static_cast<std::size_t>(T) * 3072), ts.at("result"), 0.05, false);
+        // KV codes at every written position vs vLLM's cache rows.
+        std::size_t kv_off1 = 0, kv_worse = 0;
+        for (int which = 0; which < 2; ++which) {
+            const CapTensor& ref = ts.at(which ? "v_cache" : "k_cache");
+            for (int t = 0; t < T; ++t) {
+                for (int h = 0; h < 8; ++h) {
+                    const std::size_t off = plane.offset(0, pos[t], h);
+                    for (int d = 0; d < 128; ++d) {
+                        const std::uint8_t g = which ? plane.hv[off + d] : plane.hk[off + d];
+                        const int u = ulp_distance_e4m3(g, ref.bytes[(static_cast<std::size_t>(t) * 8 + h) * 128 + d]);
+                        kv_off1 += u == 1;
+                        kv_worse += u > 1;
+                    }
+                }
+            }
+        }
+        std::printf("%-44s %-10s vs vLLM: 1-ulp %zu / %d, worse %zu\n", tag.c_str(), "kv codes", kv_off1, 2 * T * 1024, kv_worse);
+        check(kv_worse == 0 && kv_off1 <= 0.005 * 2 * T * 1024, tag + " kv codes");
+        // Attention out / lse vs vLLM's prefill kernel (P rounded per 64-key block there, per 32-key block here).
+        const std::vector<double> go = from_device_f32(dof, static_cast<std::size_t>(T) * 3072);
+        std::vector<double> ro(go.size());
+        {
+            const std::vector<float> rf = ts.at("out").f32_values();
+            for (std::size_t i = 0; i < ro.size(); ++i) { ro[i] = rf[i]; }
+        }
+        check(verify_reduction(tag + " out vs vLLM", go, ro, kOutCriterion) == 0, tag + " out vs vLLM");
+        const std::vector<double> gl = from_device_f32(dl, static_cast<std::size_t>(T) * 24);
+        const std::vector<float> rl  = ts.at("lse").f32_values();
+        double lmax = 0.0;
+        for (std::size_t i = 0; i < gl.size(); ++i) { lmax = std::max(lmax, std::fabs(gl[i] - rl[i])); }
+        std::printf("%-44s %-10s vs vLLM: max|d| %.3e\n", tag.c_str(), "lse", lmax);
+        check(lmax <= kLseAbs, tag + " lse vs vLLM");
+        if (glob && ts.count("tau") != 0) {
+            DeviceBuffer dpos = to_device_i32(pos), dtau(static_cast<std::size_t>(T) * 4);
+            Tensor tp(dpos.p, DType::I32, {T}), tt(dtau.p, DType::FP32, {T});
+            ops::inkling_log_tau(tp, tt, nullptr);
+            cuda_synchronize();
+            const std::vector<float> gt = from_device<float>(dtau, T), rt = ts.at("tau").f32_values();
+            std::size_t bad = 0;
+            for (int i = 0; i < T; ++i) { bad += gt[i] != rt[i]; }
+            std::printf("%-44s %-10s vs vLLM: mismatches %zu / %d\n", tag.c_str(), "tau", bad, T);
+            check(bad == 0, tag + " tau vs vLLM");
+        }
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     if (cuda_unavailable()) {
         std::cout << "no CUDA device: skipped\n";
         return 77;
+    }
+    if (argc > 2 && std::string(argv[1]) == "capture") {
+        try {
+            run_capture(argv[2]);
+        } catch (const std::exception& e) {
+            std::cerr << "EXCEPTION " << e.what() << '\n';
+            return 1;
+        }
+        std::cout << (g_failures == 0 ? "CAPTURE ALL PASS\n" : "CAPTURE FAILED\n");
+        return g_failures == 0 ? 0 : 1;
     }
     const std::string only = argc > 1 ? argv[1] : "";
     const auto want = [&](const std::string& name) { return only.empty() || name.find(only) != std::string::npos; };
