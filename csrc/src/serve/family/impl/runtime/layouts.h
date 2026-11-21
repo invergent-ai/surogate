@@ -39,6 +39,9 @@ struct PersistentLayout {
     family::DecoderStateLayout decoder;
     family::DecoderCheckpointLayout checkpoints;
     std::optional<GdnReplayRecordLayout> replay_records;
+    /// A visit-schedule target's speculative verify records (family/impl/runtime/visit_round.h): the per-visit conv
+    /// state before a round ([visits][rows][channels x 3]) and the round's conv inputs ([rows][visits][width][channels]).
+    std::optional<LayoutRegion> visit_records;
     std::optional<DFlashPersistentLayout> dflash;
     family::RoundStateLayout round;
     TensorLayout prefill_hidden;

@@ -429,6 +429,18 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                                  : 0,
                      });
     }
+    // A visit-schedule target's verify records, planned so --kv-capacity auto counts them (were a DeviceBuffer).
+    if constexpr (family::visit_schedule<Variant>()) {
+        if (plan.speculative_backend != SpeculativeBackend::None) {
+            const LinearAttentionStatePoolSpec state = family::visit_state_spec_if<Variant>(plan.geometry, linear_state_slots);
+            const auto channels = static_cast<std::size_t>(state.conv_channels);
+            const auto visits   = static_cast<std::size_t>(state.layers);
+            const auto width    = static_cast<std::size_t>(plan.draft_window + 1U);
+            const auto rows     = static_cast<std::size_t>(decode_batch_capacity(plan.max_concurrency, plan.speculative_backend));
+            const std::size_t old_bytes = (channels * 3 * visits * rows * 2 + 255) & ~std::size_t{255};
+            out.visit_records = builder.add(old_bytes + channels * width * visits * rows * 2, 256, "visit records");
+        }
+    }
     if constexpr (Variant::supports_dflash) {
         if (plan.features.dflash()) {
             DFlashPersistentLayout& dflash = out.dflash.emplace();
