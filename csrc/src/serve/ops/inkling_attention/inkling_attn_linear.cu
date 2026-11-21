@@ -70,9 +70,17 @@ __device__ __forceinline__ int segment_of(const LinearParams& p, int block) {
 // bits do not depend on N (test: attn_linear width invariance).
 
 /// One chunk's two MMA steps into c: a token fragment pair (u: token gid, v: token gid + 8) and a code fragment w.
+/// Pinned = the volatile MMA (program order kept: a hand-written software pipeline); otherwise the compiler schedules.
+/// Same instruction, same bits.
+template <bool Pinned = false>
 __device__ __forceinline__ void chunk_steps(float (&c)[4], const uint4& u, const uint4& v, const int4& w) {
-    mma_bf16_nv(c[0], c[1], c[2], c[3], u.x, v.x, u.y, v.y, static_cast<unsigned>(w.x), static_cast<unsigned>(w.y));
-    mma_bf16_nv(c[0], c[1], c[2], c[3], u.z, v.z, u.w, v.w, static_cast<unsigned>(w.z), static_cast<unsigned>(w.w));
+    if constexpr (Pinned) {
+        mma_bf16(c[0], c[1], c[2], c[3], u.x, v.x, u.y, v.y, static_cast<unsigned>(w.x), static_cast<unsigned>(w.y));
+        mma_bf16(c[0], c[1], c[2], c[3], u.z, v.z, u.w, v.w, static_cast<unsigned>(w.z), static_cast<unsigned>(w.w));
+    } else {
+        mma_bf16_nv(c[0], c[1], c[2], c[3], u.x, v.x, u.y, v.y, static_cast<unsigned>(w.x), static_cast<unsigned>(w.y));
+        mma_bf16_nv(c[0], c[1], c[2], c[3], u.z, v.z, u.w, v.w, static_cast<unsigned>(w.z), static_cast<unsigned>(w.w));
+    }
 }
 
 /// Cell end: acc = fmaf(scale, part, acc) per element (rows 2 lid, 2 lid + 1 of the n8 tile = elements 0 / 2, 1 / 3),
@@ -97,13 +105,15 @@ __device__ __forceinline__ float cell_scale(const LinearSegment& s, int local, i
 }
 
 // ---- narrow: N <= 16 columns (decode, verify) ------------------------------------------------------------------------
-// A warp owns 8 weight rows (one n8 tile) and all N tokens (one m16 tile). Lane (gid, lid) streams row gid's codes,
-// 8 a chunk, through a register ring kNarrowDepth chunks deep (the first issued before the PDL wait: weights never
-// depend on the previous kernel), and reads tokens gid / gid + 8 of x (L1 / L2 resident; unconditional loads from a
-// clamped address, masked after, so the compiler can hoist them). Two cells run interleaved (independent chains).
-inline constexpr int kNarrowWarps = 2;
-inline constexpr int kNarrowRows  = kNarrowWarps * 8;
-inline constexpr int kNarrowDepth = 16;
+// A warp owns 8 weight rows (one n8 tile) and all N tokens (one m16 tile). Its rows are one contiguous slab of codes:
+// lane 0 asks L2 for the whole slab at entry (before the PDL wait: weights never depend on the previous kernel), so
+// every byte is in flight at once. Lane (gid, lid) then streams row gid's codes, 8 a chunk, through a register ring
+// kNarrowDepth chunks deep, and tokens gid / gid + 8 of x (L1 / L2 resident) through a ring kNarrowXDepth deep; the
+// loads and MMAs are pinned in this order (volatile), so the rings keep their distance. Two cells run interleaved.
+inline constexpr int kNarrowWarps  = 2;
+inline constexpr int kNarrowRows   = kNarrowWarps * 8;
+inline constexpr int kNarrowDepth  = 16;
+inline constexpr int kNarrowXDepth = 4;
 
 template <int K, bool PerRow>
 __global__ __launch_bounds__(kNarrowWarps * 32) void narrow_kernel(const LinearParams p) {
@@ -120,11 +130,16 @@ __global__ __launch_bounds__(kNarrowWarps * 32) void narrow_kernel(const LinearP
     // A row past the end re-reads the last row and writes nothing.
     const std::uint8_t* row = s.codes + static_cast<std::int64_t>(s.row_begin + min(local0 + gid, s.rows - 1)) * K + 8 * lid;
 
+    if (lane == 0) {
+        const int first = min(local0, s.rows - 1);
+        const int rows  = min(8, s.rows - first);
+        prefetch_l2_bulk(s.codes + static_cast<std::int64_t>(s.row_begin + first) * K, static_cast<unsigned>(rows * K));
+    }
     // Consumption order: cell pair (2 i, 2 i + 1), chunk j of the first then chunk j of the second, j = 0..3.
     const auto order = [](int t) { return (t >> 3) * 8 + ((t & 1) << 2) + ((t >> 1) & 3); };
     uint2 ring[kNarrowDepth];
 #pragma unroll
-    for (int i = 0; i < kNarrowDepth; ++i) { ring[i] = load_ldg<uint2>(row + 32 * order(i)); }
+    for (int i = 0; i < kNarrowDepth; ++i) { ring[i] = ldg_pinned_v2(row + 32 * order(i)); }
     pdl::wait_for_dependencies();
 
     const int n_tok         = p.columns;
@@ -133,6 +148,12 @@ __global__ __launch_bounds__(kNarrowWarps * 32) void narrow_kernel(const LinearP
     const __nv_bfloat16* x0 = s.x + static_cast<std::int64_t>(t0 ? gid : 0) * K + 8 * lid;
     const __nv_bfloat16* x1 = s.x + static_cast<std::int64_t>(t1 ? gid + 8 : 0) * K + 8 * lid;
     const auto mask         = [](uint4 v, bool ok) { return ok ? v : make_uint4(0, 0, 0, 0); };
+    uint4 xr0[kNarrowXDepth], xr1[kNarrowXDepth];
+#pragma unroll
+    for (int i = 0; i < kNarrowXDepth; ++i) {
+        xr0[i] = ldg_pinned_v4(x0 + 32 * order(i));
+        xr1[i] = ldg_pinned_v4(x1 + 32 * order(i));
+    }
     float acc[4]   = {0.0F, 0.0F, 0.0F, 0.0F};
     float part0[4] = {0.0F, 0.0F, 0.0F, 0.0F};
     float part1[4] = {0.0F, 0.0F, 0.0F, 0.0F};
@@ -140,14 +161,18 @@ __global__ __launch_bounds__(kNarrowWarps * 32) void narrow_kernel(const LinearP
     for (int t = 0; t < Chunks; ++t) {
         const int ch   = order(t);
         const uint2 cw = ring[t % kNarrowDepth];
-        if (t + kNarrowDepth < Chunks) { ring[t % kNarrowDepth] = load_ldg<uint2>(row + 32 * order(t + kNarrowDepth)); }
-        const int4 w  = e4m3x8_to_bf16x8(make_int2(static_cast<int>(cw.x), static_cast<int>(cw.y)));
-        const uint4 u = mask(load_ldg<uint4>(x0 + 32 * ch), t0);
-        const uint4 v = mask(load_ldg<uint4>(x1 + 32 * ch), t1);
+        if (t + kNarrowDepth < Chunks) { ring[t % kNarrowDepth] = ldg_pinned_v2(row + 32 * order(t + kNarrowDepth)); }
+        const uint4 u = mask(xr0[t % kNarrowXDepth], t0);
+        const uint4 v = mask(xr1[t % kNarrowXDepth], t1);
+        if (t + kNarrowXDepth < Chunks) {
+            xr0[t % kNarrowXDepth] = ldg_pinned_v4(x0 + 32 * order(t + kNarrowXDepth));
+            xr1[t % kNarrowXDepth] = ldg_pinned_v4(x1 + 32 * order(t + kNarrowXDepth));
+        }
+        const int4 w = e4m3x8_to_bf16x8(make_int2(static_cast<int>(cw.x), static_cast<int>(cw.y)));
         if ((t & 1) == 0) {
-            chunk_steps(part0, u, v, w);
+            chunk_steps<true>(part0, u, v, w);
         } else {
-            chunk_steps(part1, u, v, w);
+            chunk_steps<true>(part1, u, v, w);
         }
         if ((t & 7) == 7) { // both cells of the pair complete: join them in cell order
             const int c0 = ch >> 2; // = the second cell

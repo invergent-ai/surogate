@@ -101,6 +101,23 @@ __device__ __forceinline__ void mma_bf16_nv(float& c0, float& c1, float& c2, flo
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
+/// Ask L2 to fetch [ptr, ptr + bytes) (bytes a multiple of 16; no registers, no shared memory, no completion to wait for).
+__device__ __forceinline__ void prefetch_l2_bulk(const void* ptr, unsigned bytes) {
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(ptr), "r"(bytes) : "memory");
+}
+
+/// Non-coherent global loads the compiler may not move (a register ring's distance stays as written).
+__device__ __forceinline__ uint2 ldg_pinned_v2(const void* ptr) {
+    uint2 v;
+    asm volatile("ld.global.nc.v2.u32 {%0, %1}, [%2];" : "=r"(v.x), "=r"(v.y) : "l"(ptr));
+    return v;
+}
+__device__ __forceinline__ uint4 ldg_pinned_v4(const void* ptr) {
+    uint4 v;
+    asm volatile("ld.global.nc.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(ptr));
+    return v;
+}
+
 /// The reference's `_sigmoid` (ops/attention.py): rcp.approx(ex2.approx(-x * log2 e) + 1).
 __device__ __forceinline__ float ref_sigmoid(float x) {
     return ptx_rcp(__fadd_rn(ptx_ex2(__fmul_rn(-x, kLog2e)), 1.0F));

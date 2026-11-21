@@ -47,6 +47,7 @@ inline constexpr int kRowBytes    = Geo::kHeadDim * 2;  // a bf16 tile row
 inline constexpr int kPrefillRows = 64;                 // query columns of one prefill CTA (4 row tiles)
 inline constexpr int kMaxWorkers  = 64;
 inline constexpr int kSmemLimit   = 101376;             // sm_120 opt-in shared memory per block
+inline constexpr int kL2Ahead     = 4;                  // blocks whose K / V pages are asked of L2 ahead of their loads
 
 enum Mode : int { kGated = 0, kOutLse = 1, kPartial = 2 };
 
@@ -572,6 +573,13 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
     Cursor ld, cu;
     start(ld, g_start);
     start(cu, g_start);
+    // Ask L2 for a block's K and V page slices (8 KB each, contiguous): one thread each, no registers.
+    const auto prefetch_block_l2 = [&](int kb) {
+        if (tid == 0 || tid == 32) {
+            const std::int64_t off = kv_page_offset(table_row[(kb * kBn) >> kPageShift], kvh, 0);
+            prefetch_l2_bulk((tid == 0 ? p.k_pages : p.v_pages) + off, kBn * Geo::kHeadDim);
+        }
+    };
     if constexpr (Raw == 0) {
         // Register staging (decode / verify): the next block's codes are loaded into registers while the current one
         // is computed, then widened into the tiles; no raw ring, so two CTAs fit an SM.
@@ -591,11 +599,24 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
                 rv[i] = ok ? load_ldg<int2>(p.v_pages + o) : make_int2(0, 0);
             }
         };
+        Cursor pf;
+        start(pf, g_start);
+#pragma unroll
+        for (int i = 0; i < kL2Ahead; ++i) {
+            if (pf.g < g_stop) {
+                prefetch_block_l2(pf.kb);
+                advance(pf);
+            }
+        }
         if (ld.g < g_stop) {
             load_raw(ld.kb);
             advance(ld);
         }
         while (cu.g < g_stop) {
+            if (pf.g < g_stop) {
+                prefetch_block_l2(pf.kb);
+                advance(pf);
+            }
             __syncthreads(); // every warp is done with the previous block's tiles
 #pragma unroll
             for (int i = 0; i < NR; ++i) {
@@ -626,8 +647,20 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
             }
             cp_commit();
         }
+        Cursor pf = ld;
+#pragma unroll
+        for (int i = 0; i + 1 < kL2Ahead; ++i) {
+            if (pf.g < g_stop) {
+                prefetch_block_l2(pf.kb);
+                advance(pf);
+            }
+        }
         int it = 0;
         while (cu.g < g_stop) {
+            if (pf.g < g_stop) {
+                prefetch_block_l2(pf.kb);
+                advance(pf);
+            }
             const int slot = it % Raw;
             cp_wait<Raw - 1>();
             __syncthreads(); // block visible; every warp is done with the previous tiles
