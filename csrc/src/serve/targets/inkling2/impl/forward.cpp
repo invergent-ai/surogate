@@ -9,7 +9,9 @@
 #include "targets/inkling2/impl/visits.h"
 #include "targets/inkling2/impl/naive/naive.h"
 
+#include "api/ops/inkling_attention.h"
 #include "api/ops/inkling_mix.h"
+#include "api/ops/inkling_moe.h"
 #include "core/device.h"
 
 #include <algorithm>
@@ -44,6 +46,22 @@ ops::InklingPlane packed(const Tensor& t, int column = 0, std::int64_t width = D
     const std::size_t element = t.dtype == DType::FP32 ? 4 : 2;
     return {static_cast<std::byte*>(t.data) + (static_cast<std::int64_t>(column) * width + offset) * element,
             t.dtype, width};
+}
+
+/// SUROGATE_SERVE_INKLING_NAIVE=1: the naive attention / MoE kernels instead of lanes c / d's ops (A/B checks only).
+bool use_naive() {
+    static const bool naive = std::getenv("SUROGATE_SERVE_INKLING_NAIVE") != nullptr;
+    return naive;
+}
+
+/// A view whose leading dims are contiguous and whose LAST dim (the columns) steps by `column_elems` elements.
+Tensor column_view(void* data, DType dtype, std::initializer_list<std::int32_t> dims, std::int64_t column_elems) {
+    Tensor t(data, dtype, dims);
+    const std::int64_t element = dtype == DType::FP32 ? 4 : 2;
+    const int last             = static_cast<int>(dims.size()) - 1;
+    t.nb[last]                 = column_elems * element;
+    for (int i = last + 1; i < 4; ++i) { t.nb[i] = t.nb[i - 1] * t.ne[i - 1]; }
+    return t;
 }
 
 /// A [2304, T] view of one stack slot as a strided Tensor (feature capture).
@@ -346,6 +364,64 @@ naive::MoeLayer moe_layer(const load::InklingLayerWeights& L) {
     return out;
 }
 
+ops::InklingAttentionWeights attention_weights(const Round& rd, const load::InklingLayerWeights& L) {
+    ops::InklingAttentionWeights w;
+    w.q_scale   = L.q_scale;
+    w.r_scale   = L.r_scale;
+    w.k_conv    = L.global ? L.k_conv_static : L.k_conv;
+    w.v_conv    = L.global ? L.v_conv_static : L.v_conv;
+    w.rel_table = rd.q.rel_table.at(static_cast<std::size_t>(L.layer));
+    return w;
+}
+
+/// The visit's KV plane as lane c's batch view (a single-sequence prefill's one block table as a 1-row matrix).
+PagedKVBatchLayerView kv_batch_view(const Round& rd, int visit) {
+    if (!rd.r.sequence_kv.valid()) { return rd.r.text_kv->batch_layer_view(static_cast<std::uint32_t>(visit)); }
+    const PagedKVLayerView v = rd.r.sequence_kv.layer_view(static_cast<std::uint32_t>(visit));
+    PagedKVBatchLayerView out;
+    out.k_pages       = v.k_pages;
+    out.v_pages       = v.v_pages;
+    out.k_scale_pages = v.k_scale_pages;
+    out.v_scale_pages = v.v_scale_pages;
+    out.block_tables  = Tensor(v.block_table.data, DType::I32, {static_cast<std::int32_t>(v.block_table.ne[0]), 1});
+    out.head_dim      = v.head_dim;
+    out.num_kv_heads  = v.num_kv_heads;
+    out.dtype         = v.dtype;
+    out.quant_group   = v.quant_group;
+    return out;
+}
+
+/// Visit v's slice of the verify records' inputs: BF16 [6656, W_max, B] ([b][visit][j][channel] in memory).
+Tensor records_view(const Round& rd, int visit, int batch) {
+    Tensor t(static_cast<std::uint16_t*>(rd.records.inputs) +
+                 static_cast<std::int64_t>(visit) * rd.records.width_max * kConvChannels,
+             DType::BF16, {kConvChannels, rd.records.width_max, batch});
+    t.nb[1] = static_cast<std::int64_t>(kConvChannels) * 2;
+    t.nb[2] = static_cast<std::int64_t>(rd.records.visits) * rd.records.width_max * kConvChannels * 2;
+    t.nb[3] = t.nb[2] * batch;
+    return t;
+}
+
+ops::InklingMoeWeights moe_weights(const load::InklingLayerWeights& L) {
+    const auto bank = [](const load::ExpertBank& b) {
+        if (!b.gate_up_interleaved) { throw std::logic_error("inkling2: the MoE reads the interleaved w13 rows only"); }
+        ops::InklingExpertBank out;
+        out.codes     = b.codes;
+        out.scales    = b.scales;
+        out.amax      = b.amax;
+        out.outer_den = b.outer_scale_denominator;
+        return out;
+    };
+    ops::InklingMoeWeights w;
+    w.format      = L.w13.format == load::ExpertFormat::Mxfp8 ? ops::InklingExpertFormat::Mxfp8
+                                                               : ops::InklingExpertFormat::Nvfp4;
+    w.router      = L.router.qdata;
+    w.router_bias = L.router_bias;
+    w.w13         = bank(L.w13);
+    w.w2          = bank(L.w2);
+    return w;
+}
+
 void run_visit(Round& rd, int v) {
     const VisitInfo& vi                 = kVisits[static_cast<std::size_t>(v)];
     const load::InklingLayerWeights& L  = *rd.model.full_layers.at(static_cast<std::size_t>(v)).projection.layer;
@@ -400,62 +476,116 @@ void run_visit(Round& rd, int v) {
         ops::inkling_gemm_inv_group(std::span<const ops::InklingGemmProblem>(problems, static_cast<std::size_t>(count)),
                                     static_cast<std::int32_t>(k), T, DType::BF16, s);
     }
-    // 3. attention per group (NAIVE)
-    Tensor q_out = rd.work.alloc(DType::BF16, {C::attn_width, T});
-    Tensor r_out = rd.work.alloc(DType::BF16, {C::query_heads * C::d_rel, T});
+    // 3. attention per group: lane c's invariant op (prologue: K / V conv + cache write; relative attention; gate and
+    //    sink). The K / V conv state is its: in place, recorded (verify), or captured at a rewrite checkpoint.
     Tensor gated = rd.work.alloc(DType::BF16, {C::attn_width, T});
-    const ops::InklingConvStateView state = state_view(rd, v);
-    const PlaneView plane                 = plane_view(rd, v);
-    const auto kv_input = [&](int column, int row_base) {
-        return ops::InklingPlane{bf16_ptr(qkvr) + static_cast<std::int64_t>(column) * C::qkvr_rows + row_base,
-                                 DType::BF16, C::qkvr_rows};
-    };
-    for (const Group& g : rd.groups) {
-        const auto rows = g.rows();
-        const family::VisitSegment* seg = g.segment;
-        if (seg != nullptr && seg->checkpoint_slot >= 0) {
-            ops::inkling_conv_capture_window(kv_input(g.column, C::qkvr_k_begin), 1024, rows, state, G::kStreamK,
-                                             seg->checkpoint_column, seg->checkpoint_slot, s);
-            ops::inkling_conv_capture_window(kv_input(g.column, C::qkvr_v_begin), 1024, rows, state, G::kStreamV,
-                                             seg->checkpoint_column, seg->checkpoint_slot, s);
+    if (use_naive()) {
+        Tensor q_out = rd.work.alloc(DType::BF16, {C::attn_width, T});
+        Tensor r_out = rd.work.alloc(DType::BF16, {C::query_heads * C::d_rel, T});
+        const ops::InklingConvStateView state = state_view(rd, v);
+        const PlaneView plane                 = plane_view(rd, v);
+        const auto kv_input = [&](int column, int row_base) {
+            return ops::InklingPlane{bf16_ptr(qkvr) + static_cast<std::int64_t>(column) * C::qkvr_rows + row_base,
+                                     DType::BF16, C::qkvr_rows};
+        };
+        for (const Group& g : rd.groups) {
+            const auto rows = g.rows();
+            const family::VisitSegment* seg = g.segment;
+            if (seg != nullptr && seg->checkpoint_slot >= 0) {
+                ops::inkling_conv_capture_window(kv_input(g.column, C::qkvr_k_begin), 1024, rows, state, G::kStreamK,
+                                                 seg->checkpoint_column, seg->checkpoint_slot, s);
+                ops::inkling_conv_capture_window(kv_input(g.column, C::qkvr_v_begin), 1024, rows, state, G::kStreamV,
+                                                 seg->checkpoint_column, seg->checkpoint_slot, s);
+            }
+            naive::AttentionCall call;
+            call.qkvr         = bf16_ptr(qkvr) + static_cast<std::int64_t>(g.column) * C::qkvr_rows;
+            call.qkvr_stride  = C::qkvr_rows;
+            call.width        = g.width;
+            call.batch        = g.batch;
+            call.positions    = static_cast<const std::int32_t*>(g.positions.data);
+            call.valid        = static_cast<const std::int32_t*>(g.valid.data);
+            call.table_rows   = static_cast<const std::int32_t*>(g.table_rows.data);
+            call.block_tables = plane.block_tables;
+            call.table_stride = plane.table_stride;
+            call.k_pages      = plane.k_pages;
+            call.v_pages      = plane.v_pages;
+            call.fp8          = plane.fp8;
+            call.layer        = attention_layer(L);
+            if (vi.global) {
+                call.k_dyn      = bf16_ptr(k_dyn) + static_cast<std::int64_t>(g.column) * 32;
+                call.v_dyn      = bf16_ptr(v_dyn) + static_cast<std::int64_t>(g.column) * 32;
+                call.dyn_stride = 32;
+            }
+            call.state       = state.base;
+            call.slot_stride = state.slot_stride;
+            call.tap_stride  = state.tap_stride;
+            call.slots       = static_cast<const std::int32_t*>(g.slots.data);
+            call.q_out       = bf16_ptr(q_out) + static_cast<std::int64_t>(g.column) * C::attn_width;
+            call.r_out       = bf16_ptr(r_out) + static_cast<std::int64_t>(g.column) * C::query_heads * C::d_rel;
+            call.out         = bf16_ptr(gated) + static_cast<std::int64_t>(g.column) * C::attn_width;
+            naive::attention(call, s);
+            if (g.record) {
+                ops::inkling_conv_record(kv_input(g.column, C::qkvr_k_begin), 1024, g.width, g.batch, v, G::kStreamK,
+                                         rd.records, s);
+                ops::inkling_conv_record(kv_input(g.column, C::qkvr_v_begin), 1024, g.width, g.batch, v, G::kStreamV,
+                                         rd.records, s);
+            }
+            ops::inkling_conv_update_window(kv_input(g.column, C::qkvr_k_begin), 1024, rows, state, G::kStreamK, s);
+            ops::inkling_conv_update_window(kv_input(g.column, C::qkvr_v_begin), 1024, rows, state, G::kStreamV, s);
+            if (seg != nullptr && seg->capture_slot >= 0) {
+                ops::inkling_conv_copy_slot(state, G::kStreamK, 2048, seg->state_slot, seg->capture_slot, s);
+            }
         }
-        naive::AttentionCall call;
-        call.qkvr         = bf16_ptr(qkvr) + static_cast<std::int64_t>(g.column) * C::qkvr_rows;
-        call.qkvr_stride  = C::qkvr_rows;
-        call.width        = g.width;
-        call.batch        = g.batch;
-        call.positions    = static_cast<const std::int32_t*>(g.positions.data);
-        call.valid        = static_cast<const std::int32_t*>(g.valid.data);
-        call.table_rows   = static_cast<const std::int32_t*>(g.table_rows.data);
-        call.block_tables = plane.block_tables;
-        call.table_stride = plane.table_stride;
-        call.k_pages      = plane.k_pages;
-        call.v_pages      = plane.v_pages;
-        call.fp8          = plane.fp8;
-        call.layer        = attention_layer(L);
-        if (vi.global) {
-            call.k_dyn      = bf16_ptr(k_dyn) + static_cast<std::int64_t>(g.column) * 32;
-            call.v_dyn      = bf16_ptr(v_dyn) + static_cast<std::int64_t>(g.column) * 32;
-            call.dyn_stride = 32;
-        }
-        call.state       = state.base;
-        call.slot_stride = state.slot_stride;
-        call.tap_stride  = state.tap_stride;
-        call.slots       = static_cast<const std::int32_t*>(g.slots.data);
-        call.q_out       = bf16_ptr(q_out) + static_cast<std::int64_t>(g.column) * C::attn_width;
-        call.r_out       = bf16_ptr(r_out) + static_cast<std::int64_t>(g.column) * C::query_heads * C::d_rel;
-        call.out         = bf16_ptr(gated) + static_cast<std::int64_t>(g.column) * C::attn_width;
-        naive::attention(call, s);
-        if (g.record) {
-            ops::inkling_conv_record(kv_input(g.column, C::qkvr_k_begin), 1024, g.width, g.batch, v, G::kStreamK,
-                                     rd.records, s);
-            ops::inkling_conv_record(kv_input(g.column, C::qkvr_v_begin), 1024, g.width, g.batch, v, G::kStreamV,
-                                     rd.records, s);
-        }
-        ops::inkling_conv_update_window(kv_input(g.column, C::qkvr_k_begin), 1024, rows, state, G::kStreamK, s);
-        ops::inkling_conv_update_window(kv_input(g.column, C::qkvr_v_begin), 1024, rows, state, G::kStreamV, s);
-        if (seg != nullptr && seg->capture_slot >= 0) {
-            ops::inkling_conv_copy_slot(state, G::kStreamK, 2048, seg->state_slot, seg->capture_slot, s);
+    } else {
+        const ops::InklingAttentionWeights aw = attention_weights(rd, L);
+        const ops::InklingLayerKind kind      = vi.global ? ops::InklingLayerKind::Global : ops::InklingLayerKind::Local;
+        const PagedKVBatchLayerView cache     = kv_batch_view(rd, v);
+        const ops::InklingConvStateView state = state_view(rd, v);
+        Tensor states                         = rd.r.state->conv.at(static_cast<std::size_t>(v));
+        using AG                              = ops::InklingAttentionGeometry;
+        for (const Group& g : rd.groups) {
+            const family::VisitSegment* seg = g.segment;
+            const std::int32_t n            = g.width * g.batch;
+            auto* base = bf16_ptr(qkvr) + static_cast<std::int64_t>(g.column) * C::qkvr_rows;
+            ops::InklingProjections pr;
+            pr.q    = column_view(base + AG::kRowsQ, DType::BF16, {C::head_dim, C::query_heads, n}, C::qkvr_rows);
+            pr.r    = column_view(base + AG::kRowsR, DType::BF16, {C::d_rel, C::query_heads, n}, C::qkvr_rows);
+            pr.gate = column_view(base + AG::kRowsGate, DType::BF16, {C::attn_width, n}, C::qkvr_rows);
+            pr.sink = column_view(base + AG::kRowsSink, DType::BF16, {C::query_heads, n}, C::qkvr_rows);
+            pr.k    = column_view(base + AG::kRowsK, DType::BF16, {1024, n}, C::qkvr_rows);
+            pr.v    = column_view(base + AG::kRowsV, DType::BF16, {1024, n}, C::qkvr_rows);
+            if (vi.global) {
+                pr.k_dyn = column_view(bf16_ptr(k_dyn) + static_cast<std::int64_t>(g.column) * 32, DType::BF16,
+                                       {4, C::kv_heads, n}, 32);
+                pr.v_dyn = column_view(bf16_ptr(v_dyn) + static_cast<std::int64_t>(g.column) * 32, DType::BF16,
+                                       {4, C::kv_heads, n}, 32);
+            }
+            ops::InklingAttentionRows rows;
+            rows.positions     = g.positions;
+            rows.valid_columns = g.valid;
+            rows.kv_table_rows = g.table_rows;
+            if (rd.r.block != nullptr && seg == nullptr) {
+                rows.envelope = rd.r.block->envelope;
+            } else {
+                rows.envelope.max_visible_keys = rd.r.max_visible_keys;
+            }
+            ops::InklingConvStateArgs conv;
+            conv.states = states;
+            conv.slots  = g.slots;
+            conv.mode   = g.record ? ops::InklingConvMode::Record : ops::InklingConvMode::InPlace;
+            if (g.record) { conv.records = records_view(rd, v, g.batch); }
+            if (seg != nullptr && seg->checkpoint_slot >= 0) {
+                conv.capture_column = seg->checkpoint_column;
+                conv.capture_slot   = seg->checkpoint_slot;
+            }
+            conv.k_offset = G::kStreamK;
+            conv.v_offset = G::kStreamV;
+            Tensor out(bf16_ptr(gated) + static_cast<std::int64_t>(g.column) * C::attn_width, DType::BF16,
+                       {C::attn_width, n});
+            ops::inkling_attention(pr, aw, kind, rows, conv, cache, rd.work, out, s);
+            if (seg != nullptr && seg->capture_slot >= 0) {
+                ops::inkling_conv_copy_slot(state, G::kStreamK, 2048, seg->state_slot, seg->capture_slot, s);
+            }
         }
     }
     dump("qkvr", v, qkvr.data, DType::BF16, C::qkvr_rows, C::qkvr_rows, T, 1, s);
@@ -482,17 +612,32 @@ void run_visit(Round& rd, int v) {
     Tensor mlp_in = rd.work.alloc(DType::BF16, {D, T, 1});
     mlp_input(rd, vi, L, attn_out, mlp_in);
     dump("mlp_in", v, mlp_in.data, DType::BF16, D, D, T, 1, s);
-    // 7. MoE (NAIVE), routed experts captured per VISIT
+    // 7. MoE: lane d's op (routing, NVFP4 four-over-six / MXFP8 activations, experts, combine); routed experts
+    //    captured per VISIT
     Tensor moe_out = rd.work.alloc(DType::BF16, {D, T});
-    naive::MoeCall moe;
-    moe.x      = mlp_in.data;
-    moe.tokens = T;
-    moe.layer  = moe_layer(L);
-    moe.out    = moe_out.data;
-    if (rd.r.routing.ids != nullptr && T <= rd.r.routing.columns) {
-        moe.capture = rd.r.routing.ids + static_cast<std::int64_t>(v) * rd.r.routing.columns * rd.r.routing.top_k;
+    if (use_naive()) {
+        naive::MoeCall moe;
+        moe.x      = mlp_in.data;
+        moe.tokens = T;
+        moe.layer  = moe_layer(L);
+        moe.out    = moe_out.data;
+        if (rd.r.routing.ids != nullptr && T <= rd.r.routing.columns) {
+            moe.capture = rd.r.routing.ids + static_cast<std::int64_t>(v) * rd.r.routing.columns * rd.r.routing.top_k;
+        }
+        naive::moe(moe, rd.work, s);
+    } else {
+        ops::InklingMoeCapture capture;
+        ops::InklingMoeOptions options;
+        if (rd.r.routing.ids != nullptr && T <= rd.r.routing.columns) {
+            capture.ids             = rd.r.routing.ids + static_cast<std::int64_t>(v) * rd.r.routing.columns * rd.r.routing.top_k;
+            capture.capacity_tokens = rd.r.routing.columns;
+            capture.first_token     = 0;
+            capture.token_stride    = rd.r.routing.top_k;
+            options.capture         = &capture;
+        }
+        const Tensor x(mlp_in.data, DType::BF16, {D, T});
+        ops::inkling_moe(x, moe_weights(L), moe_out, rd.work, s, options);
     }
-    naive::moe(moe, rd.work, s);
     dump("moe_out", v, moe_out.data, DType::BF16, D, D, T, 1, s);
     // 8. MLP-output conv: (residual + attn_out) + conv(moe_out) into the next partial (in place when not first)
     for (const Group& g : rd.groups) {
@@ -624,7 +769,8 @@ void Variant::run_visits(const ModelView& model, family::VisitRound& r) {
 }
 
 std::size_t Variant::visit_workspace_capacity_bytes(const family::TextGeometry&, family::TextPhase, std::int32_t batch_size,
-                                                    std::int32_t max_width, std::int32_t max_columns, std::uint32_t) {
+                                                    std::int32_t max_width, std::int32_t max_columns,
+                                                    std::uint32_t max_visible_keys) {
     const auto up = [](std::size_t bytes) { return (bytes + 255U) & ~std::size_t{255}; };
     const std::size_t T    = static_cast<std::size_t>(std::max<std::int32_t>(max_columns, std::max(batch_size, 1) * std::max(max_width, 1)));
     const std::size_t tile = std::min<std::size_t>(T, kTileColumns);
@@ -640,7 +786,25 @@ std::size_t Variant::visit_workspace_capacity_bytes(const family::TextGeometry&,
              up(tile * 2 * D * 3 * 4) + up(tile * D * 3 * 2);
     // the invariant GEMM's split partials: the controller `down` of a blend tile (the taps run unsplit in the group)
     bytes += up(ops::inkling_gemm_inv_workspace_bytes(C::gate_rank, 2 * D, static_cast<std::int32_t>(tile), 3));
-    bytes += naive::moe_workspace_bytes(static_cast<std::int32_t>(T));
+    // lanes c / d's ops (and the naive kernels behind SUROGATE_SERVE_INKLING_NAIVE); attention and MoE both counted
+    ops::GqaExecutionEnvelope envelope;
+    envelope.max_visible_keys = max_visible_keys;
+    std::size_t attention     = 0;
+    for (const auto kind : {ops::InklingLayerKind::Local, ops::InklingLayerKind::Global}) {
+        if (max_columns > 0) {
+            attention = std::max(attention, ops::inkling_attention_workspace_capacity_bytes(kind, 1, 1, max_columns, envelope));
+        }
+        if (batch_size > 0 && max_width > 0) {
+            attention = std::max(attention, ops::inkling_attention_workspace_capacity_bytes(kind, batch_size, 1, max_width,
+                                                                                            envelope));
+        }
+    }
+    const std::size_t moe = std::max({ops::inkling_moe_workspace_bytes(ops::InklingExpertFormat::Nvfp4,
+                                                                       static_cast<std::int32_t>(T), false),
+                                      ops::inkling_moe_workspace_bytes(ops::InklingExpertFormat::Mxfp8,
+                                                                       static_cast<std::int32_t>(T), false),
+                                      naive::moe_workspace_bytes(static_cast<std::int32_t>(T))});
+    bytes += up(attention) + up(moe);
     return bytes + (1U << 20);
 }
 
