@@ -6,8 +6,21 @@
 // expert's routed slots, the weight rows start at the tile's expert, and the epilogues apply the
 // per-row output scale (x_amax * w_amax[e]) * rcp_rn(1536 * den) of `ops/moe.py` `_row_scales`.
 
+//
+// Two kernels share that arithmetic (bit-identical rows; only the tiling differs):
+// - `nvfp4_expert_gemm_kernel`: one CTA per (expert tile, N tile), all warps load and compute
+//   (narrow decode / verify widths);
+// - `nvfp4_expert_gemm_persistent`: prefill. One CTA per SM loops over the round's (expert tile,
+//   N tile) items, expert-major with N inner. A producer warp streams the gathered token rows and
+//   the expert's weight rows with cp.async into a ring of stages (completion signalled on an
+//   mbarrier per stage, `cp.async.mbarrier.arrive.noinc`); 8 consumer warps (64 x 64 warp tiles)
+//   run the same m16n8k64 chain per output and release each stage on a second mbarrier. Warps
+//   skip MMAs of 16-row groups past the tile's last routed row (those rows are never stored).
+
 #include "core/pdl.cuh"
+#include "ops/kernel/func_attribute.cuh"
 #include "ops/linear/nvfp4/nvfp4_w4a4_mma.cuh"
+#include "ops/linear/nvfp4/nvfp4_w4a4_tma.cuh"
 #include "ops/sparse_moe/inkling/inkling_gemm_common.cuh"
 #include "ops/sparse_moe/inkling/inkling_moe_internal.h"
 #include "ops/sparse_moe/inkling/inkling_numerics.cuh"
@@ -17,11 +30,54 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
 namespace sinfer::ops::detail::inkling {
 namespace {
+
+/// One routed row's outputs of one MMA row group (`half` = accumulator rows +0 / +8): scale,
+/// adapter delta, then SiTU -> y (gate_up) or the bf16 down row. `n_first` = the output row of
+/// mma_n 0 for this lane (n_begin + warp offset + accumulator column).
+template <bool GateUp, int MmaN>
+__device__ __forceinline__ void store_routed_row(const GemmParams& p, int expert, int slot, int source_row,
+                                                 float weight_amax, float rcp_denominator, int n_first,
+                                                 const float (&acc)[MmaN][4], int half) {
+    const float row_scale = __fmul_rn(__fmul_rn(p.a_amax[source_row], weight_amax), rcp_denominator);
+    const int adapter     = lora_slot_of(p.lora, slot >> 3);
+    const float* low = adapter >= 0 ? p.lora.low + static_cast<std::int64_t>(slot) * p.lora.low_stride : nullptr;
+#pragma unroll
+    for (int mma_n = 0; mma_n < MmaN; ++mma_n) {
+        const int n  = n_first + mma_n * 8;
+        float value0 = __fmul_rn(acc[mma_n][2 * half], row_scale);
+        float value1 = __fmul_rn(acc[mma_n][2 * half + 1], row_scale);
+        if constexpr (GateUp) {
+            const int column = n >> 1;
+            if (adapter >= 0) {
+                const LoraBank& gate = lora_bank(p.lora, expert, 0);
+                const LoraBank& up   = lora_bank(p.lora, expert, 1);
+                value0 = __fadd_rn(value0, lora_expand(gate, adapter, column, low));
+                value1 = __fadd_rn(value1, lora_expand(up, adapter, column, low + gate.rank));
+            }
+            if (p.gate_up_tap != nullptr) {
+                *reinterpret_cast<__nv_bfloat162*>(p.gate_up_tap + static_cast<std::int64_t>(slot) * kGateUpRows + n) =
+                    __floats2bfloat162_rn(value0, value1);
+            }
+            p.out[static_cast<std::int64_t>(slot) * kIntermediate + column] =
+                situ(round_bf16(value0), round_bf16(value1), p.gammas[slot]);
+        } else {
+            if (adapter >= 0) {
+                const LoraBank& down = lora_bank(p.lora, expert, 2);
+                value0 = __fadd_rn(value0, lora_expand(down, adapter, n, low));
+                value1 = __fadd_rn(value1, lora_expand(down, adapter, n + 1, low));
+            }
+            *reinterpret_cast<__nv_bfloat162*>(p.out + static_cast<std::int64_t>(slot) * kHidden + n) =
+                __floats2bfloat162_rn(value0, value1);
+        }
+    }
+}
 
 template <int K>
 struct Nvfp4Geometry {
@@ -201,38 +257,318 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
             const int local_row = warp_m * Schedule::kWarpM + mma_m * 16 + accumulator_row + 8 * half;
             const int slot      = slots[local_row];
             if (slot < 0) { continue; }
-            const float row_scale =
-                __fmul_rn(__fmul_rn(p.a_amax[source_rows[local_row]], weight_amax), rcp_denominator);
-            const int adapter = lora_slot_of(p.lora, slot >> 3);
-            const float* low  = adapter >= 0 ? p.lora.low + static_cast<std::int64_t>(slot) * p.lora.low_stride : nullptr;
+            store_routed_row<GateUp, Schedule::kMmaN>(p, expert, slot, source_rows[local_row], weight_amax,
+                                                      rcp_denominator,
+                                                      n_begin + warp_n * Schedule::kWarpN + accumulator_col,
+                                                      accumulators[mma_m], half);
+        }
+    }
+#endif
+}
+
+// ---------------------------------------------------------------------------------------------
+// Persistent prefill kernel.
+// ---------------------------------------------------------------------------------------------
+template <int BlockM, int BlockN, int WarpsM, int WarpsN, int Stages>
+struct PersistentSchedule {
+    static constexpr int kBlockM         = BlockM; ///< token rows (MMA operand A)
+    static constexpr int kBlockN         = BlockN; ///< weight rows (operand B)
+    static constexpr int kBlockK         = 128;
+    static constexpr int kStages         = Stages;
+    static constexpr int kWarpsM         = WarpsM;
+    static constexpr int kWarpsN         = WarpsN;
+    static constexpr int kConsumerWarps  = WarpsM * WarpsN;
+    static constexpr int kConsumerThreads = kConsumerWarps * 32;
+    static constexpr int kThreads        = kConsumerThreads + 32; ///< + one producer warp
+    static constexpr int kWarpM          = BlockM / WarpsM;
+    static constexpr int kWarpN          = BlockN / WarpsN;
+    static constexpr int kMmaM           = kWarpM / 16;
+    static constexpr int kMmaN           = kWarpN / 8;
+    static constexpr int kK64PerStage    = kBlockK / 64;
+    static constexpr int kCodeRowBytes   = kBlockK / 2; ///< 64
+    static constexpr int kSegmentsPerRow = kCodeRowBytes / 16;
+    static constexpr int kNTiles         = kGateUpRows / BlockN;
+    static constexpr int kScaleRowTiles  = BlockN / 128;
+    static_assert(kGateUpRows % BlockN == 0 && BlockN % 128 == 0);
+    static_assert(kWarpM % 16 == 0 && kWarpN % 8 == 0);
+    static_assert(kSegmentsPerRow == 4);
+};
+
+template <class Schedule>
+struct PersistentStorage {
+    alignas(128) std::uint8_t a_codes[Schedule::kStages][Schedule::kBlockM * Schedule::kCodeRowBytes];
+    alignas(128) std::uint8_t b_codes[Schedule::kStages][Schedule::kBlockN * Schedule::kCodeRowBytes];
+    alignas(16) std::uint32_t a_scale4[Schedule::kStages][Schedule::kBlockM * Schedule::kK64PerStage];
+    alignas(16) std::uint8_t b_scales[Schedule::kStages][Schedule::kBlockN * Schedule::kK64PerStage * 4];
+    alignas(8) std::uint64_t full[Schedule::kStages];
+    alignas(8) std::uint64_t empty[Schedule::kStages];
+    int tile_prefix[kExperts + 1]; ///< exclusive prefix of BlockM tiles per expert; [128] = total
+    int source_rows[Schedule::kBlockM]; ///< producer-private: token row per tile row (-1 = none)
+};
+
+/// 64-byte code rows: 16-byte segment s of row r lives at segment s ^ ((r >> 1) & 3), so the 8
+/// rows of one ldmatrix phase hit 8 distinct bank groups (the TMA kernel's 64B swizzle).
+__device__ __forceinline__ int persistent_swizzled_byte(int row, int logical_byte) {
+    return (((logical_byte >> 4) ^ ((row >> 1) & 3)) << 4) | (logical_byte & 15);
+}
+
+__device__ __forceinline__ void cp_async_arrive_noinc(std::uint64_t* barrier) {
+    asm volatile("cp.async.mbarrier.arrive.noinc.shared.b64 [%0];" : : "r"(smem_addr(barrier)) : "memory");
+}
+
+struct PersistentItem {
+    int expert;
+    int row_begin;
+    int row_end;
+    int n_begin;
+};
+
+/// Item `item` (= tile * kNTiles + n tile) from the smem tile prefix: the expert is the last one
+/// whose first tile is <= the tile (experts without rows have no tiles).
+template <class Schedule>
+__device__ __forceinline__ PersistentItem persistent_item(const int* tile_prefix, const std::int32_t* offsets,
+                                                          int item) {
+    const int tile = item / Schedule::kNTiles;
+    const int n    = item - tile * Schedule::kNTiles;
+    int lo = 0, hi = kExperts - 1;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) >> 1;
+        if (tile_prefix[mid] <= tile) { lo = mid; } else { hi = mid - 1; }
+    }
+    PersistentItem result;
+    result.expert    = lo;
+    result.row_begin = offsets[lo] + (tile - tile_prefix[lo]) * Schedule::kBlockM;
+    result.row_end   = min(result.row_begin + Schedule::kBlockM, offsets[lo + 1]);
+    result.n_begin   = n * Schedule::kBlockN;
+    return result;
+}
+
+template <class Schedule, int K>
+__device__ __forceinline__ void persistent_fill_stage(const GemmParams& p, PersistentStorage<Schedule>& shared,
+                                                      int stage, int k_tile, int weight_begin, int lane) {
+    constexpr int kCodeBytesPerRow  = K / 2;
+    constexpr int kScaleBytesPerRow = K / 16;
+    constexpr int kScaleTilesPerRow = K / 64;
+    // Token rows (gathered): 4 lanes per row, one 16-byte segment each.
+    constexpr int kATasks = Schedule::kBlockM * Schedule::kSegmentsPerRow;
+#pragma unroll 4
+    for (int task = lane; task < kATasks; task += 32) {
+        const int row     = task >> 2;
+        const int segment = task & 3;
+        const int source  = shared.source_rows[row];
+        const bool valid  = source >= 0;
+        auto* destination = shared.a_codes[stage] + row * Schedule::kCodeRowBytes +
+                            persistent_swizzled_byte(row, segment * 16);
+        const auto* input = p.a_codes + static_cast<std::int64_t>(valid ? source : 0) * kCodeBytesPerRow +
+                            k_tile * Schedule::kCodeRowBytes + segment * 16;
+        cp_async_zfill<16, Cache::cg>(destination, input, valid ? 16 : 0);
+    }
+    constexpr int kAScaleBytes = Schedule::kK64PerStage * 4;
 #pragma unroll
-            for (int mma_n = 0; mma_n < Schedule::kMmaN; ++mma_n) {
-                const int n  = n_begin + warp_n * Schedule::kWarpN + mma_n * 8 + accumulator_col;
-                float value0 = __fmul_rn(accumulators[mma_m][mma_n][2 * half], row_scale);
-                float value1 = __fmul_rn(accumulators[mma_m][mma_n][2 * half + 1], row_scale);
-                if constexpr (GateUp) {
-                    const int column = n >> 1;
-                    if (adapter >= 0) {
-                        const LoraBank& gate = lora_bank(p.lora, expert, 0);
-                        const LoraBank& up   = lora_bank(p.lora, expert, 1);
-                        value0 = __fadd_rn(value0, lora_expand(gate, adapter, column, low));
-                        value1 = __fadd_rn(value1, lora_expand(up, adapter, column, low + gate.rank));
+    for (int row = lane; row < Schedule::kBlockM; row += 32) {
+        const int source  = shared.source_rows[row];
+        const bool valid  = source >= 0;
+        const auto* input = p.a_scales + static_cast<std::int64_t>(valid ? source : 0) * kScaleBytesPerRow +
+                            k_tile * kAScaleBytes;
+        cp_async_zfill<kAScaleBytes>(&shared.a_scale4[stage][row * Schedule::kK64PerStage], input,
+                                     valid ? kAScaleBytes : 0);
+    }
+    // Weight rows (contiguous inside the expert).
+    constexpr int kBTasks = Schedule::kBlockN * Schedule::kSegmentsPerRow;
+#pragma unroll 8
+    for (int task = lane; task < kBTasks; task += 32) {
+        const int row     = task >> 2;
+        const int segment = task & 3;
+        auto* destination = shared.b_codes[stage] + row * Schedule::kCodeRowBytes +
+                            persistent_swizzled_byte(row, segment * 16);
+        const auto* input = p.weights.codes + static_cast<std::int64_t>(weight_begin + row) * kCodeBytesPerRow +
+                            k_tile * Schedule::kCodeRowBytes + segment * 16;
+        cp_async<16, Cache::cg>(destination, input);
+    }
+    // Weight scales: the bank's 128-row tile layout, one 16-byte group (4 row quartiles) per task.
+    constexpr int kBScaleTasks = Schedule::kScaleRowTiles * Schedule::kK64PerStage * 32;
+#pragma unroll
+    for (int task = lane; task < kBScaleTasks; task += 32) {
+        const int row_tile  = task / (Schedule::kK64PerStage * 32);
+        const int remainder = task - row_tile * Schedule::kK64PerStage * 32;
+        const int local_k64 = remainder >> 5;
+        const int row_mod32 = remainder & 31;
+        const int global_k64      = k_tile * Schedule::kK64PerStage + local_k64;
+        const int persistent_tile = (weight_begin >> 7) + row_tile;
+        auto* destination = shared.b_scales[stage] +
+                            ((row_tile * Schedule::kK64PerStage + local_k64) * 32 + row_mod32) * 16;
+        const auto* input = p.weights.scales +
+                            static_cast<std::int64_t>(persistent_tile * kScaleTilesPerRow + global_k64) * 512 +
+                            row_mod32 * 16;
+        cp_async<16>(destination, input);
+    }
+}
+
+template <class Schedule, int K, bool GateUp>
+__global__ __launch_bounds__(Schedule::kThreads, 1) void nvfp4_expert_gemm_persistent(GemmParams p) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1200
+    __trap();
+#else
+    extern __shared__ __align__(128) unsigned char shared_bytes[];
+    auto& shared = *reinterpret_cast<PersistentStorage<Schedule>*>(shared_bytes);
+    constexpr int kKTiles = K / Schedule::kBlockK;
+    static_assert(K % Schedule::kBlockK == 0);
+
+    pdl::wait_for_dependencies();
+    pdl::trigger_dependents();
+    const int thread = static_cast<int>(threadIdx.x);
+    if (thread < 32) {
+        // Tiles per expert -> exclusive prefix (4 experts per lane, one warp scan).
+        int bounds[5];
+#pragma unroll
+        for (int i = 0; i < 5; ++i) { bounds[i] = p.offsets[4 * thread + i]; }
+        int tiles[4];
+        int local = 0;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            tiles[i] = (bounds[i + 1] - bounds[i] + Schedule::kBlockM - 1) / Schedule::kBlockM;
+            local += tiles[i];
+        }
+        int inclusive = local;
+#pragma unroll
+        for (int offset = 1; offset < 32; offset <<= 1) {
+            const int other = __shfl_up_sync(0xFFFFFFFFU, inclusive, offset);
+            if (thread >= offset) { inclusive += other; }
+        }
+        int before = inclusive - local;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            shared.tile_prefix[4 * thread + i] = before;
+            before += tiles[i];
+        }
+        if (thread == 31) { shared.tile_prefix[kExperts] = inclusive; }
+    } else if (thread == 32) {
+#pragma unroll
+        for (int stage = 0; stage < Schedule::kStages; ++stage) {
+            nvfp4_mbarrier_init(&shared.full[stage], 32);
+            nvfp4_mbarrier_init(&shared.empty[stage], Schedule::kConsumerWarps);
+        }
+        asm volatile("fence.mbarrier_init.release.cluster;" : : : "memory");
+    }
+    __syncthreads();
+    const int total_items = shared.tile_prefix[kExperts] * Schedule::kNTiles;
+    const int lane        = thread & 31;
+
+    if (thread >= Schedule::kConsumerThreads) {
+        // Producer warp.
+        int fill = 0;
+        for (int item = static_cast<int>(blockIdx.x); item < total_items; item += static_cast<int>(gridDim.x)) {
+            const PersistentItem tile = persistent_item<Schedule>(shared.tile_prefix, p.offsets, item);
+            __syncwarp();
+#pragma unroll
+            for (int row = lane; row < Schedule::kBlockM; row += 32) {
+                const int index = tile.row_begin + row;
+                shared.source_rows[row] = index < tile.row_end ? (p.sorted[index] >> p.a_row_shift) : -1;
+            }
+            __syncwarp();
+            const int weight_begin = tile.expert * kGateUpRows + tile.n_begin;
+            for (int k_tile = 0; k_tile < kKTiles; ++k_tile, ++fill) {
+                const int stage = fill % Schedule::kStages;
+                nvfp4_mbarrier_wait(&shared.empty[stage], 1U ^ ((fill / Schedule::kStages) & 1U));
+                persistent_fill_stage<Schedule, K>(p, shared, stage, k_tile, weight_begin, lane);
+                cp_async_arrive_noinc(&shared.full[stage]);
+            }
+        }
+        asm volatile("cp.async.wait_all;" : : : "memory");
+        return;
+    }
+
+    // Consumer warps.
+    const int warp          = thread >> 5;
+    const int warp_m        = warp / Schedule::kWarpsN;
+    const int warp_n        = warp - warp_m * Schedule::kWarpsN;
+    const int a_matrix      = lane >> 3;
+    const int a_row_offset  = (lane & 7) + ((a_matrix & 1) << 3);
+    const int a_column_byte = (a_matrix >> 1) * 16;
+    const int b_row_offset  = lane & 7;
+    const int b_column_byte = ((lane >> 3) & 1) * 16;
+    const int sfa_row       = ((lane & 1) << 3) | (lane >> 2);
+    const int sfb_row       = lane >> 2;
+    const float rcp_denominator = __frcp_rn(__fmul_rn(1536.0F, *p.weights.outer_den));
+    int fill = 0;
+    for (int item = static_cast<int>(blockIdx.x); item < total_items; item += static_cast<int>(gridDim.x)) {
+        const PersistentItem tile = persistent_item<Schedule>(shared.tile_prefix, p.offsets, item);
+        // 16-row groups of this warp that hold routed rows (warp-uniform).
+        const int groups = (tile.row_end - tile.row_begin + 15) >> 4;
+        const int active = min(max(groups - warp_m * Schedule::kMmaM, 0), Schedule::kMmaM);
+        float accumulators[Schedule::kMmaM][Schedule::kMmaN][4] = {};
+        for (int k_tile = 0; k_tile < kKTiles; ++k_tile, ++fill) {
+            const int stage = fill % Schedule::kStages;
+            nvfp4_mbarrier_wait(&shared.full[stage], (fill / Schedule::kStages) & 1U);
+            if (active > 0) {
+#pragma unroll
+                for (int local_k64 = 0; local_k64 < Schedule::kK64PerStage; ++local_k64) {
+                    unsigned a_fragments[Schedule::kMmaM][4];
+                    unsigned b_fragments[Schedule::kMmaN][2];
+                    unsigned a_scales[Schedule::kMmaM];
+                    unsigned b_scales[Schedule::kMmaN];
+#pragma unroll
+                    for (int mma_m = 0; mma_m < Schedule::kMmaM; ++mma_m) {
+                        if (mma_m < active) {
+                            const int row = warp_m * Schedule::kWarpM + mma_m * 16 + a_row_offset;
+                            const auto* address = shared.a_codes[stage] + row * Schedule::kCodeRowBytes +
+                                                  persistent_swizzled_byte(row, local_k64 * 32 + a_column_byte);
+                            ldmatrix_x4(a_fragments[mma_m][0], a_fragments[mma_m][1], a_fragments[mma_m][2],
+                                        a_fragments[mma_m][3], smem_addr(address));
+                            const int scale_row = warp_m * Schedule::kWarpM + mma_m * 16 + sfa_row;
+                            a_scales[mma_m] = shared.a_scale4[stage][scale_row * Schedule::kK64PerStage + local_k64];
+                        }
                     }
-                    if (p.gate_up_tap != nullptr) {
-                        *reinterpret_cast<__nv_bfloat162*>(p.gate_up_tap + static_cast<std::int64_t>(slot) * kGateUpRows + n) =
-                            __floats2bfloat162_rn(value0, value1);
+#pragma unroll
+                    for (int mma_n = 0; mma_n < Schedule::kMmaN; ++mma_n) {
+                        const int row = warp_n * Schedule::kWarpN + mma_n * 8 + b_row_offset;
+                        const auto* address = shared.b_codes[stage] + row * Schedule::kCodeRowBytes +
+                                              persistent_swizzled_byte(row, local_k64 * 32 + b_column_byte);
+                        ldmatrix_x2(b_fragments[mma_n][0], b_fragments[mma_n][1], smem_addr(address));
+                        const int scale_row    = warp_n * Schedule::kWarpN + mma_n * 8 + sfb_row;
+                        const int row_tile     = scale_row >> 7;
+                        const int row_in_tile  = scale_row & 127;
+                        b_scales[mma_n] = load_vec<unsigned>(
+                            shared.b_scales[stage] +
+                            ((row_tile * Schedule::kK64PerStage + local_k64) * 32 + (row_in_tile & 31)) * 16 +
+                            (row_in_tile >> 5) * 4);
                     }
-                    p.out[static_cast<std::int64_t>(slot) * kIntermediate + column] =
-                        situ(round_bf16(value0), round_bf16(value1), p.gammas[slot]);
-                } else {
-                    if (adapter >= 0) {
-                        const LoraBank& down = lora_bank(p.lora, expert, 2);
-                        value0 = __fadd_rn(value0, lora_expand(down, adapter, n, low));
-                        value1 = __fadd_rn(value1, lora_expand(down, adapter, n + 1, low));
+#pragma unroll
+                    for (int mma_m = 0; mma_m < Schedule::kMmaM; ++mma_m) {
+                        if (mma_m < active) {
+#pragma unroll
+                            for (int mma_n = 0; mma_n < Schedule::kMmaN; ++mma_n) {
+                                mma_nvfp4_e4m3(accumulators[mma_m][mma_n][0], accumulators[mma_m][mma_n][1],
+                                               accumulators[mma_m][mma_n][2], accumulators[mma_m][mma_n][3],
+                                               a_fragments[mma_m][0], a_fragments[mma_m][1],
+                                               a_fragments[mma_m][2], a_fragments[mma_m][3],
+                                               b_fragments[mma_n][0], b_fragments[mma_n][1], a_scales[mma_m],
+                                               b_scales[mma_n]);
+                            }
+                        }
                     }
-                    *reinterpret_cast<__nv_bfloat162*>(p.out + static_cast<std::int64_t>(slot) * kHidden + n) =
-                        __floats2bfloat162_rn(value0, value1);
                 }
+            }
+            __syncwarp();
+            if (lane == 0) { nvfp4_mbarrier_arrive(&shared.empty[stage]); }
+        }
+
+        // Epilogue straight from the accumulators (the producer is already filling the next item).
+        const float weight_amax   = p.weights.amax[tile.expert];
+        const int accumulator_row = lane >> 2;
+        const int accumulator_col = 2 * (lane & 3);
+#pragma unroll
+        for (int mma_m = 0; mma_m < Schedule::kMmaM; ++mma_m) {
+            if (mma_m >= active) { continue; }
+#pragma unroll
+            for (int half = 0; half < 2; ++half) {
+                const int index = tile.row_begin + warp_m * Schedule::kWarpM + mma_m * 16 + accumulator_row + 8 * half;
+                if (index >= tile.row_end) { continue; }
+                const int slot = p.sorted[index];
+                store_routed_row<GateUp, Schedule::kMmaN>(p, tile.expert, slot, slot >> p.a_row_shift, weight_amax,
+                                                          rcp_denominator,
+                                                          tile.n_begin + warp_n * Schedule::kWarpN + accumulator_col,
+                                                          accumulators[mma_m], half);
             }
         }
     }
@@ -251,6 +587,64 @@ void launch_schedule(const GemmParams& params, std::int32_t slots, cudaStream_t 
     }
 }
 
+using PersistentWide = PersistentSchedule<128, 256, 2, 4, 3>; ///< warp tiles 64 x 64
+using PersistentAlt  = PersistentSchedule<128, 128, 2, 4, 4>; ///< warp tiles 64 x 32 (timing knob)
+
+int multiprocessors() {
+    static int cached[64] = {};
+    int device            = 0;
+    if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= 64) { return 1; }
+    if (cached[device] == 0) {
+        int count = 0;
+        if (cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device) != cudaSuccess || count <= 0) {
+            count = 1;
+        }
+        cached[device] = count;
+    }
+    return cached[device];
+}
+
+template <class Schedule, int K, bool GateUp>
+void launch_persistent(const GemmParams& params, std::int32_t slots, cudaStream_t stream) {
+    const int max_tiles = std::min(kExperts, slots) + slots / Schedule::kBlockM;
+    if (max_tiles == 0) { return; }
+    const int items = max_tiles * Schedule::kNTiles;
+    const dim3 grid(static_cast<unsigned>(std::min(items, multiprocessors())));
+    constexpr std::size_t kShared = sizeof(PersistentStorage<Schedule>);
+    auto* kernel = nvfp4_expert_gemm_persistent<Schedule, K, GateUp>;
+    cudaError_t status = ::sinfer::ops::set_func_attribute_per_device(
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kShared));
+    if (status == cudaSuccess) {
+        status = pdl::launch_dependent({grid, dim3(Schedule::kThreads), kShared, stream}, kernel, params);
+    }
+    if (status != cudaSuccess) {
+        throw std::runtime_error(std::string("inkling_moe: nvfp4 persistent expert gemm: ") + cudaGetErrorString(status));
+    }
+}
+
+/// Prefill kernel choice. TIMING KNOB (removed once measured): SUROGATE_INKLING_NVFP4_PREFILL=old
+/// (the v1 per-tile kernel) | alt (persistent, 128 x 128 tiles); default persistent 128 x 256.
+/// Every choice computes the same bits.
+int prefill_variant() {
+    static const int variant = [] {
+        const char* value = std::getenv("SUROGATE_INKLING_NVFP4_PREFILL");
+        if (value == nullptr) { return 0; }
+        if (std::strcmp(value, "old") == 0) { return 1; }
+        if (std::strcmp(value, "alt") == 0) { return 2; }
+        return 0;
+    }();
+    return variant;
+}
+
+template <int K, bool GateUp>
+void launch_prefill(const GemmParams& params, std::int32_t slots, cudaStream_t stream) {
+    switch (prefill_variant()) {
+    case 1: launch_schedule<WideSchedule, K, GateUp>(params, slots, stream); return;
+    case 2: launch_persistent<PersistentAlt, K, GateUp>(params, slots, stream); return;
+    default: launch_persistent<PersistentWide, K, GateUp>(params, slots, stream); return;
+    }
+}
+
 void require(const GemmParams& params) {
     if (params.weights.codes == nullptr || params.weights.scales == nullptr ||
         params.weights.amax == nullptr || params.weights.outer_den == nullptr) {
@@ -266,7 +660,7 @@ void launch_nvfp4_gate_up(const GemmParams& params, std::int32_t slots, GemmSche
     if (schedule == GemmSchedule::Narrow) {
         launch_schedule<NarrowSchedule, kHidden, true>(params, slots, stream);
     } else {
-        launch_schedule<WideSchedule, kHidden, true>(params, slots, stream);
+        launch_prefill<kHidden, true>(params, slots, stream);
     }
 }
 
@@ -276,12 +670,12 @@ void launch_nvfp4_down(const GemmParams& params, std::int32_t slots, GemmSchedul
     if (schedule == GemmSchedule::Narrow) {
         launch_schedule<NarrowSchedule, kIntermediate, false>(params, slots, stream);
     } else {
-        launch_schedule<WideSchedule, kIntermediate, false>(params, slots, stream);
+        launch_prefill<kIntermediate, false>(params, slots, stream);
     }
 }
 
 std::int32_t nvfp4_tile_rows(GemmSchedule schedule) {
-    return schedule == GemmSchedule::Narrow ? NarrowSchedule::kBlockM : WideSchedule::kBlockM;
+    return schedule == GemmSchedule::Narrow ? NarrowSchedule::kBlockM : PersistentWide::kBlockM;
 }
 
 } // namespace sinfer::ops::detail::inkling

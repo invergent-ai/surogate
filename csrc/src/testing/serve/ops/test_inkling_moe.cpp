@@ -672,7 +672,17 @@ int test_moe(ops::InklingExpertFormat format) {
     const DeviceRun pad = run_moe(l, padded, 32, &live);
     width_bad += !std::equal(base.out.begin(), base.out.end(), pad.out.begin());
     for (std::size_t i = static_cast<std::size_t>(kT) * H; i < pad.out.size(); ++i) { width_bad += pad.out[i] != 0; }
-    failures += report("width invariance T=1 / 24 / 300 / padded 32 (bit-exact)", width_bad);
+    // A prefill-sized round (several tiles per expert; rows land at atomic-order positions).
+    constexpr int kHuge = 4096;
+    std::vector<float> huge_x(static_cast<std::size_t>(kHuge) * H);
+    std::copy(x.begin(), x.end(), huge_x.begin());
+    Rng huge_rng(nv ? 17 : 18);
+    for (std::size_t i = x.size(); i < huge_x.size(); ++i) { huge_x[i] = huge_rng.uniform(-2.0F, 2.0F); }
+    round_to_bf16(huge_x);
+    const DeviceRun huge = run_moe(l, huge_x, kHuge);
+    width_bad += !std::equal(base.out.begin(), base.out.end(), huge.out.begin());
+    width_bad += !std::equal(wide.out.begin(), wide.out.end(), huge.out.begin());
+    failures += report("width invariance T=1 / 24 / 300 / 4096 / padded 32 (bit-exact)", width_bad);
 
     // Expert LoRA: zero adapter neutral; base tokens untouched; delta vs host.
     Adapter zero, adapter;
