@@ -136,6 +136,16 @@ void launch_lora_shrink(const __nv_bfloat16* source, std::int32_t source_k, bool
 void launch_decode_expert_units(const InklingExpertBank& bank, bool nvfp4, std::int32_t k, std::int32_t first,
                                 std::int32_t count, __nv_bfloat16* unit, float* factor, cudaStream_t stream);
 
+/// Test-only row-load mode of the PDL audit (inkling_test_read_only_loads): 0 plain, 1 ld.nc, 2 ld.cg; one
+/// host-side mode (row_load_mode_host) that picks the kernel instantiations; serving always launches mode 0.
+void set_read_only_control(int mode);
+void set_row_load_mode_nvfp4(int mode);
+/// Test-only planter kernel (inkling_test_plant_reads).
+void launch_test_plant_reads(const void* buffer, std::int64_t bytes, int* sink, cudaStream_t stream);
+/// Test-only PDL writer kernel (inkling_test_copy_rows).
+void launch_test_copy_rows(const void* source, void* destination, std::int64_t bytes, int hostile, int* sink,
+                           cudaStream_t stream);
+
 /// inkling_bench_predecessor's kernel (benchmark only).
 void launch_bench_predecessor(std::int32_t nanoseconds, cudaStream_t stream);
 
@@ -172,6 +182,10 @@ struct GemmParams {
     LoraRound lora;
     /// L2 prefetch-size hint for the weight-code loads (0 none, 128, 256): same bytes (with_l2_prefetch).
     std::int32_t l2_prefetch = 0;
+    /// Narrow NVFP4 down WITHOUT the fused y quantisation (agent-EN-d5, rounds of T >= kPlainDownMinTokens): A = the y
+    /// rows quantised once by the standalone kernel (a_codes / a_scales / a_amax = y_codes / y_scales / y_amax); the
+    /// w2 stages are still requested before the dependency wait. Same arithmetic.
+    std::int32_t plain_narrow_down = 0;
 };
 
 /// The weight loads' L2 prefetch hint (`GemmParams::l2_prefetch`): 128 bytes. Measured 12:54 (card 7, cold,

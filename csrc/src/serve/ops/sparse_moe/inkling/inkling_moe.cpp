@@ -38,6 +38,11 @@ using namespace detail::inkling;
 constexpr std::size_t kAlignment = 256;
 /// Rounds below this width take the narrow tile schedules (same arithmetic; a speed choice).
 constexpr std::int32_t kNarrowMaxTokens = 64;
+/// Narrow NVFP4 rounds this wide quantise y once per row (standalone kernel) and run the plain down instead of the
+/// fused-y down, which re-quantises its rows in every one of its 36 N tiles. Measured (agent-EN-d5, gpubox1 card 1,
+/// cold, P5, three sessions 17:35-17:52): T=32 250.5 -> 244.7 us, T=64 290.6 -> 280.5; T=8 / 16 slower (+0.5 / +2):
+/// the fused form stays below 32. Same bits (width-invariance and capture tests).
+constexpr std::int32_t kPlainDownMinTokens = 32;
 
 constexpr std::size_t aligned(std::size_t bytes) {
     return (bytes + kAlignment - 1) / kAlignment * kAlignment;
@@ -374,9 +379,11 @@ void inkling_moe(const Tensor& x, const InklingMoeWeights& weights, Tensor& out,
         launch_lora_shrink(b.y, kIntermediate, false, b.ids, live, lora, stream);
     };
     if (!narrow) { down_shrink(); }
+    const bool plain_down = narrow && nvfp4 && tokens >= kPlainDownMinTokens;
     if (nvfp4) {
-        // Narrow rounds quantise y inside the down kernel; the standalone pass then runs only for test taps.
-        if (!narrow || taps != nullptr) {
+        // Narrow rounds below kPlainDownMinTokens quantise y inside the down kernel; the standalone pass then runs
+        // only for test taps.
+        if (!narrow || taps != nullptr || plain_down) {
             launch_quant_nvfp4(b.y, slots, kIntermediate, b.ids, live, b.y_codes, b.y_scales, b.y_amax, stream);
         }
     } else {
@@ -396,6 +403,7 @@ void inkling_moe(const Tensor& x, const InklingMoeWeights& weights, Tensor& out,
     down.a_amax      = b.y_amax;
     down.a_bf16      = nvfp4 ? b.y : b.y_bf16; // NVFP4: the bf16 y rows the narrow down kernel quantises
     down.a_row_shift = 0; // slot rows
+    down.plain_narrow_down = plain_down ? 1 : 0;
     down.offsets     = b.offsets;
     down.sorted      = b.sorted;
     down.weights     = weights.w2;
@@ -491,6 +499,25 @@ void inkling_softcap_swiglu(const Tensor& gate_up, const Tensor& gamma, Tensor& 
 
 void inkling_bench_predecessor(std::int32_t nanoseconds, cudaStream_t stream) {
     launch_bench_predecessor(nanoseconds, stream);
+}
+
+void inkling_test_read_only_loads(int mode) {
+    set_read_only_control(mode);
+    set_row_load_mode_nvfp4(mode);
+}
+
+void inkling_test_plant_reads(const void* buffer, std::int64_t bytes, int* sink, cudaStream_t stream) {
+    if (bytes <= 0 || bytes % 16 != 0) { throw std::invalid_argument("inkling_test_plant_reads: bytes must be a positive multiple of 16"); }
+    launch_test_plant_reads(buffer, bytes, sink, stream);
+}
+
+void inkling_test_copy_rows(const void* source, void* destination, std::int64_t bytes, cudaStream_t stream,
+                            bool hostile, int* sink) {
+    if (bytes <= 0 || bytes % 16 != 0) {
+        throw std::invalid_argument("inkling_test_copy_rows: bytes must be a positive multiple of 16");
+    }
+    if (hostile && sink == nullptr) { throw std::invalid_argument("inkling_test_copy_rows: hostile needs a sink"); }
+    launch_test_copy_rows(source, destination, bytes, hostile ? 1 : 0, sink, stream);
 }
 
 void inkling_decode_expert_units(const InklingExpertBank& bank, InklingExpertFormat format, std::int32_t k,

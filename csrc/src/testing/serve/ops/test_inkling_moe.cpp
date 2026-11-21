@@ -1108,6 +1108,105 @@ int test_state_contract(const Layer& l, const std::vector<float>& x, const Devic
                   bad + dirty);
 }
 
+/// PDL-chain regression (PDL audit, agent-EN 17:48 after lane c's FP8 finding): the engine's decode pattern -- per visit
+/// a PDL-launched writer fills ONE reused x buffer, then inkling_moe runs on it with ONE reused workspace arena (y,
+/// logits, ids, ... at the same addresses every visit) and the persistent state -- launched back to back, eager and as a
+/// CUDA graph; each visit's output (distinct buffers) vs run_moe on that visit's input (fresh buffers, synchronised).
+/// A stale read of a reused buffer shows up as bit differences. Two writer forms: plain (the engine's pattern), and
+/// HOSTILE: before each writer a planter reads the old x through ld.global.nc on every SM, and the writer itself, after
+/// letting the MoE launch, reads the old x through ld.global.nc on every SM before overwriting it (stale lines sit next
+/// to the MoE's freshly launched CTAs). Controls (reported, not checked): inkling_test_read_only_loads(1) puts the
+/// activation row loads back on ld.global.nc (negative control: should show stale rows), (2) on ld.global.cg.
+int test_pdl_chain(const Layer& l, int seed) {
+    constexpr int kVisits = 12, kInputs = 4;
+    int failures = 0;
+    cudaStream_t stream = nullptr;
+    cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
+    for (const int tokens : {1, 8, 64, 300}) {
+        const std::size_t row_elems = static_cast<std::size_t>(tokens) * H;
+        Rng rng(static_cast<std::uint64_t>(seed) * 1000 + static_cast<std::uint64_t>(tokens));
+        std::vector<std::vector<float>> inputs(kInputs, std::vector<float>(row_elems));
+        std::vector<DeviceBuffer> sources;
+        std::vector<std::vector<std::uint16_t>> refs;
+        for (auto& in : inputs) {
+            for (auto& v : in) { v = rng.uniform(-2.0F, 2.0F); }
+            round_to_bf16(in);
+            sources.push_back(to_device(to_bf16_bits(in)));
+            refs.push_back(run_moe(l, in, tokens).out);
+        }
+        DeviceBuffer x_shared(row_elems * 2), sink(sizeof(int));
+        std::vector<DeviceBuffer> outs;
+        for (int v = 0; v < kVisits; ++v) { outs.emplace_back(row_elems * 2); }
+        DeviceArena arena(ops::inkling_moe_workspace_bytes(l.format, tokens, false));
+        ops::InklingMoeOptions options;
+        options.state = persistent_state();
+        bool hostile = false;
+        const auto chain = [&] {
+            for (int v = 0; v < kVisits; ++v) {
+                if (hostile) {
+                    ops::inkling_test_plant_reads(x_shared.p, static_cast<std::int64_t>(row_elems * 2),
+                                                  static_cast<int*>(sink.p), stream);
+                }
+                ops::inkling_test_copy_rows(sources[v % kInputs].p, x_shared.p, static_cast<std::int64_t>(row_elems * 2),
+                                            stream, hostile, static_cast<int*>(sink.p));
+                Tensor tx(x_shared.p, DType::BF16, {H, tokens}), tout(outs[v].p, DType::BF16, {H, tokens});
+                ops::inkling_moe(tx, l.view, tout, arena, stream, options);
+                arena.reset();
+            }
+        };
+        const auto compare = [&](const std::string& route, bool control) {
+            cuda_synchronize(stream);
+            std::size_t bad = 0;
+            int first_bad = -1;
+            for (int v = 0; v < kVisits; ++v) {
+                const auto got = from_device<std::uint16_t>(outs[v], row_elems);
+                const auto& want = refs[v % kInputs];
+                for (std::size_t e = 0; e < row_elems; ++e) {
+                    if (got[e] != want[e]) {
+                        ++bad;
+                        if (first_bad < 0) { first_bad = v; }
+                    }
+                }
+                cuda_check(cudaMemset(outs[v].p, 0xFF, outs[v].bytes), "poison");
+            }
+            std::printf("  pdl chain %s T=%-3d %-24s %d visits, reused x / arena: %zu / %zu outputs bit-different%s\n",
+                        l.format == ops::InklingExpertFormat::Nvfp4 ? "NVFP4" : "MXFP8", tokens, route.c_str(), kVisits, bad,
+                        static_cast<std::size_t>(kVisits) * row_elems,
+                        first_bad >= 0 ? (" (first visit " + std::to_string(first_bad) + ")").c_str() : "");
+            if (!control) { failures += bad != 0; }
+        };
+        for (const int form : {0, 1, 2, 3, 4, 5}) {
+            const int mode = form % 3;
+            hostile        = form >= 3;
+            const bool control = mode != 0;
+            const std::string tag = std::string(hostile ? " hostile" : "") +
+                                    (mode == 1 ? " [ld.nc control]" : (mode == 2 ? " [ld.cg control]" : ""));
+            ops::inkling_test_read_only_loads(mode);
+            for (int rep = 0; rep < 2; ++rep) {
+                chain();
+                compare("eager" + tag, control);
+            }
+            cudaGraph_t graph = nullptr;
+            cudaGraphExec_t exec = nullptr;
+            cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "begin capture");
+            chain();
+            cuda_check(cudaStreamEndCapture(stream, &graph), "end capture");
+            cuda_check(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
+            for (int replay = 0; replay < 2; ++replay) {
+                cuda_check(cudaGraphLaunch(exec, stream), "launch");
+                compare("graph" + tag, control);
+            }
+            cudaGraphExecDestroy(exec);
+            cudaGraphDestroy(graph);
+        }
+        ops::inkling_test_read_only_loads(0);
+        failures += state_nonzero_words() != 0;
+    }
+    cudaStreamDestroy(stream);
+    return report("pdl chain: reused x / arena, PDL writer, eager + graph, T=1/8/64/300 == fresh runs (bit-exact)",
+                  failures);
+}
+
 int test_moe(ops::InklingExpertFormat format) {
     const bool nv = format == ops::InklingExpertFormat::Nvfp4;
     std::printf("[%s layer]\n", nv ? "NVFP4" : "MXFP8");
@@ -1271,6 +1370,7 @@ int test_moe(ops::InklingExpertFormat format) {
     // cos ~ 0), not a precision one.
     failures += report("LoRA: delta direction vs host (cos >= 0.99)", worst_delta_cos >= 0.99 ? 0 : 1);
     failures += test_state_contract(l, x, base, wide);
+    failures += test_pdl_chain(l, nv ? 31 : 32);
     failures += test_lora_store(l, x, base, ids, gammas, w13, w2);
     failures += test_decode_units(l, nv ? "NVFP4 synthetic" : "MXFP8 synthetic");
     return failures;

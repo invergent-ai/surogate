@@ -168,11 +168,12 @@ inline constexpr int kFusedYRowBytes = kIntermediate / 2 + 16;
 inline constexpr int kFusedYScaleWords = kIntermediate / 64;
 
 /// 16 bf16 at `source` (32-byte aligned) as fp32 (the quant kernel's load16).
+template <int RowLoad>
 __device__ __forceinline__ void load16_bf16(const __nv_bfloat16* source, float* x) {
     const uint4* words = reinterpret_cast<const uint4*>(source);
 #pragma unroll
     for (int half = 0; half < 2; ++half) {
-        const uint4 v                = words[half];
+        const uint4 v                = load_row16<RowLoad>(words + half); // y rows: plain after the wait (PDL audit)
         const std::uint32_t parts[4] = {v.x, v.y, v.z, v.w};
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
@@ -182,7 +183,11 @@ __device__ __forceinline__ void load16_bf16(const __nv_bfloat16* source, float* 
     }
 }
 
-template <class Schedule, int K, bool GateUp, bool FusedYQuant = false>
+/// `PreWaitWeights` (the plain narrow down, kPlainDownMinTokens): the weight stages are requested before the
+/// dependency wait -- the routing they need was complete before the gate_up's wait returned and is read through L2,
+/// as in the fused-y down -- the token rows (y quantised by the standalone kernel) after it.
+/// `RowLoad` (fused-y down only): the y rows' test-only load mode (load_row16); serving launches 0.
+template <class Schedule, int K, bool GateUp, bool FusedYQuant = false, bool PreWaitWeights = false, int RowLoad = 0>
 __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_expert_gemm_kernel(
     GemmParams p) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1200
@@ -190,6 +195,8 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     __trap();
 #else
     using Geometry = Nvfp4Geometry<K>;
+    constexpr bool kPreWait = FusedYQuant || PreWaitWeights;
+    static_assert(!PreWaitWeights || (!GateUp && !FusedYQuant));
     __shared__ Nvfp4W4a4SharedStorage<Schedule> shared;
     __shared__ int tile_info[3];
     __shared__ int slots[Schedule::kBlockM];
@@ -201,25 +208,36 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     __shared__ std::uint32_t y_scales[FusedYQuant ? Schedule::kBlockM * kFusedYScaleWords : 1];
     __shared__ float y_amax[FusedYQuant ? Schedule::kBlockM : 1];
 
-    if constexpr (!FusedYQuant) { pdl::wait_for_dependencies(); }
+    if constexpr (!kPreWait) { pdl::wait_for_dependencies(); }
     pdl::trigger_dependents();
     if (threadIdx.x == 0) { done_count = 0; }
     // Fused: the routing (offsets / sorted, written by the select kernel two or more launches back,
     // complete before the gate_up kernel's wait returned) is read through L2 BEFORE this kernel's
     // dependency wait, so the expert's w2 stages stream while the predecessor finishes.
-    find_expert_tile<Schedule::kBlockM, FusedYQuant>(p.offsets, static_cast<int>(blockIdx.x), tile_info);
+    find_expert_tile<Schedule::kBlockM, kPreWait>(p.offsets, static_cast<int>(blockIdx.x), tile_info);
     const int expert = tile_info[0];
     if (expert < 0) {
-        if constexpr (FusedYQuant) { pdl::wait_for_dependencies(); }
+        if constexpr (kPreWait) { pdl::wait_for_dependencies(); }
         return;
     }
     const int row_begin = tile_info[1];
     const int row_end   = tile_info[2];
     const int n_begin       = (static_cast<int>(blockIdx.y) + p.n_tile0) * Schedule::kBlockN;
     const int weight_begin  = expert * kGateUpRows + n_begin;
+    constexpr int kKTilesTotal = K / Schedule::kBlockK;
+    if constexpr (PreWaitWeights) {
+        // Weight stages first, one cp.async group each; the token-row stages follow after the wait in ONE group,
+        // so k-tile 0 waits for every group (cp_wait<0> below). Same bytes into the same shared addresses.
+        static_assert(kKTilesTotal >= Schedule::kStages);
+#pragma unroll
+        for (int stage = 0; stage < Schedule::kStages; ++stage) {
+            stage_expert_weight<Geometry, Schedule>(p, shared, stage, stage, weight_begin);
+            cp_commit();
+        }
+    }
     for (int row = static_cast<int>(threadIdx.x); row < Schedule::kBlockM; row += Schedule::kThreads) {
         const int index   = row_begin + row;
-        const int slot    = index < row_end ? (FusedYQuant ? __ldcg(p.sorted + index) : p.sorted[index]) : -1;
+        const int slot    = index < row_end ? (kPreWait ? __ldcg(p.sorted + index) : p.sorted[index]) : -1;
         slots[row]        = slot;
         source_rows[row]  = slot >= 0 ? (slot >> p.a_row_shift) : -1;
     }
@@ -258,7 +276,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
             float amax = 0.0F;
             for (int block = quant_lane; block < kBlocks; block += 32) {
                 float x[16];
-                load16_bf16(y_row + block * 16, x);
+                load16_bf16<RowLoad>(y_row + block * 16, x);
 #pragma unroll
                 for (int j = 0; j < 16; ++j) { amax = fmaxf(amax, fabsf(x[j])); }
             }
@@ -266,7 +284,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
             const Nvfp4RowScales row_scales = nvfp4_row_scales(amax);
             for (int block = quant_lane; block < kBlocks; block += 32) {
                 float x[16];
-                load16_bf16(y_row + block * 16, x);
+                load16_bf16<RowLoad>(y_row + block * 16, x);
                 const Nvfp4Block quantized =
                     nvfp4_quantize_block_4o6(x, row_scales, nvfp4_block_in_head(block, kIntermediate));
                 *reinterpret_cast<uint2*>(codes_row + block * 8) =
@@ -276,6 +294,13 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
             }
             if (quant_lane == 0) { y_amax[row] = amax; }
         }
+    } else if constexpr (PreWaitWeights) {
+        pdl::wait_for_dependencies();
+#pragma unroll
+        for (int stage = 0; stage < Schedule::kStages; ++stage) {
+            stage_gathered_activation<Schedule, K>(p, source_rows, shared, stage, stage);
+        }
+        cp_commit();
     } else {
 #pragma unroll
         for (int stage = 0; stage < Schedule::kStages; ++stage) {
@@ -302,7 +327,11 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
 
     for (int k_tile = 0; k_tile < kKTiles; ++k_tile) {
         const int stage = k_tile % Schedule::kStages;
-        cp_wait<kWaitGroups>();
+        if (PreWaitWeights && k_tile == 0) {
+            cp_wait<0>();
+        } else {
+            cp_wait<kWaitGroups>();
+        }
         __syncthreads();
 #pragma unroll
         for (int local_k64 = 0; local_k64 < Schedule::kK64PerStage; ++local_k64) {
@@ -731,7 +760,7 @@ __global__ __launch_bounds__(Schedule::kThreads, 1) void nvfp4_expert_gemm_persi
 #endif
 }
 
-template <class Schedule, int K, bool GateUp, bool FusedYQuant = false>
+template <class Schedule, int K, bool GateUp, bool FusedYQuant = false, bool PreWaitWeights = false, int RowLoad = 0>
 void launch_schedule(const GemmParams& params, std::int32_t slots, cudaStream_t stream) {
     const int max_tiles = std::min(kExperts, slots) + slots / Schedule::kBlockM;
     if (max_tiles == 0) { return; }
@@ -739,7 +768,9 @@ void launch_schedule(const GemmParams& params, std::int32_t slots, cudaStream_t 
     set_n_tiles(p, Schedule::kBlockN);
     const dim3 grid(static_cast<unsigned>(max_tiles), static_cast<unsigned>(p.n_tiles));
     const cudaError_t status = pdl::launch_dependent({grid, dim3(Schedule::kThreads), 0, stream},
-                                                     nvfp4_expert_gemm_kernel<Schedule, K, GateUp, FusedYQuant>, p);
+                                                     nvfp4_expert_gemm_kernel<Schedule, K, GateUp, FusedYQuant,
+                                                                              PreWaitWeights, RowLoad>,
+                                                     p);
     if (status != cudaSuccess) {
         throw std::runtime_error(std::string("inkling_moe: nvfp4 expert gemm: ") + cudaGetErrorString(status));
     }
@@ -828,6 +859,8 @@ void require(const GemmParams& params) {
 
 } // namespace
 
+void set_row_load_mode_nvfp4(int mode) { row_load_mode_host() = mode; }
+
 void launch_nvfp4_gate_up(const GemmParams& params, std::int32_t slots, GemmSchedule schedule,
                           cudaStream_t stream) {
     require(params);
@@ -843,10 +876,20 @@ void launch_nvfp4_down(const GemmParams& params, std::int32_t slots, GemmSchedul
                        cudaStream_t stream) {
     require(params);
     const GemmParams p = with_l2_prefetch(params);
-    if (schedule == GemmSchedule::Narrow) {
+    if (schedule == GemmSchedule::Narrow && p.plain_narrow_down != 0) {
+        // y quantised by the standalone kernel (kPlainDownMinTokens); w2 still streams before the wait.
+        if (p.a_codes == nullptr || p.a_scales == nullptr || p.a_amax == nullptr) {
+            throw std::invalid_argument("inkling_moe: the plain narrow NVFP4 down needs the quantised y rows");
+        }
+        launch_schedule<NarrowSchedule, kIntermediate, false, false, true>(p, slots, stream);
+    } else if (schedule == GemmSchedule::Narrow) {
         // The y quantisation runs in this kernel's prologue (a_bf16 = y rows); w2 streams before the wait.
         if (p.a_bf16 == nullptr) { throw std::invalid_argument("inkling_moe: narrow NVFP4 down needs the y rows"); }
-        launch_schedule<NarrowSchedule, kIntermediate, false, true>(p, slots, stream);
+        switch (row_load_mode_host()) { // test-only modes (inkling_test_read_only_loads); serving = 0
+        case 1: launch_schedule<NarrowSchedule, kIntermediate, false, true, false, 1>(p, slots, stream); break;
+        case 2: launch_schedule<NarrowSchedule, kIntermediate, false, true, false, 2>(p, slots, stream); break;
+        default: launch_schedule<NarrowSchedule, kIntermediate, false, true>(p, slots, stream); break;
+        }
     } else {
         launch_prefill<kIntermediate, false>(p, slots, stream);
     }
