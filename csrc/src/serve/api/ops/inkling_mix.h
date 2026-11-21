@@ -252,6 +252,19 @@ void inkling_gemm_inv(const void* weight, std::int32_t n, std::int32_t k, const 
                       void* out, DType out_dtype, std::int32_t ldc, const InklingGemmBatch& batch, void* workspace,
                       std::size_t workspace_bytes, cudaStream_t stream);
 
+/// Up to 4 problems of one k, token count and store type in ONE launch, each with its own weights, row count, input
+/// and output (the q-side / K / V row ranges of a 3-input qkvr). Each element runs exactly the chain of
+/// inkling_gemm_inv; shapes that split (inkling_gemm_split > 1) are refused here.
+struct InklingGemmProblem {
+    const void* weight = nullptr; ///< [n, k]
+    std::int32_t n     = 0;
+    const void* x      = nullptr; ///< [k, tokens]
+    void* out          = nullptr; ///< [ldc, tokens]
+    std::int32_t ldc   = 0;
+};
+void inkling_gemm_inv_group(std::span<const InklingGemmProblem> problems, std::int32_t k, std::int32_t tokens,
+                            DType out_dtype, cudaStream_t stream);
+
 /// In place: x = (tanh(x / cap)) * cap in fp32 (vLLM LogitsProcessor soft_cap), FP32 [rows, T] with
 /// `ldc` elements per column, first `rows` rows of each column.
 void inkling_softcap_f32(float* logits, std::int32_t rows, std::int32_t tokens, std::int32_t ldc,

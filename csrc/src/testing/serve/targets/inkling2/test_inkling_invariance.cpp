@@ -20,6 +20,7 @@
 #include <numeric>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace sinfer;
@@ -181,6 +182,50 @@ int test_gemm(const GemmShape& g, std::uint32_t seed) {
         std::cout << (bad ? "FAIL " : "ok   ") << tag << " vs float64 (2 columns x " << rows << " rows): worst err/limit "
                   << worst << ", " << bad << " over\n";
         failures += bad ? 1 : 0;
+    }
+    return failures;
+}
+
+/// The 3-input qkvr of a global / looped visit: one grouped launch == three separate invariant calls, and a window of
+/// the grouped launch == the full round.
+int test_gemm_group(std::uint32_t seed) {
+    constexpr int kRows = 8600, kQ = 6552, kK = 6552, kV = 7576;
+    const auto w_bits = hash_bf16(static_cast<std::size_t>(kRows) * kD, seed, 0.06F);
+    const auto x_bits = hash_bf16(static_cast<std::size_t>(3) * kAll * kD, seed + 1, 1.0F);
+    DeviceBuffer d_w = to_device(w_bits), d_x = to_device(x_bits);
+    const auto* w = static_cast<const std::uint16_t*>(d_w.p);
+    const auto x  = [&](int stream, int c0) {
+        return static_cast<const std::uint16_t*>(d_x.p) + (static_cast<std::size_t>(stream) * kAll + c0) * kD;
+    };
+    const auto grouped = [&](int c0, int T) {
+        DeviceBuffer out(static_cast<std::size_t>(T) * kRows * 2);
+        out.fill(0);
+        auto* o = static_cast<std::uint16_t*>(out.p);
+        const ops::InklingGemmProblem pr[] = {{w, kQ, x(0, c0), o, kRows},
+                                              {w + static_cast<std::size_t>(kK) * kD, kV - kK, x(1, c0), o + kK, kRows},
+                                              {w + static_cast<std::size_t>(kV) * kD, kRows - kV, x(2, c0), o + kV, kRows}};
+        ops::inkling_gemm_inv_group(pr, kD, T, DType::BF16, nullptr);
+        cuda_synchronize();
+        return raw(out.p, out.bytes);
+    };
+    int failures = 0;
+    const auto full = grouped(0, kAll);
+    {
+        DeviceBuffer out(static_cast<std::size_t>(kAll) * kRows * 2);
+        out.fill(0);
+        auto* o = static_cast<std::uint16_t*>(out.p);
+        const int begin[] = {0, kK, kV}, rows[] = {kQ, kV - kK, kRows - kV};
+        for (int i = 0; i < 3; ++i) {
+            ops::inkling_gemm_inv(w + static_cast<std::size_t>(begin[i]) * kD, rows[i], kD, x(i, 0), kAll, o + begin[i],
+                                  DType::BF16, kRows, {}, nullptr, 0, nullptr);
+        }
+        cuda_synchronize();
+        failures += same_bits("I1 qkvr 3-input grouped launch == 3 separate calls (T=300)", full, raw(out.p, out.bytes), 2);
+    }
+    for (const auto& win : {std::pair<int, int>{0, 1}, std::pair<int, int>{299, 1}, std::pair<int, int>{100, 37}}) {
+        failures += same_bits("I1 qkvr grouped T=" + std::to_string(win.second) + " at " + std::to_string(win.first) +
+                                  " == T=300",
+                              grouped(win.first, win.second), gather(full, kRows, kAll, 1, win.first, win.second, 2), 2);
     }
     return failures;
 }
@@ -445,6 +490,7 @@ int main() {
     };
     std::uint32_t seed = 500;
     for (const auto& g : shapes) { failures += test_gemm(g, seed += 100); }
+    failures += test_gemm_group(2900);
     failures += test_attn_res(3001);
     failures += test_blend(3002);
     failures += test_conv_paths(3003);

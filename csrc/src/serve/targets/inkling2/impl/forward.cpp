@@ -357,11 +357,21 @@ void run_visit(Round& rd, int v) {
     if (Q == 1) {
         gemm_bf16(rd.work, L.qkvr, 0, C::qkvr_rows, in(0), T, qkvr.data, C::qkvr_rows, s);
     } else {
-        gemm_bf16(rd.work, L.qkvr, 0, C::qkvr_query_end, in(0), T, qkvr.data, C::qkvr_rows, s);
-        gemm_bf16(rd.work, L.qkvr, C::qkvr_k_begin, C::qkvr_v_begin - C::qkvr_k_begin, in(1), T,
-                  bf16_ptr(qkvr) + C::qkvr_k_begin, C::qkvr_rows, s);
-        gemm_bf16(rd.work, L.qkvr, C::qkvr_v_begin, C::qkvr_rows - C::qkvr_v_begin, in(2), T,
-                  bf16_ptr(qkvr) + C::qkvr_v_begin, C::qkvr_rows, s);
+        // The q-side / K / V row ranges from their own inputs: one grouped launch, each element the chain of
+        // gemm_bf16.
+        if (L.qkvr.qtype != QType::BF16_CTRL || L.qkvr.qdata == nullptr) {
+            throw std::logic_error("inkling2: only the BF16 attention weights are wired (FP8 attention: lanes b / c)");
+        }
+        const auto* w = static_cast<const std::uint16_t*>(L.qkvr.qdata);
+        const std::int64_t k = L.qkvr.k;
+        const ops::InklingGemmProblem problems[] = {
+            {w, C::qkvr_query_end, in(0), qkvr.data, C::qkvr_rows},
+            {w + C::qkvr_k_begin * k, C::qkvr_v_begin - C::qkvr_k_begin, in(1), bf16_ptr(qkvr) + C::qkvr_k_begin,
+             C::qkvr_rows},
+            {w + C::qkvr_v_begin * k, C::qkvr_rows - C::qkvr_v_begin, in(2), bf16_ptr(qkvr) + C::qkvr_v_begin,
+             C::qkvr_rows},
+        };
+        ops::inkling_gemm_inv_group(problems, static_cast<std::int32_t>(k), T, DType::BF16, s);
     }
     Tensor k_dyn, v_dyn;
     if (vi.global) {

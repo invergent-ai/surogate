@@ -52,12 +52,21 @@ using Tile64x64 = Schedule<64, 64, 32, 32, 3>;
 
 enum class Store : int { Bf16 = 0, Fp32 = 1, Partial = 2 };
 
+constexpr int kMaxGroup = 4;
+
 struct Args {
     const __nv_bfloat16* weight; // [batch][n][k]
     const __nv_bfloat16* x;      // [batch][tokens][k]
     void* out;                   // Bf16 / Fp32: [batch][tokens][ldc]; Partial: FP32 [split][batch][tokens][n]
     std::int32_t rows, k, tokens, ldc, chunk, batch;
     std::int64_t weight_stride, x_stride, out_stride;
+    // Group mode (grouped != 0): problem b = blockIdx.y reads these instead of the strided batch (never split).
+    std::int32_t grouped;
+    const __nv_bfloat16* g_weight[kMaxGroup];
+    const __nv_bfloat16* g_x[kMaxGroup];
+    void* g_out[kMaxGroup];
+    std::int32_t g_rows[kMaxGroup];
+    std::int32_t g_ldc[kMaxGroup];
 };
 
 __device__ __forceinline__ int swizzled_col(int row, int col) {
@@ -79,12 +88,14 @@ __global__ __launch_bounds__(S::kThreads) void gemm_inv_kernel(const __grid_cons
 
     const int b       = static_cast<int>(blockIdx.y);
     const int split   = static_cast<int>(blockIdx.z);
-    const auto* weight = a.weight + static_cast<std::int64_t>(b) * a.weight_stride;
-    const auto* x      = a.x + static_cast<std::int64_t>(b) * a.x_stride;
+    const auto* weight = a.grouped ? a.g_weight[b] : a.weight + static_cast<std::int64_t>(b) * a.weight_stride;
+    const auto* x      = a.grouped ? a.g_x[b] : a.x + static_cast<std::int64_t>(b) * a.x_stride;
+    const int rows     = a.grouped ? a.g_rows[b] : a.rows;
     const int tiles_n = (a.tokens + BN - 1) / BN;
     const int tile_m  = static_cast<int>(blockIdx.x) / tiles_n;
     const int tile_n  = static_cast<int>(blockIdx.x) - tile_m * tiles_n;
     const int m0 = tile_m * BM, n0 = tile_n * BN;
+    if (m0 >= rows) { return; } // a group's smaller problem: the whole CTA leaves before any barrier
     // This CTA's chain: k in [k_begin, k_end), from zero.
     const int k_begin = split * a.chunk;
     const int k_end   = min(a.k, k_begin + a.chunk);
@@ -103,7 +114,7 @@ __global__ __launch_bounds__(S::kThreads) void gemm_inv_kernel(const __grid_cons
 #pragma unroll 1
         for (int item = tid; item < BM * (BK / 8); item += THREADS) {
             const int row = item / (BK / 8), kk = (item - row * (BK / 8)) * 8;
-            const bool valid = m0 + row < a.rows && k0 + kk < k_end;
+            const bool valid = m0 + row < rows && k0 + kk < k_end;
             const auto* src  = valid ? &weight[static_cast<std::int64_t>(m0 + row) * a.k + k0 + kk] : weight;
             cp_async_zfill<16, Cache::cg>(&a_stage[row * BK + swizzled_col(row, kk)], src, valid ? 16 : 0);
         }
@@ -160,16 +171,18 @@ __global__ __launch_bounds__(S::kThreads) void gemm_inv_kernel(const __grid_cons
     cp_wait<0>();
 
     const auto store = [&](int row, int token, float value) {
-        if (row >= a.rows || token >= a.tokens) { return; }
+        if (row >= rows || token >= a.tokens) { return; }
         if constexpr (kStore == Store::Partial) {
             float* p = static_cast<float*>(a.out);
             p[((static_cast<std::int64_t>(split) * a.batch + b) * a.tokens + token) * a.rows + row] = value;
         } else {
-            const std::int64_t at = static_cast<std::int64_t>(b) * a.out_stride + static_cast<std::int64_t>(token) * a.ldc + row;
+            void* base            = a.grouped ? a.g_out[b] : a.out;
+            const std::int64_t at = (a.grouped ? 0 : static_cast<std::int64_t>(b) * a.out_stride) +
+                                    static_cast<std::int64_t>(token) * (a.grouped ? a.g_ldc[b] : a.ldc) + row;
             if constexpr (kStore == Store::Fp32) {
-                static_cast<float*>(a.out)[at] = value;
+                static_cast<float*>(base)[at] = value;
             } else {
-                static_cast<__nv_bfloat16*>(a.out)[at] = __float2bfloat16_rn(value);
+                static_cast<__nv_bfloat16*>(base)[at] = __float2bfloat16_rn(value);
             }
         }
     };
@@ -297,6 +310,42 @@ void inkling_gemm_inv(const void* weight, std::int32_t n, std::int32_t k, const 
                                                                  batch.count, splits, ldc, batch.out_stride);
     }
     CUDA_CHECK(cudaGetLastError());
+}
+
+void inkling_gemm_inv_group(std::span<const InklingGemmProblem> problems, std::int32_t k, std::int32_t tokens,
+                            DType out_dtype, cudaStream_t stream) {
+    if (problems.empty() || tokens <= 0) { return; }
+    const auto aligned = [](const void* p) { return p != nullptr && (reinterpret_cast<std::uintptr_t>(p) & 15u) == 0; };
+    if (problems.size() > static_cast<std::size_t>(kMaxGroup) || k <= 0 || k % 8 != 0 ||
+        (out_dtype != DType::BF16 && out_dtype != DType::FP32)) {
+        throw std::invalid_argument("inkling_gemm_inv_group: 1-4 problems, k a positive multiple of 8, out BF16 or FP32");
+    }
+    Args a{};
+    a.k       = k;
+    a.tokens  = tokens;
+    a.chunk   = ((k + kBlockK - 1) / kBlockK) * kBlockK;
+    a.batch   = static_cast<std::int32_t>(problems.size());
+    a.grouped = 1;
+    a.rows    = 0;
+    for (std::size_t i = 0; i < problems.size(); ++i) {
+        const InklingGemmProblem& p = problems[i];
+        if (p.n <= 0 || p.ldc < p.n || !aligned(p.weight) || !aligned(p.x) || p.out == nullptr ||
+            inkling_gemm_split(p.n, k) != 1) {
+            throw std::invalid_argument("inkling_gemm_inv_group: a problem needs n > 0, ldc >= n, aligned weight / x, "
+                                        "and a shape that runs as one chunk");
+        }
+        a.g_weight[i] = static_cast<const __nv_bfloat16*>(p.weight);
+        a.g_x[i]      = static_cast<const __nv_bfloat16*>(p.x);
+        a.g_out[i]    = p.out;
+        a.g_rows[i]   = p.n;
+        a.g_ldc[i]    = p.ldc;
+        a.rows        = std::max(a.rows, p.n); // the grid covers the largest problem
+    }
+    if (out_dtype == DType::FP32) {
+        dispatch<Store::Fp32>(a, 1, stream);
+    } else {
+        dispatch<Store::Bf16>(a, 1, stream);
+    }
 }
 
 } // namespace sinfer::ops
