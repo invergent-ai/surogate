@@ -61,15 +61,15 @@ template <class Schedule, int K>
 __device__ __forceinline__ void stage_tiles(const std::uint8_t* weight_codes,
                                             const std::uint8_t* weight_scales,
                                             const __nv_bfloat16* activations, const int* source_rows,
-                                            Mxfp8Shared<Schedule>& shared, int stage, int k_tile) {
+                                            Mxfp8Shared<Schedule>& shared, int stage, int k_tile, int prefetch) {
     constexpr int kChunksPerRow = Schedule::kBlockK / 16;
     for (int task = static_cast<int>(threadIdx.x); task < Schedule::kBlockM * kChunksPerRow;
          task += Schedule::kThreads) {
         const int row   = task / kChunksPerRow;
         const int chunk = task - row * kChunksPerRow;
-        cp_async<16, Cache::cg>(shared.codes[stage] + row * Schedule::kCodeStride + chunk * 16,
-                                weight_codes + static_cast<std::int64_t>(row) * K +
-                                    k_tile * Schedule::kBlockK + chunk * 16);
+        cp_async_cg16_hint(shared.codes[stage] + row * Schedule::kCodeStride + chunk * 16,
+                           weight_codes + static_cast<std::int64_t>(row) * K + k_tile * Schedule::kBlockK + chunk * 16,
+                           prefetch);
     }
     for (int row = static_cast<int>(threadIdx.x); row < Schedule::kBlockM; row += Schedule::kThreads) {
         cp_async<4>(shared.scales[stage] + row * 4,
@@ -151,7 +151,7 @@ __global__ __launch_bounds__(Schedule::kThreads) void mxfp8_expert_gemm_kernel(G
 #pragma unroll
     for (int stage = 0; stage < Schedule::kStages; ++stage) {
         if (stage < kKTiles) {
-            stage_tiles<Schedule, K>(weight_codes, weight_scales, p.a_bf16, source_rows, shared, stage, stage);
+            stage_tiles<Schedule, K>(weight_codes, weight_scales, p.a_bf16, source_rows, shared, stage, stage, p.l2_prefetch);
             cp_commit();
         }
     }
@@ -213,7 +213,7 @@ __global__ __launch_bounds__(Schedule::kThreads) void mxfp8_expert_gemm_kernel(G
         const int next_k_tile = k_tile + Schedule::kStages;
         if (next_k_tile < kKTiles) {
             stage_tiles<Schedule, K>(weight_codes, weight_scales, p.a_bf16, source_rows, shared, stage,
-                                     next_k_tile);
+                                     next_k_tile, p.l2_prefetch);
         }
         cp_commit();
     }
@@ -307,20 +307,22 @@ void require(const GemmParams& params) {
 void launch_mxfp8_gate_up(const GemmParams& params, std::int32_t slots, GemmSchedule schedule,
                           cudaStream_t stream) {
     require(params);
+    const GemmParams p = with_l2_prefetch(params);
     if (schedule == GemmSchedule::Narrow) {
-        launch_schedule<NarrowSchedule, kHidden, true>(params, slots, stream);
+        launch_schedule<NarrowSchedule, kHidden, true>(p, slots, stream);
     } else {
-        launch_schedule<WideSchedule, kHidden, true>(params, slots, stream);
+        launch_schedule<WideSchedule, kHidden, true>(p, slots, stream);
     }
 }
 
 void launch_mxfp8_down(const GemmParams& params, std::int32_t slots, GemmSchedule schedule,
                        cudaStream_t stream) {
     require(params);
+    const GemmParams p = with_l2_prefetch(params);
     if (schedule == GemmSchedule::Narrow) {
-        launch_schedule<NarrowSchedule, kIntermediate, false>(params, slots, stream);
+        launch_schedule<NarrowSchedule, kIntermediate, false>(p, slots, stream);
     } else {
-        launch_schedule<WideSchedule, kIntermediate, false>(params, slots, stream);
+        launch_schedule<WideSchedule, kIntermediate, false>(p, slots, stream);
     }
 }
 

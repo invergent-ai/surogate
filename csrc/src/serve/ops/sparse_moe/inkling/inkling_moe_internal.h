@@ -13,6 +13,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 
 namespace sinfer::ops::detail::inkling {
 
@@ -156,7 +157,21 @@ struct GemmParams {
     __nv_bfloat16* combined    = nullptr;
     // Adapter (table null = none).
     LoraRound lora;
+    /// L2 prefetch-size hint for the weight-code loads (0 none, 128, 256): same bytes, a timing knob.
+    std::int32_t l2_prefetch = 0;
 };
+
+/// TIMING KNOB (removed once measured): SUROGATE_INKLING_L2_PREFETCH = 128 | 256 sets the weight loads'
+/// L2 prefetch hint (`GemmParams::l2_prefetch`); unset / other = none. Every value moves the same bytes.
+inline GemmParams with_l2_prefetch(GemmParams params) {
+    static const int value = [] {
+        const char* text = std::getenv("SUROGATE_INKLING_L2_PREFETCH");
+        const int v      = text != nullptr ? std::atoi(text) : 0;
+        return v == 128 || v == 256 ? v : 0;
+    }();
+    params.l2_prefetch = value;
+    return params;
+}
 
 /// Tile schedules: Narrow for decode / verify widths, Wide for prefill. Same arithmetic.
 enum class GemmSchedule : std::uint8_t { Narrow, Wide };

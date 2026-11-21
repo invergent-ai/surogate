@@ -3,6 +3,7 @@
 // Pieces shared by the NVFP4 and MXFP8 grouped expert GEMMs of the Inkling MoE: finding a CTA's
 // expert tile in the routing offsets, the adapter slot of a token, and the fused LoRA expand.
 
+#include "ops/common/memory.cuh"
 #include "ops/sparse_moe/inkling/inkling_moe_internal.h"
 #include "ops/sparse_moe/inkling/inkling_numerics.cuh"
 
@@ -134,6 +135,19 @@ __device__ __forceinline__ void combine_arrive(const GemmParams& p, int rows, in
     }
     sync();
     if (thread == 0) { *done_count = 0; }
+}
+
+/// 16-byte cp.async (cg) with an L2 prefetch-size hint (`prefetch` 128 / 256 bytes; anything else = none).
+/// Moves the same bytes; only the DRAM access granularity changes (weight rows are read 64 bytes per
+/// k-tile, 1152 bytes apart). Warp-uniform branch.
+__device__ __forceinline__ void cp_async_cg16_hint(void* smem_dst, const void* gmem_src, int prefetch) {
+    if (prefetch == 256) {
+        asm volatile("cp.async.cg.shared.global.L2::256B [%0], [%1], 16;\n" : : "r"(smem_addr(smem_dst)), "l"(gmem_src));
+    } else if (prefetch == 128) {
+        asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n" : : "r"(smem_addr(smem_dst)), "l"(gmem_src));
+    } else {
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" : : "r"(smem_addr(smem_dst)), "l"(gmem_src));
+    }
 }
 
 /// fp32 -> bf16 -> fp32: the reference's bf16 store of gate_up followed by the SiTU's load.
