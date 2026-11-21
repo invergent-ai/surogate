@@ -1529,7 +1529,15 @@ InklingAttentionKnobs& knobs() {
         x.linear_gemm       = std::clamp(env_int("SUROGATE_INKLING_LINEAR_GEMM", x.linear_gemm), 0, 2);
         x.decode_raw        = std::clamp(env_int("SUROGATE_INKLING_ATTN_DECODE_RAW", x.decode_raw), 0, 2);
         x.fold_fence_light  = env_int("SUROGATE_INKLING_ATTN_FOLD_FENCE_LIGHT", x.fold_fence_light ? 1 : 0) != 0;
-        x.linear_x_nc       = std::clamp(env_int("SUROGATE_INKLING_LINEAR_X", x.linear_x_nc), 0, 2);
+        // Mode 1 (ld.global.nc on x) is a known-broken negative control: FP8-route decode garbage (review R5 minor 10). The
+        // environment never selects it, in any binary; the op test sets the knob field directly.
+        const int linear_x  = env_int("SUROGATE_INKLING_LINEAR_X", x.linear_x_nc);
+        if (linear_x == 1) {
+            throw std::invalid_argument(
+                "SUROGATE_INKLING_LINEAR_X=1 is refused: it selects the known-broken ld.global.nc load of the attention "
+                "projection input (FP8-route decode garbage). Unset it, or use 0 (production) or 2 (ld.global.cg).");
+        }
+        x.linear_x_nc       = std::clamp(linear_x, 0, 2);
         return x;
     }();
     return k;

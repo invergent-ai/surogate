@@ -198,7 +198,8 @@ struct InklingAttentionKnobs {
     bool fold_fence_light = true;
     // Narrow attn_linear x loads (SUROGATE_INKLING_LINEAR_X): 0 = plain ld.global (production), 1 = ld.global.nc (the
     // pre-17:5x form the compiler hoisted above the PDL wait: FP8-route decode garbage; TEST-ONLY negative control),
-    // 2 = ld.global.cg (correct, measured 1.4-2.4x slower).
+    // 2 = ld.global.cg (correct, measured 1.4-2.4x slower). The environment accepts 0 and 2 only: value 1 throws at the
+    // knobs' first read (engine load: workspace sizing); only the op test selects 1, by setting this field.
     int linear_x_nc = 0;
 };
 [[nodiscard]] InklingAttentionKnobs& inkling_attention_knobs();
