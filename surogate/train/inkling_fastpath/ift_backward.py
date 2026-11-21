@@ -31,6 +31,27 @@ EPS = 1e-6
 VOCAB = 200058
 GLOBAL_LAYERS = (5, 11, 17, 23)
 BF16, F32 = torch.bfloat16, torch.float32
+import os as _os
+import time as _time
+
+PROFILE = {"on": _os.environ.get("IFT_PROFILE", "0") == "1", "t": {}}
+
+
+class _tick:
+    """IFT_PROFILE=1: accumulated wall time per named section (synchronising; profiling runs only)."""
+
+    def __init__(self, name):
+        self.name = name
+
+    def __enter__(self):
+        if PROFILE["on"]:
+            torch.cuda.synchronize()
+            self.t0 = _time.time()
+
+    def __exit__(self, *a):
+        if PROFILE["on"]:
+            torch.cuda.synchronize()
+            PROFILE["t"][self.name] = PROFILE["t"].get(self.name, 0.0) + _time.time() - self.t0
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -262,31 +283,37 @@ def visit_torch(W: EngineWeights, vi, stack, partial, bank, ids, lora):
     partial = partial.float()
     messages = None
     Q = L.attn_norm.shape[0]
-    if vi.v == 0:
-        attn_in = torch.stack([RA.rb(RA.rms_norm(partial, L.attn_norm[j], EPS)) for j in range(Q)])
-    elif not vi.looped:
-        attn_in = RA.inkling_attn_res(stack, partial, None, L.q_attn, L.attn_norm, EPS)
-    else:
-        dests = RA.inkling_attn_res(stack, partial, None, L.q_attn, None)
-        messages = RA.inkling_attn_res([bank[0].float()], bank[1].float(), None, L.q_msg, None)
-        norm_w = L.attn_norm
-        if L.is_local:
-            dests = dests.expand(3, -1, -1)
-            norm_w = norm_w.expand(3, -1)
-        attn_in = RA.inkling_loop_blend(dests, messages[:3], L.ctrl_down[0:3], L.ctrl_gf[0:3], norm_w, EPS)
-    gated = attention(L, attn_in, pos, tau)
-    attn_partial = RA.rb(RA.mm(gated, L.wo))
-    attn_out, _ = RA.inkling_short_conv(attn_partial, L.attn_sconv, None)
-    mlp_norm = None if messages is not None else L.mlp_norm
-    if vi.first:
-        mlp_in = RA.inkling_attn_res(stack + [partial], attn_out, None, L.q_mlp, mlp_norm, EPS)
-    else:
-        mlp_in = RA.inkling_attn_res(stack, partial, attn_out, L.q_mlp, mlp_norm, EPS)
-    if messages is not None:
-        mlp_in = RA.inkling_loop_blend(mlp_in, messages[3:], L.ctrl_down[3:4], L.ctrl_gf[3:4], L.mlp_norm, EPS)
-    moe_out = moe_vec(mlp_in[0], L.experts, ids, lora)
-    new_partial, _ = RA.inkling_short_conv(moe_out, L.mlp_sconv, None, addend=attn_out,
-                                           residual=None if vi.first else partial)
+    with _tick("fwd.attn_in"):
+        if vi.v == 0:
+            attn_in = torch.stack([RA.rb(RA.rms_norm(partial, L.attn_norm[j], EPS)) for j in range(Q)])
+        elif not vi.looped:
+            attn_in = RA.inkling_attn_res(stack, partial, None, L.q_attn, L.attn_norm, EPS)
+        else:
+            dests = RA.inkling_attn_res(stack, partial, None, L.q_attn, None)
+            messages = RA.inkling_attn_res([bank[0].float()], bank[1].float(), None, L.q_msg, None)
+            norm_w = L.attn_norm
+            if L.is_local:
+                dests = dests.expand(3, -1, -1)
+                norm_w = norm_w.expand(3, -1)
+            attn_in = RA.inkling_loop_blend(dests, messages[:3], L.ctrl_down[0:3], L.ctrl_gf[0:3], norm_w, EPS)
+    with _tick("fwd.attention"):
+        gated = attention(L, attn_in, pos, tau)
+    with _tick("fwd.wo_conv"):
+        attn_partial = RA.rb(RA.mm(gated, L.wo))
+        attn_out, _ = RA.inkling_short_conv(attn_partial, L.attn_sconv, None)
+    with _tick("fwd.mlp_in"):
+        mlp_norm = None if messages is not None else L.mlp_norm
+        if vi.first:
+            mlp_in = RA.inkling_attn_res(stack + [partial], attn_out, None, L.q_mlp, mlp_norm, EPS)
+        else:
+            mlp_in = RA.inkling_attn_res(stack, partial, attn_out, L.q_mlp, mlp_norm, EPS)
+        if messages is not None:
+            mlp_in = RA.inkling_loop_blend(mlp_in, messages[3:], L.ctrl_down[3:4], L.ctrl_gf[3:4], L.mlp_norm, EPS)
+    with _tick("fwd.moe"):
+        moe_out = moe_vec(mlp_in[0], L.experts, ids, lora)
+    with _tick("fwd.out_conv"):
+        new_partial, _ = RA.inkling_short_conv(moe_out, L.mlp_sconv, None, addend=attn_out,
+                                               residual=None if vi.first else partial)
     return new_partial
 
 
@@ -385,7 +412,8 @@ class EngineVisit(torch.autograd.Function):
                 lora = dict(zip(LORA_KEYS, lt)) | {"scale": ctx.lora_scale}
             out = visit_torch(ctx.W, ctx.vi, stack, partial, bank, ctx.ids, lora)
             want = [t for t in ins if t.requires_grad]
-            grads = torch.autograd.grad(out, want, g, allow_unused=True)
+            with _tick("bwd.autograd"):
+                grads = torch.autograd.grad(out, want, g, allow_unused=True)
         it = iter(grads)
         res = [next(it) if t.requires_grad else None for t in ins]
         return (None, None, None, None, None, None, None, *res)

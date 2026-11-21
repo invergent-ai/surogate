@@ -22,15 +22,17 @@ def post(base, path, body, timeout=1800):
         return json.loads(r.read())
 
 
-def roll(base, out, groups=2, samples=4, max_tokens=1024):
-    rng = random.Random(20261121)
+def roll(base, out, groups=2, samples=4, max_tokens=1024, hard=0):
+    rng = random.Random(20261121 + hard)
     jobs = []
     for g in range(groups):
-        a, b = rng.randint(12, 99), rng.randint(12, 99)
+        a, b = (rng.randint(1000, 9999), rng.randint(1000, 9999)) if hard else (rng.randint(12, 99), rng.randint(12, 99))
+        q = (f"Compute {a} * {b} by long multiplication, showing each partial product, then give the final number."
+             if hard else f"Compute {a} * {b}. Give only the final number.")
         for s in range(samples):
             jobs.append({"group": g, "sample": s, "a": a, "b": b, "answer": str(a * b),
                          "body": {"model": "eff-policy",
-                                  "messages": [{"role": "user", "content": f"Compute {a} * {b}. Give only the final number."}],
+                                  "messages": [{"role": "user", "content": q}],
                                   "reasoning_effort": "xhigh", "temperature": 1.0, "top_p": 0.95, "top_k": 20,
                                   "max_tokens": max_tokens, "seed": 1000 * g + s, "logprobs": True,
                                   "return_token_ids": True, "return_routed_experts": True}})
@@ -73,6 +75,6 @@ def score(base, rows_path, out):
 
 if __name__ == "__main__":
     if sys.argv[1] == "roll":
-        roll(sys.argv[2], sys.argv[3], *(int(x) for x in sys.argv[4:7]))
+        roll(sys.argv[2], sys.argv[3], *(int(x) for x in sys.argv[4:8]))
     else:
         score(sys.argv[2], sys.argv[3], sys.argv[4])

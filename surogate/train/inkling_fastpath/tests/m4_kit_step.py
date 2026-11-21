@@ -149,6 +149,10 @@ def step(bin_dir, artifact, rollouts_path, ad_dir, out_dir):
     res = run_step(be, rows, 0, StepConfig(), log=log)
     t_step = time.time() - t1
     gn = opt.step()
+    import ift_backward as B
+    if B.PROFILE["on"]:
+        rep["profile_s"] = dict(B.PROFILE["t"])
+        log("profile (s): " + json.dumps({k: round(v, 2) for k, v in sorted(B.PROFILE["t"].items())}))
     rep["metrics"] = res.metrics
     rep["grad_norm"] = gn
     rep["step_seconds"] = t_step
