@@ -82,6 +82,47 @@ public:
         }
     }
 
+    /// Lane f1: the shared-prefix cache's entries go (pages a running or retained fork borrows stay
+    /// with it), and every lane re-plans: a plan that forks a dropped entry would keep its pages.
+    /// Returns false when this program has no shared-prefix cache.
+    bool drop_shared_prefixes_for_admission() noexcept {
+        if constexpr (requires(typename Package::Program& p) { p.drop_shared_prefixes(); }) {
+            instance_.program->drop_shared_prefixes();
+            for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) { invalidate_lane_plans(lane); }
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    /// Lane f1: nothing runs (or nothing is active) and the queue head fits on no lane, not even
+    /// after the other retained lanes go -- the second pass of find_admission_lane keeps the lane
+    /// it would take with everything that lane borrows, and only evicting another lane dropped the
+    /// shared prefixes. What still holds pages is idle KV: the shared prefixes and the retained
+    /// lanes, the head's own candidate lane included (--max-num-seqs 1 refused every request that
+    /// needed the pages its own retained conversation held). Gives back one piece -- the shared
+    /// prefixes once per head, then the retained lane released longest ago, to the host tier
+    /// where there is one -- and returns true; the head re-plans and tries again. False when
+    /// nothing idle is left, and only then is the head refused.
+    bool release_idle_kv_for_head(const std::shared_ptr<Request>& head) {
+        if (idle_release_head_ != head->id) {
+            idle_release_head_ = head->id;
+            if (drop_shared_prefixes_for_admission()) { return true; }
+        }
+        std::optional<std::uint32_t> oldest;
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            if (slots_[lane] == nullptr && instance_.program->has_retained_lane(lane) &&
+                (!oldest || lane_released_at_[lane] < lane_released_at_[*oldest])) {
+                oldest = lane;
+            }
+        }
+        if (!oldest) { return false; }
+        take_back_retained_lane(*oldest);
+        invalidate_lane_plans(*oldest);
+        return true;
+    }
+    std::uint64_t idle_release_head_ = ~std::uint64_t{0}; ///< the head the shared prefixes last went for
+
     ConcurrentExecutor(Instance& instance, const EngineOptions& options)
         : instance_(instance), max_concurrency_(options.max_concurrency),
           max_round_rows_(decode_batch_capacity(options.max_concurrency, options.speculative.backend)),
@@ -1628,6 +1669,19 @@ private:
                 }
             }
             admit_trace_step("evict retained lanes", request->id, evict_started);
+            // Lane f1: the second pass counted the shared prefixes no kept holder borrows as
+            // reclaimable, but only evicting a lane dropped them (evict_retained_lane). With no
+            // other lane retained -- every other lane running -- nothing went, and the head was
+            // retried until it expired (lane h, card 3 14:4x: 8 x 64k, one stream never admitted).
+            // Once per head, so a second pass that still disagrees cannot spin the admission loop.
+            if (!evicted && idle_release_head_ != request->id &&
+                !instance_.program->can_admit_lane(lane, *request->lane_plans[lane])) {
+                idle_release_head_ = request->id;
+                if (drop_shared_prefixes_for_admission()) {
+                    trace_blocked_head(request, "dropped the shared prefixes, re-plans");
+                    return AdmissionProgress::ControlProgress;
+                }
+            }
             if (!instance_.program->can_admit_lane(lane, *request->lane_plans[lane])) {
                 // `can_admit_lane_after_retained_eviction` chose this lane by summing every
                 // `sequences[other].retained && sequences[other].kv`, with no test on the
@@ -1880,6 +1934,11 @@ private:
                 for (std::uint32_t lane = 0; lane < max_concurrency_ && !running; ++lane) {
                     running = slots_[lane] != nullptr;
                 }
+                if (!running && release_idle_kv_for_head(head)) {
+                    trace_blocked_head(head, "released idle KV (on demand, nothing running), re-plans");
+                    control_progress = true;
+                    continue;
+                }
                 if (!running) {
                     trace_blocked_head(head, "refused (on demand, nothing running)");
                     (void)remove_pending_error(head, std::make_exception_ptr(RequestError(
@@ -1892,6 +1951,11 @@ private:
                 return control_progress ? AdmissionProgress::ControlProgress : AdmissionProgress::None;
             }
             const ActiveAdmissionSet active = active_admission_set();
+            if (active.size == 0 && release_idle_kv_for_head(head)) {
+                trace_blocked_head(head, "released idle KV (reserve, nothing active), re-plans");
+                control_progress = true;
+                continue;
+            }
             if (active.size == 0) {
                 trace_blocked_head(head, "refused (reserve, nothing active)");
                 (void)remove_pending_error(head, std::make_exception_ptr(RequestError(
