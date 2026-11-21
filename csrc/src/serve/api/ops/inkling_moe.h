@@ -226,4 +226,9 @@ void inkling_decode_expert_units(const InklingExpertBank& bank, InklingExpertFor
                                  std::int32_t first_expert, std::int32_t count, Tensor& unit, Tensor& factor,
                                  cudaStream_t stream);
 
+/// Benchmark helper (sinfer_inkling_moe_test --bench, INKLING_BENCH_PRED_US): one CTA that triggers its PDL
+/// dependents at entry -- as the engine's inkling_mix / gemm_inv kernels do since e1 f9ebe0eb -- and then
+/// spins `nanoseconds` of wall time, so the next kernel (the MoE's route) launches early as in serving.
+void inkling_bench_predecessor(std::int32_t nanoseconds, cudaStream_t stream);
+
 } // namespace sinfer::ops

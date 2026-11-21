@@ -15,6 +15,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
@@ -66,11 +67,64 @@ struct Buffers {
 
 constexpr std::int32_t kCounterWords = kExperts + 1;
 
+/// Prefill (T > kNarrowMaxTokens): the down GEMM and its fused combine run in this many column passes, so the
+/// down rows buffer holds 2304 / passes columns per slot (each pass covers whole N tiles of every down schedule:
+/// NVFP4 768 = 3 x 256 / 6 x 128, MXFP8 384 = 3 x 128). The arrival counters are per (token, 64-column tile), so
+/// the combine of a column tile completes inside its pass; every weight byte is still read once.
+constexpr std::int32_t down_passes(InklingExpertFormat format) {
+    return format == InklingExpertFormat::Nvfp4 ? 3 : 6;
+}
+
 template <class Allocate>
 Buffers carve(InklingExpertFormat format, std::int32_t tokens, std::int32_t rank, Allocate&& allocate) {
     const std::size_t t     = static_cast<std::size_t>(tokens);
     const std::size_t slots = t * kTopK;
     const bool nvfp4        = format == InklingExpertFormat::Nvfp4;
+    if (tokens > kNarrowMaxTokens) {
+        // Prefill layout with aliasing (lifetimes in launch order: logits -> x quant -> select / place ->
+        // gate_up -> y quant -> down passes):
+        //   region A: logits (dead after the selection) | y bf16 (gate_up -> y quant; MXFP8 quantises y IN
+        //             PLACE, so A also holds y_bf16 for the down) | NVFP4: the down pass rows (y is dead after the
+        //             y quant);
+        //   region B (MXFP8): x_bf16 (dead after gate_up) | the down pass rows.
+        const std::size_t pass_columns = static_cast<std::size_t>(kHidden / down_passes(format));
+        const std::size_t logits_bytes = t * kExperts * sizeof(float);
+        const std::size_t y_bytes      = slots * kIntermediate * sizeof(__nv_bfloat16);
+        const std::size_t pass_bytes   = slots * pass_columns * sizeof(__nv_bfloat16);
+        Buffers b;
+        b.ids      = static_cast<std::int32_t*>(allocate(slots * sizeof(std::int32_t)));
+        b.gammas   = static_cast<float*>(allocate(slots * sizeof(float)));
+        b.ranks    = static_cast<std::int32_t*>(allocate(slots * sizeof(std::int32_t)));
+        b.counters = static_cast<std::int32_t*>(allocate(kCounterWords * sizeof(std::int32_t)));
+        b.arrivals = static_cast<std::int32_t*>(allocate(t * kArrivalTiles * sizeof(std::int32_t)));
+        b.offsets  = static_cast<std::int32_t*>(allocate((kExperts + 1) * sizeof(std::int32_t)));
+        b.sorted   = static_cast<std::int32_t*>(allocate(slots * sizeof(std::int32_t)));
+        if (nvfp4) {
+            auto* region = allocate(std::max({logits_bytes, y_bytes, pass_bytes}));
+            b.logits     = static_cast<float*>(region);
+            b.y          = static_cast<__nv_bfloat16*>(region);
+            b.down       = static_cast<__nv_bfloat16*>(region);
+            b.x_codes    = static_cast<std::uint8_t*>(allocate(t * (kHidden / 2)));
+            b.x_scales   = static_cast<std::uint8_t*>(allocate(t * (kHidden / 16)));
+            b.x_amax     = static_cast<float*>(allocate(t * sizeof(float)));
+            b.y_codes    = static_cast<std::uint8_t*>(allocate(slots * (kIntermediate / 2)));
+            b.y_scales   = static_cast<std::uint8_t*>(allocate(slots * (kIntermediate / 16)));
+            b.y_amax     = static_cast<float*>(allocate(slots * sizeof(float)));
+        } else {
+            auto* region_a = allocate(std::max(logits_bytes, y_bytes));
+            b.logits       = static_cast<float*>(region_a);
+            b.y            = static_cast<__nv_bfloat16*>(region_a);
+            b.y_bf16       = static_cast<__nv_bfloat16*>(region_a);
+            auto* region_b = allocate(std::max(t * kHidden * sizeof(__nv_bfloat16), pass_bytes));
+            b.x_bf16       = static_cast<__nv_bfloat16*>(region_b);
+            b.down         = static_cast<__nv_bfloat16*>(region_b);
+        }
+        if (rank > 0) {
+            b.low_gate_up = static_cast<float*>(allocate(slots * 2 * static_cast<std::size_t>(rank) * sizeof(float)));
+            b.low_down    = static_cast<float*>(allocate(slots * static_cast<std::size_t>(rank) * sizeof(float)));
+        }
+        return b;
+    }
     Buffers b;
     b.logits   = static_cast<float*>(allocate(t * kExperts * sizeof(float)));
     b.ids      = static_cast<std::int32_t*>(allocate(slots * sizeof(std::int32_t)));
@@ -133,11 +187,18 @@ std::size_t inkling_moe_state_bytes() {
 
 std::size_t inkling_moe_workspace_bytes(InklingExpertFormat format, std::int32_t max_tokens, bool adapters) {
     if (max_tokens <= 0) { throw std::invalid_argument("inkling_moe_workspace_bytes: max_tokens must be positive"); }
-    std::size_t total = kAlignment; // the arena's offset may be unaligned when the call starts
-    carve(format, max_tokens, adapters ? InklingMoeGeometry::kMaxAdapterRank : 0, [&](std::size_t bytes) -> void* {
-        total += aligned(bytes);
-        return nullptr;
-    });
+    // The largest layout of any width <= max_tokens: the narrow one at min(max_tokens, 64) and, above 64,
+    // the prefill one at max_tokens (both grow with T).
+    const auto layout_bytes = [&](std::int32_t tokens) {
+        std::size_t total = kAlignment; // the arena's offset may be unaligned when the call starts
+        carve(format, tokens, adapters ? InklingMoeGeometry::kMaxAdapterRank : 0, [&](std::size_t bytes) -> void* {
+            total += aligned(bytes);
+            return nullptr;
+        });
+        return total;
+    };
+    std::size_t total = layout_bytes(std::min(max_tokens, kNarrowMaxTokens));
+    if (max_tokens > kNarrowMaxTokens) { total = std::max(total, layout_bytes(max_tokens)); }
     return total;
 }
 
@@ -223,6 +284,23 @@ void inkling_moe(const Tensor& x, const InklingMoeWeights& weights, Tensor& out,
     }
     if (!narrow) { launch_router_place(route, tokens, stream); }
 
+    // Test taps are copied right after the kernel that produces them: the prefill layout reuses the logits /
+    // y / x regions later in the call (carve).
+    const InklingMoeTaps* taps = options.taps;
+    const std::size_t s        = static_cast<std::size_t>(slots);
+    const auto copy = [&](void* destination, const void* source, std::size_t bytes) {
+        if (destination == nullptr || source == nullptr) { return; }
+        const cudaError_t status = cudaMemcpyAsync(destination, source, bytes, cudaMemcpyDeviceToDevice, stream);
+        if (status != cudaSuccess) {
+            throw std::runtime_error(std::string("inkling_moe taps: ") + cudaGetErrorString(status));
+        }
+    };
+    if (taps != nullptr) {
+        copy(taps->logits, b.logits, static_cast<std::size_t>(tokens) * kExperts * sizeof(float));
+        copy(taps->ids, b.ids, s * sizeof(std::int32_t));
+        copy(taps->gammas, b.gammas, s * sizeof(float));
+    }
+
     LoraRound lora;
     if (adapted) {
         lora.table        = adapters->table;
@@ -247,24 +325,37 @@ void inkling_moe(const Tensor& x, const InklingMoeWeights& weights, Tensor& out,
     gate_up.weights     = weights.w13;
     gate_up.out         = b.y;
     gate_up.lora        = lora;
-    gate_up.gate_up_tap = options.taps != nullptr ? static_cast<__nv_bfloat16*>(options.taps->gate_up) : nullptr;
+    gate_up.gate_up_tap = taps != nullptr ? static_cast<__nv_bfloat16*>(taps->gate_up) : nullptr;
     if (nvfp4) {
         launch_nvfp4_gate_up(gate_up, slots, schedule, stream);
-        // Narrow rounds quantise y inside the down kernel; the standalone pass then runs only for test taps.
-        if (!narrow || options.taps != nullptr) {
-            launch_quant_nvfp4(b.y, slots, kIntermediate, b.ids, live, b.y_codes, b.y_scales, b.y_amax, stream);
-        }
     } else {
         launch_mxfp8_gate_up(gate_up, slots, schedule, stream);
-        const InklingMoeTaps* taps = options.taps;
-        launch_quant_mxfp8(b.y, slots, kIntermediate, b.ids, live, taps != nullptr ? taps->y_codes : nullptr,
-                           taps != nullptr ? taps->y_scales : nullptr, b.y_bf16, stream);
     }
+    if (taps != nullptr) { copy(taps->y, b.y, s * kIntermediate * sizeof(__nv_bfloat16)); }
 
-    if (adapted) {
+    // The down adapter's shrink reads the bf16 y rows: before the y quantisation (MXFP8 prefill quantises y in
+    // place). Narrow rounds keep the order quant -> shrink (no aliasing there).
+    const auto down_shrink = [&] {
+        if (!adapted) { return; }
         lora.low        = b.low_down;
         lora.low_stride = rank;
         launch_lora_shrink(b.y, kIntermediate, false, b.ids, live, lora, stream);
+    };
+    if (!narrow) { down_shrink(); }
+    if (nvfp4) {
+        // Narrow rounds quantise y inside the down kernel; the standalone pass then runs only for test taps.
+        if (!narrow || taps != nullptr) {
+            launch_quant_nvfp4(b.y, slots, kIntermediate, b.ids, live, b.y_codes, b.y_scales, b.y_amax, stream);
+        }
+    } else {
+        launch_quant_mxfp8(b.y, slots, kIntermediate, b.ids, live, taps != nullptr ? taps->y_codes : nullptr,
+                           taps != nullptr ? taps->y_scales : nullptr, b.y_bf16, stream);
+    }
+    if (narrow) { down_shrink(); }
+    if (taps != nullptr && nvfp4) {
+        copy(taps->y_codes, b.y_codes, s * (kIntermediate / 2));
+        copy(taps->y_scales, b.y_scales, s * (kIntermediate / 16));
+        copy(taps->y_amax, b.y_amax, s * sizeof(float));
     }
 
     GemmParams down;
@@ -280,32 +371,27 @@ void inkling_moe(const Tensor& x, const InklingMoeWeights& weights, Tensor& out,
     down.lora        = lora;
     down.arrivals    = b.arrivals; // combine fused into down (summed in slot order by the last arriver)
     down.combined    = static_cast<__nv_bfloat16*>(out.data);
-    if (nvfp4) {
-        launch_nvfp4_down(down, slots, schedule, stream);
-    } else {
-        launch_mxfp8_down(down, slots, schedule, stream);
-    }
-
-
-    if (const InklingMoeTaps* taps = options.taps; taps != nullptr) {
-        const auto copy = [&](void* destination, const void* source, std::size_t bytes) {
-            if (destination == nullptr || source == nullptr) { return; }
-            const cudaError_t status = cudaMemcpyAsync(destination, source, bytes, cudaMemcpyDeviceToDevice, stream);
+    // Prefill: column passes (down_passes); the down rows buffer holds one pass's columns.
+    const std::int32_t passes       = narrow ? 1 : down_passes(weights.format);
+    const std::int32_t pass_columns = kHidden / passes;
+    for (std::int32_t pass = 0; pass < passes; ++pass) {
+        GemmParams columns  = down;
+        columns.out_column0 = pass * pass_columns;
+        columns.out_stride  = pass_columns;
+        if (nvfp4) {
+            launch_nvfp4_down(columns, slots, schedule, stream);
+        } else {
+            launch_mxfp8_down(columns, slots, schedule, stream);
+        }
+        if (taps != nullptr && taps->down != nullptr) {
+            const std::size_t row_bytes = static_cast<std::size_t>(pass_columns) * sizeof(__nv_bfloat16);
+            const cudaError_t status    = cudaMemcpy2DAsync(
+                static_cast<std::uint8_t*>(taps->down) + static_cast<std::size_t>(pass) * row_bytes,
+                kHidden * sizeof(__nv_bfloat16), b.down, row_bytes, row_bytes, s, cudaMemcpyDeviceToDevice, stream);
             if (status != cudaSuccess) {
                 throw std::runtime_error(std::string("inkling_moe taps: ") + cudaGetErrorString(status));
             }
-        };
-        const std::size_t s = static_cast<std::size_t>(slots);
-        copy(taps->ids, b.ids, s * sizeof(std::int32_t));
-        copy(taps->gammas, b.gammas, s * sizeof(float));
-        if (nvfp4) {
-            copy(taps->y_codes, b.y_codes, s * (kIntermediate / 2));
-            copy(taps->y_scales, b.y_scales, s * (kIntermediate / 16));
-            copy(taps->y_amax, b.y_amax, s * sizeof(float));
         }
-        copy(taps->down, b.down, s * kHidden * sizeof(__nv_bfloat16));
-        copy(taps->logits, b.logits, static_cast<std::size_t>(tokens) * kExperts * sizeof(float));
-        copy(taps->y, b.y, s * kIntermediate * sizeof(__nv_bfloat16));
     }
 }
 
@@ -370,6 +456,10 @@ void inkling_softcap_swiglu(const Tensor& gate_up, const Tensor& gamma, Tensor& 
     }
     launch_softcap_swiglu(as_bf16(gate_up.data), static_cast<const float*>(gamma.data), rows,
                           static_cast<__nv_bfloat16*>(y.data), stream);
+}
+
+void inkling_bench_predecessor(std::int32_t nanoseconds, cudaStream_t stream) {
+    launch_bench_predecessor(nanoseconds, stream);
 }
 
 void inkling_decode_expert_units(const InklingExpertBank& bank, InklingExpertFormat format, std::int32_t k,

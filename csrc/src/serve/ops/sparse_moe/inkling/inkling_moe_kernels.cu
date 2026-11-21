@@ -294,7 +294,7 @@ __device__ __forceinline__ void select_token(const float* __restrict__ logits, c
                 std::uint64_t local = keys[0];
 #pragma unroll
                 for (int i = 1; i < 4; ++i) { local = keys[i] > local ? keys[i] : local; }
-                const std::uint64_t best = warp_max_u64(local);
+                const std::uint64_t best = warp_max_key48(local);
 #pragma unroll
                 for (int i = 0; i < 4; ++i) {
                     if (keys[i] == best) { keys[i] = 0; }
@@ -317,6 +317,7 @@ __device__ __forceinline__ void select_token(const float* __restrict__ logits, c
             if (lane < kTopK) {
                 const int index    = token * kTopK + lane;
                 out.ids[index]     = my_expert;
+                if (out.local_ids != nullptr) { out.local_ids[index] = my_expert; }
                 out.gammas[index]  = gamma;
                 if (out.counts != nullptr) {
                     out.ranks[index] = atomicAdd(out.counts + my_expert, 1);
@@ -329,6 +330,7 @@ __device__ __forceinline__ void select_token(const float* __restrict__ logits, c
         } else if (lane < kTopK) {
             const int index   = token * kTopK + lane;
             out.ids[index]    = -1;
+            if (out.local_ids != nullptr) { out.local_ids[index] = -1; }
             out.gammas[index] = 0.0F;
             if (out.counts != nullptr) { out.ranks[index] = -1; }
         }
@@ -338,7 +340,9 @@ __device__ __forceinline__ void select_token(const float* __restrict__ logits, c
 /// The CTA that holds the last ticket lays out the rows: offsets by expert (an integer prefix of the
 /// counts), then, with `out.last_cta_places`, each routed slot at offsets[expert] + rank. Threads
 /// [0, 128) scan (one expert each); all `Threads` place. Called by every thread of the CTA.
-template <int Threads>
+/// `Local`: counts / ids / ranks are this CTA's shared-memory copies (`out.counts`, `out.local_ids`,
+/// `out.ranks`), read after a barrier; otherwise they come from global memory through L2.
+template <int Threads, bool Local = false>
 __device__ __forceinline__ void place_rows(const RouteOutputs& out, int tokens, int thread) {
     static_assert(Threads >= kExperts && Threads % 32 == 0);
     __shared__ int offsets[kExperts + 1];
@@ -346,7 +350,7 @@ __device__ __forceinline__ void place_rows(const RouteOutputs& out, int tokens, 
     const int warp = thread >> 5, lane = thread & 31;
     int count = 0, inclusive = 0;
     if (thread < kExperts) {
-        count     = __ldcg(out.counts + thread);
+        count     = Local ? out.counts[thread] : __ldcg(out.counts + thread);
         inclusive = count;
 #pragma unroll
         for (int offset = 1; offset < 32; offset <<= 1) {
@@ -370,8 +374,8 @@ __device__ __forceinline__ void place_rows(const RouteOutputs& out, int tokens, 
     if (!out.last_cta_places) { return; }
     __syncthreads();
     for (int index = thread; index < tokens * kTopK; index += Threads) {
-        const int expert = __ldcg(out.ids + index);
-        if (expert >= 0) { out.sorted[offsets[expert] + __ldcg(out.ranks + index)] = index; }
+        const int expert = Local ? out.local_ids[index] : __ldcg(out.ids + index);
+        if (expert >= 0) { out.sorted[offsets[expert] + (Local ? out.ranks[index] : __ldcg(out.ranks + index))] = index; }
     }
 }
 
@@ -541,13 +545,33 @@ inline constexpr int kStagedRowBytes   = kHidden * 2 + 16; ///< 4624: 8 rows x 4
 inline constexpr int kStagedTileTokens = 8;
 inline constexpr int kStagedSharedBytes = 2 * 8 * kStagedRowBytes;
 
-/// `Threads` >= 96: warps 0-2 run the K groups' MMA chains; all threads stage.
+/// The tile's 8 router rows into `staged` (cp.async, one commit group). The router weights are model
+/// weights no kernel writes, so this may run BEFORE the PDL dependency wait (the router rows then stream
+/// while the predecessor still runs; same bytes, same bits).
+template <int Threads>
+__device__ __forceinline__ void stage_router_rows(const __nv_bfloat16* __restrict__ router, int e_tile,
+                                                  unsigned char* staged) {
+    const int thread = static_cast<int>(threadIdx.x);
+    const int e0     = e_tile * 8;
+    constexpr int kChunks = kHidden / 8; // 16-byte chunks per row
+    for (int i = thread; i < 8 * kChunks; i += Threads) {
+        const int row   = i / kChunks;
+        const int chunk = i - row * kChunks;
+        cp_async<16, Cache::cg>(staged + row * kStagedRowBytes + chunk * 16,
+                                router + static_cast<std::int64_t>(e0 + row) * kHidden + chunk * 8);
+    }
+    cp_commit();
+}
+
+/// `Threads` >= 96: warps 0-2 run the K groups' MMA chains; all threads stage. `router_staged`: the
+/// caller already issued stage_router_rows (before its dependency wait).
 template <int Threads>
 __device__ __forceinline__ void router_logits_staged_tile(const __nv_bfloat16* __restrict__ x,
                                                           const __nv_bfloat16* __restrict__ router,
                                                           float* __restrict__ logits, std::int32_t tokens,
                                                           std::int32_t* __restrict__ zero, std::int32_t zero_words,
-                                                          int e_tile, int m_tile, unsigned char* staged) {
+                                                          int e_tile, int m_tile, unsigned char* staged,
+                                                          bool router_staged = false) {
     const int thread = static_cast<int>(threadIdx.x);
     if (zero != nullptr && e_tile == 0 && m_tile == 0) {
         for (int i = thread; i < zero_words; i += Threads) { zero[i] = 0; }
@@ -557,11 +581,10 @@ __device__ __forceinline__ void router_logits_staged_tile(const __nv_bfloat16* _
     unsigned char* w_rows = staged;
     unsigned char* x_rows = staged + 8 * kStagedRowBytes;
     constexpr int kChunks = kHidden / 8; // 16-byte chunks per row
+    if (!router_staged) { stage_router_rows<Threads>(router, e_tile, w_rows); }
     for (int i = thread; i < 8 * kChunks; i += Threads) {
-        const int row   = i / kChunks;
-        const int chunk = i - row * kChunks;
-        cp_async<16, Cache::cg>(w_rows + row * kStagedRowBytes + chunk * 16,
-                                router + static_cast<std::int64_t>(e0 + row) * kHidden + chunk * 8);
+        const int row    = i / kChunks;
+        const int chunk  = i - row * kChunks;
         const int token  = m0 + row;
         const bool valid = token < tokens;
         cp_async_zfill<16, Cache::cg>(x_rows + row * kStagedRowBytes + chunk * 16,
@@ -624,13 +647,15 @@ __global__ __launch_bounds__(96) void route_quant_narrow_kernel(const __nv_bfloa
                                                                 std::int32_t zero_words, LiveTokens live,
                                                                 XQuantOutputs q) {
     extern __shared__ __align__(16) unsigned char staged[];
-    pdl::wait_for_dependencies();
-    pdl::trigger_dependents();
     const int block        = static_cast<int>(blockIdx.x);
     const int router_tiles = (kExperts / 8) * ((tokens + kStagedTileTokens - 1) / kStagedTileTokens);
+    // Router rows before the dependency wait (weights only; every read of x and every write after it).
+    if (block < router_tiles) { stage_router_rows<96>(router, block % (kExperts / 8), staged); }
+    pdl::wait_for_dependencies();
+    pdl::trigger_dependents();
     if (block < router_tiles) {
         router_logits_staged_tile<96>(x, router, logits, tokens, zero, zero_words, block % (kExperts / 8),
-                                  block / (kExperts / 8), staged);
+                                  block / (kExperts / 8), staged, true);
         return;
     }
     const int row = (block - router_tiles) * 3 + (static_cast<int>(threadIdx.x) >> 5);
@@ -657,13 +682,15 @@ __global__ __launch_bounds__(kFusedRouteThreads) void route_select_narrow_kernel
     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ router, const float* __restrict__ bias,
     float* __restrict__ logits, LiveTokens live, XQuantOutputs q, RouteOutputs out, std::int32_t* tile_arrivals) {
     extern __shared__ __align__(16) unsigned char staged[];
-    pdl::wait_for_dependencies();
-    pdl::trigger_dependents();
     const int tokens       = live.tokens;
     const int block        = static_cast<int>(blockIdx.x);
     const int thread       = static_cast<int>(threadIdx.x);
     const int token_tiles  = (tokens + kStagedTileTokens - 1) / kStagedTileTokens;
     const int router_tiles = (kExperts / 8) * token_tiles;
+    // Router rows before the dependency wait (weights only; every read of x / state and every write after it).
+    if (block < router_tiles) { stage_router_rows<kFusedRouteThreads>(router, block % (kExperts / 8), staged); }
+    pdl::wait_for_dependencies();
+    pdl::trigger_dependents();
     if (block >= router_tiles) {
         const int row = (block - router_tiles) * (kFusedRouteThreads / 32) + (thread >> 5);
         if constexpr (Nvfp4) {
@@ -675,7 +702,7 @@ __global__ __launch_bounds__(kFusedRouteThreads) void route_select_narrow_kernel
     }
     const int m_tile = block / (kExperts / 8);
     router_logits_staged_tile<kFusedRouteThreads>(x, router, logits, tokens, nullptr, 0, block % (kExperts / 8),
-                                                  m_tile, staged);
+                                                  m_tile, staged, true);
     __shared__ int role;
     __threadfence();
     __syncthreads();
@@ -685,6 +712,25 @@ __global__ __launch_bounds__(kFusedRouteThreads) void route_select_narrow_kernel
     __threadfence();
     if (thread == 0) { tile_arrivals[m_tile] = 0; } // no other CTA touches it again in this call
     static_assert(kFusedRouteThreads / 32 == kStagedTileTokens);
+    if (token_tiles == 1) {
+        // One token tile (T <= 8): this selector is the only one, so it also places, from its own shared
+        // memory: ranks from shared-memory counters, no ticket, no read-back of counts / ids / ranks through
+        // L2 (4 dependent L2 round trips less). Ranks only choose a row's position inside its expert, never
+        // its arithmetic; the state words stay zero (never touched).
+        __shared__ int local_counts[kExperts];
+        __shared__ int local_ids[kStagedTileTokens * kTopK];
+        __shared__ int local_ranks[kStagedTileTokens * kTopK];
+        if (thread < kExperts) { local_counts[thread] = 0; }
+        __syncthreads();
+        RouteOutputs local = out;
+        local.counts    = local_counts;
+        local.ranks     = local_ranks;
+        local.local_ids = local_ids;
+        select_token<true>(logits, bias, live, local, thread >> 5, thread & 31);
+        __syncthreads();
+        place_rows<kFusedRouteThreads, true>(local, tokens, thread);
+        return;
+    }
     select_token<true>(logits, bias, live, out, m_tile * kStagedTileTokens + (thread >> 5), thread & 31);
     __threadfence();
     __syncthreads();
@@ -1057,6 +1103,28 @@ void launch_decode_expert_units(const InklingExpertBank& bank, bool nvfp4, std::
                expert_factor_kernel, nvfp4 ? bank.amax : nullptr, nvfp4 ? bank.outer_den : nullptr, first, count,
                factor);
     }
+}
+
+namespace {
+
+/// Benchmark predecessor (inkling_bench_predecessor): triggers its dependents at entry, then spins on the
+/// global timer (the wait loop of sparse_moe_fault_warp_skew, ops/sparse_moe/prefill/sparse_moe_prefill_body.inc).
+__global__ __launch_bounds__(32) void bench_predecessor_kernel(std::int32_t nanoseconds) {
+    pdl::trigger_dependents();
+    if (nanoseconds <= 0) { return; }
+    unsigned long long start = 0;
+    unsigned long long now   = 0;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(start)::"memory");
+    do {
+        __nanosleep(200);
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now)::"memory");
+    } while (now - start < static_cast<unsigned long long>(nanoseconds));
+}
+
+} // namespace
+
+void launch_bench_predecessor(std::int32_t nanoseconds, cudaStream_t stream) {
+    launch("bench predecessor", dim3(1), dim3(32), stream, bench_predecessor_kernel, nanoseconds);
 }
 
 } // namespace sinfer::ops::detail::inkling
