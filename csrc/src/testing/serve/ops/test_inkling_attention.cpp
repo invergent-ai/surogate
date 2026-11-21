@@ -1802,6 +1802,16 @@ void run_bench() {
         bench_attention(name("attn prefill global W8192 from 0"), K::Global, 8192, 1, 0);
         bench_attention(name("attn prefill global W8192 past 64k"), K::Global, 8192, 1, 65536);
         bench_attention(name("attn prefill local W8192 past 8k"), K::Local, 8192, 1, 8192);
+        // Lane h's price-session cases (perf/price/PLAN-P1-P2.md).
+        bench_attention(name("attn decode global 4x8k"), K::Global, 1, 4, 8191);
+        bench_attention(name("attn decode global 4x64k"), K::Global, 1, 4, 65535);
+        bench_attention(name("attn decode global 8x64k"), K::Global, 1, 8, 65535);
+        bench_attention(name("attn decode local 4x8k"), K::Local, 1, 4, 8191);
+        bench_attention(name("attn verify W8 global 1x262k"), K::Global, 8, 1, 262136);
+        bench_attention(name("attn verify W8 global 8x8k"), K::Global, 8, 8, 8184);
+        bench_attention(name("attn verify W8 local 1x8k"), K::Local, 8, 1, 8184);
+        bench_attention(name("attn verify W8 local 8x8k"), K::Local, 8, 8, 8184);
+        bench_attention(name("attn prefill global W8192 past 256k"), K::Global, 8192, 1, 262144);
     }
     unsetenv("SUROGATE_INKLING_ATTN_GROUPS");
     if (std::getenv("BENCH_ATTN_ONLY") != nullptr) { return; }
