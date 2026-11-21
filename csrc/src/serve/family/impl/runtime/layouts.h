@@ -58,6 +58,8 @@ struct PersistentLayout {
     /// class (PagedKVPool::window_lane_charge_pages), so the capacity curve can count them; zero
     /// without an elastic window class (every model but a windowed one sized automatically).
     std::uint32_t kv_window_lane_charge_pages = 0;
+    /// ... and the main-ledger pages one window page stands for (a graph-capture row's charge).
+    std::uint32_t kv_window_page_charge_pages = 0;
 };
 
 struct WorkspacePlan {
