@@ -13,7 +13,7 @@ Paths
   cut@b     prompt S[:b] (max_tokens 1), then S: the suffix prefills from b (a GPU prefix hit = a chunk cut at b)
   host@b    as cut@b on an engine with a host tier and a KV capacity of --host-capacity tokens, with one long
             unrelated prompt in between that needs the retained lane's pages: the prefix spills to the host tier and
-            S restores it from there (checked: the engine log must show `reuse=host` for S)
+            S restores it from there (checked: GET /kv_stats host "restores" grows across S's request)
 Exit status 0 iff every path equals the reference bitwise; the JSON report has the per-path detail.
 
 Example (gpubox2, Gemma 3 270M fixture):
@@ -74,6 +74,24 @@ class Engine:
         return {"prompt_ids": resp.get("prompt_token_ids"), "ids": choice.get("token_ids"),
                 "texts": lp.get("tokens"), "logprobs": lp.get("token_logprobs"), "top": lp.get("top_logprobs"),
                 "cached": ((resp.get("usage") or {}).get("prompt_tokens_details") or {}).get("cached_tokens")}
+
+    def host_restores(self):
+        """Host-tier restores so far, from GET /kv_stats (any nested "restores" counter; the request log line does
+        not name a host restore: it prints the reuse PATH, e.g. append_frontier, for GPU and host hits alike)."""
+        with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/kv_stats", timeout=30) as r:
+            stats = json.load(r)
+        total, stack = 0, [stats]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    if key == "restores" and isinstance(value, (int, float)):
+                        total += value
+                    else:
+                        stack.append(value)
+            elif isinstance(node, list):
+                stack.extend(node)
+        return total
 
     def tokenize(self, text):
         resp = post(self.port, "/tokenize", {"model": "m", "prompt": text, "with_token_strings": True})
@@ -199,10 +217,9 @@ def main():
             # An unrelated prompt that needs nearly the whole cache: the retained lane must give its pages back.
             filler = (material[::-1] * (1 + 4 * cap // max(1, len(material))))[:int(3.2 * (cap - 400))]
             eng.complete(filler, 1)
+            before = eng.host_restores()
             result = compare(ref, tail(eng.complete(s_text, k), k))
-            with open(eng.log_path, errors="replace") as log:
-                lines = [line for line in log if "done finish" in line]
-            result["restored_from_host"] = bool(lines) and "reuse=host" in lines[-1]
+            result["restored_from_host"] = eng.host_restores() > before
             report["paths"][f"host@{cut}"] = result
         finally:
             eng.close()
