@@ -317,6 +317,22 @@ void inkling_gemm_inv(const void* weight, std::int32_t n, std::int32_t k, const 
     CUDA_CHECK(cudaGetLastError());
 }
 
+void inkling_gemm_inv_partials(const void* weight, std::int32_t n, std::int32_t k, const void* x, std::int32_t tokens,
+                               const InklingGemmBatch& batch, float* partials, std::size_t partials_bytes,
+                               cudaStream_t stream) {
+    if (tokens <= 0 || batch.count <= 0) { return; }
+    const auto aligned = [](const void* p) { return p != nullptr && (reinterpret_cast<std::uintptr_t>(p) & 15u) == 0; };
+    const std::int32_t splits = inkling_gemm_split(n, k);
+    if (splits <= 1 || k % 8 != 0 || !aligned(weight) || !aligned(x) || !aligned(partials) ||
+        partials_bytes < inkling_gemm_inv_workspace_bytes(n, k, tokens, batch.count) ||
+        (batch.count > 1 && (batch.weight_stride % 8 != 0 || batch.x_stride % 8 != 0))) {
+        throw std::invalid_argument("inkling_gemm_inv_partials: a split shape, aligned operands and the partials buffer");
+    }
+    Args a{static_cast<const __nv_bfloat16*>(weight), static_cast<const __nv_bfloat16*>(x), partials, n, k, tokens, n,
+           kSplitChunk, batch.count, batch.weight_stride, batch.x_stride, 0};
+    dispatch<Store::Partial>(a, splits, stream);
+}
+
 void inkling_gemm_inv_group(std::span<const InklingGemmProblem> problems, std::int32_t k, std::int32_t tokens,
                             DType out_dtype, cudaStream_t stream) {
     if (problems.empty() || tokens <= 0) { return; }

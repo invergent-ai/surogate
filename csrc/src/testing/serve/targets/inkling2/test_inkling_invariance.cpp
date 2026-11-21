@@ -555,6 +555,51 @@ int test_conv_paths(std::uint32_t seed) {
     return failures;
 }
 
+// ------------------------------------------------------------------------------------- I6 controller tail
+
+/// inkling_controller_tail (one cluster launch) == inkling_gemm_inv (down, split + reduce) + inkling_gemm_inv (gain /
+/// forget, FP32) + inkling_blend_rms_norm, bit for bit.
+int test_controller_tail(std::uint32_t seed, int streams, int dq, int n) {
+    constexpr int kR = 64;
+    const std::string tag = "I6 controller tail S=" + std::to_string(streams) + " DQ=" + std::to_string(dq) +
+                            " T=" + std::to_string(n);
+    if (!ops::inkling_controller_tail_supported(n)) {
+        std::cout << "SKIP " << tag << ": no cluster launch on this device\n";
+        return 0;
+    }
+    const auto down_bits = hash_bf16(static_cast<std::size_t>(streams) * kR * 2 * kD, seed, 0.03F);
+    const auto gf_bits   = hash_bf16(static_cast<std::size_t>(streams) * 2 * kD * kR, seed + 1, 0.2F);
+    const auto pair      = randn_bf16(static_cast<std::size_t>(2 * kD) * n * streams, seed + 2, 1.0F);
+    const auto dest      = randn_f32(static_cast<std::size_t>(kD) * n * dq, seed + 3, 0.7F);
+    const auto msg       = randn_f32(static_cast<std::size_t>(kD) * n * streams, seed + 4, 0.7F);
+    const auto w         = randn_bf16(static_cast<std::size_t>(kD) * streams, seed + 5, 1.0F);
+    DeviceBuffer d_down = to_device(down_bits), d_gf = to_device(gf_bits), d_pair = dev_bf16(pair),
+                 d_dest = to_device(dest), d_msg = to_device(msg), d_w = dev_bf16(w);
+    Tensor t_dest(d_dest.p, DType::FP32, {kD, n, dq}), t_msg(d_msg.p, DType::FP32, {kD, n, streams});
+    Tensor t_w(d_w.p, DType::BF16, {kD, streams});
+    const ops::InklingGemmBatch down_batch{streams, static_cast<std::int64_t>(kR) * 2 * kD,
+                                           static_cast<std::int64_t>(n) * 2 * kD, static_cast<std::int64_t>(n) * kR};
+    const ops::InklingGemmBatch gf_batch{streams, static_cast<std::int64_t>(2) * kD * kR, static_cast<std::int64_t>(n) * kR,
+                                         static_cast<std::int64_t>(n) * 2 * kD};
+    const std::size_t ws = ops::inkling_gemm_inv_workspace_bytes(kR, 2 * kD, n, streams);
+    DeviceBuffer d_ws(ws), d_h(static_cast<std::size_t>(kR) * n * streams * 2),
+        d_gfo(static_cast<std::size_t>(2 * kD) * n * streams * 4), d_u(static_cast<std::size_t>(kD) * n * streams * 2),
+        d_f(static_cast<std::size_t>(kD) * n * streams * 2);
+    // unfused
+    ops::inkling_gemm_inv(d_down.p, kR, 2 * kD, d_pair.p, n, d_h.p, DType::BF16, kR, down_batch, d_ws.p, ws, nullptr);
+    ops::inkling_gemm_inv(d_gf.p, 2 * kD, kR, d_h.p, n, d_gfo.p, DType::FP32, 2 * kD, gf_batch, nullptr, 0, nullptr);
+    Tensor t_gf(d_gfo.p, DType::FP32, {2 * kD, n, streams}), t_u(d_u.p, DType::BF16, {kD, n, streams});
+    ops::inkling_blend_rms_norm(t_dest, t_msg, t_gf, t_w, 1e-6F, t_u, nullptr);
+    // fused
+    ops::inkling_gemm_inv_partials(d_down.p, kR, 2 * kD, d_pair.p, n, down_batch, static_cast<float*>(d_ws.p), ws,
+                                   nullptr);
+    Tensor t_f(d_f.p, DType::BF16, {kD, n, streams});
+    ops::inkling_controller_tail(static_cast<const float*>(d_ws.p), d_gf.p, t_dest, t_msg, t_w, 1e-6F, t_f, nullptr);
+    cuda_synchronize();
+    return same_bits(tag + " fused == reduce + gain/forget + blend norm", raw(d_f.p, d_f.bytes), raw(d_u.p, d_u.bytes),
+                     2);
+}
+
 // ------------------------------------------------------------------------------------- I5 trainer log-prob
 
 /// inkling_head_logprob == the engine's own path (invariant FP32 head + softcap, then the scoring kernel through
@@ -632,6 +677,11 @@ int main() {
     failures += test_blend_inputs(3103, 3, true, 1, 1, 3);  // MLP blend: partial + attn_out addend, mlp stream
     failures += test_conv_paths(3003);
     failures += test_head_logprob(3201);
+    for (const int n : {1, 5, 8, 13, 32}) {
+        failures += test_controller_tail(3300 + n, 3, 1, n);
+        failures += test_controller_tail(3400 + n, 3, 3, n);
+        failures += test_controller_tail(3500 + n, 1, 1, n);
+    }
     std::cout << (failures ? "FAIL" : "PASS") << " inkling_invariance (" << failures << " failures)\n";
     return failures ? 1 : 0;
 }

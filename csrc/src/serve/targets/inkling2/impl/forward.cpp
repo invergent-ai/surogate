@@ -143,16 +143,26 @@ void blended_inputs(Round& rd, const VisitInfo& vi, const load::InklingLayerWeig
         Tensor pair = rd.work.alloc(DType::BF16, {2 * D, n, streams});
         // dest mix + message mix + pair norm: one launch, bit-identical to the three ops (invariance test I3).
         ops::inkling_blend_inputs(src, dest_queries, bank, msg_queries, n, dest, msg, pair, rd.s);
+        const auto* down = bf16_ptr(L.loop_down) + static_cast<std::int64_t>(first_stream) * C::gate_rank * 2 * D;
+        const auto* gfw  = bf16_ptr(L.loop_gain_forget) + static_cast<std::int64_t>(first_stream) * 2 * D * C::gate_rank;
+        const ops::InklingGemmBatch down_batch{streams, static_cast<std::int64_t>(C::gate_rank) * 2 * D,
+                                               static_cast<std::int64_t>(n) * 2 * D,
+                                               static_cast<std::int64_t>(n) * C::gate_rank};
+        // Decode / verify widths: the `down` partials, then reduce + gain/forget + blend norm in ONE cluster launch
+        // (bit-identical to the three ops; invariance test I6), straight into `out` (one tile).
+        if (n == rd.T && ops::inkling_controller_tail_supported(n)) {
+            auto gemm_scope         = rd.work.scope();
+            const std::size_t bytes = ops::inkling_gemm_inv_workspace_bytes(C::gate_rank, 2 * D, n, streams);
+            auto* partials          = static_cast<float*>(gemm_scratch(rd.work, bytes));
+            ops::inkling_gemm_inv_partials(down, C::gate_rank, 2 * D, pair.data, n, down_batch, partials, bytes, rd.s);
+            ops::inkling_controller_tail(partials, gfw, dest, msg, norm_weight, C::rms_epsilon, out, rd.s);
+            continue;
+        }
         Tensor h  = rd.work.alloc(DType::BF16, {C::gate_rank, n, streams});
         Tensor gf = rd.work.alloc(DType::FP32, {2 * D, n, streams});
         // The controllers of the `streams` streams, one invariant launch each (down: a split fixed by its 64 x 4608
         // shape; gain / forget: FP32 out).
         {
-            const auto* down = bf16_ptr(L.loop_down) + static_cast<std::int64_t>(first_stream) * C::gate_rank * 2 * D;
-            const auto* gfw  = bf16_ptr(L.loop_gain_forget) + static_cast<std::int64_t>(first_stream) * 2 * D * C::gate_rank;
-            const ops::InklingGemmBatch down_batch{streams, static_cast<std::int64_t>(C::gate_rank) * 2 * D,
-                                                   static_cast<std::int64_t>(n) * 2 * D,
-                                                   static_cast<std::int64_t>(n) * C::gate_rank};
             const ops::InklingGemmBatch gf_batch{streams, static_cast<std::int64_t>(2) * D * C::gate_rank,
                                                  static_cast<std::int64_t>(n) * C::gate_rank,
                                                  static_cast<std::int64_t>(n) * 2 * D};
