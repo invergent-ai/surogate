@@ -99,4 +99,12 @@ inline void check_kv_cache(const PagedKVBatchLayerView& cache, const char* op) {
     }
 }
 
+/// inkling_attention_prologue with one addition: after its programmatic-dependency wait, CTA 0 zeroes `zero_count` ints at
+/// `zero` (null: none) -- the fused call's split-route arrival counters, so the attention launched next finds them zero
+/// without a memset launch (the counters live in the call's workspace, whose contents are otherwise undefined).
+void prologue_launch(const InklingProjections& projections, const InklingAttentionWeights& weights,
+                     InklingLayerKind kind, const InklingAttentionRows& rows, const InklingConvStateArgs& conv,
+                     const PagedKVBatchLayerView& cache, InklingPrologueOutputs& outputs, cudaStream_t stream,
+                     std::int32_t* zero, std::int32_t zero_count);
+
 } // namespace sinfer::ops::inkling_detail

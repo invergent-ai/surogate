@@ -148,6 +148,9 @@ struct InklingAttentionKnobs {
     int variant                     = 17;   // numerics variant bits (production 17)
     bool early_meta                 = true; // honour InklingAttentionRows::metadata_static
     std::size_t partial_cap_bytes   = std::size_t{1} << 30; // split-route partials above this -> one worker
+    // Decode / verify split route: the last worker CTA of a (row, KV head) folds its 3 x W rows (no fold_kernel launch)
+    // when W x slots <= this (SUROGATE_INKLING_ATTN_FUSED_FOLD; 0 = fold_kernel always). Same bits either way.
+    int fused_fold_max = 1 << 30;
 };
 [[nodiscard]] InklingAttentionKnobs& inkling_attention_knobs();
 
@@ -292,7 +295,9 @@ struct InklingAttentionInputs {
 ///   slots   = local: (1023 >> log2(local group)) + 2 (9 at 128-key groups);  global: group_of(max_visible_keys - 1) + 1
 ///             (P3: max_visible_keys <= 65,536 -> ceil(keys / 512); then + ceil((keys - 65,536) / 2,048) up to 131,072,
 ///             then + ceil((keys - 131,072) / 8,192); 176 at 262,144)
-///   bytes   = workers > 1 ? slots * N * 24 * (128 * 4 + 8) + 512 : 0
+///   bytes   = workers > 1 ? slots * N * 24 * (128 * 4 + 8) + 512 + (fused ? 32 * B + 256 : 0) : 0
+///   fused   = W <= 16 (decode / verify) && workers > 1 && W * slots <= InklingAttentionKnobs::fused_fold_max (the last
+///             worker CTA folds; its 8 arrival counters per row live here)
 ///   workers = decode / verify (W <= 16): clamp(floor(2 * SMs / (8 B)), 1, global 64 | local slots);
 ///             prefill: 1 when tiles * 24 * B >= 2 * SMs (tiles = ceil(W / 64)), else clamp(ceil(2 SMs / CTAs), 1, min(32, slots));
 ///             1 whenever bytes would exceed the partial cap (InklingAttentionKnobs::partial_cap_bytes, default 1 GiB).

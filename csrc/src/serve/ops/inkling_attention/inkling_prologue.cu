@@ -58,6 +58,9 @@ struct PrologueParams {
     std::int32_t kv_chunk;      // columns of one K/V unit (>= 4, or the whole row)
     std::int32_t kv_chunks;     // units per (row, head, K|V)
     std::int64_t kv_units, q_units, r_units;
+
+    std::int32_t* zero;         // CTA 0 zeroes these ints after the wait (the fused call's arrival counters); null: none
+    std::int32_t zero_count;
 };
 
 inline constexpr int kPrologueThreads = 128;
@@ -302,6 +305,9 @@ __global__ __launch_bounds__(kPrologueThreads) void prologue_kernel(ProloguePara
     // The attention launched after this one may start (its own wait guards what it reads from us).
     pdl::trigger_dependents();
     pdl::wait_for_dependencies();
+    if (p.zero != nullptr && blockIdx.x == 0) {
+        for (int i = static_cast<int>(threadIdx.x); i < p.zero_count; i += kPrologueThreads) { p.zero[i] = 0; }
+    }
     std::int64_t unit = static_cast<std::int64_t>(blockIdx.x) * (kPrologueThreads / 32) +
                         (threadIdx.x >> 5);
     if (unit < p.kv_units) {
@@ -367,6 +373,14 @@ void inkling_attention_prologue(const InklingProjections& in, const InklingAtten
                                 InklingLayerKind kind, const InklingAttentionRows& rows,
                                 const InklingConvStateArgs& conv, const PagedKVBatchLayerView& cache,
                                 InklingPrologueOutputs& out, cudaStream_t stream) {
+    inkling_detail::prologue_launch(in, wt, kind, rows, conv, cache, out, stream, nullptr, 0);
+}
+
+void inkling_detail::prologue_launch(const InklingProjections& in, const InklingAttentionWeights& wt,
+                                     InklingLayerKind kind, const InklingAttentionRows& rows,
+                                     const InklingConvStateArgs& conv, const PagedKVBatchLayerView& cache,
+                                     InklingPrologueOutputs& out, cudaStream_t stream, std::int32_t* zero,
+                                     std::int32_t zero_count) {
     using namespace inkling_detail;
     const char* op       = "inkling_attention_prologue";
     const bool global    = kind == InklingLayerKind::Global;
@@ -467,6 +481,9 @@ void inkling_attention_prologue(const InklingProjections& in, const InklingAtten
     p.kv_units  = static_cast<std::int64_t>(rs.batch) * Geo::kKvHeads * 2 * p.kv_chunks;
     p.q_units   = n * Geo::kQHeads;
     p.r_units   = n * (Geo::kQHeads / 2);
+
+    p.zero       = zero_count > 0 ? zero : nullptr;
+    p.zero_count = zero_count;
 
     const std::int64_t warps = p.kv_units + p.q_units + p.r_units;
     const pdl::LaunchConfig launch{
