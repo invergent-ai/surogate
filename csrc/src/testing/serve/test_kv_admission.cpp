@@ -216,6 +216,23 @@ void test_round_reach() {
     check(!kv_dspark_row_recomputes_exactly(1.0F, -1, 0.95F, 0.0F, true), "top_p alone keeps the reservation");
     check(!kv_dspark_row_recomputes_exactly(1.0F, -1, 1.0F, 0.05F, true), "a min_p floor keeps the reservation");
     check(!kv_dspark_row_recomputes_exactly(1.0F, -1, 1.0F, 0.0F, false), "one-hot verification keeps the reservation");
+
+    // Review R8 minor 1: either switch off leaves an untruncated sampled row on the one-hot rule.
+    using sinfer::runtime::kv_dspark_verify_coupled;
+    for (const char* on : {static_cast<const char*>(nullptr), "", "1", "2"}) {
+        for (const char* other : {static_cast<const char*>(nullptr), "", "1"}) {
+            check(kv_dspark_verify_coupled(on, other), "both switches on (unset, empty or nonzero) is coupled");
+        }
+        check(!kv_dspark_verify_coupled(on, "0"), "SUROGATE_SPEC_EXACT_SPLIT=0 is not coupled");
+        check(!kv_dspark_verify_coupled("0", on), "SUROGATE_SPEC_COUPLED=0 is not coupled");
+    }
+    const bool split_off = kv_dspark_verify_coupled(nullptr, "0");
+    check(!kv_dspark_row_recomputes_exactly(1.0F, -1, 1.0F, 0.0F, split_off),
+          "with the split routes off a sampled row keeps its reservation");
+    check(kv_dspark_row_recomputes_exactly(0.0F, -1, 1.0F, 0.0F, split_off),
+          "with the split routes off a greedy row may still be recomputed");
+    check(kv_dspark_row_recomputes_exactly(1.0F, -1, 1.0F, 0.0F, kv_dspark_verify_coupled(nullptr, nullptr)),
+          "with both switches at their defaults a sampled row is recomputable, as before");
 }
 
 /// Lane f1: without an explicit --kv-admission ondemand every engine takes the rule it had before the DSpark opt-in; with it, the

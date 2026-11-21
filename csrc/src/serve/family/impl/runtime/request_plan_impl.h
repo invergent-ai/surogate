@@ -264,10 +264,9 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
             const char* raw = std::getenv("SUROGATE_SERVE_KV_TRUNCATED_ONDEMAND");
             return raw != nullptr && std::string_view(raw) == "1";
         }();
-        static const bool coupled = [] { // install_sampling's switch
-            const char* raw = std::getenv("SUROGATE_SPEC_COUPLED");
-            return raw == nullptr || raw[0] == '\0' || std::atoi(raw) != 0;
-        }();
+        // install_sampling's switch and the split routes' (the coupled verify is a split route)
+        static const bool coupled = runtime::kv_dspark_verify_coupled(std::getenv("SUROGATE_SPEC_COUPLED"),
+                                                                      std::getenv("SUROGATE_SPEC_EXACT_SPLIT"));
         return truncated_on_demand ||
                runtime::kv_dspark_row_recomputes_exactly(base->sampling.temperature, base->sampling.top_k,
                                                          base->sampling.top_p, base->sampling.min_p, coupled);

@@ -156,6 +156,8 @@ public:
         if constexpr (kOnDemandCapable) {
             instance.program->configure_kv_admission(options.kv_admission);
             kv_on_demand_ = instance.program->kv_on_demand();
+            // Readable before the first round publishes (the server_start record is written at attach).
+            published_stats_.kv_on_demand = kv_on_demand_ ? 1U : 0U;
         }
         kv_forced_preemption_ = parse_kv_forced_preemption(std::getenv("SUROGATE_SERVE_KV_FORCE_PREEMPT"));
         kv_media_limit_       = options.media_live_bytes / 2;
