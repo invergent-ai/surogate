@@ -11,6 +11,7 @@
 #include "core/pdl.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
+#include "ops/kernel/func_attribute.cuh"
 #include "ops/sparse_moe/inkling/inkling_gemm_common.cuh"
 #include "ops/sparse_moe/inkling/inkling_moe_internal.h"
 #include "ops/sparse_moe/inkling/inkling_numerics.cuh"
@@ -47,7 +48,7 @@ struct Mxfp8Schedule {
 inline constexpr int kMxfp8KWidth = 2;
 
 using NarrowSchedule = Mxfp8Schedule<64, 8, 4, 1, 3>;
-using WideSchedule   = Mxfp8Schedule<64, 32, 2, 2, 2>;
+using WideSchedule   = Mxfp8Schedule<128, 64, 4, 2, 2>; ///< 32 x 32 warp tiles: each dequantised A fragment feeds 4 MMAs
 
 template <class Schedule>
 struct Mxfp8Shared {
@@ -115,7 +116,8 @@ __device__ __forceinline__ int mxfp8_k_hi(int step, int quad) {
 
 template <class Schedule, int K, bool GateUp, int KWidth>
 __global__ __launch_bounds__(Schedule::kThreads) void mxfp8_expert_gemm_kernel(GemmParams p) {
-    __shared__ Mxfp8Shared<Schedule> shared;
+    extern __shared__ __align__(16) unsigned char mxfp8_shared_bytes[];
+    auto& shared = *reinterpret_cast<Mxfp8Shared<Schedule>*>(mxfp8_shared_bytes);
     __shared__ int tile_info[3];
     __shared__ int slots[Schedule::kBlockN];
     __shared__ int source_rows[Schedule::kBlockN];
@@ -272,8 +274,12 @@ __global__ __launch_bounds__(Schedule::kThreads) void mxfp8_expert_gemm_kernel(G
 
 template <class Schedule, int K, bool GateUp, int KWidth>
 cudaError_t launch_kwidth(const dim3& grid, const GemmParams& params, cudaStream_t stream) {
-    return pdl::launch_dependent({grid, dim3(Schedule::kThreads), 0, stream},
-                                 mxfp8_expert_gemm_kernel<Schedule, K, GateUp, KWidth>, params);
+    constexpr std::size_t kShared = sizeof(Mxfp8Shared<Schedule>);
+    auto* kernel = mxfp8_expert_gemm_kernel<Schedule, K, GateUp, KWidth>;
+    const cudaError_t status = ::sinfer::ops::set_func_attribute_per_device(
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kShared));
+    if (status != cudaSuccess) { return status; }
+    return pdl::launch_dependent({grid, dim3(Schedule::kThreads), kShared, stream}, kernel, params);
 }
 
 template <class Schedule, int K, bool GateUp>
