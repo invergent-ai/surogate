@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 
+import numpy as np
 import torch
 
 import ift_backward as B
@@ -220,11 +221,15 @@ class RelAttentionR(torch.autograd.Function):
             b1 = min(T, b0 + q_block)
             k0 = max(0, b0 - window + 1) if window > 0 else 0
             rel = _rel_block(r_out, rel_proj, b0, b1)
-            sc, _, _ = B._rel_scores(q, k, _Shift(rel, b0), b0, b1, k0, window, scale)
+            sc, _, _ = _scores(q, k, _Shift(rel, b0), b0, b1, k0, window, scale)
             m = sc.amax(-1, keepdim=True)
             p = RA.t_exp(sc - m)
             l = p.sum(-1, keepdim=True)
-            o = torch.einsum("hgbk,hkd->hgbd", p, vv[:, k0:b1]) / l
+            if ATTN_TC:
+                nq = b1 - b0
+                o = _bmm_s(p.reshape(hk, g * nq, -1), vv[:, k0:b1].to(BF16)).reshape(hk, g, nq, dh) / l
+            else:
+                o = torch.einsum("hgbk,hkd->hgbd", p, vv[:, k0:b1]) / l
             out[b0:b1] = o.permute(2, 0, 1, 3).reshape(b1 - b0, hq, dh)
             lse[b0:b1] = (m + RA.t_log(l))[..., 0].permute(2, 0, 1).reshape(b1 - b0, hq)
         ctx.save_for_backward(q.to(BF16), k.to(BF16), v.to(BF16), r_out.to(BF16), rel_proj, out, lse)
@@ -257,19 +262,35 @@ class RelAttentionR(torch.autograd.Function):
             nq = b1 - b0
             k0 = max(0, b0 - window + 1) if window > 0 else 0
             rel = _rel_block(r_out, rel_proj, b0, b1)
-            sc, gi, valid = B._rel_scores(q, k, _Shift(rel, b0), b0, b1, k0, window, scale)
+            sc, gi, valid = _scores(q, k, _Shift(rel, b0), b0, b1, k0, window, scale)
             lb = lse[b0:b1].reshape(nq, hk, g).permute(1, 2, 0)[..., None]
             p = RA.t_exp(sc - lb)
             do = dout[b0:b1].reshape(nq, hk, g, dh).permute(1, 2, 0, 3)
             ob = out[b0:b1].reshape(nq, hk, g, dh).permute(1, 2, 0, 3)
             dlb = dlse[b0:b1].reshape(nq, hk, g).permute(1, 2, 0)[..., None]
-            dp = torch.einsum("hgbd,hkd->hgbk", do, vv[:, k0:b1])
-            dterm = (do * ob).sum(-1, keepdim=True)
-            ds = p * (dp - dterm + dlb)
             qq = q[b0:b1].reshape(nq, hk, g, dh).permute(1, 2, 0, 3)
-            dq[b0:b1] += (torch.einsum("hgbk,hkd->hgbd", ds, kk[:, k0:b1]) * scale).permute(2, 0, 1, 3).reshape(nq, hq, dh)
-            dk[k0:b1] += (torch.einsum("hgbk,hgbd->hkd", ds, qq) * scale).permute(1, 0, 2)
-            dv[k0:b1] += torch.einsum("hgbk,hgbd->hkd", p, do).permute(1, 0, 2)
+            if ATTN_TC:
+                # the same four contractions as below, [Hk, G x nq, .] bmms on bf16 tensor cores (fp32 accumulate):
+                # K, V, q hold exact bf16 values; fp32 factors (do, ds, p) are split hi + lo
+                v16, k16 = vv[:, k0:b1].to(BF16), kk[:, k0:b1].to(BF16)
+                do2 = do.reshape(hk, g * nq, dh)
+                dp = _bmm_s(do2, v16.transpose(1, 2)).reshape(hk, g, nq, -1)
+                dterm = (do * ob).sum(-1, keepdim=True)
+                ds = p * (dp - dterm + dlb)
+                ds2 = ds.reshape(hk, g * nq, -1)
+                dqb = _bmm_s(ds2, k16).reshape(hk, g, nq, dh)
+                dkb = _bmm_s(ds2.transpose(1, 2), qq.reshape(hk, g * nq, dh).to(BF16))
+                dvb = _bmm_ss(p.reshape(hk, g * nq, -1).transpose(1, 2), do2)
+            else:
+                dp = torch.einsum("hgbd,hkd->hgbk", do, vv[:, k0:b1])
+                dterm = (do * ob).sum(-1, keepdim=True)
+                ds = p * (dp - dterm + dlb)
+                dqb = torch.einsum("hgbk,hkd->hgbd", ds, kk[:, k0:b1])
+                dkb = torch.einsum("hgbk,hgbd->hkd", ds, qq)
+                dvb = torch.einsum("hgbk,hgbd->hkd", p, do)
+            dq[b0:b1] += (dqb * scale).permute(2, 0, 1, 3).reshape(nq, hq, dh)
+            dk[k0:b1] += (dkb * scale).permute(1, 0, 2)
+            dv[k0:b1] += dvb.permute(1, 0, 2)
             dsr = ds.reshape(hq, nq, -1) * valid[None]
             drel = torch.zeros(hq, nq, 1024, dtype=F32, device=q.device)
             drel.scatter_add_(2, gi[None].expand(hq, -1, -1), dsr)
@@ -286,6 +307,72 @@ class _Shift:
 
     def __getitem__(self, sl):
         return self.rel[sl.start - self.b0:sl.stop - self.b0]
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# LEVEL-1 lever 3b (ATTN_TC, default OFF until its card check): the attention's contractions as bf16 tensor-core bmms
+# with fp32 accumulation / output. q, K, V hold exact bf16 values; fp32 factors are split hi + lo (relative error
+# ~2^-16). ATTN_TC is read at call time (tests / lever_check switch it per arm).
+# ---------------------------------------------------------------------------------------------------------------
+ATTN_TC = os.environ.get("IFT_ATTN_TC", "0") == "1"
+
+
+def _tc_ok(dev):
+    if dev not in B._OUT_DTYPE:
+        B._OUT_DTYPE[dev] = B._probe_out_dtype(dev)
+    return B._OUT_DTYPE[dev]
+
+
+def _bmm16(a16, b16):
+    """a [h, n, m] @ b [h, m, d], bf16 operands, fp32 accumulate / output (fp32 fallback where out_dtype is missing)."""
+    if _tc_ok(a16.device):
+        return torch.bmm(a16, b16, out_dtype=F32)
+    return torch.bmm(a16.float(), b16.float())
+
+
+def _split16(x):
+    hi = x.to(BF16)
+    return hi, (x - hi.float()).to(BF16)
+
+
+def _bmm_s(a, b16):
+    """fp32 a @ bf16 b: a split hi + lo."""
+    hi, lo = _split16(a)
+    return _bmm16(hi, b16) + _bmm16(lo, b16)
+
+
+def _bmm_ss(a, b):
+    """fp32 a @ fp32 b: both split hi + lo."""
+    ah, al = _split16(a)
+    bh, bl = _split16(b)
+    return _bmm16(ah, bh) + _bmm16(ah, bl) + _bmm16(al, bh) + _bmm16(al, bl)
+
+
+def _rel_scores_tc(q, k, rel, b0, b1, k0, window, scale):
+    """B._rel_scores with the q . K contraction on tensor cores (both operands exact bf16 values)."""
+    nq = b1 - b0
+    hq, dh = q.shape[1], q.shape[2]
+    hk = k.shape[1]
+    g = hq // hk
+    qq = q[b0:b1].reshape(nq, hk, g, dh).permute(1, 2, 0, 3).reshape(hk, g * nq, dh)  # [Hk, G x nq, D]
+    kk = k[k0:b1].permute(1, 0, 2)  # [Hk, K, D]
+    s = _bmm16(qq.to(BF16), kk.to(BF16).transpose(1, 2)).reshape(hk, g, nq, -1) * scale
+    dist = torch.arange(b0, b1, device=q.device)[:, None] - torch.arange(k0, b1, device=q.device)[None, :]
+    gi = dist.clamp(0, 1023)
+    rr = rel[b0:b1].permute(1, 0, 2)  # [Hq, nq, E]
+    bias = torch.gather(rr, 2, gi[None].expand(hq, -1, -1))
+    in_band = (dist >= 0) & (dist < 1024)
+    bias = torch.where(in_band, bias, torch.zeros((), dtype=bias.dtype, device=bias.device))
+    s = s + bias.reshape(hk, g, nq, -1)
+    vis = dist >= 0
+    if window > 0:
+        vis &= dist < window
+    s = s.masked_fill(~vis, float("-inf"))
+    return s, gi, in_band & vis
+
+
+def _scores(q, k, rel, b0, b1, k0, window, scale):
+    return (_rel_scores_tc if ATTN_TC else B._rel_scores)(q, k, rel, b0, b1, k0, window, scale)
 
 
 
@@ -359,6 +446,132 @@ def _moe_rows(xr, gr, eg, pg, cap, ng, u13, f13, u2, f2, lo, scale):
     return RA.rb(dn)
 
 
+# ---------------------------------------------------------------------------------------------------------------
+# LEVEL-1 lever 1b (MOE_FAST, default OFF until its card check): the same S2 vjp as _moe_rows, without the id-major
+# padding and without autograd over the GEMMs. Real routing (lanes/T/tools/moe_bucket_census.py, P3' rows, 48 windows of
+# 8k): the padded bmm of a 16-expert group carries 3.96x the real rows (one expert holds most of them); with the group's
+# experts sorted by row count and cut optimally into <= 3 batches it carries 1.34x. The down projection's forward
+# value is never computed: its output is rounded straight-through and only its cotangent is used.
+# ---------------------------------------------------------------------------------------------------------------
+MOE_FAST = os.environ.get("IFT_MOE_FAST", "0") == "1"
+MOE_BATCHES = int(os.environ.get("IFT_MOE_BATCHES", "3"))
+
+
+def _h2d(t, dev):
+    """A small host tensor on `dev` through pinned memory (no pageable copy, no host sync); plain .to off CUDA."""
+    if torch.device(dev).type == "cuda":
+        return t.pin_memory().to(dev, non_blocking=True)
+    return t.to(dev)
+
+
+def _moe_plan(cnt, max_rows, nb):
+    """Batches of one group: lists of items (rows, expert within the group, first row within the group's sorted rows),
+    items longest first. An expert above max_rows is cut into several items. The sorted items are partitioned into at
+    most nb contiguous batches minimising sum(batch items x its longest item), then batches above EG items are cut."""
+    items = []
+    off = 0
+    for e, c in enumerate(cnt):
+        for s in range(0, c, max_rows):
+            items.append((min(max_rows, c - s), e, off + s))
+        off += c
+    n = len(items)
+    if n == 0:
+        return []
+    items.sort(key=lambda t: (-t[0], t[1], t[2]))
+    inf = 1 << 62
+    f = [[inf] * (n + 1) for _ in range(nb + 1)]
+    cut = [[0] * (n + 1) for _ in range(nb + 1)]
+    f[0][0] = 0
+    for b in range(1, nb + 1):
+        fp, fb, cb = f[b - 1], f[b], cut[b]
+        for j in range(b, n + 1):
+            for i in range(b - 1, j):
+                if fp[i] < inf:
+                    v = fp[i] + (j - i) * items[i][0]
+                    if v < fb[j]:
+                        fb[j], cb[j] = v, i
+    best = min(range(1, nb + 1), key=lambda b: f[b][n])
+    parts = []
+    j = n
+    for b in range(best, 0, -1):
+        i = cut[b][j]
+        parts.append(items[i:j])
+        j = i
+    parts.reverse()
+    return [bt[k:k + B.EG] for bt in parts for k in range(0, len(bt), B.EG)]
+
+
+def _unit_bwd(g3, unit):
+    """g [b, cap, N] @ unit [b, N, K]: UnitBMM's backward (g rounded to bf16 for the tensor cores, as rig.ExpertBMM)."""
+    if B._OUT_DTYPE.get(g3.device):
+        return torch.bmm(g3.to(BF16), unit, out_dtype=F32)
+    return torch.bmm(g3.float(), unit.float())
+
+
+@torch.no_grad()
+def _moe_fast_batch(items, r0, x, g, tok, gam_r, u13, f13, u2, f2, lora, scale, g0, g1, dx, dgam_r, lgr):
+    """One batch of a group: adds its rows' dX to dx, writes their d(gamma) into dgam_r, adds the LoRA gradients."""
+    dev = x.device
+    nb, cap = len(items), items[0][0]
+    lens = np.fromiter((it[0] for it in items), dtype=np.int64, count=nb)
+    es = np.fromiter((it[1] for it in items), dtype=np.int64, count=nb)
+    firsts = np.fromiter((it[2] for it in items), dtype=np.int64, count=nb)
+    kk = np.repeat(np.arange(nb), lens)
+    pos = np.arange(int(lens.sum())) - np.repeat(np.cumsum(lens) - lens, lens)
+    rel = _h2d(torch.from_numpy(firsts[kk] + pos + r0), dev)  # rows of this batch in the visit's sorted rows
+    flat = _h2d(torch.from_numpy(kk * cap + pos), dev)  # their positions in the padded [nb, cap] layout
+    kt = _h2d(torch.from_numpy(kk), dev)
+    eix = _h2d(torch.from_numpy(es), dev)
+
+    def pad(rows):
+        z = torch.zeros(nb * cap, rows.shape[1], dtype=rows.dtype, device=dev)
+        return z.index_copy(0, flat, rows).view(nb, cap, rows.shape[1])
+
+    def unpad(p3):
+        return p3.reshape(nb * cap, p3.shape[2]).index_select(0, flat)
+
+    tb = tok[rel]
+    U13, U2 = u13.index_select(0, eix), u2.index_select(0, eix)
+    fe13, fe2 = f13[eix][kt][:, None], f2[eix][kt][:, None]
+    xp = pad(x[tb])
+    gu = unpad(B._bmm_f32(xp, U13)) * fe13
+    A13 = B13 = A2 = B2 = la13 = None
+    if lora is not None:
+        A13, B13, A2, B2 = [t[g0:g1].index_select(0, eix) for t in lora]
+        la13 = torch.bmm(xp, A13.transpose(1, 2))
+        gu = gu + scale * unpad(torch.bmm(la13, B13.transpose(1, 2)))
+    gu = RA.rb(gu)
+    with torch.enable_grad():
+        gul = gu.detach().requires_grad_()
+        gml = gam_r[rel].detach().requires_grad_()
+        y = RA.inkling_softcap_swiglu(gul, gml)
+    # the down projection's vjp at y
+    c = g[tb]
+    dyp = _unit_bwd(pad(c * fe2), U2)
+    if lora is not None:
+        yp = pad(y.detach())
+        pc = pad(scale * c)
+        dla2 = torch.bmm(pc, B2)
+        dB2 = torch.bmm(pc.transpose(1, 2), torch.bmm(yp, A2.transpose(1, 2)))
+        dA2 = torch.bmm(dla2.transpose(1, 2), yp)
+        dyp = dyp + torch.bmm(dla2, A2)
+    with torch.enable_grad():
+        dgu, dgm = torch.autograd.grad(y, (gul, gml), unpad(dyp))
+    # the gate / up projection's vjp at x
+    dxp = _unit_bwd(pad(dgu * fe13), U13)
+    if lora is not None:
+        pc = pad(scale * dgu)
+        dla13 = torch.bmm(pc, B13)
+        dB13 = torch.bmm(pc.transpose(1, 2), la13)
+        dA13 = torch.bmm(dla13.transpose(1, 2), xp)
+        dxp = dxp + torch.bmm(dla13, A13)
+        for j, t in enumerate((dA13, dB13, dA2, dB2)):  # B.LORA_KEYS order; an expert cut into items repeats in eix
+            if lgr[j] is not None:
+                lgr[j][g0:g1].index_add_(0, eix, t)
+    dx.index_add_(0, tb, unpad(dxp))
+    dgam_r[rel] = dgm
+
+
 class MoEGM(torch.autograd.Function):
     """moe_out (placeholder: no consumer reads its value -- the MLP-output conv's backward is linear) as a function of
     mlp_in x [T, H] and the layer's LoRA tensors; backward group-major over the whole sequence."""
@@ -425,6 +638,13 @@ class MoEGM(torch.autograd.Function):
             if w.fmt != "nvfp4":
                 f13 = torch.ones_like(f13)
                 f2 = torch.ones_like(f2)
+            if MOE_FAST:
+                with B._tick("bwd.moe.fast"):
+                    for items in _moe_plan(cnt[g0:g1], MOE_ROWS, MOE_BATCHES):
+                        _moe_fast_batch(items, r0, x, g, tok, gam_r, u13, f13, u2, f2, lora, ctx.scale, g0, g1, dx,
+                                        dgam_r, lgr)
+                del u13, u2
+                continue
             for b0 in range(r0, r1, MOE_ROWS):
                 b1 = min(r1, b0 + MOE_ROWS)
                 tb = tok[b0:b1]
@@ -433,8 +653,8 @@ class MoEGM(torch.autograd.Function):
                 lo_e = [max(starts[e], b0) for e in range(g0, g1)]
                 hi_e = [min(starts[e] + cnt[e], b1) for e in range(g0, g1)]
                 cap = max(1, max(h - l for l, h in zip(lo_e, hi_e)))
-                off = torch.tensor([lo_e[i] - starts[g0 + i] for i in range(g1 - g0)]).pin_memory()
-                pb = pos_all[b0:b1] - off.to(dev, non_blocking=True)[eb]
+                off = _h2d(torch.tensor([lo_e[i] - starts[g0 + i] for i in range(g1 - g0)]), dev)
+                pb = pos_all[b0:b1] - off[eb]
                 with torch.enable_grad():
                     xr = x[tb].detach().requires_grad_()
                     grr = gam_r[b0:b1].detach().requires_grad_()
