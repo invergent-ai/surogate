@@ -789,14 +789,8 @@ int count_mismatch(const std::vector<T>& a, const std::vector<T>& b) {
     return bad;
 }
 
-int run_capture(const char* path, const char* dump_dir) {
-    const SafeTensors st = read_safetensors(path);
-    const bool nv   = st.meta.at("format") == "nvfp4";
-    const int tokens = std::stoi(st.meta.at("tokens"));
-    std::printf("[capture %s: layer %s visit %s, %s, T=%d]\n", path, st.meta.at("layer").c_str(),
-                st.meta.at("visit").c_str(), nv ? "NVFP4" : "MXFP8", tokens);
+void load_capture_layer(const SafeTensors& st, bool nv, Layer& l) {
     const auto format = nv ? ops::InklingExpertFormat::Nvfp4 : ops::InklingExpertFormat::Mxfp8;
-    Layer l;
     l.format = format;
     l.d_router = to_device(st.vec<std::uint16_t>("router"));
     l.d_bias   = to_device(st.vec<float>("router_bias"));
@@ -833,6 +827,17 @@ int run_capture(const char* path, const char* dump_dir) {
         l.view.w13.outer_den = static_cast<const float*>(l.d_den.p);
         l.view.w2.outer_den  = static_cast<const float*>(l.d_den.p);
     }
+}
+
+int run_capture(const char* path, const char* dump_dir) {
+    const SafeTensors st = read_safetensors(path);
+    const bool nv   = st.meta.at("format") == "nvfp4";
+    const int tokens = std::stoi(st.meta.at("tokens"));
+    std::printf("[capture %s: layer %s visit %s, %s, T=%d]\n", path, st.meta.at("layer").c_str(),
+                st.meta.at("visit").c_str(), nv ? "NVFP4" : "MXFP8", tokens);
+    const auto format = nv ? ops::InklingExpertFormat::Nvfp4 : ops::InklingExpertFormat::Mxfp8;
+    Layer l;
+    load_capture_layer(st, nv, l);
     int failures = 0;
     const auto x_bits = st.vec<std::uint16_t>("x");
     DeviceBuffer dx = to_device(x_bits);
@@ -1013,6 +1018,74 @@ int run_capture(const char* path, const char* dump_dir) {
     return failures;
 }
 
+/// Timing on real weights (M3, after parity): one CUDA-graph-captured call per T (PDL edges inside the graph),
+/// replayed; reports us / call, distinct experts touched, the bytes they imply and the share of 1,707 GB/s (lane h).
+int run_bench(const char* path) {
+    const SafeTensors st = read_safetensors(path);
+    const bool nv = st.meta.at("format") == "nvfp4";
+    const int captured = std::stoi(st.meta.at("tokens"));
+    Layer l;
+    load_capture_layer(st, nv, l);
+    const auto x_bits = st.vec<std::uint16_t>("x");
+    const double expert_bytes = nv ? 4478976.0 : 8211456.0;
+    const double router_bytes = 589824.0;
+    std::printf("[bench %s: layer %s %s]\n", path, st.meta.at("layer").c_str(), nv ? "NVFP4" : "MXFP8");
+    std::printf("  %6s %10s %9s %10s %9s %7s\n", "T", "us/call", "distinct", "MB", "GB/s", "of BW");
+    cudaStream_t stream = nullptr;
+    cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
+    for (const int tokens : {1, 2, 4, 8, 16, 32, 64, 256, 1024, 4096}) {
+        std::vector<std::uint16_t> xs(static_cast<std::size_t>(tokens) * H);
+        for (int t = 0; t < tokens; ++t) {
+            std::copy(x_bits.begin() + static_cast<std::size_t>(t % captured) * H,
+                      x_bits.begin() + static_cast<std::size_t>(t % captured + 1) * H, xs.begin() + static_cast<std::size_t>(t) * H);
+        }
+        DeviceBuffer dx = to_device(xs), dout(static_cast<std::size_t>(tokens) * H * 2);
+        DeviceArena arena(ops::inkling_moe_workspace_bytes(l.format, tokens, false));
+        Tensor tx(dx.p, DType::BF16, {H, tokens}), tout(dout.p, DType::BF16, {H, tokens});
+        // distinct experts of this round
+        DeviceBuffer dl(static_cast<std::size_t>(tokens) * E * 4), di(static_cast<std::size_t>(tokens) * TOPK * 4),
+            dw(static_cast<std::size_t>(tokens) * TOPK * 4);
+        Tensor tl(dl.p, DType::FP32, {E, tokens}), ti(di.p, DType::I32, {TOPK, tokens}), tw(dw.p, DType::FP32, {TOPK, tokens});
+        ops::inkling_route(tx, l.view, tl, ti, tw, stream);
+        cuda_synchronize(stream);
+        const auto ids = from_device<int>(di, static_cast<std::size_t>(tokens) * TOPK);
+        std::vector<bool> used(E, false);
+        for (int id : ids) { used[id] = true; }
+        const int distinct = static_cast<int>(std::count(used.begin(), used.end(), true));
+        // graph of one call
+        ops::inkling_moe(tx, l.view, tout, arena, stream);
+        arena.reset();
+        cuda_synchronize(stream);
+        cudaGraph_t graph = nullptr;
+        cudaGraphExec_t exec = nullptr;
+        cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "begin capture");
+        ops::inkling_moe(tx, l.view, tout, arena, stream);
+        cuda_check(cudaStreamEndCapture(stream, &graph), "end capture");
+        cuda_check(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
+        const int iterations = tokens <= 64 ? 400 : (tokens <= 1024 ? 50 : 10);
+        for (int i = 0; i < 10; ++i) { cuda_check(cudaGraphLaunch(exec, stream), "warmup"); }
+        cudaEvent_t start, stop;
+        cuda_check(cudaEventCreate(&start), "event");
+        cuda_check(cudaEventCreate(&stop), "event");
+        cuda_check(cudaEventRecord(start, stream), "record");
+        for (int i = 0; i < iterations; ++i) { cuda_check(cudaGraphLaunch(exec, stream), "launch"); }
+        cuda_check(cudaEventRecord(stop, stream), "record");
+        cuda_check(cudaEventSynchronize(stop), "sync");
+        float ms = 0.0F;
+        cuda_check(cudaEventElapsedTime(&ms, start, stop), "elapsed");
+        const double us    = 1000.0 * ms / iterations;
+        const double bytes = distinct * expert_bytes + router_bytes;
+        std::printf("  %6d %10.2f %9d %10.2f %9.1f %6.1f%%\n", tokens, us, distinct, bytes / 1e6, bytes / us / 1e3,
+                    100.0 * (bytes / us / 1e3) / 1707.0);
+        cudaEventDestroy(start);
+        cudaEventDestroy(stop);
+        cudaGraphExecDestroy(exec);
+        cudaGraphDestroy(graph);
+    }
+    cudaStreamDestroy(stream);
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1028,6 +1101,7 @@ int main(int argc, char** argv) {
         return 77;
     }
     int failures = 0;
+    if (argc == 3 && std::string(argv[1]) == "--bench") { return run_bench(argv[2]); }
     if ((argc == 3 || argc == 5) && std::string(argv[1]) == "--capture") {
         const char* dump = argc == 5 && std::string(argv[3]) == "--dump" ? argv[4] : nullptr;
         failures = run_capture(argv[2], dump);
