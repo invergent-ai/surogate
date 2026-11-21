@@ -29,6 +29,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <map>
@@ -1033,7 +1034,17 @@ int run_bench(const char* path) {
     std::printf("  %6s %10s %9s %10s %9s %7s\n", "T", "us/call", "distinct", "MB", "GB/s", "of BW");
     cudaStream_t stream = nullptr;
     cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
-    for (const int tokens : {1, 2, 4, 8, 16, 32, 64, 256, 1024, 4096}) {
+    // INKLING_BENCH_T="1,8,4096" selects widths (nsys sessions); default: the full sweep.
+    std::vector<int> widths{1, 2, 4, 8, 16, 32, 64, 256, 1024, 4096};
+    if (const char* list = std::getenv("INKLING_BENCH_T"); list != nullptr && *list != '\0') {
+        widths.clear();
+        for (const char* p = list; *p != '\0';) {
+            widths.push_back(std::atoi(p));
+            while (*p != '\0' && *p != ',') { ++p; }
+            if (*p == ',') { ++p; }
+        }
+    }
+    for (const int tokens : widths) {
         std::vector<std::uint16_t> xs(static_cast<std::size_t>(tokens) * H);
         for (int t = 0; t < tokens; ++t) {
             std::copy(x_bits.begin() + static_cast<std::size_t>(t % captured) * H,
