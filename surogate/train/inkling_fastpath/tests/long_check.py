@@ -40,6 +40,9 @@ def main():
     ap.add_argument("--prompts", required=True)
     ap.add_argument("--lengths", default="4096,8192,16384,32768")
     ap.add_argument("--equiv-tokens", type=int, default=1024)
+    ap.add_argument("--equiv-long", type=int, default=0, help="tokens of a long-path vs long-path equivalence (0 = off)")
+    ap.add_argument("--base-flags", default="", help="ift_long flags of the baseline arm, e.g. MOE_GM=0")
+    ap.add_argument("--skip-old", action="store_true", help="skip the ift_backward equivalence (short row)")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     eng = InklingEngine(a.bin, a.artifact, 0)
@@ -53,33 +56,54 @@ def main():
     while len(pool) < 140000:
         pool = pool + pool
     rep = {}
-    # 1. equivalence
-    ids = torch.tensor(pool[:a.equiv_tokens], dtype=torch.int32, device=eng.dev)
-    for p in params:
-        p.grad = None
-    lp0, _ = B.TrainForward(eng, W).build(ids, lora, banks)
-    l0 = -lp0.mean()
-    l0.backward()
-    g_old = grads_of(params)
-    loss_old = float(l0.detach())
-    del lp0, l0
-    for p in params:
-        p.grad = None
-    torch.cuda.reset_peak_memory_stats()
-    lp1, _ = LG.TrainForwardLong(eng, W).build(ids, lora, banks)
-    l1 = -lp1.mean()
-    l1.backward()
-    g_new = grads_of(params)
-    cos, rel = [], []
-    for x, y in zip(g_new, g_old):
-        xd, yd = x.flatten().double(), y.flatten().double()
-        cos.append(float(xd @ yd / (xd.norm() * yd.norm()).clamp_min(1e-300)))
-        rel.append(float((xd - yd).norm() / yd.norm().clamp_min(1e-300)))
-    rep["equivalence"] = {"T": a.equiv_tokens, "loss_old": loss_old, "loss_new": float(l1.detach()),
-                          "cos_min": min(cos), "rel_err_max": max(rel), "rel_err_median": sorted(rel)[len(rel) // 2],
-                          "peak_new_gib": torch.cuda.max_memory_allocated() / 2**30}
-    log("equivalence " + json.dumps(rep["equivalence"]))
-    del lp1, l1, g_old, g_new
+    def set_flags(spec):
+        saved = {}
+        for kv in [x for x in spec.split(",") if x]:
+            k, v = kv.split("=")
+            saved[k] = getattr(LG, k)
+            setattr(LG, k, type(saved[k])(int(v)) if isinstance(saved[k], (bool, int)) else v)
+        return saved
+
+    def compare(g_new, g_old):
+        cos, rel = [], []
+        for x, y in zip(g_new, g_old):
+            xd, yd = x.flatten().double(), y.flatten().double()
+            cos.append(float(xd @ yd / (xd.norm() * yd.norm()).clamp_min(1e-300)))
+            rel.append(float((xd - yd).norm() / yd.norm().clamp_min(1e-300)))
+        return {"cos_min": min(cos), "rel_err_max": max(rel), "rel_err_median": sorted(rel)[len(rel) // 2]}
+
+    def run(build, T):
+        for p in params:
+            p.grad = None
+        ids_ = torch.tensor(pool[:T], dtype=torch.int32, device=eng.dev)
+        torch.cuda.synchronize()
+        t0 = time.time()
+        lp_, _ = build(ids_, lora, banks)
+        l_ = -lp_.mean()
+        l_.backward()
+        torch.cuda.synchronize()
+        return grads_of(params), float(l_.detach()), time.time() - t0
+
+    # 1. equivalence vs the rig-validated ift_backward path (short row)
+    if not a.skip_old:
+        g_old, loss_old, _ = run(B.TrainForward(eng, W).build, a.equiv_tokens)
+        torch.cuda.reset_peak_memory_stats()
+        g_new, loss_new, _ = run(LG.TrainForwardLong(eng, W).build, a.equiv_tokens)
+        rep["equivalence"] = {"T": a.equiv_tokens, "loss_old": loss_old, "loss_new": loss_new,
+                              **compare(g_new, g_old), "peak_new_gib": torch.cuda.max_memory_allocated() / 2**30}
+        log("equivalence " + json.dumps(rep["equivalence"]))
+        del g_old, g_new
+    # 1b. long-path equivalence: baseline flags vs the current ones on a long row
+    if a.equiv_long:
+        saved = set_flags(a.base_flags)
+        g_b, l_b, t_b = run(LG.TrainForwardLong(eng, W).build, a.equiv_long)
+        for k, v in saved.items():
+            setattr(LG, k, v)
+        g_n, l_n, t_n = run(LG.TrainForwardLong(eng, W).build, a.equiv_long)
+        rep["equivalence_long"] = {"T": a.equiv_long, "base_flags": a.base_flags, "loss_base": l_b, "loss_new": l_n,
+                                   "seconds_base": t_b, "seconds_new": t_n, **compare(g_n, g_b)}
+        log("equivalence_long " + json.dumps(rep["equivalence_long"]))
+        del g_b, g_n
     # 2. memory / speed
     rep["rows"] = []
     tf = LG.TrainForwardLong(eng, W)

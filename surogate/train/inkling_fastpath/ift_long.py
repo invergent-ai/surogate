@@ -277,6 +277,153 @@ class _Shift:
         return self.rel[sl.start - self.b0:sl.stop - self.b0]
 
 
+
+# ---------------------------------------------------------------------------------------------------------------
+# LEVEL-1 lever 1: the MoE backward group-major (same S2 math as rig.moe_vec; each 16-expert group's units decoded ONCE
+# per visit per projection; rows of the whole sequence per group, in row blocks of MOE_ROWS)
+# ---------------------------------------------------------------------------------------------------------------
+MOE_ROWS = int(os.environ.get("IFT_MOE_ROWS", "32768"))
+MOE_GM = os.environ.get("IFT_MOE_GM", "1") == "1"
+
+
+class UnitBMM(torch.autograd.Function):
+    """a [g, cap, K] @ unit[g]^T (bf16 operands, fp32 accumulate / output) with a given decoded unit tensor (no copy
+    saved); backward da = g @ unit with g rounded to bf16 for the tensor cores (as rig.ExpertBMM)."""
+
+    @staticmethod
+    def forward(ctx, a, unit):
+        ctx.unit = unit
+        return B._bmm_f32(a, unit)
+
+    @staticmethod
+    def backward(ctx, g):
+        if B._OUT_DTYPE.get(g.device):
+            return torch.bmm(g.to(BF16), ctx.unit, out_dtype=F32), None
+        return torch.bmm(g.float(), ctx.unit.float()), None
+
+
+def _moe_rows(xr, gr, eg, ng, u13, f13, u2, f2, lo, scale):
+    """down rows (fp32, bf16 values) of rows xr [n, H] routed to experts eg [n] (0..ng-1 within the group), gammas gr
+    [n]: rig.moe_vec's per-group arithmetic (W4A16: unit GEMM x factor, + LoRA from the fp32 tensors, one rounding;
+    softcapped SwiGLU with the gamma; down likewise)."""
+    n = xr.shape[0]
+    counts = torch.bincount(eg, minlength=ng)
+    starts = torch.cumsum(counts, 0) - counts
+    pg = torch.arange(n, device=xr.device) - starts[eg]
+    cap = int(counts.max())
+
+    def pad(rows):
+        z = torch.zeros(ng, cap, rows.shape[1], dtype=rows.dtype, device=rows.device)
+        return z.index_put((eg, pg), rows)
+
+    xp = pad(xr)
+    gu = UnitBMM.apply(xp, u13)[eg, pg] * f13[eg][:, None]
+    if lo is not None:
+        la = torch.bmm(xp, lo["A13"].transpose(1, 2))
+        gu = gu + scale * torch.bmm(la, lo["B13"].transpose(1, 2))[eg, pg]
+    gu = RA.rb(gu)
+    y = RA.inkling_softcap_swiglu(gu, gr)
+    yp = pad(y)
+    dn = UnitBMM.apply(yp, u2)[eg, pg] * f2[eg][:, None]
+    if lo is not None:
+        la = torch.bmm(yp, lo["A2"].transpose(1, 2))
+        dn = dn + scale * torch.bmm(la, lo["B2"].transpose(1, 2))[eg, pg]
+    return RA.rb(dn)
+
+
+class MoEGM(torch.autograd.Function):
+    """moe_out (placeholder: no consumer reads its value -- the MLP-output conv's backward is linear) as a function of
+    mlp_in x [T, H] and the layer's LoRA tensors; backward group-major over the whole sequence."""
+
+    @staticmethod
+    def forward(ctx, experts, ids, scale, x, *lora_tensors):
+        ctx.experts, ctx.ids, ctx.scale = experts, ids, scale
+        ctx.offload = x.shape[0] >= OFFLOAD_MIN
+        xb = x.detach().to(BF16)
+        if ctx.offload:
+            h = torch.empty(xb.shape, dtype=BF16, device="cpu", pin_memory=True)
+            h.copy_(xb, non_blocking=True)
+            ctx.xh = h
+            ctx.save_for_backward(*lora_tensors)
+        else:
+            ctx.xh = None
+            ctx.save_for_backward(xb, *lora_tensors)
+        ctx.dev = x.device
+        return torch.zeros(1, dtype=F32, device=x.device).expand(x.shape[0], x.shape[1])
+
+    @staticmethod
+    def backward(ctx, g):
+        tick = B._tick("bwd.moe_gm")
+        tick.__enter__()
+        w = ctx.experts
+        st = ctx.saved_tensors
+        if ctx.xh is not None:
+            x = ctx.xh.to(ctx.dev, non_blocking=True).float()
+            lt = st
+        else:
+            x = st[0].float()
+            lt = st[1:]
+        dev = ctx.dev
+        g = g.contiguous()
+        T, H = x.shape
+        ids = ctx.ids.long()
+        topk = ids.shape[1]
+        need = ctx.needs_input_grad[4:]
+        lora = lt if (ctx.scale is not None and len(lt) == 4) else None
+        with torch.no_grad():
+            gam = RA.route_weights(RA._router_logits(x, w.gate_w), ids)
+        flat = ids.reshape(-1)
+        order = torch.argsort(flat, stable=True)
+        es = flat[order]
+        tok = order // topk
+        slot = order % topk
+        counts = torch.bincount(flat, minlength=B.E)
+        starts = (torch.cumsum(counts, 0) - counts).tolist()
+        cnt = counts.tolist()
+        gam_r = gam[tok, slot]
+        dx = torch.zeros(T, H, dtype=F32, device=dev)
+        dgam_r = torch.zeros_like(gam_r)
+        lgr = [torch.zeros_like(t) if (lora is not None and nd) else None for t, nd in zip(lt, need)] if lora else []
+        for g0 in range(0, B.E, B.EG):
+            g1 = min(B.E, g0 + B.EG)
+            r0, r1 = starts[g0], starts[g1 - 1] + cnt[g1 - 1]
+            if r1 == r0:
+                continue
+            u13, f13 = w.eng.decode_experts(w.layer, "w13", g0, g1 - g0)
+            u2, f2 = w.eng.decode_experts(w.layer, "w2", g0, g1 - g0)
+            if w.fmt != "nvfp4":
+                f13 = torch.ones_like(f13)
+                f2 = torch.ones_like(f2)
+            for b0 in range(r0, r1, MOE_ROWS):
+                b1 = min(r1, b0 + MOE_ROWS)
+                tb = tok[b0:b1]
+                eb = es[b0:b1] - g0
+                with torch.enable_grad():
+                    xr = x[tb].detach().requires_grad_()
+                    grr = gam_r[b0:b1].detach().requires_grad_()
+                    lo = None
+                    leaves = []
+                    if lora is not None:
+                        leaves = [t[g0:g1].detach().requires_grad_() for t in lora]
+                        lo = dict(zip(B.LORA_KEYS, leaves))
+                    dn = _moe_rows(xr, grr, eb, g1 - g0, u13, f13, u2, f2, lo, ctx.scale)
+                    grads = torch.autograd.grad(dn, [xr, grr] + leaves, g[tb])
+                dx.index_add_(0, tb, grads[0])
+                dgam_r[b0:b1] = grads[1]
+                for j, gj in enumerate(grads[2:]):
+                    if lgr[j] is not None:
+                        lgr[j][g0:g1] += gj
+            del u13, u2
+        # the routing weights' path back into x (router logits from x, ids fixed)
+        dgam = torch.zeros(T, topk, dtype=F32, device=dev)
+        dgam[tok, slot] = dgam_r
+        with torch.enable_grad():
+            xl = x.detach().requires_grad_()
+            gm = RA.route_weights(RA._router_logits(xl, w.gate_w), ids)
+            dx += torch.autograd.grad(gm, xl, dgam)[0]
+        tick.__exit__(None, None, None)
+        return (None, None, None, dx, *lgr)
+
 # ---------------------------------------------------------------------------------------------------------------
 # a visit's recompute, staged
 # ---------------------------------------------------------------------------------------------------------------
@@ -386,17 +533,11 @@ def visit_torch_long(W: B.EngineWeights, vi, stack, partial, bank, ids, lora, ch
     del attn_partial
     # 7. MLP input + MoE (per token)
 
-    def f_moe(*a):
+    def f_min(*a):
         st = [x.float() for x in a[:n]]
         p = a[n].float()
         ao = a[n + 1].float()
-        j = n + 2
-        msgs = None
-        if has_bank:
-            msgs = messages_of(a[j:j + 2])
-            j += 2
-        rid = a[j]
-        lo = dict(zip(B.LORA_KEYS, a[j + 1:j + 5])) | {"scale": scale} if scale is not None else None
+        msgs = messages_of(a[n + 2:n + 4]) if has_bank else None
         mlp_norm = None if msgs is not None else L.mlp_norm
         if first:
             mi = RA.inkling_attn_res(st + [p], ao, None, L.q_mlp, mlp_norm, EPS)
@@ -404,18 +545,29 @@ def visit_torch_long(W: B.EngineWeights, vi, stack, partial, bank, ids, lora, ch
             mi = RA.inkling_attn_res(st, p, ao, L.q_mlp, mlp_norm, EPS)
         if msgs is not None:
             mi = RA.inkling_loop_blend(mi, msgs[3:], L.ctrl_down[3:4], L.ctrl_gf[3:4], L.mlp_norm, EPS)
-        return B.moe_vec(mi[0], L.experts, rid, lo)
+        return mi[0]
+
+    def f_moe(*a):
+        rid = a[-5] if scale is not None else a[-1]
+        lo = dict(zip(B.LORA_KEYS, a[-4:])) | {"scale": scale} if scale is not None else None
+        return B.moe_vec(f_min(*a[:len(a) - (5 if scale is not None else 1)]), L.experts, rid, lo)
 
     with B._tick("fwd.moe"):
-        tok = list(stack) + [partial, attn_out] + (list(bank) if has_bank else []) + [ids]
+        tok = list(stack) + [partial, attn_out] + (list(bank) if has_bank else [])
         mvals = msinks = None
         if act_vals is not None:
-            mvals = list(act_vals[:n + 1]) + [None] + list(act_vals[n + 1:]) + [None]
+            mvals = list(act_vals[:n + 1]) + [None] + list(act_vals[n + 1:])
         if act_sinks is not None:
-            msinks = list(act_sinks[:n + 1]) + [None] + list(act_sinks[n + 1:]) + [None]
-        moe_out = tc(f_moe, tok, [0] * len(tok), [0], params=lt,
-                     store_bf16=[True] * (n + 1) + [True] + ([True, True] if has_bank else []) + [False], chunk=chunk,
-                     vals=mvals, sinks=msinks)
+            msinks = list(act_sinks[:n + 1]) + [None] + list(act_sinks[n + 1:])
+        sb = [True] * (n + 1) + [True] + ([True, True] if has_bank else [])
+        if MOE_GM:
+            mlp_in = tc(f_min, tok, [0] * len(tok), [0], store_bf16=sb, chunk=chunk, vals=mvals, sinks=msinks)
+            moe_out = MoEGM.apply(L.experts, ids, scale, mlp_in, *lt)
+            del mlp_in
+        else:
+            moe_out = tc(f_moe, tok + [ids], [0] * (len(tok) + 1), [0], params=lt, store_bf16=sb + [False],
+                         chunk=chunk, vals=None if mvals is None else mvals + [None],
+                         sinks=None if msinks is None else msinks + [None])
     # 8. MLP-output conv (full T)
     with B._tick("fwd.out_conv"):
         res_ = None
