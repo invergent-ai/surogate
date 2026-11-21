@@ -1254,12 +1254,182 @@ void run_capture(const std::string& dir) {
     }
 }
 
+// ---- bench: per-kernel time (eager, back-to-back launches on one stream; no CUDA graph) ------------------------
+
+struct BenchPlane {
+    int logical = 0;
+    DeviceBuffer k, v, bt;
+    BenchPlane(int rows, int tokens) : logical((tokens + 63) / 64) {
+        const std::size_t pages = static_cast<std::size_t>(rows) * logical;
+        k = DeviceBuffer(pages * 8 * 64 * 128);
+        v = DeviceBuffer(pages * 8 * 64 * 128);
+        cuda_check(cudaMemset(k.p, 0x30, k.bytes), "memset");
+        cuda_check(cudaMemset(v.p, 0x31, v.bytes), "memset");
+        std::vector<int> t(pages);
+        std::iota(t.begin(), t.end(), 0);
+        bt = to_device_i32(t);
+    }
+    PagedKVBatchLayerView view(int rows) const {
+        PagedKVBatchLayerView vw;
+        const int pages = rows * logical;
+        vw.k_pages      = Tensor(k.p, DType::FP8_E4M3FN, {128, 64, 8, pages});
+        vw.v_pages      = Tensor(v.p, DType::FP8_E4M3FN, {128, 64, 8, pages});
+        vw.block_tables = Tensor(bt.p, DType::I32, {logical, rows});
+        vw.head_dim     = 128;
+        vw.num_kv_heads = 8;
+        vw.dtype        = DType::FP8_E4M3FN;
+        return vw;
+    }
+};
+
+double time_us(const std::function<void()>& f, int reps = 20) {
+    for (int i = 0; i < 3; ++i) { f(); }
+    cudaEvent_t a, b;
+    cudaEventCreate(&a);
+    cudaEventCreate(&b);
+    cudaEventRecord(a);
+    for (int i = 0; i < reps; ++i) { f(); }
+    cudaEventRecord(b);
+    cudaEventSynchronize(b);
+    float ms = 0.0F;
+    cudaEventElapsedTime(&ms, a, b);
+    cudaEventDestroy(a);
+    cudaEventDestroy(b);
+    cuda_check(cudaGetLastError(), "bench");
+    return 1000.0 * ms / reps;
+}
+
+constexpr double kBwGBs  = 1707.0; // lane h, measured decode DRAM bandwidth
+constexpr double kBf16TF = 253.0;  // lane h, measured BF16 MMA peak
+
+void bench_attention(const char* name, InklingLayerKind kind, int W, int B, int first) {
+    const Layer layer(kind, 11);
+    const Rows rows = make_rows(W, B, std::vector<int>(B, first), {});
+    const int N = W * B, keys = first + W;
+    BenchPlane plane(B, keys + 64);
+    Rng rng(3);
+    std::vector<float> q, r;
+    fill_qr(rng, rows, q, r);
+    std::vector<float> qside(static_cast<std::size_t>(N) * 6552, 0.25F);
+    DeviceBuffer dq = to_device_bf16(q), dr = to_device_bf16(r), dqs = to_device_bf16(qside);
+    ops::InklingAttentionInputs in{Tensor(dq.p, DType::BF16, {128, 24, N}), Tensor(dr.p, DType::BF16, {16, 24, N}),
+                                   strided_bf16(dqs.p, G::kRowsGate, {3072}, N, 6552),
+                                   strided_bf16(dqs.p, G::kRowsSink, {24}, N, 6552),
+                                   Tensor(layer.dtable.p, DType::BF16, {16, G::kRelTableRows})};
+    const auto view = rows.view(keys);
+    WorkspaceArena work(ops::inkling_rel_attention_workspace_bytes(kind, W, B, view.envelope) + 4096);
+    DeviceBuffer dout(static_cast<std::size_t>(N) * 3072 * 2);
+    Tensor out(dout.p, DType::BF16, {3072, N});
+    const auto pv  = plane.view(B);
+    const double us = time_us([&] { ops::inkling_rel_attention(in, kind, view, pv, work, out, nullptr); });
+    const bool glob = kind == InklingLayerKind::Global;
+    // Bytes: every visible key's K and V once per row (decode / verify); FLOPs: 512 per (query, key, head).
+    double keys_read = 0.0, flops = 0.0;
+    for (int j = 0; j < W; ++j) {
+        const double vis = glob ? first + j + 1.0 : std::min(first + j + 1.0, 1024.0);
+        flops += 24.0 * vis * 512.0 * B;
+    }
+    keys_read       = (glob ? keys : std::min(keys, 1024 + W)) * static_cast<double>(B);
+    const double gb = keys_read * 8 * 256 / 1e9;
+    if (W <= G::kMaxSmallColumns) {
+        std::printf("bench %-40s %9.1f us  %7.1f GB/s  %5.1f %% of %.0f GB/s\n", name, us, gb / (us * 1e-6),
+                    100.0 * gb / (us * 1e-6) / kBwGBs, kBwGBs);
+    } else {
+        std::printf("bench %-40s %9.1f us  %7.1f TFLOP/s  %5.1f %% of %.0f (bf16)\n", name, us, flops / (us * 1e-6) / 1e12,
+                    100.0 * flops / (us * 1e-6) / 1e12 / kBf16TF, kBf16TF);
+    }
+}
+
+void bench_prologue(const char* name, InklingLayerKind kind, int W, int B, int first) {
+    const Layer layer(kind, 12);
+    const Rows rows = make_rows(W, B, std::vector<int>(B, first), {});
+    const int N = W * B;
+    BenchPlane plane(B, first + W + 64);
+    std::vector<float> proj(static_cast<std::size_t>(N) * 8600, 0.5F), dyn(static_cast<std::size_t>(N) * 32, 0.1F);
+    DeviceBuffer dproj = to_device_bf16(proj), ddyn = to_device_bf16(dyn);
+    std::vector<std::uint16_t> zeros(static_cast<std::size_t>(kC) * 3 * B, 0);
+    DeviceBuffer dstate = to_device(zeros);
+    std::vector<int> sl(B);
+    std::iota(sl.begin(), sl.end(), 0);
+    DeviceBuffer dslots = to_device_i32(sl);
+    ops::InklingProjections in;
+    in.q = strided_bf16(dproj.p, G::kRowsQ, {128, 24}, N, 8600);
+    in.r = strided_bf16(dproj.p, G::kRowsR, {16, 24}, N, 8600);
+    in.k = strided_bf16(dproj.p, G::kRowsK, {1024}, N, 8600);
+    in.v = strided_bf16(dproj.p, G::kRowsV, {1024}, N, 8600);
+    if (kind == InklingLayerKind::Global) {
+        in.k_dyn = Tensor(ddyn.p, DType::BF16, {4, 8, N});
+        in.v_dyn = Tensor(ddyn.p, DType::BF16, {4, 8, N});
+    }
+    ops::InklingConvStateArgs conv;
+    conv.states = Tensor(dstate.p, DType::BF16, {kC, 3, B});
+    conv.slots  = Tensor(dslots.p, DType::I32, {B});
+    DeviceBuffer dqo(static_cast<std::size_t>(N) * 3072 * 2), dro(static_cast<std::size_t>(N) * 384 * 2);
+    ops::InklingPrologueOutputs qr{Tensor(dqo.p, DType::BF16, {128, 24, N}), Tensor(dro.p, DType::BF16, {16, 24, N})};
+    const auto view = rows.view(first + W);
+    const auto pv   = plane.view(B);
+    const double us = time_us([&] { ops::inkling_attention_prologue(in, layer.weights(), kind, view, conv, pv, qr, nullptr); });
+    const double gb = N * 20.5e3 / 1e9;
+    std::printf("bench %-40s %9.1f us  %7.1f GB/s (~20.5 KB / column)\n", name, us, gb / (us * 1e-6));
+}
+
+void bench_linear(const char* name, int k, int k_per, int columns) {
+    const int n = k == 2304 ? 8600 : 2304;
+    const Fp8Weight fw(n, k, k_per, 1, 21);
+    std::vector<float> x(static_cast<std::size_t>(k) * columns, 0.5F);
+    DeviceBuffer dx = to_device_bf16(x), dout(static_cast<std::size_t>(n) * columns * 2);
+    Tensor xt(dx.p, DType::BF16, {k, columns});
+    Tensor ot(dout.p, DType::BF16, {n, columns});
+    const ops::InklingProjection pj{&xt, &fw.w, 0, &ot};
+    const double us = time_us([&] { ops::inkling_attn_linear(std::span<const ops::InklingProjection>(&pj, 1), nullptr, nullptr); });
+    const double gb = static_cast<double>(n) * k / 1e9, tf = 2.0 * n * k * columns / 1e12;
+    if (columns <= 8) {
+        std::printf("bench %-40s %9.1f us  %7.1f GB/s  %5.1f %% of %.0f GB/s\n", name, us, gb / (us * 1e-6),
+                    100.0 * gb / (us * 1e-6) / kBwGBs, kBwGBs);
+    } else {
+        std::printf("bench %-40s %9.1f us  %7.1f TFLOP/s  %5.1f %% of %.0f (bf16)\n", name, us, tf / (us * 1e-6),
+                    100.0 * tf / (us * 1e-6) / kBf16TF, kBf16TF);
+    }
+}
+
+void run_bench() {
+    using K = InklingLayerKind;
+    bench_attention("attn decode global 1x8k", K::Global, 1, 1, 8191);
+    bench_attention("attn decode global 1x64k", K::Global, 1, 1, 65535);
+    bench_attention("attn decode global 1x262k", K::Global, 1, 1, 262143);
+    bench_attention("attn decode local 1x8k (window)", K::Local, 1, 1, 8191);
+    bench_attention("attn decode global 8x8k", K::Global, 1, 8, 8191);
+    bench_attention("attn decode local 8x8k", K::Local, 1, 8, 8191);
+    bench_attention("attn verify W8 global 1x8k", K::Global, 8, 1, 8184);
+    bench_attention("attn prefill global W8192 from 0", K::Global, 8192, 1, 0);
+    bench_attention("attn prefill global W8192 past 64k", K::Global, 8192, 1, 65536);
+    bench_attention("attn prefill local W8192 past 8k", K::Local, 8192, 1, 8192);
+    bench_prologue("prologue local 1x1", K::Local, 1, 1, 8191);
+    bench_prologue("prologue global 8x1", K::Global, 1, 8, 8191);
+    bench_prologue("prologue local W8192", K::Local, 8192, 1, 0);
+    bench_linear("attn_linear qkvr GEMV N=1 channel", 2304, 2304, 1);
+    bench_linear("attn_linear qkvr GEMV N=1 1x128", 2304, 128, 1);
+    bench_linear("attn_linear qkvr GEMV N=8 1x128", 2304, 128, 8);
+    bench_linear("attn_linear wo GEMV N=1 1x128", 3072, 128, 1);
+    bench_linear("attn_linear qkvr GEMM N=8192 1x128", 2304, 128, 8192);
+    bench_linear("attn_linear qkvr GEMM N=8192 channel", 2304, 2304, 8192);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     if (cuda_unavailable()) {
         std::cout << "no CUDA device: skipped\n";
         return 77;
+    }
+    if (argc > 1 && std::string(argv[1]) == "bench") {
+        try {
+            run_bench();
+        } catch (const std::exception& e) {
+            std::cerr << "EXCEPTION " << e.what() << '\n';
+            return 1;
+        }
+        return 0;
     }
     if (argc > 2 && std::string(argv[1]) == "capture") {
         try {
@@ -1293,6 +1463,7 @@ int main(int argc, char** argv) {
             {"fused global verify W8", K::Global, 8, 1, {9100}, {}, M::Record, -1, true},
             {"fused local prefill W96", K::Local, 96, 1, {1200}, {}, M::InPlace, -1, true},
             {"fused global prefill W40", K::Global, 40, 1, {2000}, {}, M::InPlace, -1, true},
+            {"fused global decode B2 (tau > 1, 70k keys)", K::Global, 1, 2, {70000, 9000}, {}, M::InPlace, -1, true},
         };
         std::uint32_t seed = 1000;
         for (const auto& c : pro) {
@@ -1312,6 +1483,9 @@ int main(int argc, char** argv) {
             {"attn local prefill W70 from 0", K::Local, 70, 1, {0}, {}},
             {"attn global prefill W20 past 20000 split", K::Global, 20, 1, {20000}, {}},
             {"attn global prefill W130 forced 4 splits", K::Global, 130, 1, {2500}, {}, 4},
+            {"attn global prefill W64 past 8000 (8k keys)", K::Global, 64, 1, {8000}, {}},
+            {"attn global prefill W20 past 65000 (64k keys)", K::Global, 20, 1, {65000}, {}},
+            {"attn local prefill W64 past 65000", K::Local, 64, 1, {65000}, {}},
             {"attn local decode forced 1 split", K::Local, 1, 2, {599, 4999}, {}, 1},
             {"attn global decode forced 1 split", K::Global, 1, 2, {36, 8999}, {}, 1},
         };
