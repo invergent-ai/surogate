@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 
 namespace sinfer::ops::detail {
 
@@ -47,6 +48,15 @@ void speculative_prepare_verify_ids_launch(const Tensor& anchors, const Tensor& 
     CUDA_CHECK(cudaGetLastError());
 }
 
+bool& speculative_exact_split() {
+    // SUROGATE_SPEC_EXACT_SPLIT=0: untruncated speculative rows on the one-CTA wide kernel (read once; tests edit it).
+    static bool on = [] {
+        const char* raw = std::getenv("SUROGATE_SPEC_EXACT_SPLIT");
+        return raw == nullptr || raw[0] == '\0' || std::atoi(raw) != 0;
+    }();
+    return on;
+}
+
 namespace {
 
 // One verification round for logits of element type LogitT (BF16 or FP32). The routes,
@@ -66,13 +76,40 @@ void speculative_accept_greedy_drafts_launch_typed(
     const auto* sorted = sampling_sort_launch(logits, token_domain, configs,
         static_cast<const int32_t*>(drafts.data), static_cast<const int32_t*>(current_extents.data),
         cols, batch, scratch, layout.bytes, stream);
+    // Untruncated stochastic rows: the split route (speculative_exact_*_kernel) unless switched off; the wide
+    // kernel then skips them. Always the same launches for a shape, so a captured graph keeps one node set.
+    const bool exact_split = scratch.spec_exact_partials != nullptr && speculative_exact_split();
     speculative_accept_wide_kernel<LogitT><<<batch, kSamplerBlock, 0, stream>>>(
         static_cast<const LogitT*>(logits.data), static_cast<const int32_t*>(drafts.data),
         static_cast<const int32_t*>(current_extents.data), static_cast<int32_t*>(lengths.data),
         static_cast<int32_t*>(anchors.data), static_cast<int32_t*>(licensed_tokens.data),
         static_cast<int32_t*>(licensed_counts.data), static_cast<int32_t*>(accepted.data), configs,
-        token_domain, physical_rows, draft_count, sorted, layout.bytes);
+        token_domain, physical_rows, draft_count, sorted, layout.bytes, exact_split ? 1 : 0);
     CUDA_CHECK(cudaGetLastError());
+    if (exact_split) {
+        const std::int32_t chunks = div_up(token_domain, kSamplerFullVocabChunkItems);
+        const std::int64_t units  = static_cast<std::int64_t>(chunks) * cols * batch;
+        speculative_exact_max_kernel<LogitT>
+            <<<sampling_resident_grid(speculative_exact_max_kernel<LogitT>, units), kSamplerBlock, 0, stream>>>(
+                static_cast<const LogitT*>(logits.data), static_cast<const std::int32_t*>(drafts.data),
+                static_cast<const std::int32_t*>(current_extents.data), configs, token_domain, physical_rows,
+                draft_count, batch, scratch.spec_exact_partials, layout.bytes, chunks);
+        CUDA_CHECK(cudaGetLastError());
+        speculative_exact_partial_kernel<LogitT>
+            <<<sampling_resident_grid(speculative_exact_partial_kernel<LogitT>, units), kSamplerBlock, 0, stream>>>(
+                static_cast<const LogitT*>(logits.data), static_cast<const std::int32_t*>(drafts.data),
+                static_cast<const std::int32_t*>(current_extents.data),
+                static_cast<const std::int32_t*>(lengths.data), configs, token_domain, physical_rows, draft_count,
+                batch, scratch.spec_exact_partials, layout.bytes, chunks);
+        CUDA_CHECK(cudaGetLastError());
+        speculative_exact_finalize_kernel<LogitT><<<batch, kSamplerBlock, 0, stream>>>(
+            static_cast<const LogitT*>(logits.data), static_cast<const std::int32_t*>(drafts.data),
+            static_cast<const std::int32_t*>(current_extents.data), static_cast<std::int32_t*>(lengths.data),
+            static_cast<std::int32_t*>(anchors.data), static_cast<std::int32_t*>(licensed_tokens.data),
+            static_cast<std::int32_t*>(licensed_counts.data), static_cast<std::int32_t*>(accepted.data), configs,
+            token_domain, physical_rows, draft_count, scratch.spec_exact_partials, layout.bytes, chunks);
+        CUDA_CHECK(cudaGetLastError());
+    }
     if (!layout.multiblock) {
         speculative_accept_greedy_drafts_kernel<LogitT><<<batch, kSamplerBlock, 0, stream>>>(
             static_cast<const std::int32_t*>(target_tokens.data),

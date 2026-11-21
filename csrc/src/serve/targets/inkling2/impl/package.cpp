@@ -120,6 +120,11 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
     return attention_choice().fp8 ? WeightsProfile::Fp8Attention : WeightsProfile::Bf16Attention;
 }
 
+std::size_t Package::extra_derived_residency_bytes(const EngineOptions& options) {
+    if (options.speculative.backend != SpeculativeBackend::DFlash) { return 0; }
+    return detail::dspark_derived_device_bytes(detail::dspark_fp8_weights_requested(), detail::dspark_fp8_fold_requested());
+}
+
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
                                      WeightsProfile weights_profile) {
     load::BindOptions bind;

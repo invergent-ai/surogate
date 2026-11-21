@@ -141,6 +141,19 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
         // DSpark (lane e2): the fold and the drafter's derived weights; the runtime's DFlash guards need a payload.
         derive_dspark(weights, dspark, plan.plan.options.draft_linears_host, dspark_fp8_fold_requested());
         model.dspark = &dspark;
+        if (host_bank && dspark.fp8) {
+            // The host bank holds only the drafter's BF16 dense linears (~0.49 GiB pinned), read once above to quantise
+            // them; the FP8 drafter never reads them again (dspark.cpp dense()). Release it (M7 review): detach the
+            // objects from the artifact and null their views first, so nothing can dereference freed memory.
+            host_bank->detach(backing);
+            for (auto& L : weights.draft.layers) {
+                for (Weight* wt : {&L.q, &L.k, &L.v, &L.o, &L.k_ctx, &L.v_ctx, &L.gate, &L.up, &L.down}) {
+                    wt->qdata = nullptr;
+                    wt->payload = nullptr;
+                }
+            }
+            host_bank.reset();
+        }
     }
 
     runtime.geometry        = plan.geometry;
