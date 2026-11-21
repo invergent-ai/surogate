@@ -115,6 +115,11 @@ struct SequencePlanningInputs {
     /// Which weights these are (artifact path, size and modification time): part of the host KV
     /// tier's key namespace, the same for every replica of one artifact.
     std::uint64_t weights_identity = 0;
+    /// Lane f1 M3-C: the Main pool's laid-out (virtual) span is at least this many pages -- the
+    /// capacity curve's maximum when an elastic window class widened it -- so every candidate
+    /// between the curve's minimum and maximum lays out the same span and the reservation stays
+    /// affine in the page count (finalize_sequence_plan_impl). 0 = the span as before.
+    std::uint32_t main_page_virtual_floor = 0;
 };
 
 } // namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS

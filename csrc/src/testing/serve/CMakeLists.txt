@@ -210,6 +210,11 @@ target_compile_options(sinfer_qwen4exp_mtp_workspace_test PRIVATE -UNDEBUG)
 # head, MTP's bound unchanged.
 sinfer_add_test(sinfer_lora_graph_plan_test SOURCES test_lora_graph_plan.cpp)
 target_compile_options(sinfer_lora_graph_plan_test PRIVATE -UNDEBUG)
+# Lane f1 (ENGINE-INKLING): every serving shape of the windowed targets plans and finalizes affinely under
+# --kv-capacity auto (and as a pipeline stage), and the curve's minimum holds one full request + its window
+# charge. Needs a device context only; artifacts by --inkling / --gemma3 (77 without them).
+sinfer_add_test(sinfer_kv_capacity_shapes_test SOURCES test_kv_capacity_shapes.cpp)
+target_compile_options(sinfer_kv_capacity_shapes_test PRIVATE -UNDEBUG)
 add_executable(sinfer_radix_prefix_cache_test test_radix_prefix_cache.cpp)
 target_include_directories(sinfer_radix_prefix_cache_test PRIVATE ${SERVE_ROOT})
 target_compile_options(sinfer_radix_prefix_cache_test PRIVATE -UNDEBUG)
