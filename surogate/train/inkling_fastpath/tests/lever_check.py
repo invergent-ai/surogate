@@ -9,17 +9,18 @@
   speed     warm, unprofiled, on the same flags as the gradient. noise-1 showed the first of two identical runs 3.9 s slower
             (22.95 vs 19.03 s at 8k), and a cold forward costs 2.0 s vs 0.7 s warm: every length gets an untimed warm-up,
             the arms alternate direction between repetitions, the median counts.
-  long      the last arm vs the arm named by --long-base at a long row (gradient + speed + peak memory).
+  long      the last accepted chain arm vs the reference flags (--long-base-flags) at a long row (gradient + speed + peak).
   profile   one extra profiled pass of the last arm (section ticks synchronise: never a speed number).
 
-The verdict names, in arm order, the arms that pass; an arm after a failing one is not accepted (the stack is cumulative).
+The verdict names the chain arms that pass (an arm after a failing one is not accepted) and, apart, the variants that pass.
 Usage: python lever_check.py --bin B --artifact A --prompts DIR --out report.json [--lengths 1024,8192] [--reps 2]
-       [--long 32768] [--long-base A2] [--arms "A0:FLAG=v,...;A1:..."]
+       [--long 32768] [--long-base-flags F=v,...] [--arms "A0:FLAG=v,...;A1:..."]
 """
 
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import sys
@@ -34,17 +35,21 @@ import ift_backward as B  # noqa: E402
 import ift_long as LG  # noqa: E402
 
 COS_LINE, REL_LINE = 0.9999, 0.01
-# every arm names every flag. MOE_DET=1 from A1 on: lev-all-1 showed the MoEGM arms do not repeat (A/A rel err 0.36-0.92 % at 1k,
-# A0 repeats bit for bit), so a lever's difference could not be read below that floor. The stack holds only the levers that
-# gained at 8k in lev-all-1 (warm, repeats within 0.03 s): MoE group-major 26.95 -> 17.67 s, FAST_GEMM -> 17.14, MOE_FAST
-# 18.01 -> 13.98. Left out: ATTN_ADAPT (+0.38 s), CHUNK 4096 (+0.49 s), ATTN_TC (+1.11 s).
+# every arm names every flag; MOE_DET=1 from A1 on (lev-all-2: A/A exactly 0.0). FAST_GEMM is OUT: on the reproducible path it
+# misses the line (1.35 % at 1k, 1.17 % at 4k) for 0.5 s of 17.9 s at 8k. Chain: A0, A1, F (= A1 + MOE_FAST). "name@base" = a VARIANT:
+# judged alone against its base (and A0, and ift_backward) with the same line; a failing variant does not stop the others.
+_ON = "MOE_GM=1,MOE_DET=1,FAST_GEMM=0"
 OFF = "MOE_GM=0,MOE_DET=0,FAST_GEMM=0,ATTN_ADAPT=0,CHUNK=1024,MOE_FAST=0,ATTN_TC=0"
 DEFAULT_ARMS = ";".join((
     "A0:" + OFF,
-    "A1:MOE_GM=1,MOE_DET=1,FAST_GEMM=0,ATTN_ADAPT=0,CHUNK=1024,MOE_FAST=0,ATTN_TC=0",
-    "A2:MOE_GM=1,MOE_DET=1,FAST_GEMM=1,ATTN_ADAPT=0,CHUNK=1024,MOE_FAST=0,ATTN_TC=0",
-    "A3:MOE_GM=1,MOE_DET=1,FAST_GEMM=1,ATTN_ADAPT=0,CHUNK=1024,MOE_FAST=1,ATTN_TC=0",
+    "A1:" + _ON + ",ATTN_ADAPT=0,CHUNK=1024,MOE_FAST=0,ATTN_TC=0",
+    "F:" + _ON + ",ATTN_ADAPT=0,CHUNK=1024,MOE_FAST=1,ATTN_TC=0",
+    "FA@F:" + _ON + ",ATTN_ADAPT=1,CHUNK=1024,MOE_FAST=1,ATTN_TC=0",
+    "FC@F:" + _ON + ",ATTN_ADAPT=0,CHUNK=4096,MOE_FAST=1,ATTN_TC=0",
+    "FT@F:" + _ON + ",ATTN_ADAPT=0,CHUNK=1024,MOE_FAST=1,ATTN_TC=1",
 ))
+# the 32k reference: A1 in row blocks of 4,096 (lev-all-2: the base arm ran out of memory at 32k with blocks of 8,192)
+LONG_BASE = _ON + ",ATTN_ADAPT=0,CHUNK=1024,MOE_FAST=0,ATTN_TC=0,MOE_ROWS=4096"
 
 
 def log(msg):
@@ -55,11 +60,14 @@ def log(msg):
 
 
 def parse_arms(spec):
-    arms = []
+    arms, bases = [], {}
     for part in [x for x in spec.split(";") if x]:
         name, flags = part.split(":")
+        name, _, base = name.partition("@")
+        if base:
+            bases[name] = base
         arms.append((name, {k: int(v) for k, v in (kv.split("=") for kv in flags.split(",") if kv)}))
-    return arms
+    return arms, bases
 
 
 def apply_flags(flags):
@@ -96,10 +104,11 @@ def main():
     ap.add_argument("--lengths", default="1024,8192")
     ap.add_argument("--reps", type=int, default=2)
     ap.add_argument("--long", type=int, default=32768)
-    ap.add_argument("--long-base", default="A2")
+    ap.add_argument("--long-base-flags", default=LONG_BASE, help="complete flags of the long row's reference arm")
     a = ap.parse_args()
-    arms = parse_arms(a.arms)
+    arms, bases = parse_arms(a.arms)
     names = [n for n, _ in arms]
+    chain = [n for n in names if n not in bases]
     eng = InklingEngine(a.bin, a.artifact, 0)
     W = B.EngineWeights(eng)
     lora = B.make_lora(eng.dev, seed=7, b_std=1e-3)
@@ -165,7 +174,7 @@ def main():
             ar = {"seconds": times[name], "seconds_median": med, "tok_per_s": T / med, "loss": losses[name],
                   "finite": finite[name], "aa_floor": floors.get(name)}
             if k > 0:
-                ar["vs_previous"] = compare(first[name], first[names[k - 1]], eng.dev)
+                ar["vs_previous"] = compare(first[name], first[bases.get(name, names[k - 1])], eng.dev)
                 ar["vs_A0"] = compare(first[name], first[names[0]], eng.dev)
             if ref_old is not None:
                 ar["vs_ift_backward"] = compare(first[name], ref_old, eng.dev)
@@ -177,9 +186,8 @@ def main():
         del first, ref_old
         save()
 
-    # verdict: cumulative, stops at the first arm that misses a line
-    accepted = []
-    for k, name in enumerate(names):
+    # verdict: the chain is cumulative and stops at its first miss; a variant counts only on an accepted base
+    def arm_ok(name):
         ok = True
         for T in lengths:
             ar = rep["by_length"][str(T)]["arms"][name]
@@ -187,41 +195,58 @@ def main():
             for key in ("vs_previous", "vs_A0", "vs_ift_backward"):
                 if ar.get(key):
                     ok = ok and line_ok(ar[key])
-        if not ok:
+        return ok
+
+    accepted = []
+    for name in chain:
+        if not arm_ok(name):
             break
         accepted.append(name)
+    variants = [n for n in names if n in bases and bases[n] in accepted and arm_ok(n)]
     rep["accepted_arms"] = accepted
+    rep["accepted_variants"] = variants
     rep["last_accepted"] = accepted[-1] if accepted else None
     save()
-    log("ACCEPTED " + json.dumps(accepted))
+    log("ACCEPTED " + json.dumps(accepted) + " variants " + json.dumps(variants))
 
-    # long row: the last arm vs the base arm
-    if a.long and rep["last_accepted"] and a.long_base in names:
+    # long row: the last accepted chain arm vs the reference flags. An OOM of one side is recorded; the other still runs,
+    # but without both sides there is no gradient check and its speed does not count.
+    if a.long and rep["last_accepted"]:
         fl = dict(arms)
+        base_flags = {k: int(v) for k, v in (kv.split("=") for kv in a.long_base_flags.split(",") if kv)}
+        rows0 = LG.MOE_ROWS
         lg = {}
-        pair = (("new", rep["last_accepted"]),) if rep["last_accepted"] == a.long_base else (
-            ("base", a.long_base), ("new", rep["last_accepted"]))  # no second run when the stack IS the base arm
-        for label, name in pair:
-            apply_flags(fl[name])
+        for label, name, flags in (("base", "long-base", base_flags),
+                                   ("new", rep["last_accepted"], fl[rep["last_accepted"]])):
+            LG.MOE_ROWS = rows0
+            apply_flags(flags)
+            for p in params:
+                p.grad = None
+            gc.collect()
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
             try:
                 g, l, dt, fin = run(LG.TrainForwardLong(eng, W).build, a.long)
+                lg[label] = {"arm": name, "seconds": dt, "tok_per_s": a.long / dt, "loss": l, "finite": fin,
+                             "peak_gib": torch.cuda.max_memory_allocated() / 2**30}
+                lg["g_" + label] = g
+                del g
+                log(f"long {label} {name}: {dt:.1f} s = {a.long / dt:.0f} tok/s peak {lg[label]['peak_gib']:.1f} GiB")
             except torch.OutOfMemoryError as e:
-                lg[label] = {"arm": name, "oom": str(e).split(". ")[0][:200]}
+                lg[label] = {"arm": name, "oom": str(e).split(". ")[0][:200],
+                             "peak_gib": torch.cuda.max_memory_allocated() / 2**30}
                 log(f"long {label} {name}: OOM")
-                break
-            lg[label] = {"arm": name, "seconds": dt, "tok_per_s": a.long / dt, "loss": l, "finite": fin,
-                         "peak_gib": torch.cuda.max_memory_allocated() / 2**30}
-            lg["g_" + label] = g
-            log(f"long {label} {name}: {dt:.1f} s = {a.long / dt:.0f} tok/s peak {lg[label]['peak_gib']:.1f} GiB")
+        LG.MOE_ROWS = rows0
         if "g_base" in lg and "g_new" in lg:
             lg["compare"] = compare(lg["g_new"], lg["g_base"], eng.dev)
+            lg["line_ok"] = line_ok(lg["compare"])
             log("long compare " + json.dumps(lg["compare"]))
         lg.pop("g_base", None)
         lg.pop("g_new", None)
         rep["long"] = {"T": a.long, **lg}
         save()
+        gc.collect()
+        torch.cuda.empty_cache()
 
     # one profiled pass of the last accepted arm at the longest checked length (where the time goes next)
     if rep["last_accepted"]:
@@ -241,7 +266,7 @@ def main():
         log(f"RESULT accepted through {last}: {best:.0f} tok/s at {lengths[-1]} (target 894); see {a.out}")
     else:
         log("RESULT no arm accepted")
-    return 0 if len(accepted) == len(names) else 3
+    return 0 if len(accepted) + len(variants) == len(names) else 3
 
 
 if __name__ == "__main__":
