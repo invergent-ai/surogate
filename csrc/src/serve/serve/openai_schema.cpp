@@ -1013,6 +1013,29 @@ std::string make_chat_chunk_tool_calls(const std::string& id, const std::string&
     return sse_event(payload);
 }
 
+std::string make_chat_chunk_tool_call_deltas(const std::string& id, const std::string& model, std::int64_t created,
+                                             const std::vector<ToolCallDelta>& deltas, bool include_usage) {
+    Json calls = Json::array();
+    for (const ToolCallDelta& delta : deltas) {
+        Json item = Json::object();
+        Json function = Json::object();
+        if (delta.opens) {
+            item["id"]       = delta.id;
+            item["type"]     = "function";
+            function["name"] = delta.name;
+        }
+        item["index"] = delta.index;
+        if (delta.arguments) { function["arguments"] = *delta.arguments; }
+        item["function"] = std::move(function);
+        calls.push_back(std::move(item));
+    }
+    Json payload       = base_chunk(id, model, created);
+    payload["choices"] = Json::array(
+        {Json{{"index", 0}, {"delta", Json{{"tool_calls", std::move(calls)}}}, {"finish_reason", nullptr}}});
+    if (include_usage) { payload["usage"] = nullptr; }
+    return sse_event(payload);
+}
+
 std::string make_chat_chunk_final(const std::string& id, const std::string& model,
                                   std::int64_t created, const char* finish_reason,
                                   bool include_usage, const std::string& parallel_decoding_details) {
