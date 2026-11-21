@@ -55,6 +55,8 @@ void ProgramImplCore::compact_window_kv() noexcept {
     PagedKVPool& pool = decoder->text_kv.pool();
     if (!pool.window_elastic()) { return; }
     try {
+        // A pipeline may call this for every stage from one thread: the copies go to this stage's device.
+        const ScopedDevice selected(device.device);
         // A host-tier copy reads a lane's window pages on the copy stream until its event: those
         // lanes' pages stay where they are this time (fence_lane_copies would stall compute).
         std::vector<const PagedKVAllocation*> pinned;
