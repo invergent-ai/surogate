@@ -53,6 +53,30 @@ target_include_directories(sinfer_jinja_compat_test PRIVATE
 add_test(NAME sinfer_jinja_compat_test COMMAND sinfer_jinja_compat_test)
 set_property(GLOBAL APPEND PROPERTY SINFER_SERVE_TEST_TARGETS sinfer_jinja_compat_test)
 
+# ENGINE-INKLING lane f2: the native Inkling-2 renderer / output parser against vLLM's own Python (token-exact
+# vectors in rl/engine-inkling-2026-11-21/vectors). CPU only and deliberately not linked to libsinfer.so: the
+# frontend tokenizer and the Inkling sources are compiled in, so it builds in a minute and runs where no device is.
+# Skips (77) without INKLING_MODEL_DIR / INKLING_VECTORS.
+add_executable(sinfer_inkling_frontend_test
+  inkling/test_inkling_frontend.cpp
+  ${SERVE_ROOT}/family/impl/frontend/inkling_json.cpp
+  ${SERVE_ROOT}/family/impl/frontend/inkling_render.cpp
+  ${SERVE_ROOT}/family/impl/frontend/inkling_parse.cpp
+  ${SERVE_ROOT}/family/impl/frontend/tokenizer.cpp
+  ${SERVE_ROOT}/../tokenizer/tokenizer.cpp
+  ${SERVE_ROOT}/../tokenizer/tok_profile.cpp
+  ${SERVE_ROOT}/../tokenizer/unicode.cpp
+  ${SERVE_ROOT}/../tokenizer/unicode_data.cpp)
+target_include_directories(sinfer_inkling_frontend_test PRIVATE
+  ${SERVE_ROOT} ${SERVE_ROOT}/.. ${SERVE_ROOT}/../tokenizer ${SINFER_JSON_INCLUDE}
+  ${SUROGATE_VENDOR_DIR} ${SUROGATE_VENDOR_DIR}/utf8proc ${minja_SOURCE_DIR}/include ${fmt_SOURCE_DIR}/include)
+target_compile_definitions(sinfer_inkling_frontend_test PRIVATE FMT_HEADER_ONLY=1)
+target_compile_options(sinfer_inkling_frontend_test PRIVATE -UNDEBUG)
+target_link_libraries(sinfer_inkling_frontend_test PRIVATE sinfer_text Threads::Threads)
+add_test(NAME sinfer_inkling_frontend_test COMMAND sinfer_inkling_frontend_test)
+set_tests_properties(sinfer_inkling_frontend_test PROPERTIES SKIP_RETURN_CODE 77)
+set_property(GLOBAL APPEND PROPERTY SINFER_SERVE_TEST_TARGETS sinfer_inkling_frontend_test)
+
 function(sinfer_add_test name)
   cmake_parse_arguments(arg "NEEDS_SOURCE_DIR" "" "SOURCES;LIBRARIES" ${ARGN})
   add_executable(${name} ${arg_SOURCES})
