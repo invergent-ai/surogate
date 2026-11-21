@@ -157,16 +157,18 @@ struct GemmParams {
     __nv_bfloat16* combined    = nullptr;
     // Adapter (table null = none).
     LoraRound lora;
-    /// L2 prefetch-size hint for the weight-code loads (0 none, 128, 256): same bytes, a timing knob.
+    /// L2 prefetch-size hint for the weight-code loads (0 none, 128, 256): same bytes (with_l2_prefetch).
     std::int32_t l2_prefetch = 0;
 };
 
-/// TIMING KNOB (removed once measured): SUROGATE_INKLING_L2_PREFETCH = 128 | 256 sets the weight loads'
-/// L2 prefetch hint (`GemmParams::l2_prefetch`); unset / other = none. Every value moves the same bytes.
+/// The weight loads' L2 prefetch hint (`GemmParams::l2_prefetch`): 128 bytes. Measured 12:54 (card 7, cold,
+/// layer 0 NVFP4): T = 8 151.6 -> 131.0 us, T = 64 336.9 -> 291.1, T = 1 36.9 -> 35.7; 256 B the same; T = 4,096
+/// and MXFP8 unchanged. SUROGATE_INKLING_L2_PREFETCH = 0 | 256 overrides it (A/B only). Same bytes, same bits.
 inline GemmParams with_l2_prefetch(GemmParams params) {
     static const int value = [] {
         const char* text = std::getenv("SUROGATE_INKLING_L2_PREFETCH");
-        const int v      = text != nullptr ? std::atoi(text) : 0;
+        if (text == nullptr) { return 128; }
+        const int v = std::atoi(text);
         return v == 128 || v == 256 ? v : 0;
     }();
     params.l2_prefetch = value;
