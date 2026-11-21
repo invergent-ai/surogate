@@ -65,12 +65,12 @@ struct DSparkDerived {
 
 /// Derives the drafter's load-time weights from lane b's bound draft (w.has_draft); synchronous.
 void derive_dspark(const load::InklingWeights& w, DSparkDerived& out, bool fp8_weights = false, bool fp8_fold = false);
-/// SUROGATE_SERVE_DSPARK_FP8_FOLD=1 (read once): the FP8 Markov fold (opt-in until its card A/B).
+/// The FP8 Markov fold (default; SUROGATE_SERVE_DSPARK_BF16_FOLD=1 keeps the BF16 fold).
 [[nodiscard]] bool dspark_fp8_fold_requested();
 
 /// SUROGATE_SERVE_DSPARK_BF16_WEIGHTS=1 (read once): keep the drafter's dense linears BF16 on the device (A/B).
 [[nodiscard]] bool dspark_bf16_weights_forced();
-/// SUROGATE_SERVE_DSPARK_FP8_WEIGHTS=1 (read once) and not forced BF16: the FP8 drafter weights (opt-in for now).
+/// The FP8 drafter weights (default; SUROGATE_SERVE_DSPARK_BF16_WEIGHTS=1 keeps BF16).
 [[nodiscard]] bool dspark_fp8_weights_requested();
 
 /// The draft KV: planes of draft layers 0 / 1 / 2 (text-pool layers 48 / 49 / 50).
