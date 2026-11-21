@@ -184,7 +184,7 @@ struct GemmParams {
     std::int32_t l2_prefetch = 0;
     /// Narrow NVFP4 down WITHOUT the fused y quantisation (agent-EN-d5, rounds of T >= kPlainDownMinTokens): A = the y
     /// rows quantised once by the standalone kernel (a_codes / a_scales / a_amax = y_codes / y_scales / y_amax); the
-    /// w2 stages are still requested before the dependency wait. Same arithmetic.
+    /// routing is read and the w2 stages are requested after the dependency wait. Same arithmetic.
     std::int32_t plain_narrow_down = 0;
 };
 

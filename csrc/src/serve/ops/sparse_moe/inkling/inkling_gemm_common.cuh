@@ -16,8 +16,7 @@ namespace sinfer::ops::detail::inkling {
 /// The expert tile `tile` when each expert's routed rows (offsets[e] .. offsets[e + 1]) are cut
 /// into tiles of `TileRows`: writes {expert, row_begin, row_end} to `result` (expert -1 = past
 /// the round's tiles). Every thread of the block calls it; one barrier inside.
-/// `ThroughL2`: read the offsets with ld.global.cg (a kernel reading them before its dependency
-/// wait must not see a stale L1 line).
+/// `ThroughL2`: read the offsets with ld.global.cg. Callers load the routing only after their dependency wait.
 template <int TileRows, bool ThroughL2 = false>
 __device__ __forceinline__ void find_expert_tile(const std::int32_t* offsets, int tile,
                                                  int (&result)[3]) {
