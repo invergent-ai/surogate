@@ -129,7 +129,18 @@ struct InklingAttentionRows {
     bool metadata_static = false;
     /// The key-group cut (see InklingKeyGroups); engine and trainer must pass the same value.
     InklingKeyGroups key_groups = InklingKeyGroups::Default;
+    /// Optional persistent state (lane d's InklingMoeOptions::state pattern): device memory of
+    /// inkling_attention_state_bytes() bytes, ZEROED ONCE by the caller when allocated, written by nothing else, never
+    /// shared by two calls in flight (one per stream; calls on one stream are ordered). Not the transient workspace.
+    /// With it the decode / verify split route's last-CTA fold takes its arrival counters from here and the last CTA
+    /// returns each to zero before the grid ends (no per-call zeroing: neither the prologue's nor a zeroing launch; a
+    /// captured graph replays from zeros). The counters pick only WHICH CTA folds, never the order of a sum: same bits
+    /// with or without. Null = counters in the workspace, zeroed per call. Rows with B > 128 ignore it.
+    std::int32_t* state = nullptr;
 };
+
+/// Bytes of InklingAttentionRows::state (arrival counters for up to 128 rows x 8 KV heads: 4 KiB).
+[[nodiscard]] std::size_t inkling_attention_state_bytes();
 
 /**
  * Process-wide tuning knobs of these ops: read ONCE from the environment when the process first uses them

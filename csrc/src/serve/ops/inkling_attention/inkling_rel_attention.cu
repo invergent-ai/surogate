@@ -180,6 +180,7 @@ __device__ __forceinline__ int active_workers(const GroupSpec& gs, int lo, int h
 }
 
 inline constexpr int kFoldRowsMax = Geo::kGroup * Geo::kMaxSmallColumns; // rows of one decode / verify set
+inline constexpr int kStateRows   = 128;                                   // rows InklingAttentionRows::state covers
 
 /// The fused fold of one decode / verify set (row b, KV head kvh: 3 heads x W columns), run by the set's last worker
 /// CTA after every worker's partials landed (or by worker 0 of a set without any group, which only writes zeros).
@@ -1001,7 +1002,9 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
             __threadfence();
             __syncthreads();
             if (tid == 0) {
-                last_flag = atomicAdd(p.fold_counters + b * Geo::kKvHeads + kvh, 1) == active - 1 ? 1 : 0;
+                std::int32_t* counter = p.fold_counters + b * Geo::kKvHeads + kvh;
+                last_flag             = atomicAdd(counter, 1) == active - 1 ? 1 : 0;
+                if (last_flag != 0) { *counter = 0; } // every worker arrived: back to zero (persistent state)
             }
             __syncthreads();
             if (last_flag != 0) {
@@ -1417,7 +1420,8 @@ AttnParams make_params(const InklingAttentionInputs& in, const InklingAttentionR
     return p;
 }
 
-// `zeroed`: the fused fold's counters, already zeroed by the fused call's prologue (null: allocated and zeroed here).
+// `zeroed`: the fused fold's counters, already zeroed by the fused call's prologue, or the rows' persistent state (null:
+// allocated and zeroed here).
 void run(const InklingAttentionInputs& in, InklingLayerKind kind, const InklingAttentionRows& rows,
          const PagedKVBatchLayerView& cache, WorkspaceArena& workspace, int final_mode, Tensor* out,
          Tensor* out_f32, Tensor* lse, cudaStream_t stream, const char* op, int window = Geo::kWindow,
@@ -1456,6 +1460,7 @@ void run(const InklingAttentionInputs& in, InklingLayerKind kind, const InklingA
     if (plan.fused) {
         p.final_mode = final_mode;
         p.fold_counters = zeroed;
+        if (p.fold_counters == nullptr && rows.state != nullptr && rs.batch <= kStateRows) { p.fold_counters = rows.state; }
         if (p.fold_counters == nullptr) {
             p.fold_counters = static_cast<std::int32_t*>(workspace.alloc_bytes(static_cast<std::size_t>(plan.counters) * 4).data);
             const pdl::LaunchConfig launch{dim3(1), dim3(128), 0, stream};
@@ -1517,14 +1522,17 @@ void inkling_attention(const InklingProjections& projections, const InklingAtten
     // The fused fold's arrival counters: zeroed by the prologue (after its PDL wait), so no memset launch.
     const Plan plan = make_plan(kind, group_spec(kind, rows.key_groups), rs.width, rs.batch,
                                 static_cast<std::int32_t>(rows.envelope.max_visible_keys));
-    std::int32_t* counters =
-        plan.fused ? static_cast<std::int32_t*>(workspace.alloc_bytes(static_cast<std::size_t>(plan.counters) * 4).data) : nullptr;
+    // (Or the rows' persistent state, which the last CTA keeps at zero: then nothing is zeroed.)
+    const bool use_state   = plan.fused && rows.state != nullptr && rs.batch <= kStateRows;
+    std::int32_t* counters = use_state ? rows.state
+                             : plan.fused ? static_cast<std::int32_t*>(workspace.alloc_bytes(static_cast<std::size_t>(plan.counters) * 4).data)
+                                          : nullptr;
     InklingPrologueOutputs qr;
     qr.q = Tensor(workspace.alloc_bytes(static_cast<std::size_t>(n * Geo::kQHeads * Geo::kHeadDim * 2)).data,
                   DType::BF16, {Geo::kHeadDim, Geo::kQHeads, static_cast<std::int32_t>(n)});
     qr.r = Tensor(workspace.alloc_bytes(static_cast<std::size_t>(n * Geo::kQHeads * Geo::kRelDim * 2)).data,
                   DType::BF16, {Geo::kRelDim, Geo::kQHeads, static_cast<std::int32_t>(n)});
-    prologue_launch(projections, weights, kind, rows, conv, cache, qr, stream, counters, plan.counters);
+    prologue_launch(projections, weights, kind, rows, conv, cache, qr, stream, counters, use_state ? 0 : plan.counters);
     const InklingAttentionInputs in{qr.q, qr.r, projections.gate, projections.sink, weights.rel_table};
     run(in, kind, rows, cache, workspace, kGated, &out, nullptr, nullptr, stream, "inkling_rel_attention", Geo::kWindow,
         counters);
@@ -1567,9 +1575,11 @@ void inkling_attention_train(const InklingProjections& projections, const Inklin
     auto scope      = workspace.scope();
     const Plan plan = make_plan(kind, group_spec(kind, rows.key_groups), rs.width, rs.batch,
                                 static_cast<std::int32_t>(rows.envelope.max_visible_keys));
-    std::int32_t* counters =
-        plan.fused ? static_cast<std::int32_t*>(workspace.alloc_bytes(static_cast<std::size_t>(plan.counters) * 4).data) : nullptr;
-    prologue_launch(projections, weights, kind, rows, conv, cache, qr, stream, counters, plan.counters);
+    const bool use_state   = plan.fused && rows.state != nullptr && rs.batch <= kStateRows;
+    std::int32_t* counters = use_state ? rows.state
+                             : plan.fused ? static_cast<std::int32_t*>(workspace.alloc_bytes(static_cast<std::size_t>(plan.counters) * 4).data)
+                                          : nullptr;
+    prologue_launch(projections, weights, kind, rows, conv, cache, qr, stream, counters, use_state ? 0 : plan.counters);
     if (kind == InklingLayerKind::Global) {
         // The prologue's own tau: the same device function (log_tau) on the same positions.
         if (train.tau.numel() != n) { fail(op, "train.tau must be FP32 [N] on a global layer"); }
@@ -1581,6 +1591,10 @@ void inkling_attention_train(const InklingProjections& projections, const Inklin
 }
 
 InklingAttentionKnobs& inkling_attention_knobs() { return inkling_detail::knobs(); }
+
+std::size_t inkling_attention_state_bytes() {
+    return static_cast<std::size_t>(inkling_detail::kStateRows) * inkling_detail::Geo::kKvHeads * 4;
+}
 
 void inkling_draft_attention(const Tensor& q, std::int32_t window, const InklingAttentionRows& rows,
                              const PagedKVBatchLayerView& draft_plane, WorkspaceArena& workspace, Tensor& out,

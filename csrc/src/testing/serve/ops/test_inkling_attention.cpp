@@ -612,8 +612,26 @@ struct InvOut {
     std::vector<std::uint32_t> out, lse;
 };
 
+// Persistent attention state (InklingAttentionRows::state), zeroed once for the process; the ops must keep it zero.
+std::int32_t* persistent_state() {
+    static DeviceBuffer* buf = [] { // never freed: outlives every call, no teardown-order question at exit
+        auto* b = new DeviceBuffer(ops::inkling_attention_state_bytes());
+        cudaMemset(b->p, 0, b->bytes);
+        return b;
+    }();
+    return static_cast<std::int32_t*>(buf->p);
+}
+bool persistent_state_zero() {
+    std::vector<std::int32_t> h(ops::inkling_attention_state_bytes() / 4);
+    cudaMemcpy(h.data(), persistent_state(), h.size() * 4, cudaMemcpyDeviceToHost);
+    for (const auto x : h) {
+        if (x != 0) { return false; }
+    }
+    return true;
+}
+
 InvOut run_inv_route(InklingLayerKind kind, const InvPlane& ip, const Layer& layer, int W, const std::vector<InvRow>& rws,
-                     bool meta_static = false) {
+                     bool meta_static = false, bool state = false) {
     const int B = static_cast<int>(rws.size()), N = W * B;
     Rows rows;
     rows.W = W;
@@ -648,6 +666,7 @@ InvOut run_inv_route(InklingLayerKind kind, const InvPlane& ip, const Layer& lay
     in.rel_table = Tensor(layer.dtable.p, DType::BF16, {16, G::kRelTableRows});
     auto view            = rows.view(rows.max_keys());
     view.metadata_static = meta_static;
+    if (state) { view.state = persistent_state(); }
     WorkspaceArena work(ops::inkling_rel_attention_workspace_bytes(kind, W, B, view.envelope, view.key_groups) + 4096);
     DeviceBuffer dy(static_cast<std::size_t>(N) * 3072 * 2), dof(static_cast<std::size_t>(N) * 3072 * 4),
         dl(static_cast<std::size_t>(N) * 24 * 4);
@@ -765,6 +784,9 @@ void run_invariance_case(const InvCase& c, const char* groups, std::uint32_t see
         compare("decode B4 fold kernel", run_inv_route(c.kind, ip, layer, 1, r4));
         compare("decode B8 idle row fold kernel", run_inv_route(c.kind, ip, layer, 1, r8));
         ops::inkling_attention_knobs().fused_fold_max = 1 << 30;
+        // Counters from the persistent state (kept at zero by the last CTAs) instead of the zeroed workspace.
+        compare("decode B4 persistent state", run_inv_route(c.kind, ip, layer, 1, r4, false, true));
+        compare("decode B8 idle row persistent state", run_inv_route(c.kind, ip, layer, 1, r8, true, true));
         if (std::string(groups) == "p3" && std::getenv("SUROGATE_INKLING_ATTN_GROUPS") == nullptr) {
             g_key_groups = ops::InklingKeyGroups::Default; // the compiled default must be P3
             compare("decode B4 default key groups", run_inv_route(c.kind, ip, layer, 1, r4));
@@ -786,6 +808,7 @@ void run_invariance_case(const InvCase& c, const char* groups, std::uint32_t see
         compare("verify W8 B4 fold kernel", run_inv_route(c.kind, ip, layer, 8, r4));
         compare("verify W16 B1 fold kernel", run_inv_route(c.kind, ip, layer, 16, {{0, std::max(c.P0, std::min(v, c.L0 - 16)), 16}}));
         ops::inkling_attention_knobs().fused_fold_max = 1 << 30;
+        compare("verify W8 B4 persistent state", run_inv_route(c.kind, ip, layer, 8, r4, false, true));
         ops::inkling_attention_knobs().splits = 1;
         compare("verify W8 B4 workers 1", run_inv_route(c.kind, ip, layer, 8, r4));
         ops::inkling_attention_knobs().splits = 0;
@@ -803,11 +826,12 @@ void run_invariance_case(const InvCase& c, const char* groups, std::uint32_t see
         }
         ops::inkling_attention_knobs().splits = 0;
     }
+    const bool state_zero = persistent_state_zero();
     std::printf("%-44s routes %zu, target columns compared %zu, bit-different %zu, training entry != production on %zu "
-                "routes%s%s\n",
-                tag.c_str(), routes, columns, bad_columns, train_bad + (ref.train_same ? 0 : 1),
+                "routes, persistent state back at zero: %s%s%s\n",
+                tag.c_str(), routes, columns, bad_columns, train_bad + (ref.train_same ? 0 : 1), state_zero ? "yes" : "NO",
                 first_bad.empty() ? "" : "  first: ", first_bad.c_str());
-    check(bad_columns == 0 && train_bad == 0 && ref.train_same && columns > 0, tag);
+    check(bad_columns == 0 && train_bad == 0 && ref.train_same && columns > 0 && state_zero, tag);
     g_key_groups = ops::InklingKeyGroups::Default;
 }
 
@@ -1250,7 +1274,9 @@ void run_prologue_case(const ProCase& c, std::uint32_t seed) {
         tro.lse = Tensor(tl.p, DType::FP32, {24, N});
         Tensor tyt(ty.p, DType::BF16, {3072, N}), rot(ro.p, DType::FP32, {128, 24, N}), rlt(rl.p, DType::FP32, {24, N});
         WorkspaceArena work3(ops::inkling_attention_workspace_capacity_bytes(c.kind, c.B, c.W, c.W, view.envelope, view.key_groups) + 4096);
-        ops::inkling_attention_train(in, layer.weights(), c.kind, view, conv3, plane3.view(), work3, tyt, tro, nullptr);
+        auto view_state  = view; // the training call takes its fold counters from the persistent state
+        view_state.state = persistent_state();
+        ops::inkling_attention_train(in, layer.weights(), c.kind, view_state, conv3, plane3.view(), work3, tyt, tro, nullptr);
         const ops::InklingAttentionInputs ain{tro.q, tro.r, in.gate, in.sink, layer.weights().rel_table};
         ops::inkling_rel_attention_out_lse(ain, c.kind, view, plane3.view(), work3, rot, rlt, nullptr);
         // The standalone gated call (its counters zeroed by zero_ints_kernel) and the same with fold_kernel: == the fused
