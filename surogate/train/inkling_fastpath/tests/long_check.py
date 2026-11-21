@@ -61,6 +61,7 @@ def main():
     l0 = -lp0.mean()
     l0.backward()
     g_old = grads_of(params)
+    loss_old = float(l0.detach())
     del lp0, l0
     for p in params:
         p.grad = None
@@ -74,7 +75,7 @@ def main():
         xd, yd = x.flatten().double(), y.flatten().double()
         cos.append(float(xd @ yd / (xd.norm() * yd.norm()).clamp_min(1e-300)))
         rel.append(float((xd - yd).norm() / yd.norm().clamp_min(1e-300)))
-    rep["equivalence"] = {"T": a.equiv_tokens, "loss_old": float(l0.detach()), "loss_new": float(l1.detach()),
+    rep["equivalence"] = {"T": a.equiv_tokens, "loss_old": loss_old, "loss_new": float(l1.detach()),
                           "cos_min": min(cos), "rel_err_max": max(rel), "rel_err_median": sorted(rel)[len(rel) // 2],
                           "peak_new_gib": torch.cuda.max_memory_allocated() / 2**30}
     log("equivalence " + json.dumps(rep["equivalence"]))
