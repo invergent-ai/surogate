@@ -189,10 +189,13 @@ void dspark_markov_gate(const float* ctx, std::int32_t j, std::int32_t k, std::i
  * rows are its tokens in ascending id order (gathered at load) and part_id holds ids[v] (ties keep the lowest
  * token id). Debug outputs (null in serving): bias_out / logits_out BF16 [domain, B].
  */
+/// FP8 fold (fold_codes / fold_scales non-null: per-row e4m3 [domain rows, 256] + fp32 row scales; fold_w ignored):
+/// bias_v = bf16(scale_v * (codes[v] . latent_b) + fold_b[v]) -- the M1 lever `fp8fold`, no acceptance loss.
 void dspark_markov_vocab(const void* base, std::int32_t base_rows, std::int32_t row, std::int32_t batch,
                          const void* fold_w, const void* fold_b, const void* latent, std::int32_t domain,
                          const std::int32_t* ids, float* part_val, std::int32_t* part_id, void* bias_out,
-                         void* logits_out, cudaStream_t stream);
+                         void* logits_out, cudaStream_t stream, const void* fold_codes = nullptr,
+                         const float* fold_scales = nullptr);
 
 /// drafts[j + stride * b] = the id of the largest partial (lowest id on ties) over the `tiles` partials of lane b
 /// (stride = the drafts tensor's first extent, >= k).

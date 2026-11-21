@@ -556,6 +556,26 @@ int run(const std::string& dir, const std::string& tag) {
         report("R4 naive-attention round (info): drafts == lane c's / == reference", same_r >= 19,
                std::to_string(same_c) + " / 21 and " + std::to_string(same_r) + " / 21");
     }
+    if (tag == "fp8all") {
+        // R5: the FP8 Markov fold (opt-in lever, M1 `fp8fold`) on top: drafts vs the reference (>= 19 / 21)
+        D::DSparkDerived der8;
+        D::derive_dspark(w, der8, true, true);
+        DBuf d8(static_cast<std::size_t>(7) * B * 4);
+        D::DSparkPropose q = p;
+        q.drafts     = static_cast<std::int32_t*>(d8.data());
+        q.hidden_out = nullptr;
+        D::dspark_propose(w, der8, kv, q, work, nullptr);
+        work.reset();
+        cuda_synchronize();
+        const auto dv = from_device<std::int32_t>(d8.data(), static_cast<std::size_t>(7) * B);
+        std::size_t same_r = 0, same_c = 0;
+        for (std::size_t i = 0; i < dv.size(); ++i) {
+            same_r += dv[i] == dref[i];
+            same_c += dv[i] == dg[i];
+        }
+        report("R5 FP8 fold round: drafts == reference (>= 19 / 21) / == BF16-fold round", same_r >= 19,
+               std::to_string(same_r) + " / 21 and " + std::to_string(same_c) + " / 21");
+    }
     std::cout << (failures ? "FAIL" : "ALL PASS") << " dspark round (" << tag << ", " << failures << " failures)\n";
     return failures ? 1 : 0;
 }
