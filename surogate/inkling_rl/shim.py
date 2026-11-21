@@ -290,7 +290,7 @@ class Shim:
                      "train/seq_log_ratio": m.get("seq_log_ratio", 0.0),
                      "engine_release_sha": self.engine_sha, "batch_step": n_batch}
             for k, v in m.items():
-                if k.startswith(("offpolicy_", "unversioned_", "engine_", "r3_")):
+                if k.startswith(("offpolicy_", "unversioned_", "engine_", "r3_", "refused_")):
                     entry[f"train/{k}"] = float(v)
             with open(self.metrics_path, "a") as f:
                 f.write(json.dumps(entry) + "\n")

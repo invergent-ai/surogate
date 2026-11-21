@@ -37,11 +37,13 @@ class StepConfig:
     behavior_is_level: str = "token"
     aggregation: str = "token"
     max_policy_lag: int | None = 1
+    max_row_tokens: int | None = None      # inkling_rl.max_row_tokens: longer rows are refused (counted), never cut
 
     @classmethod
     def from_train_yaml(cls, cfg: dict) -> "StepConfig":
         loss = dict(cfg.get("loss") or {})
-        out = cls(max_policy_lag=cfg.get("max_policy_lag"))
+        out = cls(max_policy_lag=cfg.get("max_policy_lag"),
+                  max_row_tokens=(cfg.get("inkling_rl") or {}).get("max_row_tokens"))
         for k in ("variant", "seq_ratio_old", "seq_clip_low", "seq_clip_high", "teacher_tau", "behavior_is_cap",
                   "behavior_is_level", "aggregation"):
             if k in loss:
@@ -130,13 +132,26 @@ def run_step(backend, rows: list[Row], version: int | None, cfg: StepConfig, log
             f"not sampled by policy version {version - cfg.max_policy_lag}..{version} alone")
     r3 = {"r3_rows": 0.0, "r3_replayed_tokens": 0.0, "r3_bad_rows": 0.0, "r3_shape_mismatches": 0.0,
           "r3_uncovered_interior": 0.0}
+    refused_long = refused_r3 = 0
+    if cfg.max_row_tokens:
+        for r in rows:
+            if r.loss_mask.any() and r.T > cfg.max_row_tokens:
+                r.loss_mask = np.zeros_like(r.loss_mask)
+                refused_long += 1
     live = [i for i, r in enumerate(rows) if r.loss_mask.any()]
     replays = {}
-    for i in live:
+    for i in list(live):
         rp, c = replay_rows(rows[i], getattr(backend, "visits", 48), getattr(backend, "top_k", 8))
+        if c["r3_uncovered_interior"] and not getattr(backend, "replay_mixes_own", True):
+            rows[i].loss_mask = np.zeros_like(rows[i].loss_mask)      # this backend cannot run own routing per token
+            refused_r3 += 1
+            live.remove(i)
+            continue
         replays[i] = rp
         for k, v in c.items():
             r3[k] += v
+    m["refused_long_rows"] = float(refused_long)
+    m["r3_refused_rows"] = float(refused_r3)
     # step-start score (pass 1) -> mismatch metric, TIS weights, pi_old
     kl, lr_, bw = [], [], []
     starts, wts = {}, {}
