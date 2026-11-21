@@ -14,7 +14,7 @@
 namespace rf {
 namespace {
 
-enum Fmt { kBF16 = 0, kFP8 = 1, kNVFP4 = 2 };
+enum Fmt { kBF16 = 0, kFP8 = 1, kNVFP4 = 2, kMXFP8 = 3 };
 
 __device__ __forceinline__ void mma_bf16(float* c, const unsigned* a, const unsigned* b) {
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
@@ -49,11 +49,24 @@ __device__ __forceinline__ void mma_nvfp4(float* c, const unsigned* a, const uns
                    "h"(kScaleBlockId), "h"(kScaleThreadId), "r"(sfb), "h"(kScaleBlockId), "h"(kScaleThreadId));
 }
 
+// Block-scaled FP8 (e4m3 x e4m3, ue8m0 scale per 32): PTX copied from CUTLASS cute/arch/mma_sm120.hpp
+// SM120_16x8x32_TN_VS<float_e4m3_t, float_e4m3_t, float, float_ue8m0_t> (our build's _deps/cutlass-src).
+__device__ __forceinline__ void mma_mxfp8(float* c, const unsigned* a, const unsigned* b, unsigned sfa,
+                                          unsigned sfb) {
+    constexpr unsigned short kBid = 0;
+    constexpr unsigned short kTid = 0;
+    asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, {%11,%12}, {%13}, {%14,%15};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "r"(sfa), "h"(kBid), "h"(kTid),
+                   "r"(sfb), "h"(kBid), "h"(kTid));
+}
+
 // Operand bits that are finite in every format: bf16 = +-[0.5, 1) (exponent 126), e4m3 bytes with bit 6 clear
 // (exponent <= 7: never the NaN pattern), e2m1 any nibble. The toggle flips bit 0 of every byte / half: still finite.
 template <int FMT> __device__ __forceinline__ unsigned operand_bits(uint32_t h) {
     if (FMT == kBF16) return (h & 0x807F807Fu) | 0x3F003F00u;
-    if (FMT == kFP8) return h & 0xB7B7B7B7u;
+    if (FMT == kFP8 || FMT == kMXFP8) return h & 0xB7B7B7B7u;
     return h;
 }
 
@@ -71,8 +84,8 @@ __global__ void __launch_bounds__(128) mma_loop_kernel(float* __restrict__ out, 
 #pragma unroll
         for (int r = 0; r < 4; ++r) c[j][r] = 0.f;
     }
-    const unsigned sfa = 0x38383838u; // ue4m3 1.0 x 4
-    const unsigned sfb = 0x38383838u;
+    const unsigned sfa = FMT == kMXFP8 ? 0x7Fu : 0x38383838u; // ue8m0 1.0 / ue4m3 1.0 x 4
+    const unsigned sfb = sfa;
     const unsigned flip = FMT == kBF16 ? 0x00010001u : 0x01010101u;
     for (int it = 0; it < iters; ++it) {
 #pragma unroll
@@ -80,6 +93,7 @@ __global__ void __launch_bounds__(128) mma_loop_kernel(float* __restrict__ out, 
             if (FMT == kBF16) mma_bf16(c[j], a[j], b[j]);
             if (FMT == kFP8) mma_fp8(c[j], a[j], b[j]);
             if (FMT == kNVFP4) mma_nvfp4(c[j], a[j], b[j], sfa, sfb);
+            if (FMT == kMXFP8) mma_mxfp8(c[j], a[j], b[j], sfa, sfb);
         }
         const unsigned m = toggle ? flip : 0u;
 #pragma unroll
@@ -91,8 +105,10 @@ __global__ void __launch_bounds__(128) mma_loop_kernel(float* __restrict__ out, 
     out[blockIdx.x * 128 + threadIdx.x] = s;
 }
 
-constexpr double flops_per_mma(int fmt) { return fmt == kBF16 ? 4096.0 : fmt == kFP8 ? 8192.0 : 16384.0; }
-const char* fmt_name(int fmt) { return fmt == kBF16 ? "bf16" : fmt == kFP8 ? "fp8_e4m3" : "nvfp4_e2m1_ue4m3"; }
+constexpr double flops_per_mma(int fmt) { return fmt == kBF16 ? 4096.0 : (fmt == kFP8 || fmt == kMXFP8) ? 8192.0 : 16384.0; }
+const char* fmt_name(int fmt) {
+    return fmt == kBF16 ? "bf16" : fmt == kFP8 ? "fp8_e4m3" : fmt == kMXFP8 ? "mxfp8_e4m3_ue8m0" : "nvfp4_e2m1_ue4m3";
+}
 
 template <int FMT, int ILP> void mma_loop_case(int sms, int blocks_per_sm, int toggle, cudaStream_t s) {
     const int grid  = sms * blocks_per_sm;
@@ -334,6 +350,8 @@ void run_mma() {
         mma_loop_case<kFP8, 8>(sms, 2, toggle, s);
         mma_loop_case<kNVFP4, 4>(sms, 4, toggle, s);
         mma_loop_case<kNVFP4, 8>(sms, 2, toggle, s);
+        mma_loop_case<kMXFP8, 4>(sms, 4, toggle, s);
+        mma_loop_case<kMXFP8, 8>(sms, 2, toggle, s);
     }
 
     // (b) cuBLASLt
