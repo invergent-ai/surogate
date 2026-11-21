@@ -152,7 +152,8 @@ void ProgramImplCore::configure_host_tier(const std::optional<std::size_t>& budg
         append_u64(model, value);
     }
     std::size_t offset = 0;
-    for (std::size_t plane = 0; plane < text_pool.plane_count(); ++plane) {
+    // The full-context planes (all of them without a window class: window pages are not in chunks).
+    for (std::size_t plane = 0; plane < text_pool.full_plane_count(); ++plane) {
         append_u64(model, text_pool.image_plane_bytes(plane, 1));
         tier->text_offset.push_back(offset);
         offset += archive_aligned(text_pool.image_plane_bytes(plane, kChunkPages));
