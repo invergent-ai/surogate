@@ -702,6 +702,19 @@ int test_moe(ops::InklingExpertFormat format) {
     std::printf("  lora: base tokens changed %d, adapted outputs vs host: worst cos %.6f rel-L2 %.3e; worst delta cos %.5f\n",
                 base_tokens_bad, worst_lora_cos, worst_lora_rel, worst_delta_cos);
     failures += report("LoRA: base tokens bit-exact in an adapter round", base_tokens_bad);
+    // Adapter rows are width invariant too: an adapted token alone (T = 1) == its row in the 24-token round.
+    int adapted_width_bad = 0;
+    for (int t = 0; t < kT; ++t) {
+        if (slots[t] < 0 || t % 4 != 0) { continue; }
+        DeviceBuffer one_slot = to_device(std::vector<int>{slots[t]});
+        ops::InklingMoeAdapters a1{static_cast<const ops::LoraBank*>(adapter.d_table.p),
+                                   static_cast<const std::int32_t*>(one_slot.p), nullptr, 16};
+        std::vector<float> one(x.begin() + static_cast<std::size_t>(t) * H, x.begin() + static_cast<std::size_t>(t + 1) * H);
+        const DeviceRun single = run_moe(l, one, 1, nullptr, &a1);
+        adapted_width_bad += !std::equal(single.out.begin(), single.out.end(),
+                                         lora_run.out.begin() + static_cast<std::size_t>(t) * H);
+    }
+    failures += report("LoRA: adapted rows width invariant (T=1 vs 24, bit-exact)", adapted_width_bad);
     failures += report("LoRA: adapted output vs host pipeline (cos >= 0.9999, rel-L2 <= 1e-2)",
                        (worst_lora_cos >= 0.9999 && worst_lora_rel <= 1e-2) ? 0 : 1);
     // The delta is the difference of two bf16-rounded outputs: an indexing check (a wrong expert / slot / port gives
