@@ -745,7 +745,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             (void)min_width;
             scratch(layout, family::visit_workspace_if<Variant>(
                                 plan.geometry, phase, batch_size, max_width, last,
-                                envelope.max_visible_keys));
+                                envelope.max_visible_keys, plan.lora_enabled));
             return;
         }
         // The embedded input a per-layer-input family keeps beside the residual. The layers

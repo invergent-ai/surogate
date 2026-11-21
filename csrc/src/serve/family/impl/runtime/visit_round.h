@@ -168,12 +168,13 @@ void lm_head_if(const Model& model, const Tensor& hidden, Tensor& logits, cudaSt
 template <class V>
 [[nodiscard]] std::size_t visit_workspace_if(const TextGeometry& geometry, TextPhase phase, std::int32_t batch_size,
                                              std::int32_t max_width, std::int32_t max_columns,
-                                             std::uint32_t max_visible_keys) {
+                                             std::uint32_t max_visible_keys, bool lora_enabled) {
     if constexpr (visit_schedule<V>()) {
         return V::visit_workspace_capacity_bytes(geometry, phase, batch_size, max_width, max_columns,
-                                                 max_visible_keys);
+                                                 max_visible_keys, lora_enabled);
     } else {
         (void)geometry; (void)phase; (void)batch_size; (void)max_width; (void)max_columns; (void)max_visible_keys;
+        (void)lora_enabled;
         return 0;
     }
 }

@@ -12,6 +12,8 @@
 #include "api/ops/inkling_attention.h"
 #include "api/ops/inkling_mix.h"
 #include "api/ops/inkling_moe.h"
+#include "api/ops/lora_store.h"
+#include "family/impl/lora_bind_inkling.h"
 #include "core/device.h"
 
 #include <algorithm>
@@ -652,7 +654,20 @@ void run_visit(Round& rd, int v) {
     // 7. MoE: lane d's op (routing, NVFP4 four-over-six / MXFP8 activations, experts, combine); routed experts
     //    captured per VISIT
     Tensor moe_out = rd.work.alloc(DType::BF16, {D, T});
+    // S10: the round's adapter selection (published by the family schedule; none in a base round) on this
+    // physical layer's bank table (lane d's family/impl/lora_bind_inkling.h) -- every pass of a core layer shares it.
+    ops::InklingMoeAdapters adapter_storage;
+    ops::InklingMoeWeights moe_key;
+    moe_key.router = L.router.qdata;
+    const ops::InklingMoeAdapters* adapters = family::inkling_moe_round_adapters(moe_key, adapter_storage);
+    if (adapters != nullptr) {
+        const ops::LoraRound& round = ops::lora_current_round();
+        if (round.slots != nullptr && round.slots->numel() < static_cast<std::int64_t>(T)) {
+            throw std::logic_error("inkling2: the round's adapter slots are narrower than the round");
+        }
+    }
     if (use_naive()) {
+        if (adapters != nullptr) { throw std::logic_error("inkling2: the naive MoE serves no adapters"); }
         naive::MoeCall moe;
         moe.x      = mlp_in.data;
         moe.tokens = T;
@@ -672,6 +687,7 @@ void run_visit(Round& rd, int v) {
             capture.token_stride    = rd.r.routing.top_k;
             options.capture         = &capture;
         }
+        options.adapters = adapters;
         const Tensor x(mlp_in.data, DType::BF16, {D, T});
         ops::inkling_moe(x, moe_weights(L), moe_out, rd.work, s, options);
     }
@@ -819,7 +835,7 @@ void Variant::run_visits(const ModelView& model, family::VisitRound& r) {
 
 std::size_t Variant::visit_workspace_capacity_bytes(const family::TextGeometry&, family::TextPhase, std::int32_t batch_size,
                                                     std::int32_t max_width, std::int32_t max_columns,
-                                                    std::uint32_t max_visible_keys) {
+                                                    std::uint32_t max_visible_keys, bool lora_enabled) {
     const auto up = [](std::size_t bytes) { return (bytes + 255U) & ~std::size_t{255}; };
     const std::size_t T    = static_cast<std::size_t>(std::max<std::int32_t>(max_columns, std::max(batch_size, 1) * std::max(max_width, 1)));
     const std::size_t tile = std::min<std::size_t>(T, kTileColumns);
@@ -848,10 +864,11 @@ std::size_t Variant::visit_workspace_capacity_bytes(const family::TextGeometry&,
                                                                                             envelope));
         }
     }
+    // An engine started with adapters (--enable-lora / --lora-modules) books the expert LoRA buffers.
     const std::size_t moe = std::max({ops::inkling_moe_workspace_bytes(ops::InklingExpertFormat::Nvfp4,
-                                                                       static_cast<std::int32_t>(T), false),
+                                                                       static_cast<std::int32_t>(T), lora_enabled),
                                       ops::inkling_moe_workspace_bytes(ops::InklingExpertFormat::Mxfp8,
-                                                                       static_cast<std::int32_t>(T), false),
+                                                                       static_cast<std::int32_t>(T), lora_enabled),
                                       naive::moe_workspace_bytes(static_cast<std::int32_t>(T))});
     bytes += up(attention) + up(moe);
     return bytes + (1U << 20);
