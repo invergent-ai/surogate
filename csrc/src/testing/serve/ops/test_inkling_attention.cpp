@@ -802,6 +802,129 @@ void run_invariance_case(const InvCase& c, const char* groups, std::uint32_t see
     g_key_groups = ops::InklingKeyGroups::Default;
 }
 
+// ---- DSpark draft block attention (agent-EN-e2b 13:35): no bias / gate / sink, all 8 columns of a lane at one
+// position, window 1,032 (local) or global; FP64 oracle + bitwise across routes. ---------------------------------------
+struct DraftOut {
+    std::vector<std::uint16_t> o; // [N][3072]
+};
+
+DraftOut run_draft(const InvPlane& ip, int window, int W, const std::vector<InvRow>& rws, const std::vector<int>& pos_of,
+                   std::vector<float>* q_out = nullptr) {
+    const int B = static_cast<int>(rws.size()), N = W * B;
+    Rows rows;
+    rows.W = W;
+    rows.B = B;
+    rows.pos.resize(static_cast<std::size_t>(N));
+    rows.valid.resize(B);
+    rows.masked = false;
+    std::vector<int> table_rows(B);
+    std::vector<float> q(static_cast<std::size_t>(N) * 3072, 0.0F), r(384), gate(3072), sink(24);
+    for (int b = 0; b < B; ++b) {
+        rows.valid[b] = rws[b].valid;
+        rows.masked   = rows.masked || rws[b].valid != W;
+        table_rows[b] = rws[b].seq;
+        for (int j = 0; j < W; ++j) {
+            rows.pos[b * W + j] = pos_of[b];
+            const std::size_t n = static_cast<std::size_t>(j + W * b);
+            // q of (sequence, column first + j): the column index stands in for the draft row
+            if (j < rws[b].valid) { inv_inputs(rws[b].seq, rws[b].first + j, &q[n * 3072], r.data(), gate.data(), sink.data()); }
+        }
+    }
+    rows.upload();
+    rows.dtables = to_device_i32(table_rows);
+    DeviceBuffer dq = to_device_bf16(q), dout(static_cast<std::size_t>(N) * 3072 * 2);
+    cudaMemset(dout.p, 0x7f, dout.bytes);
+    int maxk = 0;
+    for (int b = 0; b < B; ++b) { maxk = std::max(maxk, pos_of[b] + 1); }
+    const auto view = rows.view(maxk);
+    WorkspaceArena work(ops::inkling_draft_attention_workspace_bytes(window, W, B, view.envelope, view.key_groups) + 4096);
+    Tensor tq(dq.p, DType::BF16, {128, 24, N}), to(dout.p, DType::BF16, {128, 24, N});
+    ops::inkling_draft_attention(tq, window, view, ip.plane->view(), work, to, nullptr);
+    cuda_synchronize();
+    if (q_out != nullptr) { *q_out = q; }
+    return {from_device<std::uint16_t>(dout, static_cast<std::size_t>(N) * 3072)};
+}
+
+void test_draft(const std::function<bool(const std::string&)>& want) {
+    struct DraftCase {
+        std::string name;
+        int window, L;
+    };
+    const std::vector<DraftCase> cases = {{"draft local 5000", 1032, 5000}, {"draft local 1030", 1032, 1030},
+                                          {"draft global 5000", 0, 5000}, {"draft global 70000", 0, 70000}};
+    std::uint32_t seed = 9100;
+    for (const auto& c : cases) {
+        if (!want(c.name)) { continue; }
+        g_key_groups      = ops::InklingKeyGroups::P3;
+        const InvPlane ip = make_inv_plane(c.L, seed++);
+        const int P       = c.L - 1; // the block's last position: every draft column of the lane attends from it
+        std::vector<float> q;
+        const DraftOut ref = run_draft(ip, c.window, 8, {{0, 0, 8}}, {P}, &q);
+        // FP64 oracle (no bias): keys [lo, P], lo = window ? max(0, P - window + 1) : 0.
+        std::vector<double> got, want_o;
+        const int lo = c.window > 0 ? std::max(0, P - c.window + 1) : 0;
+        std::vector<float> dec(256);
+        for (int x = 0; x < 256; ++x) { dec[x] = e4m3_decode(static_cast<std::uint8_t>(x)); }
+        for (int j = 0; j < 8; ++j) {
+            for (int h = 0; h < 24; ++h) {
+                const float* qh = &q[(static_cast<std::size_t>(j) * 24 + h) * 128];
+                std::vector<double> sc(P - lo + 1);
+                double m = -1e300;
+                for (int x = lo; x <= P; ++x) {
+                    const std::uint8_t* kc = &ip.plane->hk[ip.plane->offset(0, x, h / 3)];
+                    double dot = 0.0;
+                    for (int d = 0; d < 128; ++d) { dot += static_cast<double>(qh[d]) * dec[kc[d]]; }
+                    sc[x - lo] = dot / std::sqrt(128.0);
+                    m          = std::max(m, sc[x - lo]);
+                }
+                std::vector<double> o(128, 0.0);
+                double l = 0.0;
+                for (int x = lo; x <= P; ++x) {
+                    const double w         = std::exp(sc[x - lo] - m);
+                    const std::uint8_t* vc = &ip.plane->hv[ip.plane->offset(0, x, h / 3)];
+                    l += w;
+                    for (int d = 0; d < 128; ++d) { o[d] += w * dec[vc[d]]; }
+                }
+                for (int d = 0; d < 128; ++d) {
+                    want_o.push_back(o[d] / l);
+                    got.push_back(bf16_to_f32(ref.o[(static_cast<std::size_t>(j) * 24 + h) * 128 + d]));
+                }
+            }
+        }
+        check(verify_reduction(c.name + " vs FP64", got, want_o, kGatedCriterion) == 0, c.name + " vs FP64");
+        // Routes: B4 with other lanes, eight W=1 rows (one a column), workers 1 / 3, valid 5: bitwise.
+        std::size_t bad = 0, cols = 0;
+        const auto cmp = [&](const DraftOut& o, int W, int b, int valid, int col0) {
+            for (int j = 0; j < valid; ++j) {
+                ++cols;
+                const std::size_t n = static_cast<std::size_t>(j) + static_cast<std::size_t>(W) * b;
+                bad += std::memcmp(&o.o[n * 3072], &ref.o[static_cast<std::size_t>(col0 + j) * 3072], 3072 * 2) != 0;
+            }
+            for (int j = valid; j < W; ++j) {
+                const std::size_t n = static_cast<std::size_t>(j) + static_cast<std::size_t>(W) * b;
+                for (int i = 0; i < 3072; ++i) { bad += o.o[n * 3072 + i] != 0; }
+            }
+        };
+        cmp(run_draft(ip, c.window, 8, {{1, 0, 8}, {2, 0, 8}, {0, 0, 8}, {3, 0, 8}},
+                      {ip.len[1] - 1, ip.len[2] - 1, P, ip.len[3] - 1}), 8, 2, 8, 0);
+        {
+            std::vector<InvRow> r8;
+            for (int j = 0; j < 8; ++j) { r8.push_back({0, j, 1}); }
+            const DraftOut o = run_draft(ip, c.window, 1, r8, std::vector<int>(8, P));
+            for (int j = 0; j < 8; ++j) { cmp(DraftOut{std::vector<std::uint16_t>(o.o.begin() + j * 3072, o.o.begin() + (j + 1) * 3072)}, 1, 0, 1, j); }
+        }
+        for (const int splits : {1, 3}) {
+            ops::inkling_attention_knobs().splits = splits;
+            cmp(run_draft(ip, c.window, 8, {{0, 0, 8}}, {P}), 8, 0, 8, 0);
+        }
+        ops::inkling_attention_knobs().splits = 0;
+        cmp(run_draft(ip, c.window, 8, {{0, 0, 5}}, {P}), 8, 0, 5, 0);
+        std::printf("%-44s columns compared %zu, bit-different (or nonzero invalid) %zu\n", c.name.c_str(), cols, bad);
+        check(bad == 0, c.name + " routes bitwise");
+        g_key_groups = ops::InklingKeyGroups::Default;
+    }
+}
+
 void test_invariance(const std::function<bool(const std::string&)>& want) {
     using K = InklingLayerKind;
     const std::vector<InvCase> cases = {
@@ -2115,6 +2238,7 @@ int main(int argc, char** argv) {
             seed += 17;
         }
         test_invariance(want);
+        test_draft(want);
     } catch (const std::exception& e) {
         std::cerr << "EXCEPTION " << e.what() << '\n';
         return 1;

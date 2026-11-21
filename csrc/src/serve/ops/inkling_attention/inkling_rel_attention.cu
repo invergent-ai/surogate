@@ -50,7 +50,8 @@ inline constexpr int kSmemLimit   = 101376;             // sm_120 opt-in shared 
 inline constexpr int kFoldChunk   = 32;                 // partial slots per cp.async stage of fold_kernel
 
 // kTrain = the training entry: gated output AND pre-gate o + lse from the same final pass.
-enum Mode : int { kGated = 0, kOutLse = 1, kPartial = 2, kTrain = 3 };
+// kDraft = DSpark draft block attention: bf16 o, no gate / sink (the bias is off by a null table).
+enum Mode : int { kGated = 0, kOutLse = 1, kPartial = 2, kTrain = 3, kDraft = 4 };
 template <int Mode> inline constexpr bool kWritesGated  = Mode == kGated || Mode == kTrain;
 template <int Mode> inline constexpr bool kWritesOutLse = Mode == kOutLse || Mode == kTrain;
 
@@ -107,6 +108,7 @@ struct AttnParams {
     int variant;
     int l2_ahead;    // blocks asked of L2 ahead of their loads (SUROGATE_INKLING_ATTN_L2AHEAD, default 4; 0 = off)
     int metadata_static; // InklingAttentionRows::metadata_static: rows / tables / old keys readable before the PDL wait
+    int window;          // Local: keys with pos - key < window (1,024; the DSpark draft's 1,032)
     int pdl_trigger; // trigger dependents at entry (SUROGATE_INKLING_ATTN_PDL_TRIGGER, default 1)
 };
 
@@ -239,7 +241,7 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
     const int pmin = any ? positions[j_lo] : 0;
     const int pmax = any ? positions[j_hi] : -1;
     const int hi   = pmax + 1;
-    const int lo   = Local ? max(0, pmin - (Geo::kWindow - 1)) : 0;
+    const int lo   = Local ? max(0, pmin - (p.window - 1)) : 0;
     const int g_first = any ? group_of(gs, lo) : 0;
     const int g_last  = any ? group_of(gs, hi - 1) : -1;
 
@@ -289,7 +291,7 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
         rvalid[i]     = rexists[i] && rj[i] < valid;
         rpos[i]       = rvalid[i] ? positions[rj[i]] : -1;
         rn[i]         = static_cast<std::int64_t>(rj[i]) + static_cast<std::int64_t>(W) * b;
-        rg0[i]        = rvalid[i] ? group_of(gs, Local ? max(0, rpos[i] - (Geo::kWindow - 1)) : 0) : 0;
+        rg0[i]        = rvalid[i] ? group_of(gs, Local ? max(0, rpos[i] - (p.window - 1)) : 0) : 0;
         rg1[i]        = rvalid[i] ? group_of(gs, rpos[i]) : -1;
     }
 
@@ -337,10 +339,11 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
     {
         const __nv_bfloat16* r0 = p.r + (rn[0] * Geo::kQHeads + rh[0]) * Geo::kRelDim + 2 * lid;
         const __nv_bfloat16* r1 = p.r + (rn[1] * Geo::kQHeads + rh[1]) * Geo::kRelDim + 2 * lid;
-        ar[0] = word_or_zero(r0, rvalid[0]);
-        ar[1] = word_or_zero(r1, rvalid[1]);
-        ar[2] = word_or_zero(r0 + 8, rvalid[0]);
-        ar[3] = word_or_zero(r1 + 8, rvalid[1]);
+        const bool has_r = p.r != nullptr; // draft mode: no r (and no bias)
+        ar[0] = word_or_zero(r0, has_r && rvalid[0]);
+        ar[1] = word_or_zero(r1, has_r && rvalid[1]);
+        ar[2] = word_or_zero(r0 + 8, has_r && rvalid[0]);
+        ar[3] = word_or_zero(r1 + 8, has_r && rvalid[1]);
     }
 
     // Running state of the current group (this warp's head-dim share) and the folded total (Fold).
@@ -407,7 +410,7 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
     // One 64-key block for this warp's row tile (tile-uniform skip: no row of the tile sees a key of the block).
     const auto compute_block = [&](int kb) {
         const int k0 = kb * kBn;
-        if (!w_any || k0 > pmax_w || (Local && k0 + kBn - 1 < pmin_w - (Geo::kWindow - 1))) { return; }
+        if (!w_any || k0 > pmax_w || (Local && k0 + kBn - 1 < pmin_w - (p.window - 1))) { return; }
         const int kbase = kq * KeysW; // this warp's keys within the block
 
         // S = Q K^T for this warp's keys: eight chained k16 steps over the head dimension in natural order, from zero.
@@ -445,7 +448,7 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
         // Relative bias for this warp's keys within the extent: strip column c = distance d0 + c, per row a k16 MMA
         // from zero rounded to bf16 (distances >= 1,024 read the zero padding: adding it is exact).
         const int d0 = pmin_w - (k0 + kbase + KeysW - 1);
-        if (d0 < Geo::kRelExtent) {
+        if (p.table != nullptr && d0 < Geo::kRelExtent) { // draft mode: no relative bias
             __syncwarp();
 #pragma unroll
             for (int ct = 0; ct < Smem::kStripCols / 8; ++ct) {
@@ -472,7 +475,7 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
         }
 
         // Causal / window / validity mask by select, only where some element can be invisible.
-        const bool need_mask = !w_full || (k0 + kBn - 1 > pmin_w) || (Local && k0 <= pmax_w - Geo::kWindow);
+        const bool need_mask = !w_full || (k0 + kBn - 1 > pmin_w) || (Local && k0 <= pmax_w - p.window);
         if (need_mask) {
 #pragma unroll
             for (int nt = 0; nt < NTW; ++nt) {
@@ -480,7 +483,7 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
                 for (int e = 0; e < 4; ++e) {
                     const int i   = e >> 1;
                     const int key = k0 + kbase + nt * 8 + 2 * lid + (e & 1);
-                    const bool vis = rvalid[i] && key <= rpos[i] && (!Local || rpos[i] - key < Geo::kWindow);
+                    const bool vis = rvalid[i] && key <= rpos[i] && (!Local || rpos[i] - key < p.window);
                     if (!vis) { sc[nt][e] = -CUDART_INF_F; }
                 }
             }
@@ -788,6 +791,9 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
                 if constexpr (kWritesOutLse<Mode>) {
                     store_vec(p.out_f32 + (n * Geo::kQHeads + h) * Geo::kHeadDim + d0 + 8 * t, make_float2(o0, o1));
                 }
+                if constexpr (Mode == kDraft) {
+                    store_vec(p.out + (n * Geo::kQHeads + h) * Geo::kHeadDim + d0 + 8 * t, pack_bf16x2(o0, o1));
+                }
             }
             // Columns past the valid count come out zero, as the reference zeroes its padding rows.
             if constexpr (kWritesOutLse<Mode>) {
@@ -822,7 +828,7 @@ __global__ __launch_bounds__(128) void fold_kernel(const AttnParams p) {
     if (ok) {
         const GroupSpec gs = p.groups;
         const int pos      = p.positions[static_cast<std::int64_t>(W) * b + j];
-        const int g0       = group_of(gs, Local ? max(0, pos - (Geo::kWindow - 1)) : 0);
+        const int g0       = group_of(gs, Local ? max(0, pos - (p.window - 1)) : 0);
         const int ns       = group_of(gs, pos) - g0 + 1;
         poison             = ns > p.max_slots;
         count              = poison ? 0 : ns;
@@ -936,6 +942,7 @@ __global__ __launch_bounds__(128) void fold_kernel(const AttnParams p) {
         p.out_f32[(n * Geo::kQHeads + h) * Geo::kHeadDim + d] = ok ? o : 0.0F;
         if (d == 0) { p.lse[n * Geo::kQHeads + h] = ok ? __fmul_rn(lse2, kLn2) : 0.0F; }
     }
+    if constexpr (Mode == kDraft) { p.out[(n * Geo::kQHeads + h) * Geo::kHeadDim + d] = __float2bfloat16_rn(ok ? o : 0.0F); }
 }
 
 // The reference's `_gate_sink_kernel` (fusion off): bf16((x * sigmoid(gate)) * sigmoid(lse - sink)).
@@ -1034,8 +1041,8 @@ struct Plan {
 };
 
 /// Slots a row needs at most: global = groups up to the envelope's key count; local = groups a window touches.
-int max_slots_for(InklingLayerKind kind, const GroupSpec& gs, std::int32_t max_keys) {
-    if (kind == InklingLayerKind::Local) { return ((Geo::kWindow - 1) >> gs.s1) + 2; }
+int max_slots_for(InklingLayerKind kind, const GroupSpec& gs, std::int32_t max_keys, int window = Geo::kWindow) {
+    if (kind == InklingLayerKind::Local) { return ((window - 1) >> gs.s1) + 2; }
     return group_of(gs, std::max(max_keys, 1) - 1) + 1;
 }
 
@@ -1049,10 +1056,11 @@ std::size_t partial_bytes(const Plan& plan, std::int64_t columns) {
 // length up to its envelope). Prefill: the split route only for few query tiles and a small partial buffer.
 // SUROGATE_INKLING_ATTN_SPLITS=N forces N workers; SUROGATE_INKLING_ATTN_CTAS sets the decode CTA target;
 // SUROGATE_INKLING_ATTN_PARTIAL_MB caps the partial buffer (tests and measurement).
-Plan make_plan(InklingLayerKind kind, const GroupSpec& gs, std::int32_t width, std::int32_t batch, std::int32_t max_keys) {
+Plan make_plan(InklingLayerKind kind, const GroupSpec& gs, std::int32_t width, std::int32_t batch, std::int32_t max_keys,
+               int window = Geo::kWindow) {
     Plan plan;
     const int sms        = device_sms();
-    plan.max_slots       = max_slots_for(kind, gs, max_keys);
+    plan.max_slots       = max_slots_for(kind, gs, max_keys, window);
     const int slot_cap   = kind == InklingLayerKind::Global ? kMaxWorkers : plan.max_slots;
     if (width <= Geo::kMaxSmallColumns) {
         plan.decode      = true;
@@ -1117,6 +1125,7 @@ void dispatch(InklingLayerKind kind, int mode, const Plan& plan, const AttnParam
     case kGated: return local ? dispatch_mode<true, kGated>(plan, p, stream) : dispatch_mode<false, kGated>(plan, p, stream);
     case kOutLse: return local ? dispatch_mode<true, kOutLse>(plan, p, stream) : dispatch_mode<false, kOutLse>(plan, p, stream);
     case kTrain: return local ? dispatch_mode<true, kTrain>(plan, p, stream) : dispatch_mode<false, kTrain>(plan, p, stream);
+    case kDraft: return local ? dispatch_mode<true, kDraft>(plan, p, stream) : dispatch_mode<false, kDraft>(plan, p, stream);
     default: return local ? dispatch_mode<true, kPartial>(plan, p, stream) : dispatch_mode<false, kPartial>(plan, p, stream);
     }
 }
@@ -1142,15 +1151,17 @@ void launch_fold(InklingLayerKind kind, std::int64_t n, const AttnParams& p, cud
 
 AttnParams make_params(const InklingAttentionInputs& in, const InklingAttentionRows& rows,
                        const PagedKVBatchLayerView& cache, const RowsShape& rs, bool need_gate,
-                       const char* op) {
+                       const char* op, bool draft = false) {
     AttnParams p{};
     const std::int64_t n = rs.columns;
     require_contiguous(in.q, DType::BF16, n * Geo::kQHeads * Geo::kHeadDim, op, "q");
-    require_contiguous(in.r, DType::BF16, n * Geo::kQHeads * Geo::kRelDim, op, "r");
-    require_contiguous(in.rel_table, DType::BF16, Geo::kRelDim * Geo::kRelTableRows, op, "rel_table");
-    p.q     = static_cast<const __nv_bfloat16*>(in.q.data);
-    p.r     = static_cast<const __nv_bfloat16*>(in.r.data);
-    p.table = static_cast<const __nv_bfloat16*>(in.rel_table.data);
+    p.q = static_cast<const __nv_bfloat16*>(in.q.data);
+    if (!draft) { // the draft attention has no relative bias: r and the table stay null
+        require_contiguous(in.r, DType::BF16, n * Geo::kQHeads * Geo::kRelDim, op, "r");
+        require_contiguous(in.rel_table, DType::BF16, Geo::kRelDim * Geo::kRelTableRows, op, "rel_table");
+        p.r     = static_cast<const __nv_bfloat16*>(in.r.data);
+        p.table = static_cast<const __nv_bfloat16*>(in.rel_table.data);
+    }
     if (need_gate) {
         p.gate        = static_cast<const __nv_bfloat16*>(in.gate.data);
         p.gate_stride = column_stride_elements(in.gate, DType::BF16, {Geo::kAttnWidth}, n, 1, op, "gate", 4);
@@ -1177,27 +1188,31 @@ AttnParams make_params(const InklingAttentionInputs& in, const InklingAttentionR
     p.l2_ahead        = std::clamp(k.l2_ahead, -1, 16); // -1: the route's default (run)
     p.pdl_trigger     = k.pdl_trigger ? 1 : 0;
     p.metadata_static = (rows.metadata_static && k.early_meta) ? 1 : 0;
+    p.window          = Geo::kWindow;
     return p;
 }
 
 void run(const InklingAttentionInputs& in, InklingLayerKind kind, const InklingAttentionRows& rows,
          const PagedKVBatchLayerView& cache, WorkspaceArena& workspace, int final_mode, Tensor* out,
-         Tensor* out_f32, Tensor* lse, cudaStream_t stream, const char* op) {
+         Tensor* out_f32, Tensor* lse, cudaStream_t stream, const char* op, int window = Geo::kWindow) {
     const RowsShape rs = check_rows(rows, op);
-    AttnParams p       = make_params(in, rows, cache, rs, final_mode != kOutLse, op);
+    const bool draft   = final_mode == kDraft;
+    AttnParams p       = make_params(in, rows, cache, rs, final_mode == kGated || final_mode == kTrain, op, draft);
+    p.window           = window;
     const std::int64_t n = rs.columns;
-    if (final_mode != kOutLse) {
+    if (final_mode != kOutLse) { // gated output, or the draft's bf16 o (the same element count)
         require_contiguous(*out, DType::BF16, n * Geo::kAttnWidth, op, "out");
         p.out = static_cast<__nv_bfloat16*>(out->data);
     }
-    if (final_mode != kGated) {
+    if (final_mode == kOutLse || final_mode == kTrain) {
         require_contiguous(*out_f32, DType::FP32, n * Geo::kQHeads * Geo::kHeadDim, op, "out");
         require_contiguous(*lse, DType::FP32, n * Geo::kQHeads, op, "lse");
         p.out_f32 = static_cast<float*>(out_f32->data);
         p.lse     = static_cast<float*>(lse->data);
     }
     p.groups        = group_spec(kind, rows.key_groups);
-    const Plan plan = make_plan(kind, p.groups, rs.width, rs.batch, static_cast<std::int32_t>(rows.envelope.max_visible_keys));
+    const Plan plan = make_plan(kind, p.groups, rs.width, rs.batch, static_cast<std::int32_t>(rows.envelope.max_visible_keys),
+                                window);
     p.workers       = plan.workers;
     p.max_slots     = plan.max_slots;
     // L2 prefetch ahead of the loads: OFF by default -- measured slower at every distance on decode / verify (perf6ab
@@ -1216,6 +1231,8 @@ void run(const InklingAttentionInputs& in, InklingLayerKind kind, const InklingA
         launch_fold<kGated>(kind, n, p, stream);
     } else if (final_mode == kTrain) {
         launch_fold<kTrain>(kind, n, p, stream);
+    } else if (final_mode == kDraft) {
+        launch_fold<kDraft>(kind, n, p, stream);
     } else {
         launch_fold<kOutLse>(kind, n, p, stream);
     }
@@ -1314,6 +1331,29 @@ void inkling_attention_train(const InklingProjections& projections, const Inklin
 }
 
 InklingAttentionKnobs& inkling_attention_knobs() { return inkling_detail::knobs(); }
+
+void inkling_draft_attention(const Tensor& q, std::int32_t window, const InklingAttentionRows& rows,
+                             const PagedKVBatchLayerView& draft_plane, WorkspaceArena& workspace, Tensor& out,
+                             cudaStream_t stream) {
+    using namespace inkling_detail;
+    if (window < 0 || window > (1 << 20)) { fail("inkling_draft_attention", "window must be 0 (global) or a key count"); }
+    InklingAttentionInputs in;
+    in.q = q;
+    run(in, window > 0 ? InklingLayerKind::Local : InklingLayerKind::Global, rows, draft_plane, workspace, kDraft, &out,
+        nullptr, nullptr, stream, "inkling_draft_attention", window > 0 ? window : Geo::kWindow);
+}
+
+std::size_t inkling_draft_attention_workspace_bytes(std::int32_t window, std::int32_t width, std::int32_t batch,
+                                                    GqaExecutionEnvelope envelope, InklingKeyGroups key_groups) {
+    using namespace inkling_detail;
+    if (width <= 0 || batch <= 0 || window < 0 || envelope.max_visible_keys > static_cast<std::uint32_t>(1 << 20)) {
+        throw std::invalid_argument("inkling_draft_attention_workspace_bytes: outside the supported domain");
+    }
+    const InklingLayerKind kind = window > 0 ? InklingLayerKind::Local : InklingLayerKind::Global;
+    const Plan plan = make_plan(kind, group_spec(kind, key_groups), width, batch,
+                                static_cast<std::int32_t>(envelope.max_visible_keys), window > 0 ? window : Geo::kWindow);
+    return partial_bytes(plan, static_cast<std::int64_t>(width) * batch);
+}
 
 void inkling_gate_sink(const Tensor& out, const Tensor& lse, const Tensor& gate, const Tensor& sink,
                        Tensor& result, cudaStream_t stream) {

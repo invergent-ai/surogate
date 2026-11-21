@@ -361,6 +361,22 @@ void inkling_attention_train(const InklingProjections& projections, const Inklin
                              cudaStream_t stream);
 
 /**
+ * DSpark draft block attention (agent-EN-e2b, 13:35; ref/dspark_ref.py DSparkRef.attention): q BF16 [128, 24, N]
+ * contiguous (N = W * B; W = the 8 block columns of a lane), keys from the draft plane (paged unit-scale FP8 e4m3, the
+ * block's own K / V already written there at [P_b, P_b + 8)). Every column of a lane passes the block's last position
+ * P_b + 7 in rows.positions, so all its rows see one key set. window = 0: global; else keys with pos - key < window
+ * (1,032 on draft layers 0 / 2 = keys >= P_b - 1,024). Scale 128^-0.5; no relative bias, gate, sink or tau. out = BF16
+ * [128, 24, N] contiguous, o rounded once; invalid columns and idle rows zero. The same per-row arithmetic, key groups
+ * (rows.key_groups) and fold as inkling_rel_attention: batch / width / split invariant.
+ */
+void inkling_draft_attention(const Tensor& q, std::int32_t window, const InklingAttentionRows& rows,
+                             const PagedKVBatchLayerView& draft_plane, WorkspaceArena& workspace, Tensor& out,
+                             cudaStream_t stream);
+[[nodiscard]] std::size_t inkling_draft_attention_workspace_bytes(std::int32_t window, std::int32_t width,
+                                                                  std::int32_t batch, GqaExecutionEnvelope envelope,
+                                                                  InklingKeyGroups key_groups = InklingKeyGroups::Default);
+
+/**
  * Op inkling_gate_sink (ref `inkling_gate_sink`, vLLM `_gate_sink_kernel`, D1 A7): result =
  * bf16((out * sigmoid(gate)) * sigmoid(lse - sink)), sigmoid(x) = rcp.approx(ex2.approx(-x log2 e) + 1).
  * out FP32 [128, 24, N] contiguous, lse FP32 [24, N] contiguous, gate BF16 [3072, N] and sink BF16
