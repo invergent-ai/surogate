@@ -1289,7 +1289,8 @@ std::atomic<int> g_mix_reference{-1};
 bool use_reference_kernels() {
     int v = g_mix_reference.load(std::memory_order_relaxed);
     if (v < 0) {
-        v = std::getenv("SUROGATE_SERVE_INKLING_MIX_REFERENCE") != nullptr ? 1 : 0;
+        const char* raw = std::getenv("SUROGATE_SERVE_INKLING_MIX_REFERENCE");
+        v               = raw != nullptr && raw[0] != '\0' && std::atoi(raw) != 0 ? 1 : 0;
         g_mix_reference.store(v, std::memory_order_relaxed);
     }
     return v != 0;
