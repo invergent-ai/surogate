@@ -1208,6 +1208,38 @@ void run_capture(const std::string& dir) {
         std::printf("%-44s %-10s vs vLLM: max|d| %.3e (rows with equal q: %.3e); rows > 1e-4: %zu (%zu with a q_out ulp)\n",
                     tag.c_str(), "lse", lmax, lmax_clean, off, off_q);
         check(lmax <= 2e-2 && off * 200 <= gl.size(), tag + " lse vs vLLM");
+        // Numerics-variant sweep (the vLLM bit-identity experiment): vLLM's own q_out, every variant of
+        // AttnParams::variant, share of out / lse values whose fp32 bits equal vLLM's. Visits 0 and 5 only.
+        if (v == 0 || v == 5) {
+            DeviceBuffer dvq = dev("q_out");
+            const ops::InklingAttentionInputs vin{Tensor(dvq.p, DType::BF16, {128, 24, T}), qr.r, in.gate, in.sink,
+                                                  w.rel_table};
+            const std::vector<float> ro32 = ts.at("out").f32_values(), rl32 = ts.at("lse").f32_values();
+            struct Score { int variant; double out_eq, lse_eq; };
+            std::vector<Score> scores;
+            for (int variant = 0; variant < 64; ++variant) {
+                if ((variant & 6) == 6) { continue; } // P V modes are 0, 2, 4
+                setenv("SUROGATE_INKLING_ATTN_VARIANT", std::to_string(variant).c_str(), 1);
+                ops::inkling_rel_attention_out_lse(vin, kind, view, plane.view(), work, of, lse, nullptr);
+                cuda_synchronize();
+                const std::vector<float> go32 = from_device<float>(dof, ro32.size());
+                const std::vector<float> gl32 = from_device<float>(dl, rl32.size());
+                std::size_t eo = 0, el = 0;
+                for (std::size_t i = 0; i < go32.size(); ++i) { eo += std::memcmp(&go32[i], &ro32[i], 4) == 0; }
+                for (std::size_t i = 0; i < gl32.size(); ++i) { el += std::memcmp(&gl32[i], &rl32[i], 4) == 0; }
+                scores.push_back({variant, 100.0 * eo / go32.size(), 100.0 * el / gl32.size()});
+            }
+            unsetenv("SUROGATE_INKLING_ATTN_VARIANT");
+            std::sort(scores.begin(), scores.end(), [](const Score& a, const Score& b) {
+                return a.out_eq != b.out_eq ? a.out_eq > b.out_eq : a.lse_eq > b.lse_eq;
+            });
+            for (std::size_t k = 0; k < scores.size(); ++k) {
+                if (k < 6 || scores[k].variant == 0) {
+                    std::printf("%-44s variant %2d: out bits = vLLM %6.2f %%, lse bits = vLLM %6.2f %%\n", tag.c_str(),
+                                scores[k].variant, scores[k].out_eq, scores[k].lse_eq);
+                }
+            }
+        }
         if (glob && ts.count("tau") != 0) {
             DeviceBuffer dpos = to_device_i32(pos), dtau(static_cast<std::size_t>(T) * 4);
             Tensor tp(dpos.p, DType::I32, {T}), tt(dtau.p, DType::FP32, {T});

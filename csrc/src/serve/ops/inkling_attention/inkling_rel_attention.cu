@@ -33,9 +33,10 @@ namespace sinfer::ops {
 namespace inkling_detail {
 namespace {
 
-inline constexpr int kBn           = 32;          // keys per block
-inline constexpr int kStripCols    = kBn + 16;    // distances a warp's strip covers (row spread <= 15)
-inline constexpr int kStripStride  = kStripCols + 8;
+// Keys per block: 64 for prefill (aligned at key 0 like vLLM's sm_120 prefill kernel, BLOCK_N 64, so each row's
+// running maximum -- and so the bf16 rounding of P -- follows the reference block by block), 32 for decode.
+inline constexpr int kBnPrefill    = 64;
+inline constexpr int kBnDecode     = 32;
 inline constexpr int kRowBytes     = Geo::kHeadDim * 2; // a bf16 tile row
 inline constexpr int kPrefillRows  = 64;
 
@@ -63,14 +64,21 @@ struct AttnParams {
     float* lse;          // OutLse: [24, N]
     float* part_o;       // Partial: [128, 24, N, S]
     float* part_lse2;    // Partial: [24, N, S]
+    // Numerics variant bits (SUROGATE_INKLING_ATTN_VARIANT; the vLLM bit-identity experiment, DESIGN 1 A3-A5):
+    // 1 bias as s + bf16(b) * log2e (else fma), 2|4 P V update 0 = scale acc then chain the MMAs into it,
+    // 2 = chain from zero then fma(acc, alpha, pv), 4 = chain from zero then acc * alpha + pv, 8 o = acc / l
+    // with div.rn (else div.full), 16 lse with accurate log2f (else lg2.approx), 32 l = l * alpha + sum unfused.
+    int variant;
 };
 
-template <int MTiles>
+template <int MTiles, int Bn>
 struct AttnSmem {
-    std::uint8_t raw_k[2][kBn * Geo::kHeadDim];
-    std::uint8_t raw_v[2][kBn * Geo::kHeadDim];
-    __nv_bfloat16 k[kBn * Geo::kHeadDim];
-    __nv_bfloat16 v[kBn * Geo::kHeadDim];
+    static constexpr int kStripCols   = Bn + 16; // distances a warp's strip covers (row spread <= 15)
+    static constexpr int kStripStride = Bn + 24;
+    std::uint8_t raw_k[2][Bn * Geo::kHeadDim];
+    std::uint8_t raw_v[2][Bn * Geo::kHeadDim];
+    __nv_bfloat16 k[Bn * Geo::kHeadDim];
+    __nv_bfloat16 v[Bn * Geo::kHeadDim];
     __nv_bfloat16 strip[MTiles][16 * kStripStride];
 };
 
@@ -78,10 +86,17 @@ __device__ __forceinline__ unsigned word_or_zero(const __nv_bfloat16* p, bool ok
     return ok ? load_vec<unsigned>(p) : 0U;
 }
 
-template <bool Local, bool Decode, int MTiles, int Mode>
+template <bool Local, bool Decode, int MTiles, int Mode, int Bn>
 __global__ __launch_bounds__(MTiles * 32) void rel_attention_kernel(const AttnParams p) {
-    constexpr int Threads = MTiles * 32;
-    __shared__ __align__(16) AttnSmem<MTiles> sm;
+    constexpr int Threads      = MTiles * 32;
+    constexpr int NT           = Bn / 8;  // score n-tiles
+    constexpr int KK           = Bn / 16; // P V k-steps
+    constexpr int kBn          = Bn;
+    using Smem                 = AttnSmem<MTiles, Bn>;
+    constexpr int kStripCols   = Smem::kStripCols;
+    constexpr int kStripStride = Smem::kStripStride;
+    extern __shared__ __align__(16) unsigned char attn_smem_raw[];
+    Smem& sm = *reinterpret_cast<Smem*>(attn_smem_raw);
     pdl::wait_for_dependencies();
 
     const int tid  = static_cast<int>(threadIdx.x);
@@ -239,13 +254,13 @@ __global__ __launch_bounds__(MTiles * 32) void rel_attention_kernel(const AttnPa
         if (!w_any || k0 > pmax_w || (Local && k0 + kBn - 1 < pmin_w - (Geo::kWindow - 1))) { continue; }
 
         // S = Q K^T: eight chained k16 steps over the head dimension in natural order, from zero.
-        float sc[4][4];
+        float sc[NT][4];
 #pragma unroll
-        for (int nt = 0; nt < 4; ++nt) { sc[nt][0] = sc[nt][1] = sc[nt][2] = sc[nt][3] = 0.0F; }
+        for (int nt = 0; nt < NT; ++nt) { sc[nt][0] = sc[nt][1] = sc[nt][2] = sc[nt][3] = 0.0F; }
 #pragma unroll
         for (int ks = 0; ks < 8; ++ks) {
 #pragma unroll
-            for (int nt2 = 0; nt2 < 4; nt2 += 2) {
+            for (int nt2 = 0; nt2 < NT; nt2 += 2) {
                 const int key   = nt2 * 8 + (lane & 7) + ((lane >> 4) << 3);
                 const int chunk = 2 * ks + ((lane >> 3) & 1);
                 unsigned b0, b1, b2, b3;
@@ -258,7 +273,7 @@ __global__ __launch_bounds__(MTiles * 32) void rel_attention_kernel(const AttnPa
             }
         }
 #pragma unroll
-        for (int nt = 0; nt < 4; ++nt) {
+        for (int nt = 0; nt < NT; ++nt) {
 #pragma unroll
             for (int e = 0; e < 4; ++e) { sc[nt][e] = __fmul_rn(sc[nt][e], p.qk_scale_log2); }
         }
@@ -279,7 +294,7 @@ __global__ __launch_bounds__(MTiles * 32) void rel_attention_kernel(const AttnPa
             }
             __syncwarp();
 #pragma unroll
-            for (int nt = 0; nt < 4; ++nt) {
+            for (int nt = 0; nt < NT; ++nt) {
 #pragma unroll
                 for (int e = 0; e < 4; ++e) {
                     const int i = e >> 1;
@@ -287,7 +302,8 @@ __global__ __launch_bounds__(MTiles * 32) void rel_attention_kernel(const AttnPa
                     const int kc = nt * 8 + 2 * lid + (e & 1);
                     const int c  = (rpos[i] - pmin_w) + (kBn - 1) - kc;
                     const float bias = __bfloat162float(strip[(gid + 8 * i) * kStripStride + c]);
-                    sc[nt][e]        = fmaf(bias, kLog2e, sc[nt][e]);
+                    sc[nt][e] = (p.variant & 1) ? __fadd_rn(sc[nt][e], __fmul_rn(bias, kLog2e))
+                                                : fmaf(bias, kLog2e, sc[nt][e]);
                 }
             }
         }
@@ -297,7 +313,7 @@ __global__ __launch_bounds__(MTiles * 32) void rel_attention_kernel(const AttnPa
                                (Local && k0 <= pmax_w - Geo::kWindow);
         if (need_mask) {
 #pragma unroll
-            for (int nt = 0; nt < 4; ++nt) {
+            for (int nt = 0; nt < NT; ++nt) {
 #pragma unroll
                 for (int e = 0; e < 4; ++e) {
                     const int i   = e >> 1;
@@ -312,7 +328,7 @@ __global__ __launch_bounds__(MTiles * 32) void rel_attention_kernel(const AttnPa
         // Online softmax in the log2 domain (A4).
         float bm[2] = {-CUDART_INF_F, -CUDART_INF_F};
 #pragma unroll
-        for (int nt = 0; nt < 4; ++nt) {
+        for (int nt = 0; nt < NT; ++nt) {
             bm[0] = fmaxf(bm[0], fmaxf(sc[nt][0], sc[nt][1]));
             bm[1] = fmaxf(bm[1], fmaxf(sc[nt][2], sc[nt][3]));
         }
@@ -326,9 +342,9 @@ __global__ __launch_bounds__(MTiles * 32) void rel_attention_kernel(const AttnPa
             m[i]           = mn;
         }
         float bl[2] = {0.0F, 0.0F};
-        unsigned pk[2][4];
+        unsigned pk[KK][4];
 #pragma unroll
-        for (int nt = 0; nt < 4; ++nt) {
+        for (int nt = 0; nt < NT; ++nt) {
             float pv[4];
 #pragma unroll
             for (int e = 0; e < 4; ++e) {
@@ -345,8 +361,12 @@ __global__ __launch_bounds__(MTiles * 32) void rel_attention_kernel(const AttnPa
             }
         }
 #pragma unroll
-        for (int i = 0; i < 2; ++i) { l[i] = fmaf(l[i], alpha[i], warp_sum<4>(bl[i])); }
-        if (__any_sync(kFullWarpMask, alpha[0] != 1.0F || alpha[1] != 1.0F)) {
+        for (int i = 0; i < 2; ++i) {
+            const float sum = warp_sum<4>(bl[i]);
+            l[i] = (p.variant & 32) ? __fadd_rn(__fmul_rn(l[i], alpha[i]), sum) : fmaf(l[i], alpha[i], sum);
+        }
+        const int pv_mode = (p.variant >> 1) & 3;
+        if (pv_mode == 0 && __any_sync(kFullWarpMask, alpha[0] != 1.0F || alpha[1] != 1.0F)) {
 #pragma unroll
             for (int n = 0; n < 16; ++n) {
                 acc[n][0] = __fmul_rn(acc[n][0], alpha[0]);
@@ -356,20 +376,36 @@ __global__ __launch_bounds__(MTiles * 32) void rel_attention_kernel(const AttnPa
             }
         }
 
-        // O += P V (keys in order, two k16 steps).
+        // O += P V (keys in order, KK k16 steps). Mode 0: the MMA chain runs into the rescaled accumulator;
+        // modes 1 / 2: it runs from zero and joins the rescaled accumulator after (experiment, see AttnParams).
 #pragma unroll
-        for (int kk = 0; kk < 2; ++kk) {
+        for (int n2 = 0; n2 < 16; n2 += 2) {
+            float t0[4] = {0.0F, 0.0F, 0.0F, 0.0F}, t1[4] = {0.0F, 0.0F, 0.0F, 0.0F};
 #pragma unroll
-            for (int n2 = 0; n2 < 16; n2 += 2) {
+            for (int kk = 0; kk < KK; ++kk) {
                 const int key   = kk * 16 + (lane & 7) + (((lane >> 3) & 1) << 3);
                 const int chunk = n2 + (lane >> 4);
                 unsigned v0, v1, v2, v3;
                 ldmatrix_x4_t(v0, v1, v2, v3,
                               v_base + static_cast<unsigned>(key * kRowBytes + ((chunk ^ (key & 7)) << 4)));
-                mma_bf16(acc[n2][0], acc[n2][1], acc[n2][2], acc[n2][3], pk[kk][0], pk[kk][1], pk[kk][2],
-                         pk[kk][3], v0, v1);
-                mma_bf16(acc[n2 + 1][0], acc[n2 + 1][1], acc[n2 + 1][2], acc[n2 + 1][3], pk[kk][0],
-                         pk[kk][1], pk[kk][2], pk[kk][3], v2, v3);
+                if (pv_mode == 0) {
+                    mma_bf16(acc[n2][0], acc[n2][1], acc[n2][2], acc[n2][3], pk[kk][0], pk[kk][1], pk[kk][2],
+                             pk[kk][3], v0, v1);
+                    mma_bf16(acc[n2 + 1][0], acc[n2 + 1][1], acc[n2 + 1][2], acc[n2 + 1][3], pk[kk][0],
+                             pk[kk][1], pk[kk][2], pk[kk][3], v2, v3);
+                } else {
+                    mma_bf16(t0[0], t0[1], t0[2], t0[3], pk[kk][0], pk[kk][1], pk[kk][2], pk[kk][3], v0, v1);
+                    mma_bf16(t1[0], t1[1], t1[2], t1[3], pk[kk][0], pk[kk][1], pk[kk][2], pk[kk][3], v2, v3);
+                }
+            }
+            if (pv_mode != 0) {
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    const float a = alpha[e >> 1];
+                    acc[n2][e]     = pv_mode == 1 ? fmaf(acc[n2][e], a, t0[e]) : __fadd_rn(__fmul_rn(acc[n2][e], a), t0[e]);
+                    acc[n2 + 1][e] = pv_mode == 1 ? fmaf(acc[n2 + 1][e], a, t1[e])
+                                                  : __fadd_rn(__fmul_rn(acc[n2 + 1][e], a), t1[e]);
+                }
             }
         }
     }
@@ -382,7 +418,8 @@ __global__ __launch_bounds__(MTiles * 32) void rel_attention_kernel(const AttnPa
         const std::int64_t n  = rn[i];
         const int h           = rh[i];
         const bool has        = rvalid[i] && l[i] > 0.0F;
-        const float lse2      = has ? __fadd_rn(m[i], ptx_lg2(l[i])) : -CUDART_INF_F;
+        const float lse2      = has ? __fadd_rn(m[i], (p.variant & 16) ? log2f(l[i]) : ptx_lg2(l[i])) : -CUDART_INF_F;
+        const auto divide     = [&](float a) { return (p.variant & 8) ? __fdiv_rn(a, l[i]) : ptx_div_full(a, l[i]); };
         if constexpr (Mode == kGated) {
             __nv_bfloat16* dst = p.out + n * Geo::kAttnWidth + h * Geo::kHeadDim + 2 * lid;
             if (!rvalid[i]) {
@@ -396,8 +433,8 @@ __global__ __launch_bounds__(MTiles * 32) void rel_attention_kernel(const AttnPa
             const __nv_bfloat16* g = p.gate + n * p.gate_stride + h * Geo::kHeadDim + 2 * lid;
 #pragma unroll
             for (int t = 0; t < 16; ++t) {
-                const float o0 = has ? ptx_div_full(acc[t][2 * i], l[i]) : 0.0F;
-                const float o1 = has ? ptx_div_full(acc[t][2 * i + 1], l[i]) : 0.0F;
+                const float o0 = has ? divide(acc[t][2 * i]) : 0.0F;
+                const float o1 = has ? divide(acc[t][2 * i + 1]) : 0.0F;
                 const float2 gv = bf16x2_bits_to_float2(load_vec<unsigned>(g + 8 * t));
                 const float y0  = __fmul_rn(__fmul_rn(o0, ref_sigmoid(gv.x)), sig_sink);
                 const float y1  = __fmul_rn(__fmul_rn(o1, ref_sigmoid(gv.y)), sig_sink);
@@ -407,8 +444,8 @@ __global__ __launch_bounds__(MTiles * 32) void rel_attention_kernel(const AttnPa
             float* dst = p.out_f32 + (n * Geo::kQHeads + h) * Geo::kHeadDim + 2 * lid;
 #pragma unroll
             for (int t = 0; t < 16; ++t) {
-                const float o0 = has ? ptx_div_full(acc[t][2 * i], l[i]) : 0.0F;
-                const float o1 = has ? ptx_div_full(acc[t][2 * i + 1], l[i]) : 0.0F;
+                const float o0 = has ? divide(acc[t][2 * i]) : 0.0F;
+                const float o1 = has ? divide(acc[t][2 * i + 1]) : 0.0F;
                 store_vec(dst + 8 * t, make_float2(o0, o1));
             }
             // Columns past the valid count come out zero, as the reference zeroes its padding rows.
@@ -418,8 +455,8 @@ __global__ __launch_bounds__(MTiles * 32) void rel_attention_kernel(const AttnPa
             float* dst              = p.part_o + part * Geo::kHeadDim + 2 * lid;
 #pragma unroll
             for (int t = 0; t < 16; ++t) {
-                const float o0 = has ? ptx_div_full(acc[t][2 * i], l[i]) : 0.0F;
-                const float o1 = has ? ptx_div_full(acc[t][2 * i + 1], l[i]) : 0.0F;
+                const float o0 = has ? divide(acc[t][2 * i]) : 0.0F;
+                const float o1 = has ? divide(acc[t][2 * i + 1]) : 0.0F;
                 store_vec(dst + 8 * t, make_float2(o0, o1));
             }
             if (lid == 0) { p.part_lse2[part] = lse2; }
@@ -554,8 +591,16 @@ std::size_t partial_bytes(const Plan& plan, std::int64_t columns) {
 
 template <bool Local, bool Decode, int MTiles, int Mode>
 void launch_kernel(const Plan& plan, const AttnParams& p, cudaStream_t stream) {
-    const pdl::LaunchConfig launch{plan.grid, dim3(MTiles * 32), 0, stream};
-    CUDA_CHECK(pdl::launch_dependent(launch, rel_attention_kernel<Local, Decode, MTiles, Mode>, p));
+    constexpr int Bn    = Decode ? kBnDecode : kBnPrefill;
+    constexpr int bytes = static_cast<int>(sizeof(AttnSmem<MTiles, Bn>));
+    auto* kernel        = rel_attention_kernel<Local, Decode, MTiles, Mode, Bn>;
+    static const bool configured = [&] {
+        CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
+        return true;
+    }();
+    (void)configured;
+    const pdl::LaunchConfig launch{plan.grid, dim3(MTiles * 32), static_cast<std::size_t>(bytes), stream};
+    CUDA_CHECK(pdl::launch_dependent(launch, kernel, p));
 }
 
 template <bool Local, int Mode>
@@ -608,6 +653,8 @@ AttnParams make_params(const InklingAttentionInputs& in, const InklingAttentionR
     // Triton computes `softmax_scale * LOG2E` in fp32 inside the kernel; one IEEE product here.
     const float scale = static_cast<float>(0.08838834764831845);
     p.qk_scale_log2   = scale * kLog2e;
+    const char* variant = std::getenv("SUROGATE_INKLING_ATTN_VARIANT"); // experiment only; default 0
+    p.variant         = variant == nullptr ? 0 : std::atoi(variant);
     return p;
 }
 
