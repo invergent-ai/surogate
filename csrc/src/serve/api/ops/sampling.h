@@ -78,7 +78,7 @@ inline SampleKey sample_key(const SamplingConfig& config, std::int32_t position,
 }
 
 // Recompute greedy verification tokens when a request has logit overrides.
-// logits: BF16 [physical_rows,width,batch], targets: I32 [width,batch].
+// logits: BF16 or FP32 [physical_rows,width,batch], targets: I32 [width,batch].
 // Rows without overrides and stochastic rows are left unchanged.
 void sampling_update_greedy_targets(const Tensor& logits, Tensor& targets,
                                     std::int32_t token_domain, const SamplingConfig* configs,
@@ -93,7 +93,7 @@ void sampling_update_greedy_targets(const Tensor& logits, Tensor& targets,
                                                             std::int32_t max_lanes);
 
 /**
- * Produces one token id per independent request row. `logits` is contiguous BF16
+ * Produces one token id per independent request row. `logits` is contiguous BF16 or FP32
  * [physical_rows,B], `out` and `logical_positions` are contiguous I32 [B], and only vocabulary
  * rows v in [0,token_domain) participate. `configs` is a device-resident contiguous
  * SamplingConfig[B] array. Greedy and stochastic rows may coexist in one invocation.

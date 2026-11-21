@@ -49,8 +49,10 @@ inline void copy_pages(const PagedKVPool& pool, std::span<const std::int32_t> id
     // Only a page-major pool maps in granules (PagedKVOccupancy::granule_pages), so this names
     // the layout without widening the pool's interface.
     const bool page_major = pool.occupancy().granule_pages != 0;
-    for (std::size_t i = 0; i < pool.plane_count(); ++i) {
-        const Tensor& plane     = pool.plane(i);
+    // The full-context planes: all of them without a window class (window pages travel in the
+    // boundary objects, never in chunks).
+    for (std::size_t i = 0; i < pool.full_plane_count(); ++i) {
+        const Tensor& plane     = pool.full_plane(i);
         const int page_axis     = page_major ? 3 : 2;
         const auto stride       = static_cast<std::size_t>(plane.nb[page_axis]);
         const std::size_t heads = page_major ? 1 : static_cast<std::size_t>(plane.ne[3]);
@@ -152,7 +154,8 @@ void ProgramImplCore::configure_host_tier(const std::optional<std::size_t>& budg
         append_u64(model, value);
     }
     std::size_t offset = 0;
-    for (std::size_t plane = 0; plane < text_pool.plane_count(); ++plane) {
+    // The full-context planes (all of them without a window class: window pages are not in chunks).
+    for (std::size_t plane = 0; plane < text_pool.full_plane_count(); ++plane) {
         append_u64(model, text_pool.image_plane_bytes(plane, 1));
         tier->text_offset.push_back(offset);
         offset += archive_aligned(text_pool.image_plane_bytes(plane, kChunkPages));
@@ -279,9 +282,13 @@ bool ProgramImplCore::snapshot_lane(std::uint32_t lane, int reason) {
     const std::uint32_t frontier = reusable_append_frontier(sequence);
     if (frontier == 0 || frontier > sequence.ledger.size()) { return false; }
     drain_host_losses();
+    // Window-bounded KV: the windows behind the frontier and the checkpoint travel in their
+    // boundary objects, so a boundary whose window the lane no longer holds is not saved.
+    if (!window_reusable(sequence, frontier, false)) { return false; }
     const bool checkpoint = sequence.rewrite_checkpoint.valid && decoder->has_checkpoint(lane) &&
                             sequence.rewrite_checkpoint.frontier != 0 &&
-                            sequence.rewrite_checkpoint.frontier <= frontier;
+                            sequence.rewrite_checkpoint.frontier <= frontier &&
+                            window_reusable(sequence, sequence.rewrite_checkpoint.frontier, false);
     const std::uint32_t checkpoint_frontier = checkpoint ? sequence.rewrite_checkpoint.frontier : 0;
     const auto& text_pool           = decoder->text_kv.pool();
     const bool draft_pages          = sequence.kv->backend.has_value();
@@ -318,6 +325,29 @@ bool ProgramImplCore::snapshot_lane(std::uint32_t lane, int reason) {
     const auto chain = kvkeys::chunk_chain(root, ledger, frontier / kvtier::kChunkTokens);
 
     auto snapshot = std::make_unique<HostSnapshot>();
+    // The window pages behind the frontier and behind the checkpoint (empty without windows).
+    std::vector<std::int32_t> window_physical, checkpoint_window_physical;
+    if (window_paging()) {
+        const auto slots = sequence.kv->text.window_slots();
+        const auto collect = [&](std::uint32_t at, std::vector<std::uint32_t>& logical,
+                                 std::vector<std::int32_t>& physical) {
+            const std::uint32_t window = text_pool.window_tokens();
+            for (std::uint32_t page = KvWindowPages::keep_first_page(at, window); page < KvWindowPages::pages_for(at);
+                 ++page) {
+                const auto it = std::lower_bound(slots.begin(), slots.end(), page,
+                    [](const KvWindowSlot& slot, std::uint32_t value) { return slot.logical < value; });
+                if (it == slots.end() || it->logical != page) { return false; }
+                logical.push_back(page);
+                physical.push_back(it->physical);
+            }
+            return true;
+        };
+        if (!collect(frontier, snapshot->window_logical, window_physical) ||
+            (checkpoint && !collect(checkpoint_frontier, snapshot->checkpoint_window_logical,
+                                    checkpoint_window_physical))) {
+            return false; // window_reusable said yes; the keep margin makes this unreachable
+        }
+    }
     snapshot->chunks        = chunks;
     snapshot->text_pages    = text_pages;
     snapshot->backend_pages = backend_pages;
@@ -344,8 +374,12 @@ bool ProgramImplCore::snapshot_lane(std::uint32_t lane, int reason) {
     const auto state_saved = checkpoint ? prefix_state_tensors(sequence, true) : std::vector<Tensor>{};
     const std::uint32_t tail_first = chunks * kChunkPages;
     Packer boundary_pack{tier.block_bytes};
-    for (std::size_t plane = 0; plane < text_pool.plane_count(); ++plane) {
+    for (std::size_t plane = 0; plane < text_pool.full_plane_count(); ++plane) {
         snapshot->tail_text.push_back(boundary_pack.place(text_pool.image_plane_bytes(plane, text_pages - tail_first)));
+    }
+    for (std::size_t plane = 0; !window_physical.empty() && plane < text_pool.window_plane_count(); ++plane) {
+        snapshot->window.push_back(
+            boundary_pack.place(text_pool.window_image_plane_bytes(plane, window_physical.size())));
     }
     for (std::size_t plane = 0; backend_pool && plane < backend_pool->plane_count(); ++plane) {
         snapshot->tail_backend.push_back(
@@ -359,6 +393,11 @@ bool ProgramImplCore::snapshot_lane(std::uint32_t lane, int reason) {
     for (const auto& tensor : state_saved) {
         if (!tensor.is_contiguous()) { return give_back(); }
         snapshot->checkpoint_state.push_back(checkpoint_pack.place(tensor.bytes()));
+    }
+    for (std::size_t plane = 0; !checkpoint_window_physical.empty() && plane < text_pool.window_plane_count();
+         ++plane) {
+        snapshot->checkpoint_window.push_back(
+            checkpoint_pack.place(text_pool.window_image_plane_bytes(plane, checkpoint_window_physical.size())));
     }
     if (!boundary_pack.fits || !checkpoint_pack.fits) { return give_back(); }
     const std::uint32_t tail_tokens_first = chunks * kvtier::kChunkTokens;
@@ -436,6 +475,11 @@ bool ProgramImplCore::snapshot_lane(std::uint32_t lane, int reason) {
                 CUDA_CHECK(cudaMemcpyAsync(piece_at(snapshot->boundary, snapshot->state[i]), state_now[i].data,
                                            state_now[i].bytes(), cudaMemcpyDeviceToHost, tier.copy_stream));
             }
+            if (!window_physical.empty()) {
+                std::vector<std::byte*> planes;
+                for (const auto& piece : snapshot->window) { planes.push_back(piece_at(snapshot->boundary, piece)); }
+                text_pool.download_window_pages_to(window_physical, planes, tier.copy_stream);
+            }
             created.push_back(snapshot->boundary);
             bytes += boundary_pack.total();
         }
@@ -444,6 +488,13 @@ bool ProgramImplCore::snapshot_lane(std::uint32_t lane, int reason) {
                 CUDA_CHECK(cudaMemcpyAsync(piece_at(snapshot->checkpoint, snapshot->checkpoint_state[i]),
                                            state_saved[i].data, state_saved[i].bytes(), cudaMemcpyDeviceToHost,
                                            tier.copy_stream));
+            }
+            if (!checkpoint_window_physical.empty()) {
+                std::vector<std::byte*> planes;
+                for (const auto& piece : snapshot->checkpoint_window) {
+                    planes.push_back(piece_at(snapshot->checkpoint, piece));
+                }
+                text_pool.download_window_pages_to(checkpoint_window_physical, planes, tier.copy_stream);
             }
             created.push_back(snapshot->checkpoint);
             bytes += checkpoint_pack.total();
@@ -522,6 +573,33 @@ void ProgramImplCore::restore_host_snapshot(SequenceState& sequence, const Reque
     clear_lane(sequence, requests[sequence.lane]);
     sequence.copy_metadata(image.state);
     reserve_sequence_kv(sequence, plan.text_kv_page_entitlement, plan.backend_kv_page_entitlement);
+    // Window-bounded KV: map the saved window pages first (materializing checks the reuse point's
+    // window), the frontier's and, when the checkpoint comes along, the checkpoint's; their bytes
+    // are uploaded with the rest below, the checkpoint's first so the frontier's copy wins where
+    // they share a page (the frontier's has the answer's tokens past the checkpoint).
+    const bool checkpoint_window = image.state.rewrite_checkpoint.valid && snapshot.has_checkpoint &&
+                                   !snapshot.checkpoint_window_logical.empty();
+    std::vector<std::int32_t> window_physical, checkpoint_window_physical;
+    if (!snapshot.window_logical.empty()) {
+        std::vector<std::uint32_t> logical = snapshot.window_logical;
+        if (checkpoint_window) {
+            logical.insert(logical.end(), snapshot.checkpoint_window_logical.begin(),
+                           snapshot.checkpoint_window_logical.end());
+            std::sort(logical.begin(), logical.end());
+            logical.erase(std::unique(logical.begin(), logical.end()), logical.end());
+        }
+        const auto physical = sequence.kv->text.window_map_restored(logical, device.stream);
+        const auto lookup = [&](const std::vector<std::uint32_t>& wanted) {
+            std::vector<std::int32_t> out;
+            for (const std::uint32_t page : wanted) {
+                const auto at = std::lower_bound(logical.begin(), logical.end(), page) - logical.begin();
+                out.push_back(physical[static_cast<std::size_t>(at)]);
+            }
+            return out;
+        };
+        window_physical = lookup(snapshot.window_logical);
+        if (checkpoint_window) { checkpoint_window_physical = lookup(snapshot.checkpoint_window_logical); }
+    }
     const auto backend_tokens = speculative_backend == SpeculativeBackend::Mtp
         ? plan.reuse_base - 1 : speculative_backend == SpeculativeBackend::DFlash ? plan.reuse_base : 0;
     materialize_sequence_kv(sequence, plan.reuse_base, backend_tokens);
@@ -559,6 +637,17 @@ void ProgramImplCore::restore_host_snapshot(SequenceState& sequence, const Reque
     CUDA_CHECK(cudaStreamWaitEvent(tier.copy_stream, ordered, 0));
     CUDA_CHECK(cudaEventRecord(start, tier.copy_stream));
     restore_pages(text_pool, text_ids, text_need, snapshot.text_pages, tier.text_offset, snapshot.tail_text);
+    const auto restore_window = [&](family::detail::HostKvPool::ObjectId object,
+                                    const std::vector<HostSnapshot::Piece>& pieces,
+                                    const std::vector<std::int32_t>& physical) {
+        if (physical.empty()) { return; }
+        std::vector<const std::byte*> planes;
+        for (const auto& piece : pieces) { planes.push_back(piece_at(object, piece)); }
+        text_pool.upload_window_pages_from(planes, static_cast<std::uint32_t>(physical.size()), physical,
+                                           tier.copy_stream);
+    };
+    restore_window(snapshot.checkpoint, snapshot.checkpoint_window, checkpoint_window_physical);
+    restore_window(snapshot.boundary, snapshot.window, window_physical);
     if (backend_pool) {
         restore_pages(*backend_pool, backend_ids, backend_need, snapshot.backend_pages, tier.backend_offset,
                       snapshot.tail_backend);

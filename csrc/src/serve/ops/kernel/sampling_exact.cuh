@@ -34,20 +34,21 @@ __device__ inline float exact_max(float value, ExactSamplingScratch& scratch) {
     return result;
 }
 struct ExactSample { int token; float candidate_probability; };
+template <typename LogitT>
 __device__ inline ExactSample sampling_untruncated_exact(
-    const __nv_bfloat16* logits, int domain, const SamplingConfig& cfg, int position, int purpose,
+    const LogitT* logits, int domain, const SamplingConfig& cfg, int position, int purpose,
     ExactSamplingScratch& scratch, int candidate = -1, int excluded = -1,
     const int32_t* overlay = nullptr, int overlay_len = 0) {
     float max = -CUDART_INF_F;
     for (int v = threadIdx.x; v < domain; v += blockDim.x) {
-        max = fmaxf(max, sampling_adjusted_logit(__bfloat162float(logits[v]), v, cfg, overlay, overlay_len));
+        max = fmaxf(max, sampling_adjusted_logit(logit_value(logits[v]), v, cfg, overlay, overlay_len));
     }
     max = exact_max(max, scratch);
     const float floor = cfg.min_p > 0 ? max + cfg.temperature * logf(cfg.min_p) : -CUDART_INF_F;
     double total = 0;
     unsigned long long best = 0;
     for (int v = threadIdx.x; v < domain; v += blockDim.x) {
-        const float x = sampling_adjusted_logit(__bfloat162float(logits[v]), v, cfg, overlay, overlay_len);
+        const float x = sampling_adjusted_logit(logit_value(logits[v]), v, cfg, overlay, overlay_len);
         if (!isfinite(x) || x < floor) { continue; }
         total += exp((double(x) - max) / cfg.temperature);
         if (v != excluded) {
@@ -59,7 +60,7 @@ __device__ inline ExactSample sampling_untruncated_exact(
     best = sampling_block_max_key(best, scratch.keys);
     float probability = 0;
     if (candidate >= 0 && candidate < domain) {
-        const float x = sampling_adjusted_logit(__bfloat162float(logits[candidate]), candidate, cfg, overlay, overlay_len);
+        const float x = sampling_adjusted_logit(logit_value(logits[candidate]), candidate, cfg, overlay, overlay_len);
         if (isfinite(x) && x >= floor && total > 0) {
             probability = static_cast<float>(exp((double(x) - max) / cfg.temperature) / total);
         }

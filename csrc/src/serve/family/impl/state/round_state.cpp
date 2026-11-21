@@ -65,7 +65,7 @@ RoundStateLayout begin_round_state_layout(LayoutBuilder& builder, const RoundSta
             builder.add(sizeof(OrdinaryDecodeIngress), 256, "ordinary decode ingress");
         ordinary.egress = builder.add(sizeof(OrdinaryDecodeEgress), 256, "ordinary decode egress");
         ordinary.logits = add_tensor(
-            builder, DType::BF16,
+            builder, spec.logits_dtype,
             {spec.output_rows, checked_i32(spec.batch_capacity, "RoundState batch capacity")},
             "ordinary decode logits");
         ordinary.hidden =
@@ -78,7 +78,7 @@ RoundStateLayout begin_round_state_layout(LayoutBuilder& builder, const RoundSta
         finalize.hidden    = add_tensor(builder, DType::BF16,
                                         {spec.hidden, kMaximumPrefillSegments},
                                         "mixed prefill finalize hidden");
-        finalize.logits    = add_tensor(builder, DType::BF16,
+        finalize.logits    = add_tensor(builder, spec.logits_dtype,
                                         {spec.output_rows, kMaximumPrefillSegments},
                                         "mixed prefill finalize logits");
         finalize.positions = add_tensor(builder, DType::I32, {kMaximumPrefillSegments},
@@ -95,7 +95,7 @@ RoundStateLayout begin_round_state_layout(LayoutBuilder& builder, const RoundSta
     layout.pos        = add_tensor(builder, DType::I32, {1}, "step position");
     layout.rope_pos   = add_tensor(builder, DType::I32, {1}, "step rope position");
     layout.rope_delta = add_tensor(builder, DType::I32, {1}, "step rope delta");
-    layout.logits     = add_tensor(builder, DType::BF16, {spec.output_rows, 1}, "step logits");
+    layout.logits     = add_tensor(builder, spec.logits_dtype, {spec.output_rows, 1}, "step logits");
     layout.text_kv_table_row    = add_tensor(builder, DType::I32, {1}, "step Text KV table row");
     layout.backend_kv_table_row = add_tensor(builder, DType::I32, {1}, "step backend KV table row");
     layout.attention_metadata   = add_tensor(
@@ -178,7 +178,7 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
         decode.target_argmax =
             add_tensor(builder, DType::I32, {columns, batch}, "MTP decode target argmax");
         decode.target_logits =
-            add_tensor(builder, DType::BF16, {layout.spec.output_rows, columns, batch},
+            add_tensor(builder, layout.spec.logits_dtype, {layout.spec.output_rows, columns, batch},
                        "MTP decode target logits");
         decode.target_hidden = add_tensor(
             builder, DType::BF16, {layout.spec.hidden, columns, batch}, "MTP decode target hidden");
@@ -227,7 +227,7 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
         decode.target_argmax =
             add_tensor(builder, DType::I32, {columns, batch}, "DFlash target argmax");
         decode.target_logits =
-            add_tensor(builder, DType::BF16, {layout.spec.output_rows, columns, batch},
+            add_tensor(builder, layout.spec.logits_dtype, {layout.spec.output_rows, columns, batch},
                        "DFlash target logits");
         decode.target_hidden = add_tensor(
             builder, DType::BF16, {layout.spec.hidden, columns, batch}, "DFlash target hidden");

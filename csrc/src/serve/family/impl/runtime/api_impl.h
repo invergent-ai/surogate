@@ -301,6 +301,11 @@ bool Program<Variant>::kv_service_pressure() noexcept {
 }
 
 template <>
+void Program<Variant>::kv_round_boundary() noexcept {
+    impl_->kv_round_boundary();
+}
+
+template <>
 void Program<Variant>::reset_memory_peaks() noexcept {
     impl_->reset_memory_peaks();
 }

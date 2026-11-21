@@ -4,6 +4,7 @@
 #include <api/family/prepared_prompt.h>
 
 #include "family/impl/frontend/chat_template.h"
+#include "family/impl/frontend/inkling_render.h"
 #include "family/impl/frontend/media_cache.h"
 #include "family/impl/frontend/processor.h"
 #include "family/impl/frontend/test_access.h"
@@ -399,6 +400,21 @@ bool spells_qwen3_coder_tool_calls(const fi::Tokenizer& tokenizer) {
         if (ids.size() != 1) { return false; }
     }
     return true;
+}
+
+/// Inkling-2's framing tokens, when the vocabulary spells each of them as one special token. Such a checkpoint ships no
+/// chat template: vLLM renders its prompt token by token from the request (vllm/renderers/inkling_encoding.py), and
+/// so does this frontend (inkling_render.h).
+std::optional<fi::inkling::SpecialTokens> inkling_tokens(const fi::Tokenizer& tokenizer) {
+    for (const std::string_view marker : {"<|message_model|>", "<|content_thinking|>", "<|content_invoke_tool_json|>",
+                                          "<|end_message|>", "<|content_model_end_sampling|>"}) {
+        const std::optional<int> id = tokenizer.token_id(marker);
+        if (!id || !tokenizer.is_special_token(*id)) { return std::nullopt; }
+    }
+    try {
+        return fi::inkling::SpecialTokens::resolve(
+            [&](std::string_view spelling) { return tokenizer.token_id(spelling); });
+    } catch (const std::invalid_argument&) { return std::nullopt; }
 }
 
 /// The reasoning markers a checkpoint states, or the `<think>` pair when it states none.
@@ -1120,6 +1136,17 @@ public:
           vision_enabled(options.vision_enabled),
           has_chat_template(!resources.chat_template_jinja.empty() ||
                             !options.chat_template_override.empty()) {
+        // Inkling-2 (no template, its own framing tokens): the model opens a thinking block itself,
+        // `<|message_model|><|content_thinking|>`, and `<|end_message|>` closes it -- the thought the
+        // output session tracks (the thinking guard among its readers). The reply as a whole is read
+        // back by vLLM's Inkling parser in the serving layer, not by this split.
+        if (!has_chat_template && options.chat_template_override.empty()) { inkling = inkling_tokens(*tokenizer); }
+        if (inkling) {
+            reasoning.muse_glimmer = false;
+            reasoning.open         = "<|content_thinking|>";
+            reasoning.close        = "<|end_message|>";
+            reasoning.model_opens  = true;
+        }
         reasoning.marker_tokens = special_marker_tokens(*tokenizer, reasoning);
         if (const char* probe = std::getenv("SUROGATE_SERVE_TRACE_REASONING"); probe != nullptr) {
             std::fprintf(stderr,
@@ -1159,6 +1186,15 @@ public:
                                                },
                                                reasoning)
                 : chat_template.capabilities();
+        if (inkling) {
+            // What the serving layer may ask of the request is vLLM's Inkling renderer's business: the request body
+            // reaches it whole (PromptOptions::raw_chat_request). The switch is accepted and, as there, has no
+            // effect on the prompt; the model thinks when it chooses to.
+            capabilities                     = PromptCapabilities{};
+            capabilities.inkling2_chat       = true;
+            capabilities.enable_thinking     = true;
+            capabilities.thinking_by_default = true;
+        }
         capabilities.gemma4_tool_calls = spells_gemma4_tool_calls(*tokenizer);
         capabilities.qwen3_coder_tool_calls =
             chat_template.rendered_by_tokenizer() && spells_qwen3_coder_tool_calls(*tokenizer) &&
@@ -1236,6 +1272,23 @@ public:
                 std::string(reasoning_effort_name(*options.reasoning_effort));
         }
         return variables;
+    }
+
+    /// Inkling-2's prompt for the request body the serving layer handed over: vLLM's renderer, token for token.
+    /// Throws std::invalid_argument (inkling::RequestError) where vLLM refuses the request.
+    [[nodiscard]] std::vector<int> render_inkling(const PromptOptions& options) const {
+        if (!options.raw_chat_request) {
+            throw std::invalid_argument(
+                "this model renders its prompt from the chat-completions request itself; "
+                "ask it through /v1/chat/completions");
+        }
+        const fi::inkling::ChatRequest request = fi::inkling::parse_chat_request(*options.raw_chat_request);
+        return fi::inkling::render_chat(
+            request,
+            [this](std::string_view text) {
+                return tokenizer->encode(text, {.parse_added_tokens = false, .add_bos = false});
+            },
+            *inkling);
     }
 
     /// Renders the conversation with whichever renderer this checkpoint's template
@@ -1341,6 +1394,8 @@ public:
     bool preserves_thinking = false;
     /// The artifact's template has a developer role of its own (see consolidate_system_messages).
     bool supports_developer_role = false;
+    /// Inkling-2's framing tokens when this checkpoint renders natively (PromptCapabilities::inkling2_chat).
+    std::optional<fi::inkling::SpecialTokens> inkling;
     bool vision_enabled = true;
     /// Whether anything was compiled above. A checkpoint with no template is a base model, and
     /// only the raw-prompt path can serve it.
@@ -1693,6 +1748,22 @@ const PreparedPromptData& FrontendTestAccess::inspect(const PreparedPrompt& prom
 PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& control) const {
     fi::check_preparation_control(control);
     const auto start                      = Clock::now();
+    if (impl_->inkling) {
+        auto prepared               = std::make_unique<PreparedPromptData>();
+        PreparedPromptData& result  = *prepared;
+        result.uses_chat_template   = true;
+        const std::vector<int> ids  = impl_->render_inkling(input.options);
+        result.prepare.tokenize_seconds = std::chrono::duration<double>(Clock::now() - start).count();
+        fi::check_preparation_control(control, "tokenization");
+        result.token_ids.assign(ids.begin(), ids.end());
+        assign_text_positions(result);
+        (void)checked_token_count(result.token_ids.size());
+        result.identity.reusable   = true;
+        // The model writes `<|message_model|><|content_thinking|>` itself: a prompt never ends in a thought.
+        result.starts_in_reasoning = false;
+        result.prepare.seconds     = std::chrono::duration<double>(Clock::now() - start).count();
+        return PreparedPrompt(std::move(prepared));
+    }
     const PromptOptions options           = input.options;
     std::vector<fi::ChatMessage> messages = convert_messages(std::move(input.messages));
     if (impl_->tokenizer->renders_chat_template()) {
@@ -1874,6 +1945,11 @@ std::vector<std::string> Frontend::token_texts(std::span<const TokenId> ids) con
 
 std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl& control) const {
     fi::check_preparation_control(control);
+    if (impl_->inkling) {
+        const std::uint32_t count = checked_token_count(impl_->render_inkling(input.options).size());
+        fi::check_preparation_control(control, "tokenization");
+        return count;
+    }
     const PromptOptions options           = input.options;
     std::vector<fi::ChatMessage> messages = convert_messages(std::move(input.messages));
     if (impl_->tokenizer->renders_chat_template()) {
@@ -1940,7 +2016,7 @@ MediaCacheSummary Frontend::media_cache_summary() const {
     };
 }
 
-bool Frontend::supports_chat() const noexcept { return impl_->has_chat_template; }
+bool Frontend::supports_chat() const noexcept { return impl_->has_chat_template || impl_->inkling.has_value(); }
 
 std::vector<std::pair<TokenId, std::string>> Frontend::named_special_tokens() const {
     std::vector<std::pair<TokenId, std::string>> out;

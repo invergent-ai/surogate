@@ -158,6 +158,9 @@ private:
     /// --thinking-retention: give the request's assistant turns their stored reasoning back (before it is routed,
     /// so the routing key sees the prompt the replica will render). The tenant is the key the request presented.
     void restore_retained_thinking(const httplib::Request& http, GenerationRequest& request);
+    /// Whether the model a chat body names renders its prompt from the body itself (Inkling-2): its conversation
+    /// fields are then left to that renderer (RequestLimits::raw_chat) and the body travels with the request.
+    [[nodiscard]] bool renders_raw_chat(const nlohmann::ordered_json& body) const;
     /// File the reasoning of a finished answer for the conversation's next request; nothing for a cancelled one.
     void retain_answer_thinking(const ThinkingRetentionState& retention, const GenerationOutcome& outcome);
 

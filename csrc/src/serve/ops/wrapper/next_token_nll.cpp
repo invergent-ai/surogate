@@ -9,9 +9,9 @@ namespace sinfer::ops {
 
 void next_token_nll(const Tensor& logits, const Tensor& targets, Tensor& out, Tensor* argmax,
                     std::int32_t token_domain, cudaStream_t stream) {
-    if (logits.dtype != DType::BF16 || logits.data == nullptr || logits.ne[0] <= 0 ||
-        logits.ne[1] <= 0 || logits.ne[2] != 1 || logits.ne[3] != 1) {
-        throw std::invalid_argument("next_token_nll: logits must be BF16 [vocab, n]");
+    if ((logits.dtype != DType::BF16 && logits.dtype != DType::FP32) || logits.data == nullptr ||
+        logits.ne[0] <= 0 || logits.ne[1] <= 0 || logits.ne[2] != 1 || logits.ne[3] != 1) {
+        throw std::invalid_argument("next_token_nll: logits must be BF16 or FP32 [vocab, n]");
     }
     const std::int32_t columns = logits.ne[1];
     if (targets.dtype != DType::I32 || targets.data == nullptr || targets.ne[0] != columns ||

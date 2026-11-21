@@ -39,6 +39,11 @@ struct PersistentLayout {
     family::DecoderStateLayout decoder;
     family::DecoderCheckpointLayout checkpoints;
     std::optional<GdnReplayRecordLayout> replay_records;
+    /// A visit-schedule target's speculative verify records (family/impl/runtime/visit_round.h): the per-visit conv
+    /// state before a round ([visits][rows][channels x 3]) and the round's conv inputs ([rows][visits][width][channels]).
+    std::optional<LayoutRegion> visit_records;
+    /// A visit-schedule target's persistent state for its compute stream (family::visit_target_state_bytes_if).
+    std::optional<LayoutRegion> visit_target_state;
     std::optional<DFlashPersistentLayout> dflash;
     family::RoundStateLayout round;
     TensorLayout prefill_hidden;
@@ -85,6 +90,10 @@ struct SequencePlanningInputs {
     std::vector<std::uint32_t> kv_skip_layers;
     bool elastic_kv                        = false;
     bool elastic_kv_overcommit             = false;
+    /// Lane f1 M3-C: a model with windowed layers keeps them in a demand-mapped window class
+    /// whose pages are charged to the main KV ledger (on with --kv-capacity auto and elastic KV;
+    /// SUROGATE_SERVE_KV_WINDOW_ELASTIC=0 / 1 overrides). Inert without windowed layers.
+    bool kv_window_elastic                 = false;
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
     bool use_cuda_graph = true;
@@ -131,6 +140,7 @@ struct SequencePlanImpl<SINFER_FAMILY_VARIANT> {
     std::vector<std::uint32_t> kv_skip_layers;
     bool elastic_kv                        = false;
     bool elastic_kv_overcommit             = false;
+    bool kv_window_elastic                 = false; ///< SequencePlanningInputs::kv_window_elastic
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
     bool use_cuda_graph = true;

@@ -350,6 +350,9 @@ struct SharedPrefix {
     std::uint32_t slot = 0;
     std::vector<Tensor> current;
     Tensor hidden; // MTP only: the trunk's hidden at token `tokens - 1`
+    // Window-bounded KV: a copy of the window pages behind `tokens`, which a fork copies back
+    // (forks never borrow window pages). Null when the model has no windowed layers.
+    std::shared_ptr<const PagedKVWindowImage> window;
     std::uint64_t last_use = 0;
     std::uint32_t hits = 0;
     ~SharedPrefix() { if (storage) storage->free.push_back(slot); }
@@ -374,6 +377,10 @@ struct HostSnapshot {
     bool has_checkpoint = false;
     std::vector<Piece> tail_text, tail_backend; ///< one per plane: the tail pages' image
     std::vector<Piece> state, checkpoint_state; ///< one per state tensor
+    // Window-bounded KV: the window pages behind the frontier (boundary object) and behind the
+    // rewrite checkpoint (checkpoint object): their logical page numbers, one piece per window plane.
+    std::vector<std::uint32_t> window_logical, checkpoint_window_logical;
+    std::vector<Piece> window, checkpoint_window;
     std::uint64_t bytes = 0;                    ///< bytes this snapshot wrote (new objects only)
     ~HostSnapshot() {
         if (pool && entry != 0) { pool->drop_entry(entry); }
@@ -389,6 +396,9 @@ struct ArchivedSequence {
     family::detail::ArchiveBlock storage;
     std::uint32_t text_pages = 0, backend_pages = 0;
     std::vector<std::byte*> text, backend;
+    // Window-bounded KV: the window pages the lane held (logical page numbers) and their planes.
+    std::vector<std::uint32_t> window_logical;
+    std::vector<std::byte*> window;
     std::vector<std::span<std::byte>> current, checkpoint;
     std::unique_ptr<HostSnapshot> tier;
 };
@@ -611,6 +621,7 @@ public:
     [[nodiscard]] bool kv_under_pressure() const noexcept;
     /// Round boundary: perform a reserve release another engine asked for, report pressure.
     bool kv_service_pressure() noexcept;
+    void kv_round_boundary() noexcept; ///< lane f1 M3-C: window-class compaction (pipelined executor)
 
     /// --kv-admission (DESIGN-kv-admission.md), set once by the executor before any request is
     /// planned. On demand only where a recompute reproduces a sequence: not on a pipeline stage
@@ -1058,6 +1069,25 @@ private:
                                         std::uint32_t nominal);
     void trim_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
                           std::uint32_t backend_tokens = 0);
+    // Window-bounded KV pages (lane f1, prefix_cache_impl.h; DESIGN-window-kv.md). All of them do
+    // nothing unless the text pool has a window class, which only a model with windowed layers has.
+    [[nodiscard]] bool window_paging() const noexcept;
+    /// Frontiers whose window the sequence must keep: its rewrite checkpoint, and the one its
+    /// running prefill will capture.
+    [[nodiscard]] std::vector<std::uint32_t> window_pins(const SequenceState& sequence) const;
+    /// Before a forward (from materialize_sequence_kv): release what fell behind the window, map
+    /// the forward's pages. A lane not running a request (admission, restores) maps none ahead.
+    void prepare_window_kv(SequenceState& sequence, std::uint32_t main_tokens);
+    /// After a prefill chunk's tokens are committed: keep only the window behind them (+ pins).
+    void settle_window_kv(SequenceState& sequence);
+    /// May a plan resume `sequence` at `base` as far as its windowed layers go? A resident lane
+    /// asks its pages; a saved state (`archived`: archive, host tier, shared prefix) holds the
+    /// window behind its frontier and behind its rewrite checkpoint only.
+    [[nodiscard]] bool window_reusable(const SequenceState& sequence, std::uint32_t base,
+                                       bool archived) const noexcept;
+    /// M3-C: at a round boundary, compact an elastic window class (bitwise page moves); lanes
+    /// whose pages a host-tier copy may still read stay put. noexcept: a failure only skips it.
+    void compact_window_kv() noexcept;
     void release_sequence_growth_entitlement(SequenceState& sequence) noexcept;
     [[nodiscard]] family::PagedKVCache* backend_kv_cache() noexcept;
     [[nodiscard]] const family::PagedKVCache* backend_kv_cache() const noexcept;

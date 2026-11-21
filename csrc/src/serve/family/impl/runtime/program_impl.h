@@ -21,6 +21,8 @@
 #include "ops/linear/nvfp4/nvfp4_cublaslt.h"
 #include "api/ops/scatter.h"
 #include "api/ops/speculative_round.h"
+#include "api/ops/inkling_mix.h"
+#include "family/impl/runtime/visit_round.h"
 #include "ops/linear/ggml/ggml_dispatch.h"
 
 #include <cuda_runtime.h>
@@ -526,6 +528,32 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     // graphs it captures for them. The plan decided it from the options, and sized the graph
     // allowance for those graphs; an engine whose store bound nothing has no second flavor.
     base_rounds_ = plan.base_rounds && ops::lora_enabled();
+    // A visit-schedule target's verify records: the per-visit conv state before a speculative round
+    // and the round's conv inputs, which the resolve folds (family/impl/runtime/visit_round.h).
+    if (family::visit_schedule<Variant>() && speculative_backend != SpeculativeBackend::None) {
+        const auto channels = static_cast<std::size_t>(decoder->linear_attention.spec.conv_channels);
+        const auto visits   = static_cast<std::size_t>(decoder->linear_attention.layer_count());
+        const auto width    = static_cast<std::size_t>(speculative_round_width());
+        const auto rows     = static_cast<std::size_t>(batch_capacity);
+        const std::size_t old_bytes = (channels * 3 * visits * rows * 2 + 255) & ~std::size_t{255};
+        if (!plan.persistent.visit_records ||
+            plan.persistent.visit_records->bytes < old_bytes + channels * width * visits * rows * 2) {
+            throw std::logic_error("visit records: the persistent layout planned no (or a smaller) region");
+        }
+        const DeviceSpan records = plan.persistent.visit_records->bind(backing);
+        io.visit_records_old    = records.data;
+        io.visit_records_inputs = static_cast<std::byte*>(records.data) + old_bytes;
+        io.visit_records_visits = static_cast<std::int32_t>(visits);
+        io.visit_records_width  = static_cast<std::int32_t>(width);
+        io.visit_records_batch  = static_cast<std::int32_t>(rows);
+    }
+    // A visit-schedule target's persistent state for the compute stream (lane d's MoE counters): zeroed once here,
+    // then owned by the target's kernels (they leave it zeroed at the end of every call).
+    if (plan.persistent.visit_target_state) {
+        const DeviceSpan state = plan.persistent.visit_target_state->bind(backing);
+        CUDA_CHECK(cudaMemsetAsync(state.data, 0, state.bytes, device.stream));
+        io.visit_target_state = state.data;
+    }
     // Rollout Routing Replay: when the engine runs with SUROGATE_SERVE_CAPTURE_ROUTING=1 every
     // main-model forward copies each layer's selected expert ids into a fixed buffer, which the
     // graphs captured below record. Allocated before prepare_graphs() so they bake its address.
@@ -575,6 +603,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     // The shared-prefix cache cuts a capturing prompt at the prefix boundary, which a fixed
     // batch-invariant cut schedule forbids. An MTP head's KV and the boundary's hidden go with
     // the prefix (PATCHES #150); a DFlash drafter keeps context it does not copy.
+    // A visit-schedule target takes the shared prefixes and the host tier like every other target: its per-visit
+    // conv state travels in the prefix images (lane f1's prefix_state_tensors, merge M2).
     if ((speculative_backend == SpeculativeBackend::None || speculative_backend == SpeculativeBackend::Mtp) &&
         !pipeline_stage() && !ops::batch_invariant()) {
         const char* raw = std::getenv("SUROGATE_SERVE_SHARED_PREFIX_SLOTS");
@@ -629,12 +659,15 @@ bool ProgramImplCore::can_admit_lane(std::uint32_t lane, const RequestPlan& plan
     // The pool's own test: the page arithmetic, and for an overcommitting elastic pool the
     // device gate — a refusal there must keep the request pending, not fail its reservation.
     const auto can_replace = [](const PagedKVPool& pool, std::uint32_t old_pages,
-                                std::uint32_t new_pages) {
-        return pool.can_replace_entitlement(old_pages, new_pages);
+                                std::uint32_t new_pages, std::uint32_t extra = 0) {
+        return pool.can_replace_entitlement(old_pages, new_pages, extra);
     };
     const std::uint32_t old_text = sequence.kv ? sequence.kv->text.owned_entitlement() : 0;
-    if (!can_replace(decoder->text_kv.pool(), old_text, plan.summary().admission.main_kv_pages) ||
-        !leaves_kv_watermark(lane, old_text, 0, plan.summary().admission.main_kv_pages)) {
+    // Lane f1 M3-C: a lane without an allocation gets one, and an elastic window class books its
+    // window pages with it (0 for every model without one). A lane that has one keeps its charge.
+    const std::uint32_t window_charge = sequence.kv ? 0U : decoder->text_kv.pool().window_lane_charge_pages();
+    if (!can_replace(decoder->text_kv.pool(), old_text, plan.summary().admission.main_kv_pages, window_charge) ||
+        !leaves_kv_watermark(lane, old_text, 0, plan.summary().admission.main_kv_pages + window_charge)) {
         return false;
     }
     const family::PagedKVCache* backend = backend_kv_cache();
@@ -705,7 +738,10 @@ bool ProgramImplCore::can_admit_lane_after_retained_eviction(
             if (entry.second) { keep(entry.second->pages.get()); }
         }
         std::uint32_t pages = 0;
-        for (const PagedKVAllocation* allocation : kept) { pages += allocation->owned_entitlement(); }
+        // (+ the window pages an elastic window class booked for them, M3-C; 0 otherwise)
+        for (const PagedKVAllocation* allocation : kept) {
+            pages += allocation->owned_entitlement() + allocation->window_charge();
+        }
         return pages;
     };
     const auto reclaimable = [&](const PagedKVPool& pool, bool backend_pool) {
@@ -717,20 +753,23 @@ bool ProgramImplCore::can_admit_lane_after_retained_eviction(
     // The retained lanes' entitlements go back before the new one is taken: the pool's test
     // with them folded into the pages being replaced (device gate included).
     const auto can_replace = [](const PagedKVPool& pool, std::uint32_t old_pages,
-                                std::uint32_t reclaimable_pages, std::uint32_t new_pages) {
+                                std::uint32_t reclaimable_pages, std::uint32_t new_pages,
+                                std::uint32_t extra = 0) {
         if (old_pages > pool.entitled_pages() ||
             reclaimable_pages > pool.entitled_pages() - old_pages) {
             return false;
         }
-        return pool.can_replace_entitlement(old_pages + reclaimable_pages, new_pages);
+        return pool.can_replace_entitlement(old_pages + reclaimable_pages, new_pages, extra);
     };
 
     const SequenceState& sequence = sequences[lane];
     const std::uint32_t old_text  = sequence.kv ? sequence.kv->text.owned_entitlement() : 0;
+    // Lane f1 M3-C: as in can_admit_lane, a new allocation's window charge (0 without one).
+    const std::uint32_t window_charge = sequence.kv ? 0U : decoder->text_kv.pool().window_lane_charge_pages();
     if (!can_replace(decoder->text_kv.pool(), old_text, reclaimable_text,
-                     plan.summary().admission.main_kv_pages) ||
+                     plan.summary().admission.main_kv_pages, window_charge) ||
         !leaves_kv_watermark(lane, old_text, reclaimable_text,
-                             plan.summary().admission.main_kv_pages)) {
+                             plan.summary().admission.main_kv_pages + window_charge)) {
         return false;
     }
 
@@ -1329,6 +1368,30 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
                                   device.stream);
         }
         if (defer) { flush_deferred_fold_counts(); }
+        // A visit-schedule target's conv state: every row that ran a verify (not a narrow, in-place
+        // round) becomes the last 3 of [state before the round | its committed inputs].
+        if (io.visit_records_old != nullptr) {
+            std::array<ops::InklingConvFoldRow, kMaximumBatchColumns> visit_rows{};
+            std::size_t visit_count = 0;
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                if (requests[lanes[row]].pending.in_place_state) { continue; }
+                visit_rows[visit_count++] = ops::InklingConvFoldRow{
+                    .row = static_cast<std::int32_t>(row), .slot = fold_rows[row].linear_state_slot,
+                    .committed = static_cast<std::int32_t>(cancelled[row] ? 0U : accepted_tokens[row])};
+            }
+            const auto& conv = decoder->linear_attention.conv;
+            const ops::InklingConvPool pool{
+                conv.front().data,
+                conv.size() > 1 ? (static_cast<const std::byte*>(conv[1].data) -
+                                   static_cast<const std::byte*>(conv[0].data)) / 2 : 0,
+                decoder->linear_attention.conv_slot_stride_elements(),
+                static_cast<std::int32_t>(conv.size())};
+            ops::inkling_conv_fold(pool, std::span<const ops::InklingConvFoldRow>(visit_rows.data(), visit_count),
+                                   ops::InklingConvRecords{io.visit_records_old, io.visit_records_inputs,
+                                                           io.visit_records_visits, io.visit_records_width,
+                                                           io.visit_records_batch},
+                                   device.stream);
+        }
         // The n-gram PLE layer wrote its state from the round's last column, rejected drafts
         // included; its snapshots hold the state after each column, and the committed prefix's
         // last one is what the next round must start from.
@@ -1966,6 +2029,7 @@ void ProgramImplCore::materialize_sequence_kv(SequenceState& sequence, std::uint
     if (backend_tokens != 0 && backend_tokens > sequence.kv->backend->mapped_token_capacity()) {
         sequence.kv->backend->materialize_tokens(backend_tokens, device.stream);
     }
+    if (window_paging()) { prepare_window_kv(sequence, main_tokens); }
 }
 
 void ProgramImplCore::materialize_graph_chunk_window(SequenceState& sequence, std::uint32_t cursor,
@@ -2050,7 +2114,8 @@ void ProgramImplCore::prepare_graphs() {
         }
         allocations.reserve(batch_capacity);
         for (std::uint32_t row = 0; row < batch_capacity; ++row) {
-            allocations.push_back(pool.reserve(1));
+            // One page, and one window page where the pool has a window class (window_capture_fill).
+            allocations.push_back(pool.reserve(1, pool.has_window_class() ? 1U : 0U));
             PagedKVAllocation& allocation = allocations.back();
             allocation.bind_row(static_cast<std::int32_t>(row), device.stream);
             allocation.materialize_pages(1, device.stream);
@@ -2063,6 +2128,8 @@ void ProgramImplCore::prepare_graphs() {
             Tensor table = pool.block_table_row(static_cast<std::int32_t>(row));
             CUDA_CHECK(cudaMemcpyAsync(table.data, repeated.data(), table.bytes(),
                                        cudaMemcpyHostToDevice, device.stream));
+            // The window class's table the same way: a private window page, never the sentinel.
+            if (pool.has_window_class()) { allocation.window_capture_fill(device.stream); }
         }
     };
     reserve_capture_rows(decoder->text_kv, text_capture_allocations, "target KV cache");
@@ -2083,6 +2150,7 @@ void ProgramImplCore::prepare_graphs() {
         const auto settle = [](family::PagedKVCache* cache) {
             if (cache == nullptr) { return; }
             if (ElasticKvRegion* region = cache->pool().elastic_region()) { region->wait_idle(); }
+            if (ElasticKvRegion* region = cache->pool().window_elastic_region()) { region->wait_idle(); }
         };
         settle(&decoder->text_kv);
         // The draft caches have a region only if they are ever built elastic.
@@ -2643,7 +2711,9 @@ void ProgramImplCore::prepare_graphs() {
     }();
     // DFlash engines also serve target-only decision readouts. Capture the ordinary
     // target prefill body for those requests; reasoning prefills keep their feature sink.
-    if (!prefill_graph_vetoed && (speculative_backend == SpeculativeBackend::None ||
+    // A visit-schedule target's prefill / mixed graph bodies are not wired yet (lanes/e1 NOTES).
+    if (!prefill_graph_vetoed && !family::visit_schedule<Variant>() &&
+        (speculative_backend == SpeculativeBackend::None ||
                                  speculative_backend == SpeculativeBackend::DFlash)) {
         // The fp4 cutlass epilogue's device alpha scalar initializes lazily
         // with a synchronous copy; force it now so no captured body ever
@@ -3068,6 +3138,12 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 staged.rewrite_checkpoint_capture
                     ? std::optional<std::uint32_t>(staged.rewrite_checkpoint_capture->frontier)
                     : std::nullopt;
+            // Window-bounded KV maps each chunk's window pages as the chunk runs (admission mapped
+            // only the full-context planes of the whole prompt). On the graph path too: near capacity
+            // the graph window above maps nothing and the eager body runs (prepare is idempotent).
+            if (window_paging()) {
+                materialize_sequence_kv(sequence, staged.cursor + nominal, 0);
+            }
             if (staged.vision) {
                 mark_workspace_usage(workspace_plan.vision_encode);
                 result = schedule::prefill_multimodal_chunk(
@@ -3118,6 +3194,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             }
             staged.cursor += result.processed_tokens;
             sequence.text_kv_valid = staged.cursor;
+            if (window_paging()) { settle_window_kv(sequence); }
             if (staged.prepare_mtp) { sequence.mtp_kv_valid = staged.cursor; }
             if (staged.shared_capture && staged.cursor == *staged.shared_capture) {
                 // The chunk's last column, which the chunk left in place.
@@ -4455,6 +4532,7 @@ runtime::MixedRoundResult ProgramImplCore::consume_mixed_round(runtime::RoundHan
             entry.cursor += processed;
             if (entry.vision) { entry.vision->release_encoded_media_payloads(); }
             sequence.text_kv_valid = entry.cursor;
+            if (window_paging()) { settle_window_kv(sequence); }
             // The head's KV followed the trunk's through the segment (on the stage that
             // holds the head; the others keep the count, as the lone chunk does) -- to the
             // column before the prompt's last, whose pairing waits for the sampled token: the
@@ -5457,7 +5535,19 @@ bool ProgramImplCore::kv_service_pressure() noexcept {
     if (ElasticKvRegion* region = decoder->text_kv.pool().elastic_region()) {
         region->flush_reserve_release();
     }
+    // Lane f1 M3-C: an elastic window class flushes too, and compacts at this round boundary.
+    if (ElasticKvRegion* region = decoder->text_kv.pool().window_elastic_region()) {
+        region->flush_reserve_release();
+        compact_window_kv();
+    }
     return kv_under_pressure();
+}
+
+void ProgramImplCore::kv_round_boundary() noexcept {
+    if (ElasticKvRegion* region = decoder->text_kv.pool().window_elastic_region()) {
+        region->flush_reserve_release();
+        compact_window_kv();
+    }
 }
 
 bool ProgramImplCore::kv_under_pressure() const noexcept {
@@ -5468,6 +5558,11 @@ bool ProgramImplCore::kv_under_pressure() const noexcept {
 void ProgramImplCore::kv_settle() noexcept {
     try { decoder->flush_checkpoint_releases(); } catch (...) {}
     if (ElasticKvRegion* region = decoder->text_kv.pool().elastic_region()) {
+        try {
+            region->wait_idle();
+        } catch (...) {}
+    }
+    if (ElasticKvRegion* region = decoder->text_kv.pool().window_elastic_region()) {
         try {
             region->wait_idle();
         } catch (...) {}

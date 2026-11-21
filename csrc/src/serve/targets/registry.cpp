@@ -617,6 +617,7 @@ ConstructedTarget construct_target(const EngineOptions& requested, DeviceContext
     dispatch.template operator()<Qwen3_5Moe, LoadedQwen3_5Moe, Qwen3_5MoeInstance>(constructed);
     dispatch.template operator()<Qwen38FlashNext, LoadedQwen38FlashNext,
                                  Qwen38FlashNextInstance>(constructed);
+    dispatch.template operator()<Inkling2, LoadedInkling2, Inkling2Instance>(constructed);
     if (constructed.has_value()) { return std::move(*constructed); }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
                              "' has no registered target for this device");
