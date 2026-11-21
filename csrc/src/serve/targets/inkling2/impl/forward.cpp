@@ -479,10 +479,10 @@ void run_visit(Round& rd, int v) {
     // 3. attention per group: lane c's invariant op (prologue: K / V conv + cache write; relative attention; gate and
     //    sink). The K / V conv state is its: in place, recorded (verify), or captured at a rewrite checkpoint.
     Tensor gated = rd.work.alloc(DType::BF16, {C::attn_width, T});
+    const ops::InklingConvStateView state = state_view(rd, v);
     if (use_naive()) {
         Tensor q_out = rd.work.alloc(DType::BF16, {C::attn_width, T});
         Tensor r_out = rd.work.alloc(DType::BF16, {C::query_heads * C::d_rel, T});
-        const ops::InklingConvStateView state = state_view(rd, v);
         const PlaneView plane                 = plane_view(rd, v);
         const auto kv_input = [&](int column, int row_base) {
             return ops::InklingPlane{bf16_ptr(qkvr) + static_cast<std::int64_t>(column) * C::qkvr_rows + row_base,
@@ -540,7 +540,6 @@ void run_visit(Round& rd, int v) {
         const ops::InklingAttentionWeights aw = attention_weights(rd, L);
         const ops::InklingLayerKind kind      = vi.global ? ops::InklingLayerKind::Global : ops::InklingLayerKind::Local;
         const PagedKVBatchLayerView cache     = kv_batch_view(rd, v);
-        const ops::InklingConvStateView state = state_view(rd, v);
         Tensor states                         = rd.r.state->conv.at(static_cast<std::size_t>(v));
         using AG                              = ops::InklingAttentionGeometry;
         for (const Group& g : rd.groups) {
