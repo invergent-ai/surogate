@@ -1038,9 +1038,33 @@ int run_bench(const char* path) {
     Layer l;
     load_capture_layer(st, nv, l);
     const auto x_bits = st.vec<std::uint16_t>("x");
+    // INKLING_BENCH_COPIES=n (default 1): n device copies of the layer's weights, one graph each, replayed
+    // round-robin, so a decode call streams its experts from DRAM as in serving (one copy stays L2-resident:
+    // 96 MB L2 vs 36 MB per T = 1 call).
+    int copies = 1;
+    if (const char* value = std::getenv("INKLING_BENCH_COPIES"); value != nullptr && std::atoi(value) > 1) {
+        copies = std::atoi(value);
+    }
+    std::vector<DeviceBuffer> copy_buffers;
+    std::vector<ops::InklingMoeWeights> views{l.view};
+    const auto router_bits = st.vec<std::uint16_t>("router");
+    for (int c = 1; c < copies; ++c) {
+        ops::InklingMoeWeights v = l.view;
+        copy_buffers.push_back(to_device(router_bits));
+        v.router = copy_buffers.back().p;
+        for (int p = 0; p < 2; ++p) {
+            ops::InklingExpertBank& bank = p == 0 ? v.w13 : v.w2;
+            copy_buffers.push_back(to_device(l.codes[p]));
+            bank.codes = static_cast<const std::uint8_t*>(copy_buffers.back().p);
+            copy_buffers.push_back(to_device(l.scales[p]));
+            bank.scales = static_cast<const std::uint8_t*>(copy_buffers.back().p);
+        }
+        views.push_back(v);
+    }
     const double expert_bytes = nv ? 4478976.0 : 8211456.0;
     const double router_bytes = 589824.0;
-    std::printf("[bench %s: layer %s %s]\n", path, st.meta.at("layer").c_str(), nv ? "NVFP4" : "MXFP8");
+    std::printf("[bench %s: layer %s %s, %d weight cop%s]\n", path, st.meta.at("layer").c_str(), nv ? "NVFP4" : "MXFP8",
+                copies, copies == 1 ? "y (L2-warm at small T)" : "ies (DRAM-cold)");
     std::printf("  %6s %10s %9s %10s %9s %7s\n", "T", "us/call", "distinct", "MB", "GB/s", "of BW");
     cudaStream_t stream = nullptr;
     cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
@@ -1077,19 +1101,22 @@ int run_bench(const char* path) {
         ops::inkling_moe(tx, l.view, tout, arena, stream);
         arena.reset();
         cuda_synchronize(stream);
-        cudaGraph_t graph = nullptr;
-        cudaGraphExec_t exec = nullptr;
-        cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "begin capture");
-        ops::inkling_moe(tx, l.view, tout, arena, stream);
-        cuda_check(cudaStreamEndCapture(stream, &graph), "end capture");
-        cuda_check(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
+        std::vector<cudaGraph_t> graphs(views.size(), nullptr);
+        std::vector<cudaGraphExec_t> execs(views.size(), nullptr);
+        for (std::size_t c = 0; c < views.size(); ++c) {
+            cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "begin capture");
+            ops::inkling_moe(tx, views[c], tout, arena, stream);
+            arena.reset();
+            cuda_check(cudaStreamEndCapture(stream, &graphs[c]), "end capture");
+            cuda_check(cudaGraphInstantiate(&execs[c], graphs[c], 0), "instantiate");
+        }
         const int iterations = tokens <= 64 ? 400 : (tokens <= 1024 ? 50 : 10);
-        for (int i = 0; i < 10; ++i) { cuda_check(cudaGraphLaunch(exec, stream), "warmup"); }
+        for (int i = 0; i < 10; ++i) { cuda_check(cudaGraphLaunch(execs[i % execs.size()], stream), "warmup"); }
         cudaEvent_t start, stop;
         cuda_check(cudaEventCreate(&start), "event");
         cuda_check(cudaEventCreate(&stop), "event");
         cuda_check(cudaEventRecord(start, stream), "record");
-        for (int i = 0; i < iterations; ++i) { cuda_check(cudaGraphLaunch(exec, stream), "launch"); }
+        for (int i = 0; i < iterations; ++i) { cuda_check(cudaGraphLaunch(execs[i % execs.size()], stream), "launch"); }
         cuda_check(cudaEventRecord(stop, stream), "record");
         cuda_check(cudaEventSynchronize(stop), "sync");
         float ms = 0.0F;
@@ -1100,8 +1127,10 @@ int run_bench(const char* path) {
                     100.0 * (bytes / us / 1e3) / 1707.0);
         cudaEventDestroy(start);
         cudaEventDestroy(stop);
-        cudaGraphExecDestroy(exec);
-        cudaGraphDestroy(graph);
+        for (std::size_t c = 0; c < views.size(); ++c) {
+            cudaGraphExecDestroy(execs[c]);
+            cudaGraphDestroy(graphs[c]);
+        }
     }
     cudaStreamDestroy(stream);
     return 0;
