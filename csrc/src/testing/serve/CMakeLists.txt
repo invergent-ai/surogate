@@ -987,3 +987,14 @@ target_include_directories(sinfer_sampling_split_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR} ${SERVE_ROOT} ${CUDAToolkit_INCLUDE_DIRS})
 target_link_libraries(sinfer_sampling_split_test PRIVATE sinfer_core)
 target_compile_options(sinfer_sampling_split_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+
+# ENGINE-INKLING lane e2 (agent-EN-e2c): the split route of untruncated stochastic verify rows through
+# ops::speculative_accept_greedy_drafts -- batch / width invariance, determinism, the T1 distribution (chi-square over
+# many seeds) and old-vs-new; compiles the speculative + sampling launchers / wrappers itself, links sinfer_core only.
+add_executable(sinfer_spec_exact_split_test EXCLUDE_FROM_ALL ops/test_spec_exact_split.cu
+  ${SERVE_ROOT}/ops/launcher/speculative_round.cu ${SERVE_ROOT}/ops/wrapper/speculative_round.cpp
+  ${SERVE_ROOT}/ops/launcher/sampling.cu ${SERVE_ROOT}/ops/wrapper/sampling.cpp)
+target_include_directories(sinfer_spec_exact_split_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR} ${SERVE_ROOT} ${CUDAToolkit_INCLUDE_DIRS})
+target_link_libraries(sinfer_spec_exact_split_test PRIVATE sinfer_core)
+target_compile_options(sinfer_spec_exact_split_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
