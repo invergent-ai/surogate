@@ -1081,8 +1081,11 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
                     k[i] = ok ? __ldcg(reinterpret_cast<const int2*>(p.k_pages + o)) : make_int2(0, 0);
                     v[i] = ok ? __ldcg(reinterpret_cast<const int2*>(p.v_pages + o)) : make_int2(0, 0);
                 } else {
-                    k[i] = ok ? load_ldg<int2>(p.k_pages + o) : make_int2(0, 0);
-                    v[i] = ok ? load_ldg<int2>(p.v_pages + o) : make_int2(0, 0);
+                    // Weak ld.global.ca, not ld.global.nc: the round's newest keys are written by the prologue (the PDL
+                    // predecessor) and nc loads may be hoisted above the dependency wait (lane c's FP8 decode bug; review R4
+                    // of M9: no LDG.CONSTANT on producer-written operands). Same bytes, still L1-cached.
+                    k[i] = ok ? __ldca(reinterpret_cast<const int2*>(p.k_pages + o)) : make_int2(0, 0);
+                    v[i] = ok ? __ldca(reinterpret_cast<const int2*>(p.v_pages + o)) : make_int2(0, 0);
                 }
             }
         };
