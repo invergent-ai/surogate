@@ -49,6 +49,7 @@ inline constexpr int kPrefillRows = 64;                 // query columns of one 
 inline constexpr int kMaxWorkers  = 64;
 inline constexpr int kSmemLimit   = 101376;             // sm_120 opt-in shared memory per block
 inline constexpr int kFoldChunk   = 32;                 // partial slots per cp.async stage of fold_kernel
+inline constexpr int kFoldKernelFast = 32;              // fold_kernel rows of at most this many slots: the scan-free path
 
 // kTrain = the training entry: gated output AND pre-gate o + lse from the same final pass.
 // kDraft = DSpark draft block attention: bf16 o, no gate / sink (the bias is off by a null table).
@@ -365,9 +366,17 @@ __device__ __forceinline__ void fold_one_column(const AttnParams& p, int b, int 
 /// (L2: written by other CTAs). `smem` = the attention kernel's shared memory (free after its main loop).
 template <bool Local>
 __device__ void fold_set(const AttnParams& p, int b, int kvh, int valid, unsigned char* smem, int smem_bytes) {
-    if (p.width == 1 && p.max_slots <= kFoldFastSlots) {
-        fold_one_column<Local>(p, b, kvh, valid, static_cast<int>(threadIdx.x));
-        return;
+    if (p.width == 1) {
+        // the one-column fast path when the row's slot count fits (uniform: one column, one position)
+        int ns = 0;
+        if (valid > 0) {
+            const int pos = p.positions[static_cast<std::int64_t>(p.width) * b];
+            ns = group_of(p.groups, pos) - group_of(p.groups, Local ? max(0, pos - (p.window - 1)) : 0) + 1;
+        }
+        if (ns <= kFoldFastSlots && ns <= p.max_slots) {
+            fold_one_column<Local>(p, b, kvh, valid, static_cast<int>(threadIdx.x));
+            return;
+        }
     }
     const int tid    = static_cast<int>(threadIdx.x);
     const int lane   = tid & 31;
@@ -1236,12 +1245,58 @@ __global__ __launch_bounds__(128) void fold_kernel(const AttnParams p) {
         poison             = ns > p.max_slots;
         count              = poison ? 0 : ns;
     }
+    const std::int64_t stride = n_columns * Geo::kQHeads;
+    const float2* ml          = p.part_ml + n * Geo::kQHeads + h;
+    // A row of at most kFoldKernelFast slots (local rows, global rows below ~16k keys; uniform in the CTA: one row): every
+    // operand in ONE round of loads, the running maximum and fold_coeffs on the fly, the two chains in slot order -- the
+    // same operands and order as the scan path below, so the same bits -- without shared memory or barriers.
+    if (count <= kFoldKernelFast) {
+        float2 st[kFoldKernelFast];
+        float xs[kFoldKernelFast];
+        float gate_f = 0.0F, sink_f = 0.0F;
+        if constexpr (kWritesGated<Mode>) {
+            if (ok) {
+                gate_f = __bfloat162float(p.gate[n * p.gate_stride + h * Geo::kHeadDim + d]);
+                sink_f = __bfloat162float(p.sink[n * p.sink_stride + h]);
+            }
+        }
+#pragma unroll
+        for (int s = 0; s < kFoldKernelFast; ++s) {
+            const bool in = s < count;
+            st[s] = in ? ml[s * stride] : make_float2(-CUDART_INF_F, 0.0F);
+            xs[s] = in ? p.part_acc[((static_cast<std::int64_t>(s) * n_columns + n) * Geo::kQHeads + h) * Geo::kHeadDim + d] : 0.0F;
+        }
+        float M = -CUDART_INF_F, L = 0.0F, A = 0.0F;
+#pragma unroll
+        for (int s = 0; s < kFoldKernelFast; ++s) {
+            if (st[s].y > 0.0F) { // only slots < count can have l > 0
+                float Mn, a, c;
+                fold_coeffs(M, st[s].x, Mn, a, c);
+                M = Mn;
+                L = fold_value(L, a, st[s].y, c);
+                A = fold_value(A, a, xs[s], c);
+            }
+        }
+        const bool has   = ok && L > 0.0F;
+        const float lse2 = has ? final_lse2(M, L, p.variant) : -CUDART_INF_F;
+        float o          = has ? final_o(A, L, p.variant) : 0.0F;
+        if (poison) { o = CUDART_NAN_F; }
+        if constexpr (kWritesGated<Mode>) {
+            float y = 0.0F;
+            if (ok) { y = gated_value(o, gate_f, gated_sink_factor(lse2, sink_f)); }
+            p.out[n * Geo::kAttnWidth + h * Geo::kHeadDim + d] = __float2bfloat16_rn(y);
+        }
+        if constexpr (kWritesOutLse<Mode>) {
+            p.out_f32[(n * Geo::kQHeads + h) * Geo::kHeadDim + d] = ok ? o : 0.0F;
+            if (d == 0) { p.lse[n * Geo::kQHeads + h] = ok ? __fmul_rn(lse2, kLn2) : 0.0F; }
+        }
+        if constexpr (Mode == kDraft) { p.out[(n * Geo::kQHeads + h) * Geo::kHeadDim + d] = __float2bfloat16_rn(ok ? o : 0.0F); }
+        return;
+    }
     float* sm_m = fold_smem;
     float* sm_l = sm_m + p.max_slots;
     float* sm_a = sm_l + p.max_slots;
     float* sm_c = sm_a + p.max_slots;
-    const std::int64_t stride = n_columns * Geo::kQHeads;
-    const float2* ml          = p.part_ml + n * Geo::kQHeads + h;
     // Loads that do not depend on the scan go out first: the epilogue's gate / sink and the first 8 partials.
     float gate_v = 0.0F, sink_v = 0.0F;
     if constexpr (kWritesGated<Mode>) {
