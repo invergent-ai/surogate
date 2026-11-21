@@ -2,8 +2,9 @@
 //
 // Launch order of one call (each kernel waits for its predecessor, PDL):
 //   router logits (also zeroes the expert counters) -> x quantisation -> selection + placement
-//   [-> LoRA shrink (w13)] -> gate_up + SiTU -> y quantisation [-> LoRA shrink (w2)] -> down
-//   -> combine.
+//   [-> placement (wide rounds)] [-> LoRA shrink (w13)] -> gate_up + SiTU -> y quantisation
+//   [-> LoRA shrink (w2)] -> down with the combine fused (the CTA completing a token's 8 rows of a
+//   column tile sums them in slot order).
 // The fusions of DESIGN-moe.md 2.1 (route + quant in one grid, quantise y in down's prologue,
 // combine in down) change no arithmetic and come with the M3 timing.
 
@@ -46,6 +47,7 @@ struct Buffers {
     float* gammas             = nullptr;
     std::int32_t* ranks       = nullptr;
     std::int32_t* counters    = nullptr; ///< [128 counts | ticket]
+    std::int32_t* arrivals    = nullptr; ///< [T][kArrivalTiles] fused-combine counters
     std::int32_t* offsets     = nullptr;
     std::int32_t* sorted      = nullptr;
     std::uint8_t* x_codes     = nullptr;
@@ -75,6 +77,7 @@ Buffers carve(InklingExpertFormat format, std::int32_t tokens, std::int32_t rank
     b.gammas   = static_cast<float*>(allocate(slots * sizeof(float)));
     b.ranks    = static_cast<std::int32_t*>(allocate(slots * sizeof(std::int32_t)));
     b.counters = static_cast<std::int32_t*>(allocate(kCounterWords * sizeof(std::int32_t)));
+    b.arrivals = static_cast<std::int32_t*>(allocate(t * kArrivalTiles * sizeof(std::int32_t)));
     b.offsets  = static_cast<std::int32_t*>(allocate((kExperts + 1) * sizeof(std::int32_t)));
     b.sorted   = static_cast<std::int32_t*>(allocate(slots * sizeof(std::int32_t)));
     if (nvfp4) {
@@ -178,6 +181,8 @@ void inkling_moe(const Tensor& x, const InklingMoeWeights& weights, Tensor& out,
     route.ticket  = b.counters + kExperts;
     route.offsets = b.offsets;
     route.sorted  = b.sorted;
+    route.arrivals = b.arrivals;
+    route.combined = static_cast<__nv_bfloat16*>(out.data);
     if (options.capture != nullptr && options.capture->ids != nullptr) {
         if (options.capture->token_stride < kTopK) {
             throw std::invalid_argument("inkling_moe: capture token_stride must be at least 8");
@@ -194,7 +199,10 @@ void inkling_moe(const Tensor& x, const InklingMoeWeights& weights, Tensor& out,
         route.capture_first    = 0;
         route.capture_stride   = kTopK;
     }
+    const bool narrow = tokens <= kNarrowMaxTokens;
+    route.last_cta_places = narrow ? 1 : 0;
     launch_router_select(b.logits, weights.router_bias, live, route, stream);
+    if (!narrow) { launch_router_place(route, tokens, stream); }
 
     LoraRound lora;
     if (adapted) {
@@ -207,7 +215,7 @@ void inkling_moe(const Tensor& x, const InklingMoeWeights& weights, Tensor& out,
         launch_lora_shrink(input, kHidden, true, b.ids, live, lora, stream);
     }
 
-    const GemmSchedule schedule = tokens <= kNarrowMaxTokens ? GemmSchedule::Narrow : GemmSchedule::Wide;
+    const GemmSchedule schedule = narrow ? GemmSchedule::Narrow : GemmSchedule::Wide;
     GemmParams gate_up;
     gate_up.a_codes     = b.x_codes;
     gate_up.a_scales    = b.x_scales;
@@ -248,13 +256,14 @@ void inkling_moe(const Tensor& x, const InklingMoeWeights& weights, Tensor& out,
     down.weights     = weights.w2;
     down.out         = b.down;
     down.lora        = lora;
+    down.arrivals    = b.arrivals; // combine fused into down (summed in slot order by the last arriver)
+    down.combined    = static_cast<__nv_bfloat16*>(out.data);
     if (nvfp4) {
         launch_nvfp4_down(down, slots, schedule, stream);
     } else {
         launch_mxfp8_down(down, slots, schedule, stream);
     }
 
-    launch_combine(b.down, b.ids, live, static_cast<__nv_bfloat16*>(out.data), stream);
 
     if (const InklingMoeTaps* taps = options.taps; taps != nullptr) {
         const auto copy = [&](void* destination, const void* source, std::size_t bytes) {

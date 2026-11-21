@@ -22,6 +22,9 @@ inline constexpr int kTopK         = InklingMoeGeometry::kTopK;
 inline constexpr int kIntermediate = InklingMoeGeometry::kIntermediate;
 inline constexpr int kGateUpRows   = InklingMoeGeometry::kGateUpRows;
 inline constexpr int kRouterGroup  = InklingMoeGeometry::kRouterKGroup;
+/// Arrival counters per token of the fused combine: one per 64-column tile of the down output
+/// (the narrowest column tile of any down kernel).
+inline constexpr int kArrivalTiles = kHidden / 64;
 
 /// Live token count of a call: `*live` clamped to `tokens`, or `tokens`.
 struct LiveTokens {
@@ -41,6 +44,13 @@ struct RouteOutputs {
     std::int32_t capture_capacity = 0;
     std::int32_t capture_first    = 0;
     std::int32_t capture_stride   = 8;
+    /// 1: the last select CTA also writes `sorted` (narrow rounds, <= 512 slots); 0: only the
+    /// offsets, and `launch_router_place` scatters the slots in parallel (wide rounds).
+    std::int32_t last_cta_places  = 1;
+    /// Fused combine: [T][kArrivalTiles] counters zeroed here per token; padding tokens' output
+    /// rows (bf16 [T][2304]) written as zeros here (no down row ever arrives for them).
+    std::int32_t* arrivals        = nullptr;
+    __nv_bfloat16* combined       = nullptr;
 };
 
 /// Router logits fp32 [T][128] (`(p0 + p1) + p2` of bf16 m16n8k16 chains per 1024-wide K group).
@@ -53,6 +63,9 @@ void launch_router_logits(const __nv_bfloat16* x, const __nv_bfloat16* router, f
 /// (last CTA) the offsets and the expert-grouped slot list.
 void launch_router_select(const float* logits, const float* bias, LiveTokens live,
                           const RouteOutputs& out, cudaStream_t stream);
+
+/// sorted[offsets[ids[i]] + ranks[i]] = i for every routed slot i (after the select kernel).
+void launch_router_place(const RouteOutputs& out, std::int32_t tokens, cudaStream_t stream);
 
 /// Per-row NVFP4 four-over-six of bf16 rows [rows][k]: codes [rows][k/2], scales [rows][k/16]
 /// (row-major), amax [rows]. `row_ids` (nullable): rows whose id is negative are skipped;
@@ -109,6 +122,10 @@ struct GemmParams {
     __nv_bfloat16* out = nullptr;
     /// Test tap (gate_up only): the bf16 gate_up rows [T * 8][2304], interleaved. Null in serving.
     __nv_bfloat16* gate_up_tap = nullptr;
+    /// Down only: fused combine into `combined` (bf16 [T][2304]) through the arrival counters
+    /// [T][kArrivalTiles] (zeroed by the select kernel). Null = rows only.
+    std::int32_t* arrivals     = nullptr;
+    __nv_bfloat16* combined    = nullptr;
     // Adapter (table null = none).
     LoraRound lora;
 };

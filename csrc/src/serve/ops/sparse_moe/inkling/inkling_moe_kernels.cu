@@ -129,6 +129,15 @@ __global__ __launch_bounds__(128) void router_select_kernel(const float* __restr
     const int token  = static_cast<int>(blockIdx.x) * 4 + warp;
     const int tokens = live.tokens;
     const int alive  = live_count(live);
+    if (token < tokens && out.arrivals != nullptr) {
+        for (int i = lane; i < kArrivalTiles; i += 32) {
+            out.arrivals[static_cast<std::int64_t>(token) * kArrivalTiles + i] = 0;
+        }
+    }
+    if (token < tokens && token >= alive && out.combined != nullptr) {
+        uint4* row = reinterpret_cast<uint4*>(out.combined + static_cast<std::int64_t>(token) * kHidden);
+        for (int i = lane; i < kHidden / 8; i += 32) { row[i] = make_uint4(0U, 0U, 0U, 0U); }
+    }
     if (token < tokens) {
         const float* row = logits + static_cast<std::int64_t>(token) * kExperts;
         if (token < alive) {
@@ -214,11 +223,26 @@ __global__ __launch_bounds__(128) void router_select_kernel(const float* __restr
         offsets[kExperts]     = exclusive + count;
         out.offsets[kExperts] = exclusive + count;
     }
+    if (!out.last_cta_places) { return; }
     __syncthreads();
     for (int index = thread; index < tokens * kTopK; index += 128) {
         const int expert = __ldcg(out.ids + index);
         if (expert >= 0) { out.sorted[offsets[expert] + __ldcg(out.ranks + index)] = index; }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Placement of wide rounds: a thread per routed slot (the select kernel wrote ids, ranks and
+// the offsets). Positions are offsets[e] + rank; their order inside an expert never changes a
+// row's arithmetic.
+// ---------------------------------------------------------------------------------------------
+__global__ __launch_bounds__(256) void router_place_kernel(RouteOutputs out, std::int32_t slots) {
+    pdl::wait_for_dependencies();
+    pdl::trigger_dependents();
+    const int index = static_cast<int>(blockIdx.x) * 256 + static_cast<int>(threadIdx.x);
+    if (index >= slots) { return; }
+    const int expert = out.ids[index];
+    if (expert >= 0) { out.sorted[out.offsets[expert] + out.ranks[index]] = index; }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -452,6 +476,12 @@ void launch_router_select(const float* logits, const float* bias, LiveTokens liv
                           const RouteOutputs& out, cudaStream_t stream) {
     launch("router select", dim3(static_cast<unsigned>((live.tokens + 3) / 4)), dim3(128), stream,
            router_select_kernel, logits, bias, live, out);
+}
+
+void launch_router_place(const RouteOutputs& out, std::int32_t tokens, cudaStream_t stream) {
+    const std::int32_t slots = tokens * kTopK;
+    launch("router place", dim3(static_cast<unsigned>((slots + 255) / 256)), dim3(256), stream,
+           router_place_kernel, out, slots);
 }
 
 void launch_quant_nvfp4(const __nv_bfloat16* input, std::int32_t rows, std::int32_t k,

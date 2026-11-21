@@ -11,8 +11,8 @@
 // - `nvfp4_expert_gemm_kernel`: one CTA per (expert tile, N tile), all warps load and compute
 //   (narrow decode / verify widths);
 // - `nvfp4_expert_gemm_persistent`: prefill. One CTA per SM loops over the round's (expert tile,
-//   N tile) items, expert-major with N inner. A producer warp streams the gathered token rows and
-//   the expert's weight rows with cp.async into a ring of stages (completion signalled on an
+//   N tile) items, expert-major with N inner. A producer warpgroup streams the gathered token rows
+//   and the expert's weight rows with cp.async into a ring of stages (completion signalled on an
 //   mbarrier per stage, `cp.async.mbarrier.arrive.noinc`); 8 consumer warps (64 x 64 warp tiles)
 //   run the same m16n8k64 chain per output and release each stage on a second mbarrier. Warps
 //   skip MMAs of 16-row groups past the tile's last routed row (those rows are never stored).
@@ -135,9 +135,12 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     __shared__ int tile_info[3];
     __shared__ int slots[Schedule::kBlockM];
     __shared__ int source_rows[Schedule::kBlockM];
+    __shared__ int done[Schedule::kBlockM];
+    __shared__ int done_count;
 
     pdl::wait_for_dependencies();
     pdl::trigger_dependents();
+    if (threadIdx.x == 0) { done_count = 0; }
     find_expert_tile<Schedule::kBlockM>(p.offsets, static_cast<int>(blockIdx.x), tile_info);
     const int expert = tile_info[0];
     if (expert < 0) { return; }
@@ -263,6 +266,13 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
                                                       accumulators[mma_m], half);
         }
     }
+    if constexpr (!GateUp) {
+        if (p.arrivals != nullptr) {
+            combine_arrive<Schedule::kBlockN, Schedule::kThreads>(
+                p, Schedule::kBlockM, n_begin, [&](int r) { return slots[r]; }, done, &done_count,
+                static_cast<int>(threadIdx.x), [] { __syncthreads(); });
+        }
+    }
 #endif
 }
 
@@ -279,7 +289,8 @@ struct PersistentSchedule {
     static constexpr int kWarpsN         = WarpsN;
     static constexpr int kConsumerWarps  = WarpsM * WarpsN;
     static constexpr int kConsumerThreads = kConsumerWarps * 32;
-    static constexpr int kThreads        = kConsumerThreads + 32; ///< + one producer warp
+    static constexpr int kProducerThreads = 128; ///< one producer warpgroup (setmaxnreg)
+    static constexpr int kThreads        = kConsumerThreads + kProducerThreads;
     static constexpr int kWarpM          = BlockM / WarpsM;
     static constexpr int kWarpN          = BlockN / WarpsN;
     static constexpr int kMmaM           = kWarpM / 16;
@@ -304,6 +315,8 @@ struct PersistentStorage {
     alignas(8) std::uint64_t empty[Schedule::kStages];
     int tile_prefix[kExperts + 1]; ///< exclusive prefix of BlockM tiles per expert; [128] = total
     int source_rows[Schedule::kBlockM]; ///< producer-private: token row per tile row (-1 = none)
+    int done[Schedule::kBlockM];        ///< consumers: tokens completed by this item (fused combine)
+    int done_count;
 };
 
 /// 64-byte code rows: 16-byte segment s of row r lives at segment s ^ ((r >> 1) & 3), so the 8
@@ -346,13 +359,14 @@ __device__ __forceinline__ PersistentItem persistent_item(const int* tile_prefix
 template <class Schedule, int K>
 __device__ __forceinline__ void persistent_fill_stage(const GemmParams& p, PersistentStorage<Schedule>& shared,
                                                       int stage, int k_tile, int weight_begin, int lane) {
+    constexpr int kStride = Schedule::kProducerThreads;
     constexpr int kCodeBytesPerRow  = K / 2;
     constexpr int kScaleBytesPerRow = K / 16;
     constexpr int kScaleTilesPerRow = K / 64;
     // Token rows (gathered): 4 lanes per row, one 16-byte segment each.
     constexpr int kATasks = Schedule::kBlockM * Schedule::kSegmentsPerRow;
-#pragma unroll 4
-    for (int task = lane; task < kATasks; task += 32) {
+#pragma unroll 2
+    for (int task = lane; task < kATasks; task += kStride) {
         const int row     = task >> 2;
         const int segment = task & 3;
         const int source  = shared.source_rows[row];
@@ -365,7 +379,7 @@ __device__ __forceinline__ void persistent_fill_stage(const GemmParams& p, Persi
     }
     constexpr int kAScaleBytes = Schedule::kK64PerStage * 4;
 #pragma unroll
-    for (int row = lane; row < Schedule::kBlockM; row += 32) {
+    for (int row = lane; row < Schedule::kBlockM; row += kStride) {
         const int source  = shared.source_rows[row];
         const bool valid  = source >= 0;
         const auto* input = p.a_scales + static_cast<std::int64_t>(valid ? source : 0) * kScaleBytesPerRow +
@@ -375,8 +389,8 @@ __device__ __forceinline__ void persistent_fill_stage(const GemmParams& p, Persi
     }
     // Weight rows (contiguous inside the expert).
     constexpr int kBTasks = Schedule::kBlockN * Schedule::kSegmentsPerRow;
-#pragma unroll 8
-    for (int task = lane; task < kBTasks; task += 32) {
+#pragma unroll 2
+    for (int task = lane; task < kBTasks; task += kStride) {
         const int row     = task >> 2;
         const int segment = task & 3;
         auto* destination = shared.b_codes[stage] + row * Schedule::kCodeRowBytes +
@@ -388,7 +402,7 @@ __device__ __forceinline__ void persistent_fill_stage(const GemmParams& p, Persi
     // Weight scales: the bank's 128-row tile layout, one 16-byte group (4 row quartiles) per task.
     constexpr int kBScaleTasks = Schedule::kScaleRowTiles * Schedule::kK64PerStage * 32;
 #pragma unroll
-    for (int task = lane; task < kBScaleTasks; task += 32) {
+    for (int task = lane; task < kBScaleTasks; task += kStride) {
         const int row_tile  = task / (Schedule::kK64PerStage * 32);
         const int remainder = task - row_tile * Schedule::kK64PerStage * 32;
         const int local_k64 = remainder >> 5;
@@ -443,9 +457,10 @@ __global__ __launch_bounds__(Schedule::kThreads, 1) void nvfp4_expert_gemm_persi
         }
         if (thread == 31) { shared.tile_prefix[kExperts] = inclusive; }
     } else if (thread == 32) {
+        shared.done_count = 0;
 #pragma unroll
         for (int stage = 0; stage < Schedule::kStages; ++stage) {
-            nvfp4_mbarrier_init(&shared.full[stage], 32);
+            nvfp4_mbarrier_init(&shared.full[stage], Schedule::kProducerThreads);
             nvfp4_mbarrier_init(&shared.empty[stage], Schedule::kConsumerWarps);
         }
         asm volatile("fence.mbarrier_init.release.cluster;" : : : "memory");
@@ -455,28 +470,30 @@ __global__ __launch_bounds__(Schedule::kThreads, 1) void nvfp4_expert_gemm_persi
     const int lane        = thread & 31;
 
     if (thread >= Schedule::kConsumerThreads) {
-        // Producer warp.
+        // Producer warpgroup: gives registers to the consumers (the TMA kernel's split).
+        asm volatile("setmaxnreg.dec.sync.aligned.u32 40;" : : : "memory");
+        const int producer = thread - Schedule::kConsumerThreads;
         int fill = 0;
         for (int item = static_cast<int>(blockIdx.x); item < total_items; item += static_cast<int>(gridDim.x)) {
             const PersistentItem tile = persistent_item<Schedule>(shared.tile_prefix, p.offsets, item);
-            __syncwarp();
-#pragma unroll
-            for (int row = lane; row < Schedule::kBlockM; row += 32) {
+            asm volatile("bar.sync 2, %0;" : : "n"(Schedule::kProducerThreads) : "memory");
+            for (int row = producer; row < Schedule::kBlockM; row += Schedule::kProducerThreads) {
                 const int index = tile.row_begin + row;
                 shared.source_rows[row] = index < tile.row_end ? (p.sorted[index] >> p.a_row_shift) : -1;
             }
-            __syncwarp();
+            asm volatile("bar.sync 2, %0;" : : "n"(Schedule::kProducerThreads) : "memory");
             const int weight_begin = tile.expert * kGateUpRows + tile.n_begin;
             for (int k_tile = 0; k_tile < kKTiles; ++k_tile, ++fill) {
                 const int stage = fill % Schedule::kStages;
                 nvfp4_mbarrier_wait(&shared.empty[stage], 1U ^ ((fill / Schedule::kStages) & 1U));
-                persistent_fill_stage<Schedule, K>(p, shared, stage, k_tile, weight_begin, lane);
+                persistent_fill_stage<Schedule, K>(p, shared, stage, k_tile, weight_begin, producer);
                 cp_async_arrive_noinc(&shared.full[stage]);
             }
         }
         asm volatile("cp.async.wait_all;" : : : "memory");
         return;
     }
+    asm volatile("setmaxnreg.inc.sync.aligned.u32 232;" : : : "memory");
 
     // Consumer warps.
     const int warp          = thread >> 5;
@@ -571,6 +588,15 @@ __global__ __launch_bounds__(Schedule::kThreads, 1) void nvfp4_expert_gemm_persi
                                                           accumulators[mma_m], half);
             }
         }
+        if constexpr (!GateUp) {
+            if (p.arrivals != nullptr) {
+                combine_arrive<Schedule::kBlockN, Schedule::kConsumerThreads>(
+                    p, Schedule::kBlockM, tile.n_begin,
+                    [&](int r) { return tile.row_begin + r < tile.row_end ? p.sorted[tile.row_begin + r] : -1; },
+                    shared.done, &shared.done_count, thread,
+                    [] { asm volatile("bar.sync 1, %0;" : : "n"(Schedule::kConsumerThreads) : "memory"); });
+            }
+        }
     }
 #endif
 }
@@ -589,6 +615,7 @@ void launch_schedule(const GemmParams& params, std::int32_t slots, cudaStream_t 
 
 using PersistentWide = PersistentSchedule<128, 256, 2, 4, 3>; ///< warp tiles 64 x 64
 using PersistentAlt  = PersistentSchedule<128, 128, 2, 4, 4>; ///< warp tiles 64 x 32 (timing knob)
+using PersistentTall = PersistentSchedule<256, 128, 4, 2, 3>; ///< warp tiles 64 x 64 (timing knob)
 
 int multiprocessors() {
     static int cached[64] = {};
@@ -623,7 +650,8 @@ void launch_persistent(const GemmParams& params, std::int32_t slots, cudaStream_
 }
 
 /// Prefill kernel choice. TIMING KNOB (removed once measured): SUROGATE_INKLING_NVFP4_PREFILL=old
-/// (the v1 per-tile kernel) | alt (persistent, 128 x 128 tiles); default persistent 128 x 256.
+/// (the v1 per-tile kernel) | alt (persistent, 128 x 128 tiles) | tall (persistent, 256 x 128);
+/// default persistent 128 x 256.
 /// Every choice computes the same bits.
 int prefill_variant() {
     static const int variant = [] {
@@ -631,6 +659,7 @@ int prefill_variant() {
         if (value == nullptr) { return 0; }
         if (std::strcmp(value, "old") == 0) { return 1; }
         if (std::strcmp(value, "alt") == 0) { return 2; }
+        if (std::strcmp(value, "tall") == 0) { return 3; }
         return 0;
     }();
     return variant;
@@ -641,6 +670,7 @@ void launch_prefill(const GemmParams& params, std::int32_t slots, cudaStream_t s
     switch (prefill_variant()) {
     case 1: launch_schedule<WideSchedule, K, GateUp>(params, slots, stream); return;
     case 2: launch_persistent<PersistentAlt, K, GateUp>(params, slots, stream); return;
+    case 3: launch_persistent<PersistentTall, K, GateUp>(params, slots, stream); return;
     default: launch_persistent<PersistentWide, K, GateUp>(params, slots, stream); return;
     }
 }

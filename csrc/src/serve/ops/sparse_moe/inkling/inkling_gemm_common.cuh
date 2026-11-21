@@ -78,6 +78,62 @@ __device__ __forceinline__ const LoraBank& lora_bank(const LoraRound& lora, int 
     return lora.table[2 + 3 * expert + port];
 }
 
+/// Fused combine of the down GEMM (DESIGN-moe 2.1 v2). Called by the `Threads` threads that
+/// stored this tile's down rows (columns [n_begin, n_begin + Columns) of the slots `slot_of(r)`,
+/// r < rows; negative = no row), with `sync()` a barrier over exactly those threads and `done` /
+/// `done_count` scratch in shared memory (done_count zero on entry; zero again on return). Each
+/// row arrives on its token's counter for this column tile; the CTA that brings a counter to 8
+/// sums the token's 8 rows in slot order, ((0 + d0) + d1) ... + d7 in fp32 (the combine
+/// kernel's arithmetic: no atomics in the sum, no dependence on which CTA arrives last).
+template <int Columns, int Threads, class SlotOf, class Sync>
+__device__ __forceinline__ void combine_arrive(const GemmParams& p, int rows, int n_begin, SlotOf slot_of,
+                                               int* done, int* done_count, int thread, Sync sync) {
+    static_assert(Columns % 8 == 0 && kGateUpRows % Columns == 0);
+    constexpr int kTilesPerToken = kGateUpRows / Columns;
+    constexpr int kChunks        = Columns / 8;
+    const int n_tile             = n_begin / Columns;
+    __threadfence();
+    sync();
+    for (int r = thread; r < rows; r += Threads) {
+        const int slot = slot_of(r);
+        if (slot < 0) { continue; }
+        const int token = slot >> 3;
+        if (atomicAdd(p.arrivals + static_cast<std::int64_t>(token) * kArrivalTiles + n_tile, 1) == kTopK - 1) {
+            done[atomicAdd(done_count, 1)] = token;
+        }
+    }
+    static_assert(kTilesPerToken <= kArrivalTiles);
+    sync();
+    __threadfence();
+    const int count = *done_count;
+    for (int task = thread; task < count * kChunks; task += Threads) {
+        const int token  = done[task / kChunks];
+        const int column = n_begin + (task % kChunks) * 8;
+        float acc[8]     = {};
+#pragma unroll
+        for (int s = 0; s < kTopK; ++s) {
+            const uint4 v = __ldcg(reinterpret_cast<const uint4*>(
+                p.out + (static_cast<std::int64_t>(token) * kTopK + s) * kHidden + column));
+            const std::uint32_t words[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                acc[2 * i]     = __fadd_rn(acc[2 * i], __uint_as_float(words[i] << 16));
+                acc[2 * i + 1] = __fadd_rn(acc[2 * i + 1], __uint_as_float(words[i] & 0xFFFF0000U));
+            }
+        }
+        std::uint32_t packed[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const __nv_bfloat162 pair = __floats2bfloat162_rn(acc[2 * i], acc[2 * i + 1]);
+            packed[i]                 = *reinterpret_cast<const std::uint32_t*>(&pair);
+        }
+        *reinterpret_cast<uint4*>(p.combined + static_cast<std::int64_t>(token) * kHidden + column) =
+            make_uint4(packed[0], packed[1], packed[2], packed[3]);
+    }
+    sync();
+    if (thread == 0) { *done_count = 0; }
+}
+
 /// fp32 -> bf16 -> fp32: the reference's bf16 store of gate_up followed by the SiTU's load.
 __device__ __forceinline__ float round_bf16(float value) {
     return __bfloat162float(__float2bfloat16_rn(value));

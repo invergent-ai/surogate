@@ -119,9 +119,12 @@ __global__ __launch_bounds__(Schedule::kThreads) void mxfp8_expert_gemm_kernel(G
     __shared__ int tile_info[3];
     __shared__ int slots[Schedule::kBlockN];
     __shared__ int source_rows[Schedule::kBlockN];
+    __shared__ int done[Schedule::kBlockN];
+    __shared__ int done_count;
 
     pdl::wait_for_dependencies();
     pdl::trigger_dependents();
+    if (threadIdx.x == 0) { done_count = 0; }
     find_expert_tile<Schedule::kBlockN>(p.offsets, static_cast<int>(blockIdx.x), tile_info);
     const int expert = tile_info[0];
     if (expert < 0) { return; }
@@ -256,6 +259,13 @@ __global__ __launch_bounds__(Schedule::kThreads) void mxfp8_expert_gemm_kernel(G
                     row[n_second]      = __float2bfloat16_rn(second);
                 }
             }
+        }
+    }
+    if constexpr (!GateUp) {
+        if (p.arrivals != nullptr) {
+            combine_arrive<Schedule::kBlockM, Schedule::kThreads>(
+                p, Schedule::kBlockN, n_begin, [&](int r) { return slots[r]; }, done, &done_count,
+                static_cast<int>(threadIdx.x), [] { __syncthreads(); });
         }
     }
 }
