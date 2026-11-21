@@ -547,6 +547,13 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         io.visit_records_width  = static_cast<std::int32_t>(width);
         io.visit_records_batch  = static_cast<std::int32_t>(rows);
     }
+    // A visit-schedule target's persistent state for the compute stream (lane d's MoE counters): zeroed once here,
+    // then owned by the target's kernels (they leave it zeroed at the end of every call).
+    if (plan.persistent.visit_target_state) {
+        const DeviceSpan state = plan.persistent.visit_target_state->bind(backing);
+        CUDA_CHECK(cudaMemsetAsync(state.data, 0, state.bytes, device.stream));
+        io.visit_target_state = state.data;
+    }
     // Rollout Routing Replay: when the engine runs with SUROGATE_SERVE_CAPTURE_ROUTING=1 every
     // main-model forward copies each layer's selected expert ids into a fixed buffer, which the
     // graphs captured below record. Allocated before prepare_graphs() so they bake its address.

@@ -2065,6 +2065,7 @@ void TextContext::run_visit_round(Tensor& x, Tap& tap, std::span<const family::V
                                              io_.visit_records_batch};
         round.routing = family::VisitRoutingCapture{io_.routing_capture, io_.routing_capture_columns,
                                                     io_.routing_capture_top_k};
+        round.target_state = io_.visit_target_state;
         if constexpr (Tap::enabled) {
             round.features = family::VisitFeatureCapture{
                 &tap, [](void* context, int feature, const Tensor& value, cudaStream_t stream) {

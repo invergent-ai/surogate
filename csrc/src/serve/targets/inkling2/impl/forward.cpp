@@ -688,6 +688,8 @@ void run_visit(Round& rd, int v) {
             options.capture         = &capture;
         }
         options.adapters = adapters;
+        // Lane d's narrow-round router + select fold: the stream's persistent counters (zeroed once at startup).
+        options.state = static_cast<std::int32_t*>(rd.r.target_state);
         const Tensor x(mlp_in.data, DType::BF16, {D, T});
         ops::inkling_moe(x, moe_weights(L), moe_out, rd.work, s, options);
     }
@@ -832,6 +834,8 @@ void Variant::run_visits(const ModelView& model, family::VisitRound& r) {
         d.active = false;
     }
 }
+
+std::size_t Variant::visit_target_state_bytes() { return ops::inkling_moe_state_bytes(); }
 
 std::size_t Variant::visit_workspace_capacity_bytes(const family::TextGeometry&, family::TextPhase, std::int32_t batch_size,
                                                     std::int32_t max_width, std::int32_t max_columns,

@@ -138,6 +138,9 @@ struct VisitRound {
     VisitRoutingCapture routing{};
     VisitFeatureCapture features{};
     std::uint32_t max_visible_keys = 0; ///< host promise: max over rows of the last position + 1
+    /// The target's persistent state for this compute stream (V::visit_target_state_bytes() bytes, zeroed once at
+    /// startup, never touched by the runtime afterwards); null when the target asks for none.
+    void* target_state             = nullptr;
     WorkspaceArena* work           = nullptr;
     cudaStream_t stream            = nullptr;
 };
@@ -162,6 +165,15 @@ void lm_head_if(const Model& model, const Tensor& hidden, Tensor& logits, cudaSt
         V::lm_head(model, hidden, logits, stream);
     } else {
         (void)model; (void)hidden; (void)logits; (void)stream;
+    }
+}
+
+template <class V>
+[[nodiscard]] std::size_t visit_target_state_bytes_if() {
+    if constexpr (visit_schedule<V>()) {
+        return V::visit_target_state_bytes();
+    } else {
+        return 0;
     }
 }
 

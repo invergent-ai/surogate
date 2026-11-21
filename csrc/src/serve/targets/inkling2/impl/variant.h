@@ -57,6 +57,8 @@ struct Variant {
     /// Runs visits [round.first_visit, round.last_visit) over the round (DESIGN-target.md 1.2 / 1.4).
     static void run_visits(const ModelView& model, family::VisitRound& round);
     /// Workspace one `run_visits` call needs at the widest round of the phase.
+    /// Persistent state for the compute stream: lane d's `InklingMoeOptions::state` (zeroed once by the program).
+    [[nodiscard]] static std::size_t visit_target_state_bytes();
     [[nodiscard]] static std::size_t visit_workspace_capacity_bytes(const family::TextGeometry& geometry,
                                                                     family::TextPhase phase,
                                                                     std::int32_t batch_size,

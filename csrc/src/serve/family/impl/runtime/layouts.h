@@ -42,6 +42,8 @@ struct PersistentLayout {
     /// A visit-schedule target's speculative verify records (family/impl/runtime/visit_round.h): the per-visit conv
     /// state before a round ([visits][rows][channels x 3]) and the round's conv inputs ([rows][visits][width][channels]).
     std::optional<LayoutRegion> visit_records;
+    /// A visit-schedule target's persistent state for its compute stream (family::visit_target_state_bytes_if).
+    std::optional<LayoutRegion> visit_target_state;
     std::optional<DFlashPersistentLayout> dflash;
     family::RoundStateLayout round;
     TensorLayout prefill_hidden;

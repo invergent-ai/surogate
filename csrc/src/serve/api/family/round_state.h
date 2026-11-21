@@ -362,6 +362,9 @@ struct RoundState {
     std::int32_t visit_records_visits  = 0;
     std::int32_t visit_records_width   = 0;
     std::int32_t visit_records_batch   = 0;
+    /// A visit-schedule target's persistent state for its single compute stream (V::visit_target_state_bytes(),
+    /// zeroed once at startup; e.g. lane d's MoE counters). Null for every other target.
+    void* visit_target_state           = nullptr;
     std::optional<MtpPrefillState> mtp;
     std::optional<DFlashPrefillState> dflash_prefill;
     std::optional<MtpDecodeState> mtp_decode;

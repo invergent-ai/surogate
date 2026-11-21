@@ -440,6 +440,9 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
             const std::size_t old_bytes = (channels * 3 * visits * rows * 2 + 255) & ~std::size_t{255};
             out.visit_records = builder.add(old_bytes + channels * width * visits * rows * 2, 256, "visit records");
         }
+        if (const std::size_t state = family::visit_target_state_bytes_if<Variant>(); state > 0) {
+            out.visit_target_state = builder.add(state, 256, "visit target state");
+        }
     }
     if constexpr (Variant::supports_dflash) {
         if (plan.features.dflash()) {
