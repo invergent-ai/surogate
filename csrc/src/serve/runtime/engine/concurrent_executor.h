@@ -1471,6 +1471,49 @@ private:
         }
     }
 
+    /// Lane f1 (SUROGATE_SERVE_KV_BLOCK_TRACE=1, diagnostics only): why the queue head is not
+    /// admitted, one line each time the head, the pool's entitled pages or the running count
+    /// changes -- the pool, and for each lane its plan's reuse and pages and the two lane tests --
+    /// so a head that waits until it expires names what held it.
+    void trace_blocked_head(const std::shared_ptr<Request>& head, const char* why) {
+        static const bool enabled = std::getenv("SUROGATE_SERVE_KV_BLOCK_TRACE") != nullptr;
+        if (!enabled || !head || !head->base_plan) { return; }
+        const auto kv = instance_.program->kv_occupancy();
+        std::uint32_t running = 0;
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) { running += slots_[lane] != nullptr ? 1U : 0U; }
+        const std::array<std::uint64_t, 3> key{head->id, kv.entitled_pages, running};
+        if (key == last_block_trace_) { return; }
+        last_block_trace_ = key;
+        std::string lanes;
+        char item[160];
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            if (slots_[lane] != nullptr) {
+                std::snprintf(item, sizeof(item), " L%u:busy", lane);
+            } else if (!head->lane_plans[lane]) {
+                std::snprintf(item, sizeof(item), " L%u:%s,noplan", lane,
+                              instance_.program->has_retained_lane(lane) ? "ret" : "free");
+            } else {
+                const auto& plan = *head->lane_plans[lane];
+                std::snprintf(item, sizeof(item), " L%u:%s,reuse=%u%s,pages=%u,admit=%d,evict=%d", lane,
+                              instance_.program->has_retained_lane(lane) ? "ret" : "free",
+                              plan.summary().reusable_prompt_tokens, plan.summary().host_restore ? "(host)" : "",
+                              plan.summary().admission.main_kv_pages,
+                              int(instance_.program->can_admit_lane(lane, plan)),
+                              int(instance_.program->can_admit_lane_after_retained_eviction(lane, plan)));
+            }
+            lanes += item;
+        }
+        std::fprintf(stderr,
+                     "kv-block: head %llu %s: prompt %u reserve %u admission %u | pool entitled %u in_use %u "
+                     "mapped %u capacity %u | running %u pressure %d transient %zu |%s\n",
+                     static_cast<unsigned long long>(head->id), why, head->base_plan->summary().prompt_tokens,
+                     head->base_plan->summary().reservation.main_kv_pages,
+                     head->base_plan->summary().admission.main_kv_pages, kv.entitled_pages, kv.pages_in_use,
+                     kv.mapped_pages, kv.capacity_pages, running, int(instance_.program->kv_under_pressure()),
+                     instance_.request_memory.summary().used_bytes, lanes.c_str());
+    }
+    std::array<std::uint64_t, 3> last_block_trace_{};
+
     /// Among free lanes that reuse equally much of a request, the one whose loss costs least:
     /// a lane holding no retained prefix first, then the retained prefix released longest
     /// ago. Picking the lowest index instead handed a new conversation the lane another
@@ -1612,6 +1655,7 @@ private:
                 // stays alive, which is the point, but the request is not refused early. Claim
                 // control progress only when something was actually evicted, so a
                 // disagreement that frees nothing cannot spin the admission loop.
+                trace_blocked_head(request, evicted ? "evicted retained lanes, still short" : "eviction freed nothing");
                 invalidate_lane_plans(lane);
                 return evicted ? AdmissionProgress::ControlProgress : AdmissionProgress::None;
             }
@@ -1816,6 +1860,7 @@ private:
             // The frozen media buffer is also outside the lane/page protection accounting.
             // Owners release their regions when prefill finishes; retry admission at that boundary.
             if (instance_.program->kv_under_pressure() || instance_.request_memory.summary().used_bytes != 0) {
+                trace_blocked_head(head, "waits for device memory");
                 static const bool pack_trace = std::getenv("SUROGATE_SERVE_PACK_TRACE") != nullptr;
                 if (pack_trace) {
                     std::fprintf(stderr, "pack-trace: head %llu waits: kv_pressure=%d transient_bytes=%zu\n",
@@ -1836,16 +1881,19 @@ private:
                     running = slots_[lane] != nullptr;
                 }
                 if (!running) {
+                    trace_blocked_head(head, "refused (on demand, nothing running)");
                     (void)remove_pending_error(head, std::make_exception_ptr(RequestError(
                         RequestErrorKind::Overloaded, "insufficient KV capacity while GPU prefixes are retained")));
                     control_progress = true;
                     continue;
                 }
+                trace_blocked_head(head, "waits for running lanes (on demand)");
                 protection_.reset();
                 return control_progress ? AdmissionProgress::ControlProgress : AdmissionProgress::None;
             }
             const ActiveAdmissionSet active = active_admission_set();
             if (active.size == 0) {
+                trace_blocked_head(head, "refused (reserve, nothing active)");
                 (void)remove_pending_error(head, std::make_exception_ptr(RequestError(
                     RequestErrorKind::Overloaded, "insufficient KV capacity while GPU prefixes are retained")));
                 control_progress = true;

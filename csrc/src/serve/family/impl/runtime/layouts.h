@@ -54,6 +54,10 @@ struct PersistentLayout {
     /// Bytes of the Main pool's planes living outside the arena (elastic pools), counted in the
     /// device reservation as their worst case; zero otherwise.
     std::size_t elastic_plane_bytes = 0;
+    /// Lane f1 M3-C: the main-ledger pages every text allocation is charged for an elastic window
+    /// class (PagedKVPool::window_lane_charge_pages), so the capacity curve can count them; zero
+    /// without an elastic window class (every model but a windowed one sized automatically).
+    std::uint32_t kv_window_lane_charge_pages = 0;
 };
 
 struct WorkspacePlan {

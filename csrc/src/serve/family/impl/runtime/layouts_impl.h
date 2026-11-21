@@ -586,6 +586,10 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                 if (plane.spec.window > 0) { window_page_bytes += plane.storage.region.bytes / plane.storage.shape[3]; }
             }
             out.elastic_plane_bytes += window_page_bytes * text_pool.spec.window_floor_pages;
+            // The charge as the pool computes it (window bytes over full-context page bytes,
+            // rounded up): the capacity curve adds it per lane (make_sequence_planner_impl).
+            out.kv_window_lane_charge_pages =
+                kv_window_main_equivalent(text_pool.spec.window_lane_charge, window_page_bytes, per_page);
         }
     }
     return out;
@@ -1463,17 +1467,37 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         }(),
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);
-    const std::uint32_t minimum_pages = std::max(logical_pages, inputs.max_concurrency);
-    const std::uint64_t maximum_pages64 =
+    std::uint32_t minimum_pages = std::max(logical_pages, inputs.max_concurrency);
+    std::uint64_t maximum_pages64 =
         static_cast<std::uint64_t>(inputs.max_concurrency) * logical_pages;
     if (maximum_pages64 > std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error("maximum Main KV page count exceeds uint32");
     }
-    const auto maximum_pages = static_cast<std::uint32_t>(maximum_pages64);
 
     auto planner     = std::make_unique<family::detail::SequencePlannerImpl<Variant>>();
     planner->inputs  = inputs;
     planner->minimum = build_sequence_candidate(inputs, minimum_pages);
+    // Lane f1 M3-C: an elastic window class charges every text allocation its window pages in the
+    // main ledger, so one full-context request needs logical_pages + charge and every lane at full
+    // context max_concurrency x that. Without it the curve topped out at max_concurrency x
+    // logical_pages: --max-num-seqs 1 --max-model-len 98304 resolved 1,536 pages and refused a
+    // 92.6k prompt (1,447 pages + 175 charged) with nothing else in the pool (e1, card 7 14:35).
+    // Zero charge (every model without an elastic window class) leaves the curve as it was.
+    if (const std::uint32_t charge = planner->minimum->persistent.kv_window_lane_charge_pages; charge != 0) {
+        const std::uint64_t per_lane = static_cast<std::uint64_t>(logical_pages) + charge;
+        const std::uint64_t minimum64 = std::max<std::uint64_t>(
+            per_lane, static_cast<std::uint64_t>(inputs.max_concurrency) * (1ULL + charge));
+        maximum_pages64 = static_cast<std::uint64_t>(inputs.max_concurrency) * per_lane;
+        if (maximum_pages64 > std::numeric_limits<std::uint32_t>::max()) {
+            throw std::overflow_error("maximum Main KV page count exceeds uint32");
+        }
+        minimum_pages    = static_cast<std::uint32_t>(minimum64);
+        planner->minimum = build_sequence_candidate(inputs, minimum_pages);
+        if (planner->minimum->persistent.kv_window_lane_charge_pages != charge) {
+            throw std::logic_error("KV window lane charge depends on the page count");
+        }
+    }
+    const auto maximum_pages = static_cast<std::uint32_t>(maximum_pages64);
     planner->curve   = runtime::SequenceCapacityCurve{
           .main_page_tokens                     = static_cast<std::uint32_t>(kPagedKVPageSize),
           .minimum_main_page_groups             = minimum_pages,
