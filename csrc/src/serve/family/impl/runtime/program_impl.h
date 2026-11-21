@@ -399,18 +399,6 @@ void ProgramImplCore::configure_stage(const SequencePlanImpl& plan) {
     if (stage_import.data) { std::memset(stage_import.data, 0, stage_boundary_bytes_); }
     if (stage_export.data) { std::memset(stage_export.data, 0, stage_boundary_bytes_); }
     if (family::dspark_drafter<Variant>() && plan.features.dflash()) {
-        // Review R5 minor 3: the split routes carry the coupled verify, so switching them off leaves the row on the
-        // one-hot rule even though SUROGATE_SPEC_COUPLED still reads 1. Debug knob: say so at startup.
-        const char* coupled_raw = std::getenv("SUROGATE_SPEC_COUPLED");
-        const char* split_raw   = std::getenv("SUROGATE_SPEC_EXACT_SPLIT");
-        const bool coupled_on = coupled_raw == nullptr || coupled_raw[0] == '\0' || std::atoi(coupled_raw) != 0;
-        const bool split_on   = split_raw == nullptr || split_raw[0] == '\0' || std::atoi(split_raw) != 0;
-        if (coupled_on && !split_on) {
-            std::fprintf(stderr, "engine: WARNING SUROGATE_SPEC_EXACT_SPLIT=0 disables coupled verification: untruncated "
-                                 "sampled rows use the one-hot rule, so MTP on != MTP off at temperature > 0\n");
-        }
-    }
-    if (family::dspark_drafter<Variant>() && plan.features.dflash()) {
         // DSpark on a pipeline (ENGINE-INKLING lane e1): the stage with the head holds the drafter and proposes each
         // round's drafts before the first stage launches; the first stage verifies them from its draft import.
         const std::size_t bytes = 2 * schedule::kDSparkDraftImportStride * sizeof(std::int32_t);
@@ -540,6 +528,18 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     if (plan.persistent.dflash) {
         dflash.emplace(backing, *plan.persistent.dflash, *decoder);
         if (pipeline_stage()) { stage.features = &dflash->prefill_features; }
+        if (family::dspark_drafter<Variant>()) {
+            // Review R5 minor 3: the split routes carry the coupled verify, so switching them off leaves the row on the
+            // one-hot rule even though SUROGATE_SPEC_COUPLED still reads 1. Debug knob: say so at startup.
+            const char* coupled_raw = std::getenv("SUROGATE_SPEC_COUPLED");
+            const char* split_raw   = std::getenv("SUROGATE_SPEC_EXACT_SPLIT");
+            const bool coupled_on = coupled_raw == nullptr || coupled_raw[0] == '\0' || std::atoi(coupled_raw) != 0;
+            const bool split_on   = split_raw == nullptr || split_raw[0] == '\0' || std::atoi(split_raw) != 0;
+            if (coupled_on && !split_on) {
+                std::fprintf(stderr, "engine: WARNING SUROGATE_SPEC_EXACT_SPLIT=0 disables coupled verification: untruncated "
+                                     "sampled rows use the one-hot rule, so MTP on != MTP off at temperature > 0\n");
+            }
+        }
     }
     if (dflash.has_value() != plan.features.dflash()) {
         throw std::logic_error("DFlash state does not match the frozen sequence plan");
