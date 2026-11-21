@@ -598,6 +598,7 @@ struct InvRow {
 // Outputs of one route, per column: gated bf16 bits [N][3072], out fp32 bits [N][3072], lse fp32 bits [N][24].
 struct InvOut {
     int W = 0;
+    bool train_same = false; // the training entry's three outputs == the production calls', bitwise
     std::vector<InvRow> rows;
     std::vector<std::uint16_t> gated;
     std::vector<std::uint32_t> out, lse;
@@ -645,8 +646,18 @@ InvOut run_inv_route(InklingLayerKind kind, const InvPlane& ip, const Layer& lay
     Tensor y(dy.p, DType::BF16, {3072, N}), of(dof.p, DType::FP32, {128, 24, N}), lse(dl.p, DType::FP32, {24, N});
     ops::inkling_rel_attention(in, kind, view, ip.plane->view(), work, y, nullptr);
     ops::inkling_rel_attention_out_lse(in, kind, view, ip.plane->view(), work, of, lse, nullptr);
+    // The training entry on the same rows: gated, o and lse from one pass, bitwise equal to the two calls above.
+    DeviceBuffer ty(dy.bytes), to(dof.bytes), tl(dl.bytes);
+    Tensor tyt(ty.p, DType::BF16, {3072, N}), tot(to.p, DType::FP32, {128, 24, N}), tlt(tl.p, DType::FP32, {24, N});
+    ops::inkling_rel_attention_train(in, kind, view, ip.plane->view(), work, tyt, tot, tlt, nullptr);
     cuda_synchronize();
     InvOut o;
+    o.train_same = from_device<std::uint16_t>(ty, static_cast<std::size_t>(N) * 3072) ==
+                       from_device<std::uint16_t>(dy, static_cast<std::size_t>(N) * 3072) &&
+                   from_device<std::uint32_t>(to, static_cast<std::size_t>(N) * 3072) ==
+                       from_device<std::uint32_t>(dof, static_cast<std::size_t>(N) * 3072) &&
+                   from_device<std::uint32_t>(tl, static_cast<std::size_t>(N) * 24) ==
+                       from_device<std::uint32_t>(dl, static_cast<std::size_t>(N) * 24);
     o.W     = W;
     o.rows  = rws;
     o.gated = from_device<std::uint16_t>(dy, static_cast<std::size_t>(N) * 3072);
@@ -677,10 +688,14 @@ void run_invariance_case(const InvCase& c, const char* groups, std::uint32_t see
         }
         return v;
     };
-    std::size_t routes = 0, columns = 0, bad_columns = 0;
+    std::size_t routes = 0, columns = 0, bad_columns = 0, train_bad = 0;
     std::string first_bad;
     const auto compare = [&](const std::string& route, const InvOut& o) {
         ++routes;
+        if (!o.train_same) {
+            ++train_bad;
+            if (first_bad.empty()) { first_bad = route + " (training entry)"; }
+        }
         for (std::size_t b = 0; b < o.rows.size(); ++b) {
             if (o.rows[b].seq != 0) { continue; }
             for (int j = 0; j < o.rows[b].valid; ++j) {
@@ -759,9 +774,11 @@ void run_invariance_case(const InvCase& c, const char* groups, std::uint32_t see
         }
         unsetenv("SUROGATE_INKLING_ATTN_SPLITS");
     }
-    std::printf("%-44s routes %zu, target columns compared %zu, bit-different %zu%s%s\n", tag.c_str(), routes, columns,
-                bad_columns, first_bad.empty() ? "" : "  first: ", first_bad.c_str());
-    check(bad_columns == 0 && columns > 0, tag);
+    std::printf("%-44s routes %zu, target columns compared %zu, bit-different %zu, training entry != production on %zu "
+                "routes%s%s\n",
+                tag.c_str(), routes, columns, bad_columns, train_bad + (ref.train_same ? 0 : 1),
+                first_bad.empty() ? "" : "  first: ", first_bad.c_str());
+    check(bad_columns == 0 && train_bad == 0 && ref.train_same && columns > 0, tag);
     unsetenv("SUROGATE_INKLING_ATTN_GROUPS");
 }
 
@@ -1056,6 +1073,49 @@ void run_prologue_case(const ProCase& c, std::uint32_t seed) {
         const std::vector<double> ref_y = gated_oracle(rows, ref_o, ref_l, gate, sink);
         const std::vector<double> got_y = from_device_bf16(dout, static_cast<std::size_t>(N) * 3072);
         check(verify_reduction(c.name + " fused gated", got_y, ref_y, kGatedCriterion) == 0, c.name + " fused");
+
+        // The fused training call on a third copy of the original state and plane: its gated output == the fused
+        // call's, its q / r == the prologue's, its o / lse == the out-lse route's on those q / r, bitwise; tau (global)
+        // within 1 ulp of the host's logf (the prologue's own device function).
+        Plane plane3(c.B, maxk + 64, 0x7F, seed + 2);
+        plane3.hk = plane_k0;
+        plane3.hv = plane_v0;
+        plane3.upload();
+        DeviceBuffer dstate3 = to_device_bf16(state), drec3 = to_device_bf16(records);
+        ops::InklingConvStateArgs conv3 = conv;
+        conv3.states = Tensor(dstate3.p, DType::BF16, {kC, 3, S});
+        if (c.mode == ops::InklingConvMode::Record) { conv3.records = Tensor(drec3.p, DType::BF16, {kC, Wmax, c.B}); }
+        const std::size_t sn = static_cast<std::size_t>(N);
+        DeviceBuffer tq(sn * 3072 * 2), tr(sn * 384 * 2), ttau(sn * 4), to(sn * 3072 * 4), tl(sn * 24 * 4), ty(sn * 3072 * 2),
+            ro(sn * 3072 * 4), rl(sn * 24 * 4);
+        ops::InklingAttentionTrainOutputs tro;
+        tro.q   = Tensor(tq.p, DType::BF16, {128, 24, N});
+        tro.r   = Tensor(tr.p, DType::BF16, {16, 24, N});
+        tro.tau = glob ? Tensor(ttau.p, DType::FP32, {N}) : Tensor{};
+        tro.o   = Tensor(to.p, DType::FP32, {128, 24, N});
+        tro.lse = Tensor(tl.p, DType::FP32, {24, N});
+        Tensor tyt(ty.p, DType::BF16, {3072, N}), rot(ro.p, DType::FP32, {128, 24, N}), rlt(rl.p, DType::FP32, {24, N});
+        WorkspaceArena work3(ops::inkling_attention_workspace_capacity_bytes(c.kind, c.B, c.W, c.W, view.envelope) + 4096);
+        ops::inkling_attention_train(in, layer.weights(), c.kind, view, conv3, plane3.view(), work3, tyt, tro, nullptr);
+        const ops::InklingAttentionInputs ain{tro.q, tro.r, in.gate, in.sink, layer.weights().rel_table};
+        ops::inkling_rel_attention_out_lse(ain, c.kind, view, plane3.view(), work3, rot, rlt, nullptr);
+        cuda_synchronize();
+        const bool same_y = from_device<std::uint16_t>(ty, sn * 3072) == from_device<std::uint16_t>(dout, sn * 3072);
+        const bool same_q = from_device<std::uint16_t>(tq, sn * 3072) == from_device<std::uint16_t>(dqo, sn * 3072);
+        const bool same_r = from_device<std::uint16_t>(tr, sn * 384) == from_device<std::uint16_t>(dro, sn * 384);
+        const bool same_o = from_device<std::uint32_t>(to, sn * 3072) == from_device<std::uint32_t>(ro, sn * 3072) &&
+                            from_device<std::uint32_t>(tl, sn * 24) == from_device<std::uint32_t>(rl, sn * 24);
+        int tau_bad = 0;
+        if (glob) {
+            const std::vector<float> tg = from_device<float>(ttau, sn);
+            for (int i = 0; i < N; ++i) {
+                const float want = host_tau(rows.pos[i]);
+                tau_bad += std::fabs(tg[i] - want) > std::fabs(want) * 2.4e-7F;
+            }
+        }
+        std::printf("%-44s %-8s training call: out %s, q %s, r %s, o+lse %s, tau off > 1 ulp %d\n", c.name.c_str(), "train",
+                    same_y ? "==" : "DIFF", same_q ? "==" : "DIFF", same_r ? "==" : "DIFF", same_o ? "==" : "DIFF", tau_bad);
+        check(same_y && same_q && same_r && same_o && tau_bad == 0, c.name + " training call");
     }
 }
 

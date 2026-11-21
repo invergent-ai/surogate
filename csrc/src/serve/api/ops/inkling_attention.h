@@ -273,6 +273,36 @@ void inkling_rel_attention_out_lse(const InklingAttentionInputs& inputs, Inkling
                                    Tensor& out, Tensor& lse, cudaStream_t stream);
 
 /**
+ * Training entry (agent-EN 11:3x; lane g1b's engine-op IR): THE production attention -- same plan, kernels and per-row
+ * arithmetic as inkling_rel_attention on every route -- writing in the same pass the gated output `out` (contiguous
+ * BF16 [3072, N]), the pre-gate output `o` (contiguous FP32 [128, 24, N]) and the natural `lse` (contiguous FP32
+ * [24, N]); invalid columns and idle rows are zero in all three. Bitwise: out == inkling_rel_attention's, o / lse ==
+ * inkling_rel_attention_out_lse's on the same rows (test: invariance ... train entry).
+ */
+void inkling_rel_attention_train(const InklingAttentionInputs& inputs, InklingLayerKind kind,
+                                 const InklingAttentionRows& rows, const PagedKVBatchLayerView& cache,
+                                 WorkspaceArena& workspace, Tensor& out, Tensor& o, Tensor& lse, cudaStream_t stream);
+
+/// What the fused training call exposes besides its gated output: the prologue's q_out (BF16 [128, 24, N]) and r_out
+/// (BF16 [16, 24, N]), both contiguous and written by the prologue itself; tau (FP32 [N], global layers: the
+/// prologue's own values; local layers: unused, may be empty); o and lse as inkling_rel_attention_train.
+struct InklingAttentionTrainOutputs {
+    Tensor q;
+    Tensor r;
+    Tensor tau;
+    Tensor o;
+    Tensor lse;
+};
+
+/// inkling_attention (prologue + attention + gate / sink) for the trainer: the same calls, the prologue's q / r / tau
+/// kept, o and lse written by the same final pass as `out`. Needs no workspace for q / r (the caller's tensors).
+void inkling_attention_train(const InklingProjections& projections, const InklingAttentionWeights& weights,
+                             InklingLayerKind kind, const InklingAttentionRows& rows,
+                             const InklingConvStateArgs& conv, const PagedKVBatchLayerView& cache,
+                             WorkspaceArena& workspace, Tensor& out, InklingAttentionTrainOutputs& train,
+                             cudaStream_t stream);
+
+/**
  * Op inkling_gate_sink (ref `inkling_gate_sink`, vLLM `_gate_sink_kernel`, D1 A7): result =
  * bf16((out * sigmoid(gate)) * sigmoid(lse - sink)), sigmoid(x) = rcp.approx(ex2.approx(-x log2 e) + 1).
  * out FP32 [128, 24, N] contiguous, lse FP32 [24, N] contiguous, gate BF16 [3072, N] and sink BF16

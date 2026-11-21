@@ -48,7 +48,10 @@ inline constexpr int kPrefillRows = 64;                 // query columns of one 
 inline constexpr int kMaxWorkers  = 64;
 inline constexpr int kSmemLimit   = 101376;             // sm_120 opt-in shared memory per block
 
-enum Mode : int { kGated = 0, kOutLse = 1, kPartial = 2 };
+// kTrain = the training entry: gated output AND pre-gate o + lse from the same final pass.
+enum Mode : int { kGated = 0, kOutLse = 1, kPartial = 2, kTrain = 3 };
+template <int Mode> inline constexpr bool kWritesGated  = Mode == kGated || Mode == kTrain;
+template <int Mode> inline constexpr bool kWritesOutLse = Mode == kOutLse || Mode == kTrain;
 
 /// Key groups, a function of the absolute key position only, in three tiers: keys below t1 in groups of 1 << s1,
 /// keys in [t1, t2) in groups of 1 << s2, keys from t2 in groups of 1 << s3 (t1 a multiple of 1 << s1, t2 - t1 of
@@ -698,31 +701,30 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
             const bool has       = rvalid[i] && Lt[i] > 0.0F;
             const float lse2     = has ? final_lse2(Mt[i], Lt[i], p.variant) : -CUDART_INF_F;
             const int d0         = 8 * kq * DTW + 2 * lid;
-            if constexpr (Mode == kGated) {
-                __nv_bfloat16* dst = p.out + n * Geo::kAttnWidth + h * Geo::kHeadDim + d0;
-                if (!rvalid[i]) {
+            float sig_sink       = 0.0F;
+            if constexpr (kWritesGated<Mode>) {
+                if (rvalid[i]) { sig_sink = gated_sink_factor(lse2, p.sink + n * p.sink_stride + h); }
+            }
 #pragma unroll
-                    for (int t = 0; t < DTW; ++t) { store_vec(dst + 8 * t, 0U); }
-                    continue;
+            for (int t = 0; t < DTW; ++t) {
+                const float o0 = has ? final_o(sm.fold_a[warp][t * 4 + 2 * i][lane], Lt[i], p.variant) : 0.0F;
+                const float o1 = has ? final_o(sm.fold_a[warp][t * 4 + 2 * i + 1][lane], Lt[i], p.variant) : 0.0F;
+                if constexpr (kWritesGated<Mode>) {
+                    __nv_bfloat16* dst = p.out + n * Geo::kAttnWidth + h * Geo::kHeadDim + d0 + 8 * t;
+                    if (rvalid[i]) {
+                        const float2 gv = bf16x2_bits_to_float2(
+                            load_vec<unsigned>(p.gate + n * p.gate_stride + h * Geo::kHeadDim + d0 + 8 * t));
+                        store_vec(dst, pack_bf16x2(gated_value(o0, gv.x, sig_sink), gated_value(o1, gv.y, sig_sink)));
+                    } else {
+                        store_vec(dst, 0U);
+                    }
                 }
-                const float sig_sink   = gated_sink_factor(lse2, p.sink + n * p.sink_stride + h);
-                const __nv_bfloat16* g = p.gate + n * p.gate_stride + h * Geo::kHeadDim + d0;
-#pragma unroll
-                for (int t = 0; t < DTW; ++t) {
-                    const float o0  = has ? final_o(sm.fold_a[warp][t * 4 + 2 * i][lane], Lt[i], p.variant) : 0.0F;
-                    const float o1  = has ? final_o(sm.fold_a[warp][t * 4 + 2 * i + 1][lane], Lt[i], p.variant) : 0.0F;
-                    const float2 gv = bf16x2_bits_to_float2(load_vec<unsigned>(g + 8 * t));
-                    store_vec(dst + 8 * t, pack_bf16x2(gated_value(o0, gv.x, sig_sink), gated_value(o1, gv.y, sig_sink)));
+                if constexpr (kWritesOutLse<Mode>) {
+                    store_vec(p.out_f32 + (n * Geo::kQHeads + h) * Geo::kHeadDim + d0 + 8 * t, make_float2(o0, o1));
                 }
-            } else {
-                float* dst = p.out_f32 + (n * Geo::kQHeads + h) * Geo::kHeadDim + d0;
-#pragma unroll
-                for (int t = 0; t < DTW; ++t) {
-                    const float o0 = has ? final_o(sm.fold_a[warp][t * 4 + 2 * i][lane], Lt[i], p.variant) : 0.0F;
-                    const float o1 = has ? final_o(sm.fold_a[warp][t * 4 + 2 * i + 1][lane], Lt[i], p.variant) : 0.0F;
-                    store_vec(dst + 8 * t, make_float2(o0, o1));
-                }
-                // Columns past the valid count come out zero, as the reference zeroes its padding rows.
+            }
+            // Columns past the valid count come out zero, as the reference zeroes its padding rows.
+            if constexpr (kWritesOutLse<Mode>) {
                 if (kq == 0 && lid == 0) { p.lse[n * Geo::kQHeads + h] = rvalid[i] ? __fmul_rn(lse2, kLn2) : 0.0F; }
             }
         }
@@ -813,14 +815,15 @@ __global__ __launch_bounds__(128) void fold_kernel(const AttnParams p) {
     const float lse2 = has ? final_lse2(M, L, p.variant) : -CUDART_INF_F;
     float o          = has ? final_o(A, L, p.variant) : 0.0F;
     if (poison) { o = CUDART_NAN_F; }
-    if constexpr (Mode == kGated) {
+    if constexpr (kWritesGated<Mode>) {
         float y = 0.0F;
         if (ok) {
             const float g = __bfloat162float(p.gate[n * p.gate_stride + h * Geo::kHeadDim + d]);
             y             = gated_value(o, g, gated_sink_factor(lse2, p.sink + n * p.sink_stride + h));
         }
         p.out[n * Geo::kAttnWidth + h * Geo::kHeadDim + d] = __float2bfloat16_rn(y);
-    } else {
+    }
+    if constexpr (kWritesOutLse<Mode>) {
         p.out_f32[(n * Geo::kQHeads + h) * Geo::kHeadDim + d] = ok ? o : 0.0F;
         if (d == 0) { p.lse[n * Geo::kQHeads + h] = ok ? __fmul_rn(lse2, kLn2) : 0.0F; }
     }
@@ -987,6 +990,7 @@ void dispatch(InklingLayerKind kind, int mode, const Plan& plan, const AttnParam
     switch (mode) {
     case kGated: return local ? dispatch_mode<true, kGated>(plan, p, stream) : dispatch_mode<false, kGated>(plan, p, stream);
     case kOutLse: return local ? dispatch_mode<true, kOutLse>(plan, p, stream) : dispatch_mode<false, kOutLse>(plan, p, stream);
+    case kTrain: return local ? dispatch_mode<true, kTrain>(plan, p, stream) : dispatch_mode<false, kTrain>(plan, p, stream);
     default: return local ? dispatch_mode<true, kPartial>(plan, p, stream) : dispatch_mode<false, kPartial>(plan, p, stream);
     }
 }
@@ -1045,12 +1049,13 @@ void run(const InklingAttentionInputs& in, InklingLayerKind kind, const InklingA
          const PagedKVBatchLayerView& cache, WorkspaceArena& workspace, int final_mode, Tensor* out,
          Tensor* out_f32, Tensor* lse, cudaStream_t stream, const char* op) {
     const RowsShape rs = check_rows(rows, op);
-    AttnParams p       = make_params(in, rows, cache, rs, final_mode == kGated, op);
+    AttnParams p       = make_params(in, rows, cache, rs, final_mode != kOutLse, op);
     const std::int64_t n = rs.columns;
-    if (final_mode == kGated) {
+    if (final_mode != kOutLse) {
         require_contiguous(*out, DType::BF16, n * Geo::kAttnWidth, op, "out");
         p.out = static_cast<__nv_bfloat16*>(out->data);
-    } else {
+    }
+    if (final_mode != kGated) {
         require_contiguous(*out_f32, DType::FP32, n * Geo::kQHeads * Geo::kHeadDim, op, "out");
         require_contiguous(*lse, DType::FP32, n * Geo::kQHeads, op, "lse");
         p.out_f32 = static_cast<float*>(out_f32->data);
@@ -1074,6 +1079,8 @@ void run(const InklingAttentionInputs& in, InklingLayerKind kind, const InklingA
     dispatch(kind, kPartial, plan, p, stream);
     if (final_mode == kGated) {
         launch_fold<kGated>(kind, n, p, stream);
+    } else if (final_mode == kTrain) {
+        launch_fold<kTrain>(kind, n, p, stream);
     } else {
         launch_fold<kOutLse>(kind, n, p, stream);
     }
@@ -1139,6 +1146,35 @@ void inkling_rel_attention_out_lse(const InklingAttentionInputs& inputs, Inkling
                                    Tensor& out, Tensor& lse, cudaStream_t stream) {
     inkling_detail::run(inputs, kind, rows, cache, workspace, inkling_detail::kOutLse, nullptr, &out, &lse,
                         stream, "inkling_rel_attention_out_lse");
+}
+
+void inkling_rel_attention_train(const InklingAttentionInputs& inputs, InklingLayerKind kind,
+                                 const InklingAttentionRows& rows, const PagedKVBatchLayerView& cache,
+                                 WorkspaceArena& workspace, Tensor& out, Tensor& o, Tensor& lse, cudaStream_t stream) {
+    inkling_detail::run(inputs, kind, rows, cache, workspace, inkling_detail::kTrain, &out, &o, &lse, stream,
+                        "inkling_rel_attention_train");
+}
+
+void inkling_attention_train(const InklingProjections& projections, const InklingAttentionWeights& weights,
+                             InklingLayerKind kind, const InklingAttentionRows& rows,
+                             const InklingConvStateArgs& conv, const PagedKVBatchLayerView& cache,
+                             WorkspaceArena& workspace, Tensor& out, InklingAttentionTrainOutputs& train,
+                             cudaStream_t stream) {
+    using namespace inkling_detail;
+    const char* op       = "inkling_attention_train";
+    const RowsShape rs   = check_rows(rows, op);
+    const std::int64_t n = rs.columns;
+    require_contiguous(train.q, DType::BF16, n * Geo::kQHeads * Geo::kHeadDim, op, "train.q");
+    require_contiguous(train.r, DType::BF16, n * Geo::kQHeads * Geo::kRelDim, op, "train.r");
+    InklingPrologueOutputs qr{train.q, train.r};
+    inkling_attention_prologue(projections, weights, kind, rows, conv, cache, qr, stream);
+    if (kind == InklingLayerKind::Global) {
+        // The prologue's own tau: the same device function (log_tau) on the same positions.
+        if (train.tau.numel() != n) { fail(op, "train.tau must be FP32 [N] on a global layer"); }
+        inkling_log_tau(rows.positions, train.tau, stream);
+    }
+    const InklingAttentionInputs in{train.q, train.r, projections.gate, projections.sink, weights.rel_table};
+    inkling_rel_attention_train(in, kind, rows, cache, workspace, out, train.o, train.lse, stream);
 }
 
 void inkling_gate_sink(const Tensor& out, const Tensor& lse, const Tensor& gate, const Tensor& sink,
