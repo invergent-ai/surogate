@@ -1614,8 +1614,11 @@ target_sources(sinfer_ops PRIVATE
   ${SERVE_ROOT}/ops/inkling_mix/inkling_mix.cu
   ${SERVE_ROOT}/ops/inkling_mix/inkling_gemm_inv.cu
   ${SERVE_ROOT}/ops/inkling_mix/inkling_head_logprob.cu
+  ${SERVE_ROOT}/ops/inkling_mix/inkling_lora.cu
   ${SERVE_ROOT}/ops/inkling_mix/inkling_gemm_f32.cpp)
 set_source_files_properties(${SERVE_ROOT}/ops/inkling_mix/inkling_mix.cu
+  PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:-fmad=false>")
+set_source_files_properties(${SERVE_ROOT}/ops/inkling_mix/inkling_lora.cu
   PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:-fmad=false>")
 # Vendor-tuned CPU GEMM, optional and injected by path. Both live outside the
 # tree as reference checkouts rather than vendored dependencies, so a build with

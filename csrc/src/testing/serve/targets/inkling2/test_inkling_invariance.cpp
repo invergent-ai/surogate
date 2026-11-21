@@ -9,6 +9,7 @@
 // I1 also checks the GEMM against a float64 host product (a loose bound: a wrong chain is off by O(1)).
 
 #include "api/ops/inkling_mix.h"
+#include "api/ops/lora.h"
 #include "api/ops/sampled_logprob.h"
 #include "core/device.h"
 #include "ops/op_tester.h"
@@ -651,6 +652,112 @@ int test_head_logprob(std::uint32_t seed) {
     return failures;
 }
 
+// ------------------------------------------------------------------------------------- I7 attention LoRA delta
+
+/// inkling_lora_delta: one column alone == in the round; base tokens (slot -1) and a zero adapter leave the rows
+/// bitwise; a uniform slot == every token on that slot; adapted rows within 1 bf16 ulp of a float64 reference.
+int test_lora_delta(std::uint32_t seed) {
+    constexpr int R = 16, T = kAll, kSlots = 3, kOut = 600;
+    constexpr int n0 = 512, n1 = 24; // two slices in one output plane (rows [0, 512) and [512, 536)), as qkvr's
+    const auto a0 = randn_bf16(static_cast<std::size_t>(kSlots) * R * kD, seed, 0.05F);
+    const auto a1 = randn_bf16(static_cast<std::size_t>(kSlots) * R * kD, seed + 1, 0.05F);
+    auto b0 = randn_bf16(static_cast<std::size_t>(kSlots) * n0 * R, seed + 2, 0.05F);
+    auto b1 = randn_bf16(static_cast<std::size_t>(kSlots) * n1 * R, seed + 3, 0.05F);
+    for (int i = 0; i < n0 * R; ++i) { b0[static_cast<std::size_t>(n0) * R + i] = 0.0F; } // slot 1: zero adapter
+    for (int i = 0; i < n1 * R; ++i) { b1[static_cast<std::size_t>(n1) * R + i] = 0.0F; }
+    const auto x0  = randn_bf16(static_cast<std::size_t>(T) * kD, seed + 4, 1.0F);
+    const auto x1  = randn_bf16(static_cast<std::size_t>(T) * kD, seed + 5, 1.0F);
+    const auto out = randn_bf16(static_cast<std::size_t>(T) * kOut, seed + 6, 1.0F);
+    std::vector<std::int32_t> slots(T);
+    for (int t = 0; t < T; ++t) { slots[t] = (t % 4) - 1; } // -1 base, 0, 1 zero adapter, 2
+    DeviceBuffer d_a0 = dev_bf16(a0), d_a1 = dev_bf16(a1), d_b0 = dev_bf16(b0), d_b1 = dev_bf16(b1);
+    DeviceBuffer d_x0 = dev_bf16(x0), d_x1 = dev_bf16(x1), d_slots = to_device(slots);
+    std::vector<ops::LoraBank> table(2);
+    table[0] = {d_a0.p, d_b0.p, static_cast<std::int64_t>(R) * kD, static_cast<std::int64_t>(n0) * R, R, n0, kD};
+    table[1] = {d_a1.p, d_b1.p, static_cast<std::int64_t>(R) * kD, static_cast<std::int64_t>(n1) * R, R, n1, kD};
+    DeviceBuffer d_table(table.size() * sizeof(ops::LoraBank));
+    CUDA_CHECK(cudaMemcpy(d_table.p, table.data(), table.size() * sizeof(ops::LoraBank), cudaMemcpyHostToDevice));
+    const auto run = [&](int c0, int n, const std::int32_t* uniform) {
+        DeviceBuffer d_out = dev_bf16(out);
+        auto* o = static_cast<std::uint16_t*>(d_out.p) + static_cast<std::size_t>(c0) * kOut;
+        const ops::InklingLoraSlice sl[2] = {
+            {0, n0, static_cast<const std::uint16_t*>(d_x0.p) + static_cast<std::size_t>(c0) * kD, kD, o, kOut},
+            {1, n1, static_cast<const std::uint16_t*>(d_x1.p) + static_cast<std::size_t>(c0) * kD, kD, o + n0, kOut}};
+        const std::size_t ws = ops::inkling_lora_delta_workspace_bytes(2, R, n);
+        DeviceBuffer d_ws(ws);
+        ops::inkling_lora_delta(d_table.p, sl, 2, R, n, uniform ? nullptr : static_cast<const std::int32_t*>(d_slots.p) + c0,
+                                uniform, d_ws.p, ws, nullptr);
+        cuda_synchronize();
+        return from_device<std::uint16_t>(d_out.p, static_cast<std::size_t>(T) * kOut);
+    };
+    const auto full  = run(0, T, nullptr);
+    const auto base  = bits(out);
+    int failures     = 0;
+    // (a) base tokens and the zero adapter: bitwise the input
+    std::size_t moved = 0;
+    for (int t = 0; t < T; ++t) {
+        if (slots[t] != -1 && slots[t] != 1) { continue; }
+        for (int j = 0; j < kOut; ++j) { moved += full[t * kOut + j] != base[t * kOut + j]; }
+    }
+    std::cout << (moved ? "FAIL " : "ok   ") << "I7 lora delta: base tokens + zero adapter rows untouched: " << moved
+              << " elements moved\n";
+    failures += moved ? 1 : 0;
+    // (b) one column alone == in the round
+    std::size_t bad_w = 0;
+    for (const int c : {0, 1, 3, 7, 150, 298, 299}) {
+        const auto one = run(c, 1, nullptr);
+        for (int j = 0; j < kOut; ++j) { bad_w += one[c * kOut + j] != full[c * kOut + j]; }
+    }
+    std::cout << (bad_w ? "FAIL " : "ok   ") << "I7 lora delta: one column alone == in the round (7 columns): " << bad_w
+              << " differ\n";
+    failures += bad_w ? 1 : 0;
+    // (c) a uniform slot == every token on it
+    std::vector<std::int32_t> two(T, 2);
+    DeviceBuffer d_two = to_device(two), d_cell = to_device(std::vector<std::int32_t>{2});
+    std::swap(d_slots.p, d_two.p);
+    const auto per_token = run(0, T, nullptr);
+    std::swap(d_slots.p, d_two.p);
+    const auto uniform = run(0, T, static_cast<const std::int32_t*>(d_cell.p));
+    std::size_t bad_u = 0;
+    for (std::size_t i = 0; i < uniform.size(); ++i) { bad_u += uniform[i] != per_token[i]; }
+    std::cout << (bad_u ? "FAIL " : "ok   ") << "I7 lora delta: uniform slot == per-token slots: " << bad_u << " differ\n";
+    failures += bad_u ? 1 : 0;
+    // (d) adapted rows vs a float64 reference: within 1 bf16 ulp
+    std::size_t far = 0, changed = 0;
+    for (int t = 0; t < T; ++t) {
+        const int sl = slots[t];
+        if (sl != 0 && sl != 2) { continue; }
+        for (int part = 0; part < 2; ++part) {
+            const auto& A = part ? a1 : a0;
+            const auto& B = part ? b1 : b0;
+            const auto& X = part ? x1 : x0;
+            const int n   = part ? n1 : n0;
+            double low[R];
+            for (int r = 0; r < R; ++r) {
+                double acc = 0.0;
+                for (int k = 0; k < kD; ++k) {
+                    acc += static_cast<double>(A[(static_cast<std::size_t>(sl) * R + r) * kD + k]) * X[static_cast<std::size_t>(t) * kD + k];
+                }
+                low[r] = acc;
+            }
+            for (int j = 0; j < n; ++j) {
+                double delta = 0.0;
+                for (int r = 0; r < R; ++r) { delta += static_cast<double>(B[(static_cast<std::size_t>(sl) * n + j) * R + r]) * low[r]; }
+                const int row      = (part ? n0 : 0) + j;
+                const double want  = static_cast<double>(out[static_cast<std::size_t>(t) * kOut + row]) + delta;
+                const float got    = bf16_to_f32(full[t * kOut + row]);
+                const double ulp   = std::max(std::fabs(want), 1e-30) * (1.0 / 128.0);
+                far += std::fabs(static_cast<double>(got) - want) > ulp;
+                changed += full[t * kOut + row] != base[t * kOut + row];
+            }
+        }
+    }
+    std::cout << (far ? "FAIL " : "ok   ") << "I7 lora delta vs float64: " << far << " beyond 1 bf16 ulp (" << changed
+              << " elements changed)\n";
+    failures += far || changed == 0 ? 1 : 0;
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -677,6 +784,7 @@ int main() {
     failures += test_blend_inputs(3103, 3, true, 1, 1, 3);  // MLP blend: partial + attn_out addend, mlp stream
     failures += test_conv_paths(3003);
     failures += test_head_logprob(3201);
+    failures += test_lora_delta(3601);
     for (const int n : {1, 5, 8, 13, 32}) {
         failures += test_controller_tail(3300 + n, 3, 1, n);
         failures += test_controller_tail(3400 + n, 3, 3, n);
