@@ -459,6 +459,222 @@ __global__ __launch_bounds__(128) void gemm_kernel(const LinearParams p) {
     }
 }
 
+// ---- GEMM, operand roles transposed: codes = MMA operand A, x = operand B (N > 16) --------------------------------
+// gemm1 (lanes/c NOTES, 16:5x) measured gemm_kernel 5.4-5.9 % slower than BASE ee8d2f30 at N = 8,192. SASS (agent-EN-c4,
+// lanes/c/sass/gemm_{cur,base}.sass): 105 MOVs per 64-K step in gemm_kernel's main loop (BASE: 8). An A fragment
+// interleaves tokens gid / gid + 8 at 4-byte grain ({u.x, v.x, u.y, v.y}), which no LDS.128 of a K-contiguous x tile
+// yields, so every MMA's A quad was assembled by MOVs. Here the roles are transposed: the widened codes are operand A
+// (the widen pass writes them straight in fragment order: one LDS.128 = one step's A quad {row gid, row gid + 8} x
+// {K 8 l + 0..1, 8 l + 2..3} (step A) / {8 l + 4..5, 8 l + 6..7} (step B)), and x is operand B (one LDS.128 of token gid's
+// K [8 l, 8 l + 8) = step A's pair (.x, .y) and step B's pair (.z, .w)). Every MMA keeps the chain's k-slot assignment
+// (step A: slots 2 l + {0, 1} <- K 8 l + {0, 1}, 2 l + 8 + {0, 1} <- 8 l + {2, 3}; step B the next four), the chunk order,
+// the cells from zero and cell_end in cell order; element (token t, row r) is the same 16 exact products x[t][k] w[r][k]
+// at the same k slots summed into the same accumulator -- only the MMA computes it as D^T = B^T A^T. That this gives the
+// same bits as narrow_kernel / gemm_kernel (x = operand A) is a TEST (attn_linear width: this kernel at N = 17 / 64 / 8192
+// vs the narrow kernels and vs gemm_kernel), not an assumption.
+// Direct = no widened tile: each warp widens its own A fragments from the code tile (each code widened twice, by the
+// two token warps) and the step needs no widen pass and one barrier less; !Direct = gemm_kernel's shared widen pass.
+// Code tile: 16-byte piece p of CTA row r at p ^ (r & 2): the fragment reads (LDS.64, rows gid + 16 m, K 32 c + 8 l) are
+// conflict-free per half warp. Scales (1x128 / 128x128): each thread's 4 rows' scale pointers once at entry; a cell's 4
+// scales are loaded at its first step and used at its end (gemm1 lever "prefetch the scales").
+template <bool WithW>
+struct GemmTSmem {
+    std::uint8_t codes[2][kTn * kTk];      // 2 x 4 KiB, [row][k], piece-swizzled
+    __nv_bfloat16 x[2][kTm * kTk];         // 2 x 8 KiB, [token][k], swizzled (swz64)
+    int4 w[4 * 2 * 2 * 32];                // 8 KiB, A quads [m16 tile][chunk][step][lane]
+};
+template <>
+struct GemmTSmem<false> {
+    std::uint8_t codes[2][kTn * kTk];
+    __nv_bfloat16 x[2][kTm * kTk];
+};
+
+__device__ __forceinline__ int code_off(int row, int piece, int half) {
+    return row * kTk + ((piece ^ (row & 2)) << 4) + (half << 3);
+}
+
+/// Cell end with rows by element: elements 0 / 1 are row gid (scale s_lo), 2 / 3 row gid + 8 (s_hi) of an m16 row tile;
+/// the same per-element operation as cell_end (fmaf(scale, part, acc), or acc + part per channel).
+template <bool PerRow>
+__device__ __forceinline__ void cell_end_rows(float (&acc)[4], float (&part)[4], float s_lo, float s_hi) {
+    if constexpr (PerRow) {
+#pragma unroll
+        for (int e = 0; e < 4; ++e) { acc[e] = __fadd_rn(acc[e], part[e]); }
+    } else {
+        acc[0] = fmaf(s_lo, part[0], acc[0]);
+        acc[1] = fmaf(s_lo, part[1], acc[1]);
+        acc[2] = fmaf(s_hi, part[2], acc[2]);
+        acc[3] = fmaf(s_hi, part[3], acc[3]);
+    }
+    part[0] = part[1] = part[2] = part[3] = 0.0F;
+}
+
+template <int K, bool PerRow, bool Direct>
+__global__ __launch_bounds__(128) void gemm_t_kernel(const LinearParams p) {
+    __shared__ __align__(16) GemmTSmem<!Direct> sm;
+    const int block        = static_cast<int>(blockIdx.x);
+    const LinearSegment& s = p.seg[segment_of(p, block)];
+    const int tid          = static_cast<int>(threadIdx.x);
+    const int warp         = tid >> 5;
+    const int lane         = tid & 31;
+    const int gid          = lane >> 2;
+    const int lid          = lane & 3;
+    const int wm           = warp >> 1; // warp token block (32 tokens = 4 n8 tiles)
+    const int wn           = warp & 1;  // warp row block (32 rows = 2 m16 tiles)
+    const int local0       = (block - s.block_begin) * kTn;
+    const int col0         = static_cast<int>(blockIdx.y) * kTm;
+    constexpr int Steps    = K / kTk;
+
+    const auto stage_codes = [&](int step, int slot) {
+        const int k0 = step * kTk;
+        for (int c = tid; c < 256; c += 128) {
+            const int row = c >> 2, piece = c & 3;
+            const int local = local0 + row;
+            const bool ok   = local < s.rows;
+            const std::uint8_t* src =
+                s.codes + static_cast<std::int64_t>(s.row_begin + (ok ? local : 0)) * K + k0 + piece * 16;
+            cp_async_zfill<16>(&sm.codes[slot][code_off(row, piece, 0)], src, ok ? 16 : 0);
+        }
+    };
+    const auto stage_x = [&](int step, int slot) {
+        const int k0 = step * kTk;
+        for (int c = tid; c < 512; c += 128) {
+            const int tok = c >> 3, chunk = c & 7;
+            const bool ok = col0 + tok < p.columns;
+            const __nv_bfloat16* src = s.x + static_cast<std::int64_t>(ok ? col0 + tok : 0) * K + k0 + chunk * 8;
+            cp_async_zfill<16>(&sm.x[slot][swz64(tok, chunk)], src, ok ? 16 : 0);
+        }
+    };
+    // Two code rows (r, r + 8) of chunk c, lane l's 8 K each, widened: the step A / step B A quads.
+    const auto a_quads = [&](int slot, int r, int c, int l, int4& qa, int4& qb) {
+        const int piece = 2 * c + (l >> 1), half = l & 1;
+        const int4 lo   = e4m3x8_to_bf16x8(load_vec<int2>(&sm.codes[slot][code_off(r, piece, half)]));
+        const int4 hi   = e4m3x8_to_bf16x8(load_vec<int2>(&sm.codes[slot][code_off(r + 8, piece, half)]));
+        qa              = make_int4(lo.x, hi.x, lo.y, hi.y);
+        qb              = make_int4(lo.z, hi.z, lo.w, hi.w);
+    };
+
+    float acc[2][4][4], part[2][4][4];
+#pragma unroll
+    for (int mt = 0; mt < 2; ++mt) {
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) { acc[mt][nt][e] = part[mt][nt][e] = 0.0F; }
+        }
+    }
+    // This thread's rows: m16 tile mt, half h -> local0 + 32 wn + 16 mt + gid + 8 h; their scale rows (cells).
+    const auto out_row = [&](int mt, int h) { return local0 + 32 * wn + 16 * mt + gid + 8 * h; };
+    const float* srow[2][2];
+#pragma unroll
+    for (int mt = 0; mt < 2; ++mt) {
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int row = s.row_begin + min(out_row(mt, h), s.rows - 1);
+            srow[mt][h]   = s.scales + static_cast<std::int64_t>(row / s.rows_per) * (PerRow ? 1 : s.kcells);
+        }
+    }
+
+    stage_codes(0, 0);
+    if (Steps > 1) { stage_codes(1, 1); }
+    pdl::wait_for_dependencies();
+    stage_x(0, 0);
+    cp_commit();
+    if (Steps > 1) { stage_x(1, 1); }
+    cp_commit();
+    float sc[2][2] = {{1.0F, 1.0F}, {1.0F, 1.0F}};
+    for (int st = 0; st < Steps; ++st) {
+        const int slot = st & 1;
+        if constexpr (!PerRow) {
+            if ((st & 1) == 0) { // this cell's scales, used at its end (two steps on)
+#pragma unroll
+                for (int mt = 0; mt < 2; ++mt) {
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) { sc[mt][h] = srow[mt][h][st >> 1]; }
+                }
+            }
+        }
+        cp_wait<1>();
+        __syncthreads();
+        if constexpr (!Direct) {
+            // Widen this step's codes into A quads: 4 m16 tiles x 2 chunks x 32 lanes, two items a thread.
+#pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                const int item = tid + 128 * i;
+                const int ln = item & 31, c = (item >> 5) & 1, m16 = item >> 6;
+                int4 qa, qb;
+                a_quads(slot, 16 * m16 + (ln >> 2), c, ln & 3, qa, qb);
+                sm.w[((m16 * 2 + c) * 2) * 32 + ln]      = qa;
+                sm.w[((m16 * 2 + c) * 2 + 1) * 32 + ln] = qb;
+            }
+            __syncthreads();
+        }
+#pragma unroll
+        for (int c = 0; c < 2; ++c) {
+            int4 qa[2], qb[2];
+            uint4 b[4];
+#pragma unroll
+            for (int mt = 0; mt < 2; ++mt) {
+                if constexpr (Direct) {
+                    a_quads(slot, 32 * wn + 16 * mt + gid, c, lid, qa[mt], qb[mt]);
+                } else {
+                    const int m16 = 2 * wn + mt;
+                    qa[mt]        = sm.w[((m16 * 2 + c) * 2) * 32 + lane];
+                    qb[mt]        = sm.w[((m16 * 2 + c) * 2 + 1) * 32 + lane];
+                }
+            }
+#pragma unroll
+            for (int nt = 0; nt < 4; ++nt) { b[nt] = load_vec<uint4>(&sm.x[slot][swz64(32 * wm + 8 * nt + gid, 4 * c + lid)]); }
+#pragma unroll
+            for (int mt = 0; mt < 2; ++mt) {
+#pragma unroll
+                for (int nt = 0; nt < 4; ++nt) {
+                    float(&d)[4] = part[mt][nt];
+                    mma_bf16_nv(d[0], d[1], d[2], d[3], static_cast<unsigned>(qa[mt].x), static_cast<unsigned>(qa[mt].y),
+                                static_cast<unsigned>(qa[mt].z), static_cast<unsigned>(qa[mt].w), b[nt].x, b[nt].y);
+                    mma_bf16_nv(d[0], d[1], d[2], d[3], static_cast<unsigned>(qb[mt].x), static_cast<unsigned>(qb[mt].y),
+                                static_cast<unsigned>(qb[mt].z), static_cast<unsigned>(qb[mt].w), b[nt].z, b[nt].w);
+                }
+            }
+        }
+        __syncthreads(); // this stage's slots (and the A tile) are free
+        if (st + 2 < Steps) {
+            stage_codes(st + 2, slot);
+            stage_x(st + 2, slot);
+        }
+        cp_commit();
+        if ((st & 1) == 1) { // a cell ends every 128 columns (two steps): join its partial to the total
+#pragma unroll
+            for (int mt = 0; mt < 2; ++mt) {
+#pragma unroll
+                for (int nt = 0; nt < 4; ++nt) { cell_end_rows<PerRow>(acc[mt][nt], part[mt][nt], sc[mt][0], sc[mt][1]); }
+            }
+        }
+    }
+    cp_wait<0>();
+
+#pragma unroll
+    for (int mt = 0; mt < 2; ++mt) {
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int local = out_row(mt, h);
+            if (local >= s.rows) { continue; }
+            const float scl = PerRow ? *srow[mt][h] : 1.0F;
+#pragma unroll
+            for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+                for (int e = 0; e < 2; ++e) {
+                    const int tok = col0 + 32 * wm + 8 * nt + 2 * lid + e;
+                    if (tok >= p.columns) { continue; }
+                    const float v = acc[mt][nt][2 * h + e];
+                    s.out[static_cast<std::int64_t>(tok) * s.out_stride + local] =
+                        __float2bfloat16_rn(PerRow ? __fmul_rn(v, scl) : v);
+                }
+            }
+        }
+    }
+}
+
 struct Prepared {
     LinearParams params{};
     int k      = 0;
@@ -571,6 +787,28 @@ void inkling_attn_linear(std::span<const InklingProjection> projections, Workspa
     const pdl::LaunchConfig launch{
         dim3(static_cast<unsigned>(pr.blocks), static_cast<unsigned>((pr.params.columns + kTm - 1) / kTm)),
         dim3(128), 0, stream};
+    const int lgemm = inkling_attention_knobs().linear_gemm;
+    if (lgemm == 1 || lgemm == 2) {
+        const bool direct = lgemm == 2;
+        if (pr.k == 2304) {
+            if (direct) {
+                CUDA_CHECK(per_row ? pdl::launch_dependent(launch, gemm_t_kernel<2304, true, true>, pr.params)
+                                   : pdl::launch_dependent(launch, gemm_t_kernel<2304, false, true>, pr.params));
+            } else {
+                CUDA_CHECK(per_row ? pdl::launch_dependent(launch, gemm_t_kernel<2304, true, false>, pr.params)
+                                   : pdl::launch_dependent(launch, gemm_t_kernel<2304, false, false>, pr.params));
+            }
+        } else {
+            if (direct) {
+                CUDA_CHECK(per_row ? pdl::launch_dependent(launch, gemm_t_kernel<3072, true, true>, pr.params)
+                                   : pdl::launch_dependent(launch, gemm_t_kernel<3072, false, true>, pr.params));
+            } else {
+                CUDA_CHECK(per_row ? pdl::launch_dependent(launch, gemm_t_kernel<3072, true, false>, pr.params)
+                                   : pdl::launch_dependent(launch, gemm_t_kernel<3072, false, false>, pr.params));
+            }
+        }
+        return;
+    }
     if (pr.k == 2304) {
         CUDA_CHECK(per_row ? pdl::launch_dependent(launch, gemm_kernel<2304, true>, pr.params)
                            : pdl::launch_dependent(launch, gemm_kernel<2304, false>, pr.params));

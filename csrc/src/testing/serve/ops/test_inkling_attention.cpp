@@ -17,6 +17,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -1595,24 +1596,35 @@ void run_linear_width_case(const std::string& name, int k, int k_per, int rows_p
     std::string first;
     // Widths 1 .. 64 (narrow: the cell-split kernel), then 1 / 9 / 16 through the one-warp-per-tile narrow kernel.
     // (split mode: 1 = default (wo split, qkvr one-warp), 2 = both split, 0 = both one-warp)
-    const std::vector<std::pair<int, int>> widths = {{1, 1}, {2, 1}, {8, 1}, {9, 1}, {16, 1}, {17, 1}, {64, 1},
-                                                     {1, 2}, {9, 2}, {16, 2}, {1, 0}, {9, 0}, {16, 0}};
-    for (const auto& [n, split] : widths) {
+    // GEMM routes (linear_gemm, N > 16): the reference runs the default; 8,192 / 17 / 64 also through the other two
+    // (0 = gemm_kernel, x = operand A; 1 = gemm_t_kernel shared widen; 2 = gemm_t_kernel direct widen).
+    const int gemm_default = ops::inkling_attention_knobs().linear_gemm;
+    const std::vector<std::array<int, 3>> widths = {
+        {1, 1, gemm_default}, {2, 1, gemm_default}, {8, 1, gemm_default}, {9, 1, gemm_default}, {16, 1, gemm_default},
+        {17, 1, gemm_default}, {64, 1, gemm_default}, {1, 2, gemm_default}, {9, 2, gemm_default}, {16, 2, gemm_default},
+        {1, 0, gemm_default}, {9, 0, gemm_default}, {16, 0, gemm_default},
+        {8192, 1, 0}, {17, 1, 0}, {64, 1, 0}, {8192, 1, 1}, {17, 1, 1}, {64, 1, 1}, {8192, 1, 2}, {17, 1, 2}, {64, 1, 2}};
+    for (const auto& [n, split, gemm] : widths) {
         ops::inkling_attention_knobs().linear_split = split;
+        ops::inkling_attention_knobs().linear_gemm  = gemm;
         const auto got = run(n);
         ops::inkling_attention_knobs().linear_split = 1;
+        ops::inkling_attention_knobs().linear_gemm  = gemm_default;
         for (std::size_t i = 0; i < ranges.size(); ++i) {
             const std::size_t count = static_cast<std::size_t>(ranges[i].second) * n; // columns are contiguous
             total += count;
             for (std::size_t e = 0; e < count; ++e) {
                 if (got[i][e] != ref[i][e]) {
                     ++bad;
-                    if (first.empty()) { first = "N=" + std::to_string(n) + " segment " + std::to_string(i); }
+                    if (first.empty()) {
+                        first = "N=" + std::to_string(n) + " split " + std::to_string(split) + " gemm " +
+                                std::to_string(gemm) + " segment " + std::to_string(i);
+                    }
                 }
             }
         }
     }
-    std::printf("%-44s widths 1 2 8 9 16 17 64 (+ 1 9 16 split / one-warp) vs 8192: %zu / %zu outputs bit-different%s%s\n",
+    std::printf("%-44s widths 1 2 8 9 16 17 64 (+ 1 9 16 split / one-warp; 8192 17 64 x gemm 0 / 1 / 2) vs 8192: %zu / %zu outputs bit-different%s%s\n",
                 name.c_str(), bad, total,
                 first.empty() ? "" : "  first: ", first.c_str());
     check(bad == 0, name);
@@ -2309,10 +2321,25 @@ void run_bench_ab() {
 // The "GEMM 6 %" question (agent-EN): the qkvr GEMM rows, interleaved three times (pair with the BASE binary's bench).
 void run_bench_gemm() {
     cuda_check(cudaStreamCreateWithFlags(&g_stream, cudaStreamNonBlocking), "stream");
+    // Arms of linear_gemm interleaved (0 = gemm_kernel, 1 = gemm_t shared widen, 2 = gemm_t direct widen), three rounds.
+    const int gemm_default = ops::inkling_attention_knobs().linear_gemm;
     for (int rep = 0; rep < 3; ++rep) {
-        bench_linear("attn_linear qkvr GEMM N=8192 1x128", 2304, 128, 8192);
-        bench_linear("attn_linear qkvr GEMM N=8192 channel", 2304, 2304, 8192);
+        for (const int g : {0, 1, 2}) {
+            ops::inkling_attention_knobs().linear_gemm = g;
+            const std::string a = "attn_linear qkvr GEMM N=8192 1x128 gemm" + std::to_string(g);
+            const std::string b = "attn_linear qkvr GEMM N=8192 channel gemm" + std::to_string(g);
+            bench_linear(a.c_str(), 2304, 128, 8192);
+            bench_linear(b.c_str(), 2304, 2304, 8192);
+        }
     }
+    for (const int g : {0, 1, 2}) { // wo at N = 8,192 and the qkvr GEMM at a 4,096 chunk (the serving default, DESIGN 11.3)
+        ops::inkling_attention_knobs().linear_gemm = g;
+        const std::string a = "attn_linear wo GEMM N=8192 channel gemm" + std::to_string(g);
+        const std::string b = "attn_linear qkvr GEMM N=4096 channel gemm" + std::to_string(g);
+        bench_linear(a.c_str(), 3072, 3072, 8192);
+        bench_linear(b.c_str(), 2304, 2304, 4096);
+    }
+    ops::inkling_attention_knobs().linear_gemm = gemm_default;
 }
 
 // For nsys (per-kernel durations inside the graphs): a few decode probes and the wo projection, p1.

@@ -1477,6 +1477,7 @@ InklingAttentionKnobs& knobs() {
         x.linear_split      = std::clamp(env_int("SUROGATE_INKLING_LINEAR_SPLIT", x.linear_split), 0, 2);
         x.fused_prologue    = env_int("SUROGATE_INKLING_ATTN_FUSED_PROLOGUE", x.fused_prologue ? 1 : 0) != 0;
         x.fold_fast         = env_int("SUROGATE_INKLING_ATTN_FOLD_FAST", 1) != 0;
+        x.linear_gemm       = std::clamp(env_int("SUROGATE_INKLING_LINEAR_GEMM", x.linear_gemm), 0, 2);
         return x;
     }();
     return k;

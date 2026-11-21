@@ -180,6 +180,10 @@ struct InklingAttentionKnobs {
     // fold_kernel: rows of <= 32 slots take the scan-free path (SUROGATE_INKLING_ATTN_FOLD_FAST=0 = always the scan).
     // Same bits either way.
     bool fold_fast = true;
+    // inkling_attn_linear, N > 16 (SUROGATE_INKLING_LINEAR_GEMM): 0 = gemm_kernel (x = MMA operand A), 1 = gemm_t_kernel
+    // (codes = operand A in fragment order from a shared widen pass, x = operand B), 2 = gemm_t_kernel widening each
+    // warp's own A fragments (no widened tile). Same bits on every route (test attn_linear width).
+    int linear_gemm = 1;
 };
 [[nodiscard]] InklingAttentionKnobs& inkling_attention_knobs();
 
