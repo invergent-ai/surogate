@@ -105,6 +105,7 @@ struct AttnParams {
     // div.rn (else div.full), 16 lse with accurate log2f (else lg2.approx), 32 l = l * alpha + sum unfused.
     int variant;
     int l2_ahead;    // blocks asked of L2 ahead of their loads (SUROGATE_INKLING_ATTN_L2AHEAD, default 4; 0 = off)
+    int metadata_static; // InklingAttentionRows::metadata_static: rows / tables / old keys readable before the PDL wait
     int pdl_trigger; // trigger dependents at entry (SUROGATE_INKLING_ATTN_PDL_TRIGGER, default 1)
 };
 
@@ -187,10 +188,16 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
     constexpr int kSS      = Smem::kStripStride;
     extern __shared__ __align__(16) unsigned char attn_smem_raw[];
     Smem& sm = *reinterpret_cast<Smem*>(attn_smem_raw);
-    pdl::wait_for_dependencies();
-    // Dependents (the fold, or the next op: the wo projection streams its weights before its own wait) may launch now;
-    // they read nothing of ours before their wait, which waits for this grid to finish.
-    if (p.pdl_trigger != 0) { pdl::trigger_dependents(); }
+    // With static metadata (the caller's promise, InklingAttentionRows::metadata_static) the rows, the block tables and
+    // the keys before the round's first position are read before the programmatic-dependency wait (they were written
+    // before the step's first kernel); q / r / gate / sink and the round's own keys only after it.
+    const bool early_meta = p.metadata_static != 0;
+    if (!early_meta) {
+        pdl::wait_for_dependencies();
+        // Dependents (the fold, or the next op: the wo projection streams its weights before its own wait) may launch
+        // now; they read nothing of ours before their wait, which waits for this grid to finish.
+        if (p.pdl_trigger != 0) { pdl::trigger_dependents(); }
+    }
 
     const int tid  = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
@@ -283,6 +290,20 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
         rn[i]         = static_cast<std::int64_t>(rj[i]) + static_cast<std::int64_t>(W) * b;
         rg0[i]        = rvalid[i] ? group_of(gs, Local ? max(0, rpos[i] - (Geo::kWindow - 1)) : 0) : 0;
         rg1[i]        = rvalid[i] ? group_of(gs, rpos[i]) : -1;
+    }
+
+    if (early_meta) {
+        // Ask L2 for the first two blocks of this worker whose keys all precede the round (written by earlier steps),
+        // so their loads after the wait hit L2: the position -> table -> page -> code chain overlaps the prologue.
+        if (g_start < g_stop && (tid == 0 || tid == 32)) {
+            const int kb0 = max(group_begin(gs, g_start), lo) >> 6;
+            for (int kb = kb0; kb < kb0 + 2 && kb * kBn + kBn - 1 < pmin; ++kb) {
+                const std::int64_t off = kv_page_offset(table_row[(kb * kBn) >> kPageShift], kvh, 0);
+                prefetch_l2_bulk((tid == 0 ? p.k_pages : p.v_pages) + off, kBn * Geo::kHeadDim);
+            }
+        }
+        pdl::wait_for_dependencies();
+        if (p.pdl_trigger != 0) { pdl::trigger_dependents(); }
     }
 
     // Q (eight k16 steps) and R fragments, in registers for the whole walk.
@@ -1096,6 +1117,7 @@ AttnParams make_params(const InklingAttentionInputs& in, const InklingAttentionR
     p.variant     = env_int("SUROGATE_INKLING_ATTN_VARIANT", 17) & (1 | 8 | 16 | 32);
     p.l2_ahead    = std::clamp(env_int("SUROGATE_INKLING_ATTN_L2AHEAD", -1), -1, 16); // -1: the route's default (run)
     p.pdl_trigger = env_int("SUROGATE_INKLING_ATTN_PDL_TRIGGER", 1) != 0 ? 1 : 0;
+    p.metadata_static = (rows.metadata_static && env_int("SUROGATE_INKLING_ATTN_EARLY_META", 1) != 0) ? 1 : 0;
     return p;
 }
 

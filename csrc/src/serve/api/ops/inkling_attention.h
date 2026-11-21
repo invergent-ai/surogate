@@ -100,6 +100,11 @@ struct InklingAttentionRows {
     Tensor valid_columns;
     Tensor kv_table_rows;
     GqaExecutionEnvelope envelope{};
+    /// Caller's promise (default false): positions, valid_columns, kv_table_rows and the plane's block tables were
+    /// complete before the step's FIRST kernel (host copies), and the plane's keys before each row's first position
+    /// were written by earlier steps. The attention then reads them before its programmatic-dependency wait and asks
+    /// L2 for its first old blocks, overlapping the prologue. Same bits either way.
+    bool metadata_static = false;
 };
 
 /// InPlace (prefill, decode, the narrow MTP round): each row's slot is read, then replaced by the

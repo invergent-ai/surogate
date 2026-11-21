@@ -604,7 +604,8 @@ struct InvOut {
     std::vector<std::uint32_t> out, lse;
 };
 
-InvOut run_inv_route(InklingLayerKind kind, const InvPlane& ip, const Layer& layer, int W, const std::vector<InvRow>& rws) {
+InvOut run_inv_route(InklingLayerKind kind, const InvPlane& ip, const Layer& layer, int W, const std::vector<InvRow>& rws,
+                     bool meta_static = false) {
     const int B = static_cast<int>(rws.size()), N = W * B;
     Rows rows;
     rows.W = W;
@@ -637,7 +638,8 @@ InvOut run_inv_route(InklingLayerKind kind, const InvPlane& ip, const Layer& lay
     in.gate      = Tensor(dg.p, DType::BF16, {3072, N});
     in.sink      = Tensor(ds.p, DType::BF16, {24, N});
     in.rel_table = Tensor(layer.dtable.p, DType::BF16, {16, G::kRelTableRows});
-    const auto view = rows.view(rows.max_keys());
+    auto view            = rows.view(rows.max_keys());
+    view.metadata_static = meta_static;
     WorkspaceArena work(ops::inkling_rel_attention_workspace_bytes(kind, W, B, view.envelope) + 4096);
     DeviceBuffer dy(static_cast<std::size_t>(N) * 3072 * 2), dof(static_cast<std::size_t>(N) * 3072 * 4),
         dl(static_cast<std::size_t>(N) * 24 * 4);
@@ -725,7 +727,7 @@ void run_invariance_case(const InvCase& c, const char* groups, std::uint32_t see
         for (std::size_t i = 0; i + 1 < edges.size(); ++i) {
             const int w = edges[i + 1] - edges[i];
             compare("chunk [" + std::to_string(edges[i]) + ", " + std::to_string(edges[i + 1]) + ")",
-                    run_inv_route(c.kind, ip, layer, w, {{0, edges[i], w}}));
+                    run_inv_route(c.kind, ip, layer, w, {{0, edges[i], w}}, (i & 1) != 0));
         }
     }
     for (const int p : c.decode) {
@@ -733,6 +735,7 @@ void run_invariance_case(const InvCase& c, const char* groups, std::uint32_t see
         auto r4 = others(3);
         r4.insert(r4.begin() + 1, InvRow{0, p, 1});
         compare("decode B4", run_inv_route(c.kind, ip, layer, 1, r4));
+        compare("decode B4 static metadata", run_inv_route(c.kind, ip, layer, 1, r4, true));
         auto r8 = others(7);
         r8.insert(r8.begin() + 5, InvRow{0, p, 1});
         compare("decode B8", run_inv_route(c.kind, ip, layer, 1, r8));
@@ -754,6 +757,7 @@ void run_invariance_case(const InvCase& c, const char* groups, std::uint32_t see
         for (const auto& o : others(3)) { r4.push_back({o.seq, std::max(0, std::min(o.first, ip.len[o.seq] - 8)), std::min(8, ip.len[o.seq])}); }
         r4.insert(r4.begin() + 2, InvRow{0, v, w});
         compare("verify W8 B4", run_inv_route(c.kind, ip, layer, 8, r4));
+        compare("verify W8 B4 static metadata", run_inv_route(c.kind, ip, layer, 8, r4, true));
         compare("verify W8 B1 valid 5", run_inv_route(c.kind, ip, layer, 8, {{0, v, std::min(5, w)}}));
         compare("verify W3 B2", run_inv_route(c.kind, ip, layer, 3, {{r4[0].seq, r4[0].first, std::min(3, r4[0].valid)}, {0, v, std::min(3, w)}}));
         compare("verify W16 B1", run_inv_route(c.kind, ip, layer, 16, {{0, std::max(c.P0, std::min(v, c.L0 - 16)), 16}}));
@@ -1758,7 +1762,10 @@ void bench_attention(const char* name, InklingLayerKind kind, int W, int B, int 
                                    strided_bf16(dqs.p, G::kRowsSink, {24}, N, 6552),
                                    Tensor(layer.dtable.p, DType::BF16, {16, G::kRelTableRows})};
     std::vector<ops::InklingAttentionRows> views;
-    for (const auto& rr : rot) { views.push_back(rr.view(keys)); }
+    for (const auto& rr : rot) {
+        views.push_back(rr.view(keys));
+        views.back().metadata_static = std::getenv("BENCH_META_STATIC") != nullptr;
+    }
     WorkspaceArena work(ops::inkling_rel_attention_workspace_bytes(kind, W, B, views[0].envelope) + 4096);
     DeviceBuffer dout(static_cast<std::size_t>(N) * 3072 * 2);
     Tensor out(dout.p, DType::BF16, {3072, N});
@@ -1894,27 +1901,30 @@ void bench_attention_wo(const char* name, InklingLayerKind kind, int first) {
 void run_bench_ab() {
     using K = InklingLayerKind;
     cuda_check(cudaStreamCreateWithFlags(&g_stream, cudaStreamNonBlocking), "stream");
-    setenv("SUROGATE_INKLING_ATTN_GROUPS", "p1", 1);
-    // Prefill: L2 prefetch distance (decode settled 11:30: off).
-    for (const char* l2 : {"0", "2", "4"}) {
+    setenv("SUROGATE_INKLING_ATTN_GROUPS", "p3", 1);
+    // Static-metadata pre-wait L2 ask (decode / verify) off vs on; prefill L2 distance 0 vs 4.
+    for (const char* meta : {"0", "1"}) {
+        if (meta[0] == '1') { setenv("BENCH_META_STATIC", "1", 1); } else { unsetenv("BENCH_META_STATIC"); }
+        const std::string tag = std::string(" [p3 meta=") + meta + "]";
+        bench_attention(("decode global 1x8k" + tag).c_str(), K::Global, 1, 1, 8191);
+        bench_attention(("decode global 1x64k" + tag).c_str(), K::Global, 1, 1, 65535);
+        bench_attention(("decode global 1x262k" + tag).c_str(), K::Global, 1, 1, 262143);
+        bench_attention(("decode local 1x8k" + tag).c_str(), K::Local, 1, 1, 8191);
+        bench_attention(("decode global 8x8k" + tag).c_str(), K::Global, 1, 8, 8191);
+        bench_attention(("verify W8 global 1x8k" + tag).c_str(), K::Global, 8, 1, 8184);
+        bench_attention(("verify W8 local 1x8k" + tag).c_str(), K::Local, 8, 1, 8184);
+    }
+    unsetenv("BENCH_META_STATIC");
+    for (const char* l2 : {"0", "4"}) {
         setenv("SUROGATE_INKLING_ATTN_L2AHEAD", l2, 1);
-        const std::string tag = std::string(" [p1 l2=") + l2 + "]";
+        const std::string tag = std::string(" [p3 l2=") + l2 + "]";
         bench_attention(("prefill global W8192 from 0" + tag).c_str(), K::Global, 8192, 1, 0);
-        bench_attention(("prefill global W8192 past 64k" + tag).c_str(), K::Global, 8192, 1, 65536);
         bench_attention(("prefill local W8192 past 8k" + tag).c_str(), K::Local, 8192, 1, 8192);
     }
     unsetenv("SUROGATE_INKLING_ATTN_L2AHEAD");
-    // Decode defaults (l2 off, trigger on) and the pair with wo.
-    bench_attention("decode global 1x8k [p1 default]", K::Global, 1, 1, 8191);
-    bench_attention("decode global 1x262k [p1 default]", K::Global, 1, 1, 262143);
-    bench_attention("verify W8 global 1x8k [p1 default]", K::Global, 8, 1, 8184);
-    bench_attention_wo("pair global 1x8k + wo [p1 default]", K::Global, 8191);
-    bench_attention_wo("pair local 1x8k + wo [p1 default]", K::Local, 8191);
     unsetenv("SUROGATE_INKLING_ATTN_GROUPS");
-    bench_linear("attn_linear qkvr narrow N=1 channel", 2304, 2304, 1);
     bench_linear("attn_linear qkvr narrow N=1 1x128", 2304, 128, 1);
     bench_linear("attn_linear qkvr narrow N=8 1x128", 2304, 128, 8);
-    bench_linear("attn_linear qkvr narrow N=16 1x128", 2304, 128, 16);
     bench_linear("attn_linear wo narrow N=1 1x128", 3072, 128, 1);
     bench_linear("attn_linear wo narrow N=1 channel", 3072, 3072, 1);
     bench_linear("attn_linear wo narrow N=8 1x128", 3072, 128, 8);
