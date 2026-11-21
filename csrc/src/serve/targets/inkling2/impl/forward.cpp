@@ -534,27 +534,47 @@ void Variant::run_visits(const ModelView& model, family::VisitRound& r) {
     const InklingModel& im = model_of(model);
     Round rd{model, r, im, *im.queries, *r.work, r.stream, r.x.ne[1], {}, {}, {}};
     auto round_scope = rd.work.scope();
-    // Groups: every segment (B = 1) and the decode / verify block.
-    for (const family::VisitSegment& seg : r.segments) {
+    // Groups: every segment (B = 1) and the decode / verify block. The segments' KV rows and state slots are staged
+    // with ONE host copy before the round's first visit kernel (so they are complete before any attention kernel:
+    // lane c's metadata_static); under a stream capture (never for a visit target's prompt rounds today) the copy
+    // from pageable memory is not allowed and they are written by kernels instead.
+    cudaStreamCaptureStatus seg_capture = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(rd.s, &seg_capture));
+    std::vector<std::int32_t> seg_ints;
+    Tensor seg_dev;
+    if (!r.segments.empty()) { seg_dev = rd.work.alloc(DType::I32, {static_cast<std::int32_t>(2 * r.segments.size())}); }
+    for (std::size_t i = 0; i < r.segments.size(); ++i) {
+        const family::VisitSegment& seg = r.segments[i];
         Group g;
         g.column    = seg.column;
         g.width     = seg.count;
         g.batch     = 1;
         g.positions = Tensor(static_cast<std::int32_t*>(r.positions.data) + seg.column, DType::I32, {seg.count, 1});
-        Tensor ints = rd.work.alloc(DType::I32, {2});
+        auto* ints  = static_cast<std::int32_t*>(seg_dev.data) + 2 * i;
         if (seg.table_row.data != nullptr && !r.sequence_kv.valid()) {
             g.table_rows = seg.table_row.view({1});
+            seg_ints.push_back(0); // unused
         } else {
             if (!r.sequence_kv.valid() && seg.kv_table_row < 0) {
                 throw std::logic_error("inkling2: a segment without a KV row");
             }
-            naive::fill_i32(static_cast<std::int32_t*>(ints.data), 1, r.sequence_kv.valid() ? 0 : seg.kv_table_row, rd.s);
-            g.table_rows = Tensor(ints.data, DType::I32, {1});
+            seg_ints.push_back(r.sequence_kv.valid() ? 0 : seg.kv_table_row);
+            g.table_rows = Tensor(ints, DType::I32, {1});
         }
-        naive::fill_i32(static_cast<std::int32_t*>(ints.data) + 1, 1, seg.state_slot, rd.s);
-        g.slots      = Tensor(static_cast<std::int32_t*>(ints.data) + 1, DType::I32, {1});
-        g.segment    = &seg;
+        seg_ints.push_back(seg.state_slot);
+        g.slots   = Tensor(ints + 1, DType::I32, {1});
+        g.segment = &seg;
         rd.groups.push_back(g);
+    }
+    if (!seg_ints.empty()) {
+        if (seg_capture == cudaStreamCaptureStatusNone) {
+            CUDA_CHECK(cudaMemcpyAsync(seg_dev.data, seg_ints.data(), seg_ints.size() * sizeof(std::int32_t),
+                                       cudaMemcpyHostToDevice, rd.s));
+        } else {
+            for (std::size_t i = 0; i < seg_ints.size(); ++i) {
+                naive::fill_i32(static_cast<std::int32_t*>(seg_dev.data) + i, 1, seg_ints[i], rd.s);
+            }
+        }
     }
     if (r.block != nullptr && r.block->batch > 0) {
         const family::VisitBlock& b = *r.block;
