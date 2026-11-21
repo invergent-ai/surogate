@@ -10,6 +10,7 @@
 #include "api/ops/inkling_mix.h"
 
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/kernel/func_attribute.cuh"
 
@@ -75,6 +76,7 @@ __device__ __forceinline__ int swizzled_col(int row, int col) {
 
 template <class S, Store kStore>
 __global__ __launch_bounds__(S::kThreads) void gemm_inv_kernel(const __grid_constant__ Args a) {
+    pdl::wait_for_dependencies(); // PDL: every read / write after the producer grid completes
     constexpr int BM = S::kBlockRows, BN = S::kBlockCols, BK = kBlockK;
     constexpr int WM = S::kWarpRows, WN = S::kWarpCols, MT = S::kMmaRows, NT = S::kMmaCols;
     constexpr int KSUB = BK / 16, STAGES = S::kStages, WARPS_N = S::kWarpsN, THREADS = S::kThreads;
@@ -205,6 +207,7 @@ template <typename OutT>
 __global__ void __launch_bounds__(256) reduce_kernel(const float* __restrict__ partial, OutT* __restrict__ out,
                                                      std::int32_t rows, std::int32_t tokens, std::int32_t batch,
                                                      std::int32_t splits, std::int32_t ldc, std::int64_t out_stride) {
+    pdl::wait_for_dependencies();
     const std::int64_t total = static_cast<std::int64_t>(batch) * tokens * rows;
     const std::int64_t i     = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= total) { return; }
@@ -235,7 +238,8 @@ void launch(const Args& a, std::int32_t splits, cudaStream_t stream) {
                                                  S::kSharedBytes));
     }
     const dim3 grid(static_cast<unsigned>(tiles), static_cast<unsigned>(a.batch), static_cast<unsigned>(splits));
-    gemm_inv_kernel<S, kStore><<<grid, S::kThreads, S::kSharedBytes, stream>>>(a);
+    CUDA_CHECK(pdl::launch_dependent({grid, dim3(S::kThreads), static_cast<std::size_t>(S::kSharedBytes), stream},
+                                     gemm_inv_kernel<S, kStore>, a));
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -302,12 +306,13 @@ void inkling_gemm_inv(const void* weight, std::int32_t n, std::int32_t k, const 
     const std::int64_t total = static_cast<std::int64_t>(batch.count) * tokens * n;
     const unsigned blocks    = static_cast<unsigned>((total + 255) / 256);
     if (out_dtype == DType::FP32) {
-        reduce_kernel<float><<<blocks, 256, 0, stream>>>(static_cast<const float*>(workspace), static_cast<float*>(out),
-                                                         n, tokens, batch.count, splits, ldc, batch.out_stride);
+        CUDA_CHECK(pdl::launch_dependent({dim3(blocks), dim3(256), 0, stream}, reduce_kernel<float>,
+                                         static_cast<const float*>(workspace), static_cast<float*>(out), n, tokens,
+                                         batch.count, splits, ldc, batch.out_stride));
     } else {
-        reduce_kernel<__nv_bfloat16><<<blocks, 256, 0, stream>>>(static_cast<const float*>(workspace),
-                                                                 static_cast<__nv_bfloat16*>(out), n, tokens,
-                                                                 batch.count, splits, ldc, batch.out_stride);
+        CUDA_CHECK(pdl::launch_dependent({dim3(blocks), dim3(256), 0, stream}, reduce_kernel<__nv_bfloat16>,
+                                         static_cast<const float*>(workspace), static_cast<__nv_bfloat16*>(out), n,
+                                         tokens, batch.count, splits, ldc, batch.out_stride));
     }
     CUDA_CHECK(cudaGetLastError());
 }

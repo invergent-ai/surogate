@@ -5,7 +5,8 @@
 
 #include "api/ops/inkling_mix.h"
 
-#include "core/device.h" // CUDA_CHECK
+#include "core/device.h"
+#include "core/pdl.cuh" // CUDA_CHECK
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -158,6 +159,7 @@ __device__ __forceinline__ void mix_query(const float (&x)[N][kPer], const float
 
 template <int N>
 __global__ void __launch_bounds__(kThreads) attn_res_kernel(const __grid_constant__ AttnResArgs a) {
+    pdl::wait_for_dependencies(); // PDL: every read / write after the producer grid completes
     __shared__ float scratch[(kThreads / 32) * (N > 2 ? N : 2)];
     const std::int64_t t = blockIdx.x;
     float x[N][kPer];
@@ -210,6 +212,7 @@ struct BlendInputsArgs {
 /// the same device code and order as the three separate kernels: bit-identical to them.
 template <int N>
 __global__ void __launch_bounds__(kThreads) blend_inputs_kernel(const __grid_constant__ BlendInputsArgs a) {
+    pdl::wait_for_dependencies(); // PDL: every read / write after the producer grid completes
     __shared__ float scratch[(kThreads / 32) * (N > 2 ? N : 2)];
     const std::int64_t t = blockIdx.x;
     float x[N][kPer];
@@ -281,6 +284,7 @@ __global__ void __launch_bounds__(kThreads)
 __global__ void __launch_bounds__(kThreads)
     rms_norm_kernel(PlaneDev x_plane, const bf16* w, int num_weights, float eps, bf16* out,
                     std::int64_t columns) {
+    pdl::wait_for_dependencies();
     __shared__ float scratch[kThreads / 32];
     const std::int64_t t = blockIdx.x;
     float x[kPer];
@@ -307,6 +311,7 @@ __global__ void __launch_bounds__(kThreads)
 __global__ void __launch_bounds__(kThreads)
     pair_rms_norm_kernel(const float* dest, std::int64_t dest_stream_stride, const float* msg,
                          bf16* out, std::int64_t columns) {
+    pdl::wait_for_dependencies();
     __shared__ float scratch[(kThreads / 32) * 2];
     const std::int64_t t = blockIdx.x;
     const std::int64_t s = blockIdx.y;
@@ -338,6 +343,7 @@ __global__ void __launch_bounds__(kThreads)
     blend_rms_norm_kernel(const float* dest, std::int64_t dest_stream_stride, const float* msg,
                           const float* gain_forget, const bf16* w, int w_stream_stride, float eps,
                           bf16* out, std::int64_t columns) {
+    pdl::wait_for_dependencies();
     __shared__ float scratch[kThreads / 32];
     const std::int64_t t   = blockIdx.x;
     const std::int64_t s   = blockIdx.y;
@@ -405,6 +411,7 @@ __device__ __forceinline__ float conv_seq(const ConvArgs& a, int b, std::int64_t
 
 __global__ void __launch_bounds__(kConvChannelTile)
     short_conv_kernel(const __grid_constant__ ConvArgs a) {
+    pdl::wait_for_dependencies(); // PDL: every read / write after the producer grid completes
     const int c = blockIdx.x * kConvChannelTile + threadIdx.x;
     const int b = blockIdx.z;
     if (c >= a.channels) { return; }
@@ -455,6 +462,7 @@ __global__ void __launch_bounds__(kConvChannelTile)
 __global__ void __launch_bounds__(kConvChannelTile)
     conv_window_kernel(const __grid_constant__ ConvArgs a, int capture_column, int capture_slot,
                        int update_slots) {
+    pdl::wait_for_dependencies();
     const int c = blockIdx.x * kConvChannelTile + threadIdx.x;
     const int b = blockIdx.y;
     if (c >= a.channels) { return; }
@@ -548,6 +556,7 @@ __global__ void conv_fold_kernel(const __grid_constant__ FoldArgs f, bf16* pool,
 }
 
 __global__ void softcap_f32_kernel(float* logits, int rows, int tokens, std::int64_t ldc, float cap) {
+    pdl::wait_for_dependencies();
     const std::int64_t i     = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::int64_t total = static_cast<std::int64_t>(rows) * tokens;
     if (i >= total) { return; }
@@ -663,12 +672,12 @@ void inkling_attn_res(const InklingAttnResSources& sources, std::int32_t columns
     a.columns = columns;
     const dim3 grid(static_cast<unsigned>(columns));
     switch (sources.stack_count + 1) {
-    case 1: attn_res_kernel<1><<<grid, kThreads, 0, stream>>>(a); break;
-    case 2: attn_res_kernel<2><<<grid, kThreads, 0, stream>>>(a); break;
-    case 3: attn_res_kernel<3><<<grid, kThreads, 0, stream>>>(a); break;
-    case 4: attn_res_kernel<4><<<grid, kThreads, 0, stream>>>(a); break;
-    case 5: attn_res_kernel<5><<<grid, kThreads, 0, stream>>>(a); break;
-    case 6: attn_res_kernel<6><<<grid, kThreads, 0, stream>>>(a); break;
+    case 1: CUDA_CHECK(pdl::launch_dependent({grid, dim3(kThreads), 0, stream}, attn_res_kernel<1>, a)); break;
+    case 2: CUDA_CHECK(pdl::launch_dependent({grid, dim3(kThreads), 0, stream}, attn_res_kernel<2>, a)); break;
+    case 3: CUDA_CHECK(pdl::launch_dependent({grid, dim3(kThreads), 0, stream}, attn_res_kernel<3>, a)); break;
+    case 4: CUDA_CHECK(pdl::launch_dependent({grid, dim3(kThreads), 0, stream}, attn_res_kernel<4>, a)); break;
+    case 5: CUDA_CHECK(pdl::launch_dependent({grid, dim3(kThreads), 0, stream}, attn_res_kernel<5>, a)); break;
+    case 6: CUDA_CHECK(pdl::launch_dependent({grid, dim3(kThreads), 0, stream}, attn_res_kernel<6>, a)); break;
     default: fail(op, "unsupported source count");
     }
     CUDA_CHECK(cudaGetLastError());
@@ -761,12 +770,12 @@ void inkling_blend_inputs(const InklingAttnResSources& dest_sources, const Tenso
     a.columns      = columns;
     const dim3 grid(static_cast<unsigned>(columns));
     switch (dest_sources.stack_count + 1) {
-    case 1: blend_inputs_kernel<1><<<grid, kThreads, 0, stream>>>(a); break;
-    case 2: blend_inputs_kernel<2><<<grid, kThreads, 0, stream>>>(a); break;
-    case 3: blend_inputs_kernel<3><<<grid, kThreads, 0, stream>>>(a); break;
-    case 4: blend_inputs_kernel<4><<<grid, kThreads, 0, stream>>>(a); break;
-    case 5: blend_inputs_kernel<5><<<grid, kThreads, 0, stream>>>(a); break;
-    case 6: blend_inputs_kernel<6><<<grid, kThreads, 0, stream>>>(a); break;
+    case 1: CUDA_CHECK(pdl::launch_dependent({grid, dim3(kThreads), 0, stream}, blend_inputs_kernel<1>, a)); break;
+    case 2: CUDA_CHECK(pdl::launch_dependent({grid, dim3(kThreads), 0, stream}, blend_inputs_kernel<2>, a)); break;
+    case 3: CUDA_CHECK(pdl::launch_dependent({grid, dim3(kThreads), 0, stream}, blend_inputs_kernel<3>, a)); break;
+    case 4: CUDA_CHECK(pdl::launch_dependent({grid, dim3(kThreads), 0, stream}, blend_inputs_kernel<4>, a)); break;
+    case 5: CUDA_CHECK(pdl::launch_dependent({grid, dim3(kThreads), 0, stream}, blend_inputs_kernel<5>, a)); break;
+    case 6: CUDA_CHECK(pdl::launch_dependent({grid, dim3(kThreads), 0, stream}, blend_inputs_kernel<6>, a)); break;
     default: fail(op, "unsupported source count");
     }
     CUDA_CHECK(cudaGetLastError());
@@ -789,10 +798,11 @@ void inkling_blend_rms_norm(const Tensor& dest, const Tensor& message, const Ten
     require(contiguous_shape(out, DType::BF16, kD, t, s), op, "out must be BF16 [2304, T, S]");
     const std::int64_t dest_stream = dest.ne[2] == 1 ? 0 : static_cast<std::int64_t>(t) * kD;
     const int w_stream             = norm_weight.ne[1] == 1 ? 0 : kD;
-    blend_rms_norm_kernel<<<dim3(static_cast<unsigned>(t), static_cast<unsigned>(s)), kThreads, 0, stream>>>(
+    CUDA_CHECK(pdl::launch_dependent(
+        {dim3(static_cast<unsigned>(t), static_cast<unsigned>(s)), dim3(kThreads), 0, stream}, blend_rms_norm_kernel,
         static_cast<const float*>(dest.data), dest_stream, static_cast<const float*>(message.data),
-        static_cast<const float*>(gain_forget.data), static_cast<const bf16*>(norm_weight.data),
-        w_stream, eps, static_cast<bf16*>(out.data), t);
+        static_cast<const float*>(gain_forget.data), static_cast<const bf16*>(norm_weight.data), w_stream, eps,
+        static_cast<bf16*>(out.data), static_cast<std::int64_t>(t)));
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -824,11 +834,13 @@ void inkling_short_conv(const InklingPlane& x, std::int32_t channels, const Tens
     const dim3 grid(grid_count(channels, kConvChannelTile), grid_count(rows.width, kConvColumnTile),
                     static_cast<unsigned>(rows.batch));
     a.fuse_window = capture_slot < 0 && rows.width <= kConvColumnTile ? 1 : 0;
-    short_conv_kernel<<<grid, kConvChannelTile, 0, stream>>>(a);
+    CUDA_CHECK(pdl::launch_dependent({grid, dim3(kConvChannelTile), 0, stream}, short_conv_kernel, a));
     CUDA_CHECK(cudaGetLastError());
     if (!a.fuse_window) {
-        conv_window_kernel<<<dim3(grid_count(channels, kConvChannelTile), static_cast<unsigned>(rows.batch)),
-                             kConvChannelTile, 0, stream>>>(a, capture_column, capture_slot, 1);
+        CUDA_CHECK(pdl::launch_dependent(
+            {dim3(grid_count(channels, kConvChannelTile), static_cast<unsigned>(rows.batch)), dim3(kConvChannelTile), 0,
+             stream},
+            conv_window_kernel, a, capture_column, capture_slot, 1));
         CUDA_CHECK(cudaGetLastError());
     }
 }
