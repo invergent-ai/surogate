@@ -848,6 +848,24 @@ int ift_tensor(void* handle, const char* name, std::int64_t* desc) {
     });
 }
 
+/// Lane d's exact unit decode of one physical layer's expert bank (the backward's dX operand, STE): `which` 0 = w13
+/// (k 2304, rows interleaved gate / up), 1 = w2 (k 1152). unit: BF16 [count * 2304][k]; factor: FP32 [count]
+/// (NVFP4 amax[e] / den; MXFP8 1). dX = sum_slots (dY . unit[e]) * factor[e].
+int ift_decode_experts(void* handle, int layer, int which, std::int32_t first, std::int32_t count, void* unit,
+                       float* factor, void* stream) {
+    return guarded([&] {
+        Handle* h = as_handle(handle);
+        if (layer < 0 || layer >= C::physical_layers) { throw std::out_of_range("layer"); }
+        const auto& L                 = h->data->weights.layers.at(static_cast<std::size_t>(layer));
+        const ops::InklingMoeWeights w = moe_weights(L);
+        const std::int32_t k          = which == 0 ? C::hidden : C::intermediate;
+        Tensor u(unit, DType::BF16, {k, count * 2304});
+        Tensor f(factor, DType::FP32, {count});
+        ops::inkling_decode_expert_units(which == 0 ? w.w13 : w.w2, w.format, k, first, count, u, f,
+                                         static_cast<cudaStream_t>(stream));
+    });
+}
+
 /// Bytes of a VisitTaps / InklingMoeAdapters / LoraBank (the Python binding checks its struct layouts against these).
 std::size_t ift_sizeof(int which) {
     switch (which) {

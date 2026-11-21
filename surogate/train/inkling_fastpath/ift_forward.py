@@ -45,12 +45,13 @@ def make_taps(eng: InklingEngine, v: int, T: int, names=("attn_in", "qkvr", "gat
 
 @torch.no_grad()
 def forward(eng: InklingEngine, ids: torch.Tensor, save: bool = True, tap_names=None, on_visit=None,
-            adapters=None):
-    """ids int32 [T] on the engine's device. on_visit(v, x, bufs) is called after every visit (tests)."""
+            adapters_per_layer=None):
+    """ids int32 [T] on the engine's device. adapters_per_layer: None (base) or 24 MoeAdapters (by physical layer;
+    every pass of a core layer reads its layer's table, as the engine). on_visit(v, x, bufs) after every visit."""
     assert ids.dtype == torch.int32 and ids.is_contiguous()
     T = ids.numel()
     x = torch.zeros(T, eng.c["residual"], dtype=torch.bfloat16, device=eng.dev)
-    ws = eng.workspace(T, adapters is not None)
+    ws = eng.workspace(T, adapters_per_layer is not None)
     seg = Segment(T, eng.dev)
     eng.embed(ids, x, ws)
     x0 = slot(x, 0).clone() if save else None
@@ -59,7 +60,8 @@ def forward(eng: InklingEngine, ids: torch.Tensor, save: bool = True, tap_names=
     for v in range(eng.c["layers"]):
         seg.conv.zero_()
         taps, bufs = (make_taps(eng, v, T, tap_names) if tap_names else (None, {}))
-        eng.run_visit(v, x, T, seg, ws, routing[v], taps, adapters)
+        ad = adapters_per_layer[eng.visits[v].layer] if adapters_per_layer is not None else None
+        eng.run_visit(v, x, T, seg, ws, routing[v], taps, ad)
         if save:
             outs.append(slot(x, eng.visits[v].next_partial).clone())
         if on_visit is not None:

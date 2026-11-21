@@ -112,6 +112,8 @@ def load_lib(bin_dir: str) -> Lib:
     s.ift_tensor.argtypes = [_VP, ctypes.c_char_p, _I64P]
     s.ift_sizeof.restype = _SZ
     s.ift_sizeof.argtypes = [ctypes.c_int]
+    if hasattr(s, "ift_decode_experts"):
+        s.ift_decode_experts.argtypes = [_VP, ctypes.c_int, ctypes.c_int, _I32, _I32, _VP, _VP, _VP]
     if s.ift_abi_version() != ABI_VERSION:
         raise RuntimeError(f"shim ABI {s.ift_abi_version()} != binding {ABI_VERSION}")
     for which, struct in ((0, VisitTaps), (1, MoeAdapters), (2, LoraBank)):
@@ -219,6 +221,17 @@ class InklingEngine:
         self._check(self.lib.shim.ift_head_logprob(self.h, hidden.data_ptr(), N, ids.data_ptr(), out.data_ptr(),
                                                    ws.data_ptr(), ws.numel(), self.stream()), "ift_head_logprob")
         return out
+
+    def decode_experts(self, layer: int, which: str, first: int, count: int, out: torch.Tensor | None = None):
+        """Lane d's exact unit decode: (unit bf16 [count, 2304, k], factor fp32 [count]); which 'w13' (k 2304) or
+        'w2' (k 1152). dX = sum over a token's slots of (dY . unit[e]) * factor[e]."""
+        k = 2304 if which == "w13" else 1152
+        unit = out if out is not None else torch.empty(count, 2304, k, dtype=torch.bfloat16, device=self.dev)
+        factor = torch.empty(count, dtype=torch.float32, device=self.dev)
+        self._check(self.lib.shim.ift_decode_experts(self.h, layer, 0 if which == "w13" else 1, first, count,
+                                                     unit.data_ptr(), factor.data_ptr(), self.stream()),
+                    f"ift_decode_experts({layer}, {which})")
+        return unit, factor
 
     def close(self) -> None:
         if getattr(self, "h", None):
