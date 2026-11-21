@@ -236,7 +236,10 @@ void inkling_moe(const Tensor& x, const InklingMoeWeights& weights, Tensor& out,
     gate_up.gate_up_tap = options.taps != nullptr ? static_cast<__nv_bfloat16*>(options.taps->gate_up) : nullptr;
     if (nvfp4) {
         launch_nvfp4_gate_up(gate_up, slots, schedule, stream);
-        launch_quant_nvfp4(b.y, slots, kIntermediate, b.ids, live, b.y_codes, b.y_scales, b.y_amax, stream);
+        // Narrow rounds quantise y inside the down kernel; the standalone pass then runs only for test taps.
+        if (!narrow || options.taps != nullptr) {
+            launch_quant_nvfp4(b.y, slots, kIntermediate, b.ids, live, b.y_codes, b.y_scales, b.y_amax, stream);
+        }
     } else {
         launch_mxfp8_gate_up(gate_up, slots, schedule, stream);
         const InklingMoeTaps* taps = options.taps;
@@ -254,7 +257,7 @@ void inkling_moe(const Tensor& x, const InklingMoeWeights& weights, Tensor& out,
     down.a_codes     = b.y_codes;
     down.a_scales    = b.y_scales;
     down.a_amax      = b.y_amax;
-    down.a_bf16      = b.y_bf16;
+    down.a_bf16      = nvfp4 ? b.y : b.y_bf16; // NVFP4: the bf16 y rows the narrow down kernel quantises
     down.a_row_shift = 0; // slot rows
     down.offsets     = b.offsets;
     down.sorted      = b.sorted;

@@ -42,10 +42,10 @@ namespace {
 /// adapter delta, then SiTU -> y (gate_up) or the bf16 down row. `n_first` = the output row of
 /// mma_n 0 for this lane (n_begin + warp offset + accumulator column).
 template <bool GateUp, int MmaN>
-__device__ __forceinline__ void store_routed_row(const GemmParams& p, int expert, int slot, int source_row,
+__device__ __forceinline__ void store_routed_row(const GemmParams& p, int expert, int slot, float row_amax,
                                                  float weight_amax, float rcp_denominator, int n_first,
                                                  const float (&acc)[MmaN][4], int half) {
-    const float row_scale = __fmul_rn(__fmul_rn(p.a_amax[source_row], weight_amax), rcp_denominator);
+    const float row_scale = __fmul_rn(__fmul_rn(row_amax, weight_amax), rcp_denominator);
     const int adapter     = lora_slot_of(p.lora, slot >> 3);
     const float* low = adapter >= 0 ? p.lora.low + static_cast<std::int64_t>(slot) * p.lora.low_stride : nullptr;
 #pragma unroll
@@ -123,7 +123,28 @@ __device__ __forceinline__ void stage_gathered_activation(const GemmParams& p, c
     }
 }
 
-template <class Schedule, int K, bool GateUp>
+/// Narrow down with the y quantisation fused (DESIGN-moe 2.1): the tile's routed y rows quantised
+/// (four-over-six, the quant kernel's code) into a resident shared A operand; row stride 592 bytes
+/// (576 + 16: the 8 rows of an ldmatrix phase hit distinct bank groups).
+inline constexpr int kFusedYRowBytes = kIntermediate / 2 + 16;
+inline constexpr int kFusedYScaleWords = kIntermediate / 64;
+
+/// 16 bf16 at `source` (32-byte aligned) as fp32 (the quant kernel's load16).
+__device__ __forceinline__ void load16_bf16(const __nv_bfloat16* source, float* x) {
+    const uint4* words = reinterpret_cast<const uint4*>(source);
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+        const uint4 v                = words[half];
+        const std::uint32_t parts[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            x[half * 8 + 2 * i]     = __uint_as_float(parts[i] << 16);
+            x[half * 8 + 2 * i + 1] = __uint_as_float(parts[i] & 0xFFFF0000U);
+        }
+    }
+}
+
+template <class Schedule, int K, bool GateUp, bool FusedYQuant = false>
 __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_expert_gemm_kernel(
     GemmParams p) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1200
@@ -137,18 +158,28 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     __shared__ int source_rows[Schedule::kBlockM];
     __shared__ int done[Schedule::kBlockM];
     __shared__ int done_count;
+    // Fused y quantisation only (1-element arrays otherwise).
+    __shared__ __align__(16) std::uint8_t y_codes[FusedYQuant ? Schedule::kBlockM * kFusedYRowBytes : 16];
+    __shared__ std::uint32_t y_scales[FusedYQuant ? Schedule::kBlockM * kFusedYScaleWords : 1];
+    __shared__ float y_amax[FusedYQuant ? Schedule::kBlockM : 1];
 
-    pdl::wait_for_dependencies();
+    if constexpr (!FusedYQuant) { pdl::wait_for_dependencies(); }
     pdl::trigger_dependents();
     if (threadIdx.x == 0) { done_count = 0; }
-    find_expert_tile<Schedule::kBlockM>(p.offsets, static_cast<int>(blockIdx.x), tile_info);
+    // Fused: the routing (offsets / sorted, written by the select kernel two or more launches back,
+    // complete before the gate_up kernel's wait returned) is read through L2 BEFORE this kernel's
+    // dependency wait, so the expert's w2 stages stream while the predecessor finishes.
+    find_expert_tile<Schedule::kBlockM, FusedYQuant>(p.offsets, static_cast<int>(blockIdx.x), tile_info);
     const int expert = tile_info[0];
-    if (expert < 0) { return; }
+    if (expert < 0) {
+        if constexpr (FusedYQuant) { pdl::wait_for_dependencies(); }
+        return;
+    }
     const int row_begin = tile_info[1];
     const int row_end   = tile_info[2];
     for (int row = static_cast<int>(threadIdx.x); row < Schedule::kBlockM; row += Schedule::kThreads) {
         const int index   = row_begin + row;
-        const int slot    = index < row_end ? p.sorted[index] : -1;
+        const int slot    = index < row_end ? (FusedYQuant ? __ldcg(p.sorted + index) : p.sorted[index]) : -1;
         slots[row]        = slot;
         source_rows[row]  = slot >= 0 ? (slot >> p.a_row_shift) : -1;
     }
@@ -159,15 +190,66 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     constexpr int kKTiles   = K / Schedule::kBlockK;
     constexpr int kWaitGroups = kKTiles < Schedule::kStages ? kKTiles - 1 : Schedule::kStages - 1;
     static_assert(K % Schedule::kBlockK == 0);
+    static_assert(!FusedYQuant || (!GateUp && K == kIntermediate));
 
+    if constexpr (FusedYQuant) {
 #pragma unroll
-    for (int stage = 0; stage < Schedule::kStages; ++stage) {
-        if (stage < kKTiles) {
-            stage_gathered_activation<Schedule, K>(p, source_rows, shared, stage, stage);
-            stage_nvfp4_w4a4_weight<Geometry, Schedule>(p.weights.codes, p.weights.scales, shared,
-                                                        stage, stage, weight_begin,
-                                                        Nvfp4W4a4IdentityRows{});
-            cp_commit();
+        for (int stage = 0; stage < Schedule::kStages; ++stage) {
+            if (stage < kKTiles) {
+                stage_nvfp4_w4a4_weight<Geometry, Schedule>(p.weights.codes, p.weights.scales, shared,
+                                                            stage, stage, weight_begin,
+                                                            Nvfp4W4a4IdentityRows{});
+                cp_commit();
+            }
+        }
+        pdl::wait_for_dependencies();
+        // y rows -> four-over-six (quant_nvfp4_row's arithmetic), a warp per row.
+        const int quant_lane = static_cast<int>(threadIdx.x) & 31;
+        for (int row = static_cast<int>(threadIdx.x) >> 5; row < Schedule::kBlockM; row += Schedule::kThreads / 32) {
+            const int source = source_rows[row];
+            std::uint8_t* codes_row = y_codes + row * kFusedYRowBytes;
+            std::uint32_t* scales_row = y_scales + row * kFusedYScaleWords;
+            if (source < 0) {
+                // Unrouted tile rows: zero codes (their MMA rows are never stored).
+                for (int i = quant_lane; i < kIntermediate / 32; i += 32) {
+                    reinterpret_cast<uint4*>(codes_row)[i] = make_uint4(0U, 0U, 0U, 0U);
+                }
+                if (quant_lane < kFusedYScaleWords) { scales_row[quant_lane] = 0U; }
+                continue;
+            }
+            const __nv_bfloat16* y_row = p.a_bf16 + static_cast<std::int64_t>(source) * kIntermediate;
+            constexpr int kBlocks = kIntermediate / 16;
+            float amax = 0.0F;
+            for (int block = quant_lane; block < kBlocks; block += 32) {
+                float x[16];
+                load16_bf16(y_row + block * 16, x);
+#pragma unroll
+                for (int j = 0; j < 16; ++j) { amax = fmaxf(amax, fabsf(x[j])); }
+            }
+            amax = warp_max(amax);
+            const Nvfp4RowScales row_scales = nvfp4_row_scales(amax);
+            for (int block = quant_lane; block < kBlocks; block += 32) {
+                float x[16];
+                load16_bf16(y_row + block * 16, x);
+                const Nvfp4Block quantized =
+                    nvfp4_quantize_block_4o6(x, row_scales, nvfp4_block_in_head(block, kIntermediate));
+                *reinterpret_cast<uint2*>(codes_row + block * 8) =
+                    make_uint2(static_cast<std::uint32_t>(quantized.codes),
+                               static_cast<std::uint32_t>(quantized.codes >> 32));
+                reinterpret_cast<std::uint8_t*>(scales_row)[block] = quantized.scale;
+            }
+            if (quant_lane == 0) { y_amax[row] = amax; }
+        }
+    } else {
+#pragma unroll
+        for (int stage = 0; stage < Schedule::kStages; ++stage) {
+            if (stage < kKTiles) {
+                stage_gathered_activation<Schedule, K>(p, source_rows, shared, stage, stage);
+                stage_nvfp4_w4a4_weight<Geometry, Schedule>(p.weights.codes, p.weights.scales, shared,
+                                                            stage, stage, weight_begin,
+                                                            Nvfp4W4a4IdentityRows{});
+                cp_commit();
+            }
         }
     }
 
@@ -198,12 +280,19 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
             for (int mma_m = 0; mma_m < Schedule::kMmaM; ++mma_m) {
                 const int row           = warp_m * Schedule::kWarpM + mma_m * 16 + a_row_offset;
                 const int logical_byte  = local_k64 * 32 + a_column_byte;
-                const int physical_byte = nvfp4_w4a4_swizzled_byte<Schedule>(row, logical_byte);
-                const auto* address = shared.a_codes[stage] + row * Schedule::kCodeRowBytes + physical_byte;
-                ldmatrix_x4(a_fragments[mma_m][0], a_fragments[mma_m][1], a_fragments[mma_m][2],
-                            a_fragments[mma_m][3], smem_addr(address));
-                const int scale_row = warp_m * Schedule::kWarpM + mma_m * 16 + sfa_row;
-                a_scales[mma_m] = shared.a_scale4[stage][scale_row * Schedule::kK64PerStage + local_k64];
+                const int scale_row     = warp_m * Schedule::kWarpM + mma_m * 16 + sfa_row;
+                if constexpr (FusedYQuant) {
+                    const auto* address = y_codes + row * kFusedYRowBytes + k_tile * Schedule::kCodeRowBytes + logical_byte;
+                    ldmatrix_x4(a_fragments[mma_m][0], a_fragments[mma_m][1], a_fragments[mma_m][2],
+                                a_fragments[mma_m][3], smem_addr(address));
+                    a_scales[mma_m] = y_scales[scale_row * kFusedYScaleWords + k_tile * Schedule::kK64PerStage + local_k64];
+                } else {
+                    const int physical_byte = nvfp4_w4a4_swizzled_byte<Schedule>(row, logical_byte);
+                    const auto* address = shared.a_codes[stage] + row * Schedule::kCodeRowBytes + physical_byte;
+                    ldmatrix_x4(a_fragments[mma_m][0], a_fragments[mma_m][1], a_fragments[mma_m][2],
+                                a_fragments[mma_m][3], smem_addr(address));
+                    a_scales[mma_m] = shared.a_scale4[stage][scale_row * Schedule::kK64PerStage + local_k64];
+                }
             }
 #pragma unroll
             for (int mma_n = 0; mma_n < Schedule::kMmaN; ++mma_n) {
@@ -240,7 +329,9 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
         __syncthreads();
         const int next_k_tile = k_tile + Schedule::kStages;
         if (next_k_tile < kKTiles) {
-            stage_gathered_activation<Schedule, K>(p, source_rows, shared, stage, next_k_tile);
+            if constexpr (!FusedYQuant) {
+                stage_gathered_activation<Schedule, K>(p, source_rows, shared, stage, next_k_tile);
+            }
             stage_nvfp4_w4a4_weight<Geometry, Schedule>(p.weights.codes, p.weights.scales, shared,
                                                         stage, next_k_tile, weight_begin,
                                                         Nvfp4W4a4IdentityRows{});
@@ -260,7 +351,13 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
             const int local_row = warp_m * Schedule::kWarpM + mma_m * 16 + accumulator_row + 8 * half;
             const int slot      = slots[local_row];
             if (slot < 0) { continue; }
-            store_routed_row<GateUp, Schedule::kMmaN>(p, expert, slot, source_rows[local_row], weight_amax,
+            float row_amax;
+            if constexpr (FusedYQuant) {
+                row_amax = y_amax[local_row];
+            } else {
+                row_amax = p.a_amax[source_rows[local_row]];
+            }
+            store_routed_row<GateUp, Schedule::kMmaN>(p, expert, slot, row_amax, weight_amax,
                                                       rcp_denominator,
                                                       n_begin + warp_n * Schedule::kWarpN + accumulator_col,
                                                       accumulators[mma_m], half);
@@ -582,7 +679,7 @@ __global__ __launch_bounds__(Schedule::kThreads, 1) void nvfp4_expert_gemm_persi
                 const int index = tile.row_begin + warp_m * Schedule::kWarpM + mma_m * 16 + accumulator_row + 8 * half;
                 if (index >= tile.row_end) { continue; }
                 const int slot = p.sorted[index];
-                store_routed_row<GateUp, Schedule::kMmaN>(p, tile.expert, slot, slot >> p.a_row_shift, weight_amax,
+                store_routed_row<GateUp, Schedule::kMmaN>(p, tile.expert, slot, p.a_amax[slot >> p.a_row_shift], weight_amax,
                                                           rcp_denominator,
                                                           tile.n_begin + warp_n * Schedule::kWarpN + accumulator_col,
                                                           accumulators[mma_m], half);
@@ -601,13 +698,13 @@ __global__ __launch_bounds__(Schedule::kThreads, 1) void nvfp4_expert_gemm_persi
 #endif
 }
 
-template <class Schedule, int K, bool GateUp>
+template <class Schedule, int K, bool GateUp, bool FusedYQuant = false>
 void launch_schedule(const GemmParams& params, std::int32_t slots, cudaStream_t stream) {
     const int max_tiles = std::min(kExperts, slots) + slots / Schedule::kBlockM;
     if (max_tiles == 0) { return; }
     const dim3 grid(static_cast<unsigned>(max_tiles), kGateUpRows / Schedule::kBlockN);
     const cudaError_t status = pdl::launch_dependent({grid, dim3(Schedule::kThreads), 0, stream},
-                                                     nvfp4_expert_gemm_kernel<Schedule, K, GateUp>, params);
+                                                     nvfp4_expert_gemm_kernel<Schedule, K, GateUp, FusedYQuant>, params);
     if (status != cudaSuccess) {
         throw std::runtime_error(std::string("inkling_moe: nvfp4 expert gemm: ") + cudaGetErrorString(status));
     }
@@ -698,7 +795,9 @@ void launch_nvfp4_down(const GemmParams& params, std::int32_t slots, GemmSchedul
                        cudaStream_t stream) {
     require(params);
     if (schedule == GemmSchedule::Narrow) {
-        launch_schedule<NarrowSchedule, kIntermediate, false>(params, slots, stream);
+        // The y quantisation runs in this kernel's prologue (a_bf16 = y rows); w2 streams before the wait.
+        if (params.a_bf16 == nullptr) { throw std::invalid_argument("inkling_moe: narrow NVFP4 down needs the y rows"); }
+        launch_schedule<NarrowSchedule, kIntermediate, false, true>(params, slots, stream);
     } else {
         launch_prefill<kIntermediate, false>(params, slots, stream);
     }

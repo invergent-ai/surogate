@@ -15,14 +15,16 @@ namespace sinfer::ops::detail::inkling {
 /// The expert tile `tile` when each expert's routed rows (offsets[e] .. offsets[e + 1]) are cut
 /// into tiles of `TileRows`: writes {expert, row_begin, row_end} to `result` (expert -1 = past
 /// the round's tiles). Every thread of the block calls it; one barrier inside.
-template <int TileRows>
+/// `ThroughL2`: read the offsets with ld.global.cg (a kernel reading them before its dependency
+/// wait must not see a stale L1 line).
+template <int TileRows, bool ThroughL2 = false>
 __device__ __forceinline__ void find_expert_tile(const std::int32_t* offsets, int tile,
                                                  int (&result)[3]) {
     if (threadIdx.x < 32) {
         const int lane = static_cast<int>(threadIdx.x);
         int bounds[5];
 #pragma unroll
-        for (int i = 0; i < 5; ++i) { bounds[i] = offsets[4 * lane + i]; }
+        for (int i = 0; i < 5; ++i) { bounds[i] = ThroughL2 ? __ldcg(offsets + 4 * lane + i) : offsets[4 * lane + i]; }
         int tiles[4];
         int local = 0;
 #pragma unroll
