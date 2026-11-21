@@ -259,6 +259,10 @@ sinfer_add_test(sinfer_kv_cache_test
 sinfer_add_test(sinfer_kv_admission_test
   SOURCES test_kv_admission.cpp
   LIBRARIES sinfer_core)
+# Window-bounded KV pages (lane f1): the host-only page manager; needs no device.
+sinfer_add_test(sinfer_kv_window_pages_test
+  SOURCES test_kv_window_pages.cpp
+  LIBRARIES sinfer_core)
 sinfer_add_test(sinfer_elastic_kv_region_test
   SOURCES test_elastic_kv_region.cpp
   LIBRARIES sinfer_core)
