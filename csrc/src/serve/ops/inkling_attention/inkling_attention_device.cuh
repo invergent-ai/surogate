@@ -82,6 +82,15 @@ __device__ __forceinline__ float ptx_div_full(float a, float b) {
     return y;
 }
 
+/// m16n8k8 bf16 MMA (fp32 accumulate): a0 / a1 = rows gid / gid + 8, k 2 lid .. + 1; b0 = k 2 lid .. + 1, n gid.
+__device__ __forceinline__ void mma_bf16_k8(float& c0, float& c1, float& c2, float& c3, unsigned a0, unsigned a1,
+                                            unsigned b0) {
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.bf16.bf16.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+                 : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+                 : "r"(a0), "r"(a1), "r"(b0));
+}
+
 /// The reference's `_sigmoid` (ops/attention.py): rcp.approx(ex2.approx(-x * log2 e) + 1).
 __device__ __forceinline__ float ref_sigmoid(float x) {
     return ptx_rcp(__fadd_rn(ptx_ex2(__fmul_rn(-x, kLog2e)), 1.0F));

@@ -464,6 +464,321 @@ __global__ __launch_bounds__(MTiles * 32) void rel_attention_kernel(const AttnPa
     }
 }
 
+// ---- decode / verify v2 (rows of W <= 10: 1 or 2 row tiles) -----------------------------------------------------
+// A row tile's 16 rows are served by FOUR warps, warp kq owning keys 8 kq .. 8 kq + 7 of every 32-key block with its
+// own running max, sum and accumulator (P V on m16n8k8, P straight from the score registers); the four are merged at
+// the end as split-KV partials are (FlashDecoding). The next block's e4m3 codes are prefetched into registers
+// while the current block is computed, then widened into the swizzled bf16 tiles: no raw ring in shared memory. The
+// merge buffer aliases the tiles. Same numerics class as the M2 kernel (P rounded against each warp's own running
+// maximum, like any split).
+template <int MTiles>
+struct DecodeSmem {
+    static constexpr int kWarps       = 4 * MTiles;
+    static constexpr int kStripStride = 24;  // 16 distances + pad
+    static constexpr int kTileBytes   = 2 * 32 * Geo::kHeadDim * 2;         // K + V bf16 tiles
+    static constexpr int kMergeBytes  = kWarps * 16 * 64 * 4;              // half a head dim of fp32 acc a warp
+    static constexpr int kUnionBytes  = kTileBytes > kMergeBytes ? kTileBytes : kMergeBytes;
+    alignas(16) unsigned char u[kUnionBytes];
+    __nv_bfloat16 strip[kWarps][16 * kStripStride];
+    float mrow[kWarps][16];
+    float lrow[kWarps][16];
+};
+
+template <bool Local, int MTiles, int Mode>
+__global__ __launch_bounds__(MTiles * 128) void rel_decode_kernel(const AttnParams p) {
+    constexpr int Threads = MTiles * 128;
+    constexpr int NR      = 512 / Threads; // 8-byte code chunks of K (and of V) a thread prefetches per block
+    using Smem            = DecodeSmem<MTiles>;
+    extern __shared__ __align__(16) unsigned char dec_smem_raw[];
+    Smem& sm = *reinterpret_cast<Smem*>(dec_smem_raw);
+    __nv_bfloat16* k_tile = reinterpret_cast<__nv_bfloat16*>(sm.u);
+    __nv_bfloat16* v_tile = k_tile + 32 * Geo::kHeadDim;
+    float* mbuf           = reinterpret_cast<float*>(sm.u);
+    pdl::wait_for_dependencies();
+
+    const int tid  = static_cast<int>(threadIdx.x);
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int gid  = lane >> 2;
+    const int lid  = lane & 3;
+    const int mt   = warp >> 2;
+    const int kq   = warp & 3;
+    const int split = static_cast<int>(blockIdx.x);
+    const int kvh   = static_cast<int>(blockIdx.y);
+    const int b     = static_cast<int>(blockIdx.z);
+    const int W     = p.width;
+    int valid       = W;
+    if (p.valid_columns != nullptr) { valid = max(0, min(p.valid_columns[b], W)); }
+    const std::int32_t* positions = p.positions + static_cast<std::int64_t>(W) * b;
+    const std::int32_t* table_row = p.block_tables + static_cast<std::int64_t>(p.table_rows[b]) * p.table_stride;
+    const std::int64_t n_columns  = static_cast<std::int64_t>(W) * p.batch;
+
+    // CTA key range (all rows), split into contiguous 32-key blocks.
+    const bool any = valid > 0;
+    const int pmin = any ? positions[0] : 0;
+    const int pmax = any ? positions[valid - 1] : -1;
+    const int hi   = pmax + 1;
+    int kb_begin = 0, kb_end = 0;
+    if (any) {
+        const int lo    = Local ? max(0, pmin - (Geo::kWindow - 1)) : 0;
+        const int kb_lo = lo / 32;
+        const int nblk  = (hi + 31) / 32 - kb_lo;
+        kb_begin        = kb_lo + static_cast<int>(static_cast<std::int64_t>(split) * nblk / p.splits);
+        kb_end          = kb_lo + static_cast<int>(static_cast<std::int64_t>(split + 1) * nblk / p.splits);
+    }
+
+    // This warp's row tile (rows 16 mt .. 16 mt + 15; row = 3 j + h).
+    const int w_rho0  = mt * 16;
+    const int w_j0    = w_rho0 / Geo::kGroup;
+    const int w_j1    = min((w_rho0 + 15) / Geo::kGroup, valid - 1);
+    const bool w_any  = w_j0 <= w_j1;
+    const int pmin_w  = w_any ? positions[w_j0] : 0;
+    const int pmax_w  = w_any ? positions[w_j1] : -1;
+    const bool w_full = (w_rho0 + 15) < Geo::kGroup * valid;
+
+    int rj[2], rh[2], rpos[2];
+    bool rvalid[2], rexists[2];
+    std::int64_t rn[2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int rho = w_rho0 + gid + 8 * i;
+        rj[i]         = rho / Geo::kGroup;
+        rh[i]         = kvh * Geo::kGroup + rho % Geo::kGroup;
+        rexists[i]    = rho < Geo::kGroup * W;
+        rvalid[i]     = rexists[i] && rj[i] < valid;
+        rpos[i]       = rvalid[i] ? positions[rj[i]] : -1;
+        rn[i]         = static_cast<std::int64_t>(rj[i]) + static_cast<std::int64_t>(W) * b;
+    }
+    unsigned af[8][4];
+    unsigned ar[4];
+    {
+        const __nv_bfloat16* q0 = p.q + (rn[0] * Geo::kQHeads + rh[0]) * Geo::kHeadDim + 2 * lid;
+        const __nv_bfloat16* q1 = p.q + (rn[1] * Geo::kQHeads + rh[1]) * Geo::kHeadDim + 2 * lid;
+#pragma unroll
+        for (int ks = 0; ks < 8; ++ks) {
+            af[ks][0] = word_or_zero(q0 + 16 * ks, rvalid[0]);
+            af[ks][1] = word_or_zero(q1 + 16 * ks, rvalid[1]);
+            af[ks][2] = word_or_zero(q0 + 16 * ks + 8, rvalid[0]);
+            af[ks][3] = word_or_zero(q1 + 16 * ks + 8, rvalid[1]);
+        }
+        const __nv_bfloat16* r0 = p.r + (rn[0] * Geo::kQHeads + rh[0]) * Geo::kRelDim + 2 * lid;
+        const __nv_bfloat16* r1 = p.r + (rn[1] * Geo::kQHeads + rh[1]) * Geo::kRelDim + 2 * lid;
+        ar[0] = word_or_zero(r0, rvalid[0]);
+        ar[1] = word_or_zero(r1, rvalid[1]);
+        ar[2] = word_or_zero(r0 + 8, rvalid[0]);
+        ar[3] = word_or_zero(r1 + 8, rvalid[1]);
+    }
+
+    float acc[16][4];
+#pragma unroll
+    for (int n = 0; n < 16; ++n) { acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.0F; }
+    float m[2] = {-CUDART_INF_F, -CUDART_INF_F};
+    float l[2] = {0.0F, 0.0F};
+
+    int2 rk[NR], rv[NR];
+    const auto load_raw = [&](int kb) {
+        const int k0          = kb * 32;
+        const std::int64_t off = kv_page_offset(table_row[k0 >> kPageShift], kvh, k0 & (kPageTokens - 1));
+        const int keys_ok     = hi - k0;
+#pragma unroll
+        for (int i = 0; i < NR; ++i) {
+            const int c   = tid + i * Threads;
+            const int key = c >> 4;
+            const std::int64_t o = off + key * Geo::kHeadDim + (c & 15) * 8;
+            const bool ok = key < keys_ok;
+            rk[i] = ok ? load_ldg<int2>(p.k_pages + o) : make_int2(0, 0);
+            rv[i] = ok ? load_ldg<int2>(p.v_pages + o) : make_int2(0, 0);
+        }
+    };
+    const unsigned k_base = smem_addr(k_tile);
+    const unsigned v_base = smem_addr(v_tile);
+    __nv_bfloat16* strip  = sm.strip[warp];
+    constexpr int kSS     = Smem::kStripStride;
+
+    if (kb_begin < kb_end) { load_raw(kb_begin); }
+    for (int kb = kb_begin; kb < kb_end; ++kb) {
+        __syncthreads(); // every warp is done with the previous block's tiles
+#pragma unroll
+        for (int i = 0; i < NR; ++i) {
+            const int c = tid + i * Threads, key = c >> 4, part = c & 15;
+            const int e = key * Geo::kHeadDim + ((part ^ (key & 7)) << 3);
+            store_vec(k_tile + e, e4m3x8_to_bf16x8(rk[i]));
+            store_vec(v_tile + e, e4m3x8_to_bf16x8(rv[i]));
+        }
+        __syncthreads();
+        if (kb + 1 < kb_end) { load_raw(kb + 1); } // in flight during this block's math
+
+        const int kw0 = kb * 32 + 8 * kq; // this warp's first key
+        if (!w_any || kw0 > pmax_w || (Local && kw0 + 7 < pmin_w - (Geo::kWindow - 1))) { continue; }
+
+        // S for 8 keys: eight chained k16 steps (two per ldmatrix.x4).
+        float sc[4] = {0.0F, 0.0F, 0.0F, 0.0F};
+#pragma unroll
+        for (int ks2 = 0; ks2 < 4; ++ks2) {
+            const int key   = 8 * kq + (lane & 7);
+            const int chunk = 4 * ks2 + (lane >> 3);
+            unsigned b0, b1, b2, b3;
+            ldmatrix_x4(b0, b1, b2, b3, k_base + static_cast<unsigned>(key * kRowBytes + ((chunk ^ (key & 7)) << 4)));
+            mma_bf16(sc[0], sc[1], sc[2], sc[3], af[2 * ks2][0], af[2 * ks2][1], af[2 * ks2][2], af[2 * ks2][3], b0, b1);
+            mma_bf16(sc[0], sc[1], sc[2], sc[3], af[2 * ks2 + 1][0], af[2 * ks2 + 1][1], af[2 * ks2 + 1][2],
+                     af[2 * ks2 + 1][3], b2, b3);
+        }
+#pragma unroll
+        for (int e = 0; e < 4; ++e) { sc[e] = __fmul_rn(sc[e], p.qk_scale_log2); }
+
+        const int d0 = pmin_w - (kw0 + 7); // distance of strip column 0
+        if (d0 < Geo::kRelExtent) {
+            __syncwarp();
+#pragma unroll
+            for (int ct = 0; ct < 2; ++ct) {
+                const __nv_bfloat16* t =
+                    p.table + static_cast<std::int64_t>(d0 + 8 * ct + gid + Geo::kRelTablePad) * Geo::kRelDim + 2 * lid;
+                float c0 = 0.0F, c1 = 0.0F, c2 = 0.0F, c3 = 0.0F;
+                mma_bf16(c0, c1, c2, c3, ar[0], ar[1], ar[2], ar[3], load_vec<unsigned>(t), load_vec<unsigned>(t + 8));
+                store_vec(strip + gid * kSS + 8 * ct + 2 * lid, pack_bf16x2(c0, c1));
+                store_vec(strip + (gid + 8) * kSS + 8 * ct + 2 * lid, pack_bf16x2(c2, c3));
+            }
+            __syncwarp();
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int i = e >> 1;
+                if (!rvalid[i]) { continue; }
+                const int c      = (rpos[i] - pmin_w) + 7 - (2 * lid + (e & 1));
+                const float bias = __bfloat162float(strip[(gid + 8 * i) * kSS + c]);
+                sc[e] = (p.variant & 1) ? __fadd_rn(sc[e], __fmul_rn(bias, kLog2e)) : fmaf(bias, kLog2e, sc[e]);
+            }
+        }
+        if (!w_full || (kw0 + 7 > pmin_w) || (Local && kw0 <= pmax_w - Geo::kWindow)) {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int i   = e >> 1;
+                const int key = kw0 + 2 * lid + (e & 1);
+                if (!(rvalid[i] && key <= rpos[i] && (!Local || rpos[i] - key < Geo::kWindow))) { sc[e] = -CUDART_INF_F; }
+            }
+        }
+        float alpha[2], msafe[2];
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const float bm = warp_max<4>(fmaxf(sc[2 * i], sc[2 * i + 1]));
+            const float mn = fmaxf(m[i], bm);
+            msafe[i]       = mn == -CUDART_INF_F ? 0.0F : mn;
+            alpha[i]       = ptx_ex2(__fsub_rn(m[i], msafe[i]));
+            m[i]           = mn;
+        }
+        float pv[4];
+#pragma unroll
+        for (int e = 0; e < 4; ++e) { pv[e] = ptx_ex2(__fsub_rn(sc[e], msafe[e >> 1])); }
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const float sum = warp_sum<4>(__fadd_rn(pv[2 * i], pv[2 * i + 1]));
+            l[i] = (p.variant & 32) ? __fadd_rn(__fmul_rn(l[i], alpha[i]), sum) : fmaf(l[i], alpha[i], sum);
+        }
+        if (__any_sync(kFullWarpMask, alpha[0] != 1.0F || alpha[1] != 1.0F)) {
+#pragma unroll
+            for (int n = 0; n < 16; ++n) {
+                acc[n][0] = __fmul_rn(acc[n][0], alpha[0]);
+                acc[n][1] = __fmul_rn(acc[n][1], alpha[0]);
+                acc[n][2] = __fmul_rn(acc[n][2], alpha[1]);
+                acc[n][3] = __fmul_rn(acc[n][3], alpha[1]);
+            }
+        }
+        const unsigned pa0 = pack_bf16x2(pv[0], pv[1]), pa1 = pack_bf16x2(pv[2], pv[3]);
+#pragma unroll
+        for (int n4 = 0; n4 < 4; ++n4) {
+            const int key   = 8 * kq + (lane & 7);
+            const int chunk = 4 * n4 + (lane >> 3);
+            unsigned v0, v1, v2, v3;
+            ldmatrix_x4_t(v0, v1, v2, v3, v_base + static_cast<unsigned>(key * kRowBytes + ((chunk ^ (key & 7)) << 4)));
+            mma_bf16_k8(acc[4 * n4][0], acc[4 * n4][1], acc[4 * n4][2], acc[4 * n4][3], pa0, pa1, v0);
+            mma_bf16_k8(acc[4 * n4 + 1][0], acc[4 * n4 + 1][1], acc[4 * n4 + 1][2], acc[4 * n4 + 1][3], pa0, pa1, v1);
+            mma_bf16_k8(acc[4 * n4 + 2][0], acc[4 * n4 + 2][1], acc[4 * n4 + 2][2], acc[4 * n4 + 2][3], pa0, pa1, v2);
+            mma_bf16_k8(acc[4 * n4 + 3][0], acc[4 * n4 + 3][1], acc[4 * n4 + 3][2], acc[4 * n4 + 3][3], pa0, pa1, v3);
+        }
+    }
+
+    // Merge the four key-quarter warps of each row tile, half a head dim at a time; warp kq then finishes dims
+    // 64 h + 16 kq .. + 15 of its tile's 16 rows (lane: row lane / 2, dims 8 (lane & 1) .. + 7).
+    if (lid == 0) {
+        sm.mrow[warp][gid]     = m[0];
+        sm.mrow[warp][gid + 8] = m[1];
+        sm.lrow[warp][gid]     = l[0];
+        sm.lrow[warp][gid + 8] = l[1];
+    }
+    const int r      = lane >> 1;             // merge row within the tile
+    const int rho    = w_rho0 + r;
+    const int mj     = rho / Geo::kGroup;
+    const int mh     = kvh * Geo::kGroup + rho % Geo::kGroup;
+    const bool mex   = rho < Geo::kGroup * W;
+    const bool mval  = mex && mj < valid;
+    const std::int64_t mn_col = static_cast<std::int64_t>(mj) + static_cast<std::int64_t>(W) * b;
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        __syncthreads(); // tiles (h = 0) / the previous half's buffer (h = 1) are free
+#pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            const int n = 8 * h + t, d = 8 * t + 2 * lid;
+            float* row0 = mbuf + (static_cast<std::int64_t>(warp) * 16 + gid) * 64 + d;
+            float* row1 = mbuf + (static_cast<std::int64_t>(warp) * 16 + gid + 8) * 64 + d;
+            store_vec(row0, make_float2(acc[n][0], acc[n][1]));
+            store_vec(row1, make_float2(acc[n][2], acc[n][3]));
+        }
+        __syncthreads();
+        // The four partials of this row (warps 4 mt .. 4 mt + 3).
+        float mstar = -CUDART_INF_F;
+#pragma unroll
+        for (int w = 0; w < 4; ++w) { mstar = fmaxf(mstar, sm.mrow[4 * mt + w][r]); }
+        const float ms = mstar == -CUDART_INF_F ? 0.0F : mstar;
+        float f[4], L = 0.0F;
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            f[w] = ptx_ex2(__fsub_rn(sm.mrow[4 * mt + w][r], ms)); // -inf -> 0
+            L    = fmaf(f[w], sm.lrow[4 * mt + w][r], L);
+        }
+        const bool has   = mval && L > 0.0F;
+        const float lse2 = has ? __fadd_rn(ms, (p.variant & 16) ? log2f(L) : ptx_lg2(L)) : -CUDART_INF_F;
+        const int dloc   = 16 * kq + 8 * (lane & 1);            // within the half
+        const int dim    = 64 * h + dloc;
+        float o[8];
+#pragma unroll
+        for (int c = 0; c < 8; ++c) {
+            float a = 0.0F;
+#pragma unroll
+            for (int w = 0; w < 4; ++w) { a = fmaf(f[w], mbuf[(static_cast<std::int64_t>(4 * mt + w) * 16 + r) * 64 + dloc + c], a); }
+            o[c] = has ? ((p.variant & 8) ? __fdiv_rn(a, L) : ptx_div_full(a, L)) : 0.0F;
+        }
+        if (!mex) { continue; }
+        if constexpr (Mode == kGated) {
+            __nv_bfloat16* dst = p.out + mn_col * Geo::kAttnWidth + mh * Geo::kHeadDim + dim;
+            if (!mval) {
+                store_vec(dst, make_uint4(0, 0, 0, 0));
+                continue;
+            }
+            const float sig_sink =
+                ref_sigmoid(__fsub_rn(__fmul_rn(lse2, kLn2), __bfloat162float(p.sink[mn_col * p.sink_stride + mh])));
+            const __nv_bfloat16* g = p.gate + mn_col * p.gate_stride + mh * Geo::kHeadDim + dim;
+            unsigned packed[4];
+#pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                const float2 gv = bf16x2_bits_to_float2(load_vec<unsigned>(g + 2 * c));
+                packed[c]       = pack_bf16x2(__fmul_rn(__fmul_rn(o[2 * c], ref_sigmoid(gv.x)), sig_sink),
+                                              __fmul_rn(__fmul_rn(o[2 * c + 1], ref_sigmoid(gv.y)), sig_sink));
+            }
+            store_vec(dst, make_uint4(packed[0], packed[1], packed[2], packed[3]));
+        } else if constexpr (Mode == kOutLse) {
+            float* dst = p.out_f32 + (mn_col * Geo::kQHeads + mh) * Geo::kHeadDim + dim;
+            store_vec(dst, make_float4(o[0], o[1], o[2], o[3]));
+            store_vec(dst + 4, make_float4(o[4], o[5], o[6], o[7]));
+            if (h == 0 && kq == 0 && (lane & 1) == 0) { p.lse[mn_col * Geo::kQHeads + mh] = mval ? __fmul_rn(lse2, kLn2) : 0.0F; }
+        } else {
+            const std::int64_t part = (static_cast<std::int64_t>(split) * n_columns + mn_col) * Geo::kQHeads + mh;
+            float* dst              = p.part_o + part * Geo::kHeadDim + dim;
+            store_vec(dst, make_float4(o[0], o[1], o[2], o[3]));
+            store_vec(dst + 4, make_float4(o[4], o[5], o[6], o[7]));
+            if (h == 0 && kq == 0 && (lane & 1) == 0) { p.part_lse2[part] = lse2; }
+        }
+    }
+}
+
 // The split merge of `_rel_decode_combine_kernel` (A6), then the gate and sink (A7) or out / lse.
 template <int Mode>
 __global__ __launch_bounds__(128) void combine_kernel(const AttnParams p) {
@@ -562,8 +877,10 @@ Plan make_plan(InklingLayerKind kind, std::int32_t width, std::int32_t batch, st
         plan.decode = true;
         plan.mtiles = (Geo::kGroup * width + 15) / 16;
         const int work = Geo::kKvHeads * batch;
+        const bool v2  = plan.mtiles <= 2 && !decode_v1_forced();
         plan.splits    = kind == InklingLayerKind::Global ? std::clamp((2 * sms + work - 1) / work, 1, 64)
-                                                          : std::clamp((sms + work - 1) / work, 1, 9);
+                         : v2 ? std::clamp((2 * sms + work - 1) / work, 1, 17)
+                              : std::clamp((sms + work - 1) / work, 1, 9);
     } else {
         plan.decode      = false;
         plan.mtiles      = 4;
@@ -603,9 +920,31 @@ void launch_kernel(const Plan& plan, const AttnParams& p, cudaStream_t stream) {
     CUDA_CHECK(pdl::launch_dependent(launch, kernel, p));
 }
 
+bool decode_v1_forced() {
+    const char* raw = std::getenv("SUROGATE_INKLING_DECODE_V1"); // A/B against the M2 decode kernel
+    return raw != nullptr && raw[0] == '1';
+}
+
+template <bool Local, int MTiles, int Mode>
+void launch_decode_v2(const Plan& plan, const AttnParams& p, cudaStream_t stream) {
+    constexpr int bytes = static_cast<int>(sizeof(DecodeSmem<MTiles>));
+    auto* kernel        = rel_decode_kernel<Local, MTiles, Mode>;
+    static const bool configured = [&] {
+        CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
+        return true;
+    }();
+    (void)configured;
+    const pdl::LaunchConfig launch{plan.grid, dim3(MTiles * 128), static_cast<std::size_t>(bytes), stream};
+    CUDA_CHECK(pdl::launch_dependent(launch, kernel, p));
+}
+
 template <bool Local, int Mode>
 void dispatch_mode(const Plan& plan, const AttnParams& p, cudaStream_t stream) {
     if (!plan.decode) { return launch_kernel<Local, false, 4, Mode>(plan, p, stream); }
+    if (plan.mtiles <= 2 && !decode_v1_forced()) {
+        return plan.mtiles == 1 ? launch_decode_v2<Local, 1, Mode>(plan, p, stream)
+                                : launch_decode_v2<Local, 2, Mode>(plan, p, stream);
+    }
     switch (plan.mtiles) {
     case 1: return launch_kernel<Local, true, 1, Mode>(plan, p, stream);
     case 2: return launch_kernel<Local, true, 2, Mode>(plan, p, stream);
