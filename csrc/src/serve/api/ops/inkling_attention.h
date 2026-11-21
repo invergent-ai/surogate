@@ -151,6 +151,9 @@ struct InklingAttentionKnobs {
     // Decode / verify split route: the last worker CTA of a (row, KV head) folds its 3 x W rows (no fold_kernel launch)
     // when W x slots <= this (SUROGATE_INKLING_ATTN_FUSED_FOLD; 0 = fold_kernel always). Same bits either way.
     int fused_fold_max = 1 << 30;
+    // inkling_attn_linear, N <= 16: the cell-split narrow kernel (a row tile's cells over several warps, joined in cell
+    // order; SUROGATE_INKLING_LINEAR_SPLIT=0 = the one-warp-per-tile narrow kernel). Same bits either way.
+    bool linear_split = true;
 };
 [[nodiscard]] InklingAttentionKnobs& inkling_attention_knobs();
 

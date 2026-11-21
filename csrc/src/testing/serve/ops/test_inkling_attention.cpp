@@ -1520,8 +1520,13 @@ void run_linear_width_case(const std::string& name, int k, int k_per, int rows_p
     const auto ref = run(nmax);
     std::size_t bad = 0, total = 0;
     std::string first;
-    for (const int n : {1, 2, 8, 9, 16, 17, 64}) {
+    // Widths 1 .. 64 (narrow: the cell-split kernel), then 1 / 9 / 16 through the one-warp-per-tile narrow kernel.
+    const std::vector<std::pair<int, bool>> widths = {{1, true}, {2, true}, {8, true}, {9, true}, {16, true}, {17, true},
+                                                      {64, true}, {1, false}, {9, false}, {16, false}};
+    for (const auto& [n, split] : widths) {
+        ops::inkling_attention_knobs().linear_split = split;
         const auto got = run(n);
+        ops::inkling_attention_knobs().linear_split = true;
         for (std::size_t i = 0; i < ranges.size(); ++i) {
             const std::size_t count = static_cast<std::size_t>(ranges[i].second) * n; // columns are contiguous
             total += count;
@@ -1533,7 +1538,8 @@ void run_linear_width_case(const std::string& name, int k, int k_per, int rows_p
             }
         }
     }
-    std::printf("%-44s widths 1 2 8 9 16 17 64 vs 8192: %zu / %zu outputs bit-different%s%s\n", name.c_str(), bad, total,
+    std::printf("%-44s widths 1 2 8 9 16 17 64 (+ 1 9 16 one-warp narrow) vs 8192: %zu / %zu outputs bit-different%s%s\n",
+                name.c_str(), bad, total,
                 first.empty() ? "" : "  first: ", first.c_str());
     check(bad == 0, name);
 }
@@ -2099,6 +2105,21 @@ void run_bench_fold() {
     }
     unsetenv("BENCH_META_STATIC");
     ops::inkling_attention_knobs().fused_fold_max = 1 << 30;
+    // Narrow attn_linear: one-warp-per-tile (split 0) vs cell-split (split 1).
+    for (const int split : {0, 1}) {
+        ops::inkling_attention_knobs().linear_split = split != 0;
+        const std::string tag = split != 0 ? " [split]" : " [one-warp]";
+        const auto nm = [&](const char* w) { static std::string x; x = std::string(w) + tag; return x.c_str(); };
+        bench_linear(nm("attn_linear qkvr narrow N=1 1x128"), 2304, 128, 1);
+        bench_linear(nm("attn_linear qkvr narrow N=1 channel"), 2304, 2304, 1);
+        bench_linear(nm("attn_linear qkvr narrow N=8 1x128"), 2304, 128, 8);
+        bench_linear(nm("attn_linear qkvr narrow N=16 1x128"), 2304, 128, 16);
+        bench_linear(nm("attn_linear wo narrow N=1 1x128"), 3072, 128, 1);
+        bench_linear(nm("attn_linear wo narrow N=1 channel"), 3072, 3072, 1);
+        bench_linear(nm("attn_linear wo narrow N=8 1x128"), 3072, 128, 8);
+        bench_linear(nm("attn_linear wo narrow N=16 1x128"), 3072, 128, 16);
+    }
+    ops::inkling_attention_knobs().linear_split = true;
 }
 
 // Decode attention (1 x 8k global, gated) followed by the wo projection (N = 1, 1x128) in ONE CUDA graph with PDL edges:

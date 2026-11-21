@@ -1222,6 +1222,7 @@ InklingAttentionKnobs& knobs() {
         x.early_meta        = env_int("SUROGATE_INKLING_ATTN_EARLY_META", 1) != 0;
         x.partial_cap_bytes = static_cast<std::size_t>(std::max(0, env_int("SUROGATE_INKLING_ATTN_PARTIAL_MB", 1024))) << 20;
         x.fused_fold_max    = std::max(0, env_int("SUROGATE_INKLING_ATTN_FUSED_FOLD", x.fused_fold_max));
+        x.linear_split      = env_int("SUROGATE_INKLING_LINEAR_SPLIT", 1) != 0;
         return x;
     }();
     return k;
