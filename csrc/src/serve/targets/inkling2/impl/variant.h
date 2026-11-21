@@ -9,6 +9,7 @@
 #include "targets/inkling2/impl/config.h"
 #include "targets/inkling2/impl/model.h"
 #include "family/impl/runtime/visit_round.h"
+#include "family/impl/runtime/dspark_round.h"
 
 #include <api/family/runtime.h>
 #include <api/family/text_geometry.h>
@@ -16,6 +17,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <vector>
 
 namespace sinfer::targets::inkling2::detail {
@@ -71,6 +73,28 @@ struct Variant {
                                                                      std::int32_t slots);
     /// The KV plane windows (lane f1's hook): 1,024 for the 40 local visits, 0 for the 8 global ones.
     [[nodiscard]] static std::vector<std::int32_t> kv_layer_windows(const family::TextGeometry& geometry);
+
+    // ---- DSpark (lane e2, family/impl/runtime/dspark_round.h, impl/dspark.cpp): the drafter through the DFlash
+    // runtime; its draft KV = text-pool planes 48 / 49 / 50 (draft layers 0 / 1 / 2) when geometry.dflash is set ----
+    static constexpr bool dspark_drafter              = true;
+    /// Measured DSpark round graph (f1c 15:24, 262,144 x 8 lanes: 20 MiB for 8 exact-b graphs at k = 7, 80 MiB for the
+    /// 32 of --spec-adaptive = 2.5 MiB each; e2b mtp5g: 2.0 MiB at 1 lane): 8 MiB per class (3.2x margin) instead of
+    /// the family's 64 / 96 MiB.
+    static constexpr std::uint64_t dflash_graph_allowance_per_class_bytes = 8ULL * 1024ULL * 1024ULL;
+    static constexpr std::uint32_t dspark_first_plane = TextConfig::layers;
+    /// {1032, 0, 1032} (block-anchored local windows, the global draft layer) under `--speculative dflash`, else {}.
+    [[nodiscard]] static std::vector<std::int32_t> extra_kv_planes(const family::TextGeometry& geometry,
+                                                                   const family::StartupFeatures& features);
+    static void dspark_append(const ModelView& model, const family::DSparkRuntime& runtime,
+                              const family::DSparkAppendArgs& args);
+    static void dspark_propose(const ModelView& model, const family::DSparkRuntime& runtime,
+                               const family::DSparkProposeArgs& args);
+    [[nodiscard]] static std::size_t dspark_append_workspace_bytes(std::int32_t columns);
+    /// The draft cap of a lane under --spec-adaptive (static per content kind, lanes/e2/k_policy.py: greedy round
+    /// dynamics priced by the 1-stream 8k byte bound): the last content marker of the current model message --
+    /// tool-call JSON 7, message structure 7, thinking 3, answer text 2.
+    [[nodiscard]] static std::uint32_t dspark_draft_cap(std::span<const TokenId> ledger);
+    [[nodiscard]] static std::size_t dspark_propose_workspace_bytes(std::int32_t batch, std::uint32_t max_visible_keys);
 
     // ---- residual hooks (ResidualHooks<Variant>) ----
     /// Slot 0 of the stack = embed_norm(embed[ids]); the other slots are written by the visits.

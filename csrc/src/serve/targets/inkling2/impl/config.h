@@ -57,16 +57,17 @@ struct VisionConfig : family::VisionBackboneConfig {
     static constexpr int output_hidden = TextConfig::hidden;
 };
 
-/// The DSpark drafter rides the DFlash runtime (lane e2); off until e2 flips it.
+/// The DSpark drafter rides the DFlash runtime (lane e2, family/impl/runtime/dspark_round.h): `--speculative dflash`
+/// runs it, k <= 7 drafts per round (block 8).
 struct DFlashConfig {
-    static constexpr bool supported = false;
+    static constexpr bool supported = true;
 };
 
 inline constexpr float kAttentionScale                   = 0.08838834764831845F; // 128^-0.5
 inline constexpr float kGdnScale                         = 0.0F;                 // no linear-attention layers
 inline constexpr std::uint32_t kPrefillChunkAlignment    = 128;
 inline constexpr std::uint32_t kMaximumMtpDraftTokens    = 0;
-inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 0;
+inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 7;
 inline constexpr std::uint32_t kNativeContext            = 1048576;
 
 } // namespace sinfer::targets::inkling2::detail

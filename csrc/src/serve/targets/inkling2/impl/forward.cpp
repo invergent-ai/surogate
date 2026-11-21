@@ -473,7 +473,13 @@ void run_visit(Round& rd, int v) {
     cudaStream_t s                      = rd.s;
     auto scope                          = rd.work.scope();
     if (vi.feature >= 0 && rd.r.features.active()) {
-        rd.r.features.capture(rd.r.features.context, vi.feature, slot_tensor(rd.r.x, vi.partial, T), s);
+        // DSpark (lane e2): a contiguous [2304, T] copy -- the sink's verify path views the value it is given.
+        Tensor feature   = rd.work.alloc(DType::BF16, {D, T});
+        const Tensor src = slot_tensor(rd.r.x, vi.partial, T);
+        CUDA_CHECK(cudaMemcpy2DAsync(feature.data, static_cast<std::size_t>(D) * 2, src.data,
+                                     static_cast<std::size_t>(src.nb[1]), static_cast<std::size_t>(D) * 2,
+                                     static_cast<std::size_t>(T), cudaMemcpyDeviceToDevice, s));
+        rd.r.features.capture(rd.r.features.context, vi.feature, feature, s);
     }
     // 1. attention inputs
     const int Q    = (vi.global || vi.looped) ? 3 : 1;
@@ -893,6 +899,14 @@ void Variant::run_visits(const ModelView& model, family::VisitRound& r) {
     d.active = d.dir != nullptr && !dumped && capturing == cudaStreamCaptureStatusNone && !r.segments.empty() &&
                rd.T >= min_columns;
     for (int v = r.first_visit; v < r.last_visit; ++v) { run_visit(rd, v); }
+    // DSpark's fourth feature (lane e2): the final-norm output, the BF16 hidden the LM head reads, captured before the
+    // runtime checks the round's features are complete; the same invariant mix finish() runs.
+    if (r.features.active() && r.last_visit == C::layers) {
+        auto scope    = rd.work.scope();
+        Tensor hidden = rd.work.alloc(DType::BF16, {D, rd.T});
+        final_residual_mix(model, r.x, hidden, rd.work, rd.s);
+        r.features.capture(r.features.context, 3, hidden, rd.s);
+    }
     if (d.active) {
         dumped   = true;
         d.active = false;
@@ -914,6 +928,7 @@ std::size_t Variant::visit_workspace_capacity_bytes(const family::TextGeometry&,
     bytes += 2 * up(T * 32 * 2);                             // dynamic taps
     bytes += up(T * C::attn_width * 2) * 2 + up(T * 384 * 2); // q_out, gated, r_out
     bytes += up(T * D * 2) * 4;                              // attn_partial, attn_out, mlp_in, moe_out
+    bytes += up(T * D * 2);                                  // a DSpark feature copy (lane e2)
     // the looped blend tile: dest + msg fp32, pair, h, gf fp32, blended
     bytes += up(tile * D * 3 * 4) + up(tile * D * 3 * 4) + up(tile * 2 * D * 3 * 2) + up(tile * C::gate_rank * 3 * 2) +
              up(tile * 2 * D * 3 * 4) + up(tile * D * 3 * 2);

@@ -1620,6 +1620,11 @@ set_source_files_properties(${SERVE_ROOT}/ops/inkling_mix/inkling_mix.cu
   PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:-fmad=false>")
 set_source_files_properties(${SERVE_ROOT}/ops/inkling_mix/inkling_lora.cu
   PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:-fmad=false>")
+# Inkling-2-Mini DSpark drafter ops (ENGINE-INKLING lane e2, api/ops/dspark.h). -fmad=false: unfused like
+# rl/engine-inkling-2026-11-21/ref/dspark_ref.py; only the inkling2 target calls them.
+target_sources(sinfer_ops PRIVATE ${SERVE_ROOT}/ops/dspark/dspark.cu)
+set_source_files_properties(${SERVE_ROOT}/ops/dspark/dspark.cu
+  PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:-fmad=false>")
 # Vendor-tuned CPU GEMM, optional and injected by path. Both live outside the
 # tree as reference checkouts rather than vendored dependencies, so a build with
 # neither must still work -- the encoder's own AVX-512 microkernel is always

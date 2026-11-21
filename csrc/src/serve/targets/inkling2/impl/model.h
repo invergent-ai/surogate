@@ -7,6 +7,7 @@
 
 #include "targets/inkling2/impl/config.h"
 #include "targets/inkling2/impl/load/bindings.h"
+#include "targets/inkling2/impl/dspark.h"
 
 #include "artifact/materializer.h"
 #include "core/arena.h"
@@ -44,6 +45,7 @@ struct DerivedQueries {
 struct InklingModel {
     const load::InklingWeights* weights   = nullptr;
     const DerivedQueries* queries         = nullptr;
+    const DSparkDerived* dspark           = nullptr; ///< set when the drafter is bound (lane e2)
 };
 
 /// The `FullAttentionProjectionWeights` of a visit: its physical layer and where it sits in the schedule.
@@ -92,6 +94,7 @@ public:
     family::FrontendResources frontend;
     load::InklingWeights weights;
     DerivedQueries queries;
+    DSparkDerived dspark; ///< the drafter's load-time derivations (lane e2); empty without `--speculative dflash`
     InklingModel model;
     RuntimeModelView runtime;
 };

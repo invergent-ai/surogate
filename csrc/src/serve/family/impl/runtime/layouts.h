@@ -29,6 +29,8 @@ struct DFlashPersistentLayout {
     TensorLayout prefill_features;
     TensorLayout prefill_positions;
     TensorLayout pending_features;
+    /// DSpark only (family/impl/runtime/dspark_round.h): BF16 [hidden, lanes], each lane's Markov feature.
+    std::optional<TensorLayout> dspark_f_rnn;
 
     [[nodiscard]] std::size_t kv_payload_bytes() const noexcept {
         return local.payload_bytes() + (full ? full->payload_bytes() : 0);

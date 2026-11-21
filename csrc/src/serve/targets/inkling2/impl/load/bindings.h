@@ -147,6 +147,9 @@ struct BindOptions {
     AttentionChoice attention;
     /// Bind the DSpark drafter to the device (MTP on); otherwise its objects are validated only.
     bool draft = false;
+    /// The drafter's dense linears (q k v o k_ctx v_ctx gate up down) in a mapped host bank instead of the device: the
+    /// target re-quantises them to FP8 on the device at load (lane e2, DSpark FP8 drafter weights).
+    bool draft_linears_host = false;
     /// Placement of one physical layer's objects (a pipeline stage keeps its own visits' layers; a core layer
     /// is needed by every stage that runs one of its passes). Unset: the placement in force for every layer.
     std::function<artifact::TensorPlacement(std::int32_t layer)> layer_placement;
