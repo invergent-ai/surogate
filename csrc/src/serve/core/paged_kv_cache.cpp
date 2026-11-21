@@ -1508,9 +1508,11 @@ std::uint32_t PagedKVPool::compact_window_class(std::span<const PagedKVAllocatio
     }
     const auto in_use = static_cast<std::uint32_t>(used.size());
     if (granules <= (in_use + granule - 1U) / granule + 1U) { return 0; }
+    // The lane range and the sentinel (immovable, but its granule is always mapped: holes there are free to fill).
     std::vector<std::int32_t> lane_used;
     for (const std::int32_t page : used) {
-        if (static_cast<std::uint32_t>(page) >= lane_first && static_cast<std::uint32_t>(page) < lane_last) {
+        if (page == window_sentinel_ ||
+            (static_cast<std::uint32_t>(page) >= lane_first && static_cast<std::uint32_t>(page) < lane_last)) {
             lane_used.push_back(page);
         }
     }
