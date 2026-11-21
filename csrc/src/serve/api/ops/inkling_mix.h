@@ -175,6 +175,15 @@ void inkling_conv_attn_res(const InklingPlane& x, const Tensor& conv_weight, con
                            const InklingAttnResSources& sources, const Tensor& queries, const Tensor* norm_weight,
                            float norm_eps, Tensor& out, cudaStream_t stream);
 
+/// (d) fusion 1b, decode form: the same conv into `conv_out`, then inkling_blend_inputs whose dest sources read
+/// `conv_out` as `last` or `addend` -- one launch, one CTA per W = 1 row, bit-identical to the two ops.
+void inkling_conv_blend_inputs(const InklingPlane& x, const Tensor& conv_weight, const InklingConvRows& rows,
+                               const InklingConvStateView& state, std::int32_t channel_offset,
+                               const InklingPlane& conv_out, const InklingAttnResSources& dest_sources,
+                               const Tensor& dest_queries, const InklingAttnResSources& bank,
+                               const Tensor& message_queries, Tensor& dest, Tensor& message, Tensor& pair,
+                               cudaStream_t stream);
+
 void inkling_short_conv(const InklingPlane& x, std::int32_t channels, const Tensor& weight,
                         const InklingConvRows& rows, const InklingConvStateView& state,
                         std::int32_t channel_offset, const InklingPlane* residual,

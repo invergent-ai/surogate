@@ -827,6 +827,81 @@ int test_conv_attn_res(std::uint32_t seed, int B, bool as_last) {
     return failures;
 }
 
+/// inkling_conv_blend_inputs (decode rows) == inkling_short_conv + inkling_blend_inputs, bitwise (conv output, windows,
+/// dest, message, pair), one stream (the MLP input of a looped visit).
+int test_conv_blend(std::uint32_t seed, int B, bool as_last) {
+    constexpr int kSlotsN = 40;
+    const int stack = as_last ? 3 : 2;
+    const std::size_t slot_elems = static_cast<std::size_t>(G::kConvChannels) * 3;
+    const auto w      = randn_bf16(static_cast<std::size_t>(kD) * 4, seed, 0.4F);
+    const auto x      = randn_bf16(static_cast<std::size_t>(B) * kD, seed + 1, 1.0F);
+    const auto init   = randn_bf16(slot_elems * kSlotsN, seed + 2, 1.0F);
+    const auto planes = randn_bf16(static_cast<std::size_t>(stack + 3) * B * kD, seed + 3, 1.0F); // + 2 bank planes
+    const auto dq     = randn_f32(kD, seed + 4, 0.05F);
+    const auto mq     = randn_f32(kD, seed + 5, 0.05F);
+    std::vector<int> pos(B), valid(B), slots(B);
+    for (int b = 0; b < B; ++b) {
+        pos[b]   = b < 3 ? b : 90 + 5 * b;
+        valid[b] = (b % 6 == 5) ? 0 : 1;
+        slots[b] = (7 * b + 2) % kSlotsN;
+    }
+    DeviceBuffer d_w = dev_bf16(w), d_x = dev_bf16(x), d_planes = dev_bf16(planes), d_dq = to_device(dq),
+                 d_mq = to_device(mq), d_pos = to_device(pos), d_valid = to_device(valid), d_slots = to_device(slots);
+    const Tensor w_t(d_w.p, DType::BF16, {4, kD}), dq_t(d_dq.p, DType::FP32, {kD, 1}), mq_t(d_mq.p, DType::FP32, {kD, 1});
+    const ops::InklingConvRows rows{1, B, Tensor(d_pos.p, DType::I32, {1, B}), Tensor(d_valid.p, DType::I32, {B}),
+                                    Tensor(d_slots.p, DType::I32, {B})};
+    const auto plane = [&](void* p, int i) {
+        return ops::InklingPlane{static_cast<std::uint16_t*>(p) + static_cast<std::size_t>(i) * B * kD, DType::BF16, kD};
+    };
+    struct Run {
+        std::vector<std::uint8_t> conv, state, dest, msg, pair;
+    };
+    const auto run = [&](bool fused) {
+        DeviceBuffer d_pool = dev_bf16(init), d_conv(static_cast<std::size_t>(B) * kD * 2),
+                     d_dest(static_cast<std::size_t>(B) * kD * 4), d_msg(static_cast<std::size_t>(B) * kD * 4),
+                     d_pair(static_cast<std::size_t>(B) * 2 * kD * 2);
+        d_conv.fill(0);
+        const ops::InklingConvStateView view{d_pool.p, static_cast<std::int64_t>(slot_elems), G::kConvChannels};
+        const ops::InklingPlane conv_out{d_conv.p, DType::BF16, kD};
+        ops::InklingAttnResSources src;
+        src.stack_count = stack;
+        for (int i = 0; i < stack; ++i) { src.stack[i] = plane(d_planes.p, i); }
+        if (as_last) {
+            src.stack[src.stack_count++] = plane(d_planes.p, stack);
+            src.last                     = conv_out;
+        } else {
+            src.last   = plane(d_planes.p, stack);
+            src.addend = conv_out;
+        }
+        ops::InklingAttnResSources bank;
+        bank.stack_count = 1;
+        bank.stack[0]    = plane(d_planes.p, stack + 1);
+        bank.last        = plane(d_planes.p, stack + 2);
+        Tensor dest(d_dest.p, DType::FP32, {kD, B, 1}), msg(d_msg.p, DType::FP32, {kD, B, 1}),
+            pair(d_pair.p, DType::BF16, {2 * kD, B, 1});
+        const ops::InklingPlane xin{d_x.p, DType::BF16, kD};
+        if (fused) {
+            ops::inkling_conv_blend_inputs(xin, w_t, rows, view, G::kStreamAttn, conv_out, src, dq_t, bank, mq_t, dest,
+                                           msg, pair, nullptr);
+        } else {
+            ops::inkling_short_conv(xin, kD, w_t, rows, view, G::kStreamAttn, nullptr, nullptr, conv_out, nullptr);
+            ops::inkling_blend_inputs(src, dq_t, bank, mq_t, B, dest, msg, pair, nullptr);
+        }
+        cuda_synchronize();
+        return Run{raw(d_conv.p, d_conv.bytes), raw(d_pool.p, d_pool.bytes), raw(d_dest.p, d_dest.bytes),
+                   raw(d_msg.p, d_msg.bytes), raw(d_pair.p, d_pair.bytes)};
+    };
+    const Run u = run(false), f = run(true);
+    const std::string tag = "I9 conv + blend_inputs fused, B=" + std::to_string(B) + (as_last ? " (last)" : " (addend)");
+    int failures = 0;
+    failures += same_bits(tag + ": conv output", f.conv, u.conv, 2);
+    failures += same_bits(tag + ": conv windows", f.state, u.state, 2);
+    failures += same_bits(tag + ": dest", f.dest, u.dest, 4);
+    failures += same_bits(tag + ": message", f.msg, u.msg, 4);
+    failures += same_bits(tag + ": pair", f.pair, u.pair, 2);
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -857,6 +932,8 @@ int main() {
     for (const int B : {1, 5, 32}) {
         failures += test_conv_attn_res(3700 + B, B, true);
         failures += test_conv_attn_res(3800 + B, B, false);
+        failures += test_conv_blend(3900 + B, B, true);
+        failures += test_conv_blend(4000 + B, B, false);
     }
     for (const int n : {1, 5, 8, 13, 32}) {
         failures += test_controller_tail(3300 + n, 3, 1, n);

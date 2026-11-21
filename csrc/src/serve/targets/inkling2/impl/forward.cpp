@@ -174,11 +174,25 @@ ops::InklingConvStateView state_view(const Round& rd, int visit) {
     return {conv.data, static_cast<std::int64_t>(kConvChannels) * 3, kConvChannels};
 }
 
+/// (d) fusion 1b: the attention-output conv that produces the dest mix's `last` / `addend` on a decode round
+/// (one W = 1 group), done inside the blend launch.
+struct FusedConv {
+    ops::InklingPlane x;
+    const Tensor* weight = nullptr;
+    ops::InklingConvRows rows;
+    ops::InklingConvStateView state;
+    std::int32_t channel_offset = 0;
+    ops::InklingPlane out;
+};
+
 /// The fp32 AttnRes mix + message blend of a looped visit, column-tiled (DESIGN-target.md 3.4).
 /// streams = {0, 1, 2} (attention q / k / v inputs) or {3} (MLP input); `out` BF16 [D, T, S].
 void blended_inputs(Round& rd, const VisitInfo& vi, const load::InklingLayerWeights& L,
                     const ops::InklingAttnResSources& sources, const Tensor& dest_queries, int first_stream,
-                    int streams, const Tensor& norm_weight, Tensor& out) {
+                    int streams, const Tensor& norm_weight, Tensor& out, const FusedConv* conv = nullptr) {
+    if (conv != nullptr && rd.T > kTileColumns) {
+        throw std::logic_error("inkling2: the fused conv + blend takes one tile (a decode round)");
+    }
     const int core_index = vi.layer - C::core_start;
     const Tensor& messages = rd.q.message.at(static_cast<std::size_t>(core_index));
     const int dq = dest_queries.ne[1];
@@ -204,8 +218,14 @@ void blended_inputs(Round& rd, const VisitInfo& vi, const load::InklingLayerWeig
                            DType::FP32, {D, streams});
         Tensor msg  = rd.work.alloc(DType::FP32, {D, n, streams});
         Tensor pair = rd.work.alloc(DType::BF16, {2 * D, n, streams});
-        // dest mix + message mix + pair norm: one launch, bit-identical to the three ops (invariance test I3).
-        ops::inkling_blend_inputs(src, dest_queries, bank, msg_queries, n, dest, msg, pair, rd.s);
+        // dest mix + message mix + pair norm: one launch, bit-identical to the three ops (invariance test I3); with the
+        // attention-output conv in front of it on a decode round (I9).
+        if (conv != nullptr) {
+            ops::inkling_conv_blend_inputs(conv->x, *conv->weight, conv->rows, conv->state, conv->channel_offset,
+                                           conv->out, src, dest_queries, bank, msg_queries, dest, msg, pair, rd.s);
+        } else {
+            ops::inkling_blend_inputs(src, dest_queries, bank, msg_queries, n, dest, msg, pair, rd.s);
+        }
         const auto* down = bf16_ptr(L.loop_down) + static_cast<std::int64_t>(first_stream) * C::gate_rank * 2 * D;
         const auto* gfw  = bf16_ptr(L.loop_gain_forget) + static_cast<std::int64_t>(first_stream) * 2 * D * C::gate_rank;
         const ops::InklingGemmBatch down_batch{streams, static_cast<std::int64_t>(C::gate_rank) * 2 * D,
@@ -723,16 +743,22 @@ void run_visit(Round& rd, int v) {
     // 5. attention-output conv (+ 6. the MLP input mix: one fused launch on a decode round of a non-looped visit)
     Tensor attn_out = rd.work.alloc(DType::BF16, {D, T});
     Tensor mlp_in   = rd.work.alloc(DType::BF16, {D, T, 1});
-    const bool fuse_conv_mix = !fusions_off() && !vi.looped && rd.groups.size() == 1 &&
-                               rd.groups[0].segment == nullptr && !rd.groups[0].record && rd.groups[0].width == 1 &&
-                               rd.groups[0].column == 0 && rd.groups[0].batch == T;
+    const bool fuse_conv_mix = !fusions_off() && rd.groups.size() == 1 && rd.groups[0].segment == nullptr &&
+                               !rd.groups[0].record && rd.groups[0].width == 1 && rd.groups[0].column == 0 &&
+                               rd.groups[0].batch == T && T <= kTileColumns;
     if (fuse_conv_mix) {
         const Group& g                         = rd.groups[0];
         const ops::InklingAttnResSources src   = mlp_sources(rd, vi, attn_out);
         const Tensor& queries                  = rd.q.mlp.at(static_cast<std::size_t>(vi.layer));
         const Tensor norm                      = vector_as_rows(L.moe_input_norm, 1);
-        ops::inkling_conv_attn_res(packed(attn_partial, 0), L.attn_out_conv, g.rows(), state, G::kStreamAttn,
-                                   packed(attn_out, 0), src, queries, &norm, C::rms_epsilon, mlp_in, s);
+        if (!vi.looped) {
+            ops::inkling_conv_attn_res(packed(attn_partial, 0), L.attn_out_conv, g.rows(), state, G::kStreamAttn,
+                                       packed(attn_out, 0), src, queries, &norm, C::rms_epsilon, mlp_in, s);
+        } else {
+            const FusedConv fc{packed(attn_partial, 0), &L.attn_out_conv, g.rows(), state, G::kStreamAttn,
+                               packed(attn_out, 0)};
+            blended_inputs(rd, vi, L, src, queries, 3, 1, norm, mlp_in, &fc);
+        }
     }
     for (const Group& g : rd.groups) {
         if (fuse_conv_mix) { break; }
