@@ -165,6 +165,31 @@ void apply_attn_lora(WorkspaceArena& work, const AttnLoraSelection& sel, const o
     ops::inkling_lora_delta(sel.table, slices, count, sel.rank, tokens, sel.token_slot, sel.uniform, low.data, bytes, s);
 }
 
+/// Lane d's InklingMoeOptions::workspace_tokens: the widest call the arena's free bytes still book (the visit
+/// workspace was planned for the phase's widest round, so the free space at the MoE step is at least that call's
+/// layout), so a narrower prefill call may take fewer down column passes. Speed only: the bits are the same.
+std::int32_t moe_workspace_tokens(const WorkspaceArena& work, ops::InklingExpertFormat format, bool adapters,
+                                  std::int32_t tokens) {
+    constexpr std::size_t kSlack = std::size_t{1} << 16; // the carve's per-buffer alignment, generously
+    const std::size_t used = work.used(), capacity = work.capacity();
+    if (capacity <= used + kSlack) { return 0; }
+    const std::size_t free = capacity - used - kSlack;
+    if (ops::inkling_moe_workspace_bytes(format, tokens, adapters) > free) { return 0; }
+    std::int32_t lo = tokens, hi = std::max<std::int32_t>(tokens, 1) * 2;
+    while (hi <= (1 << 20) && ops::inkling_moe_workspace_bytes(format, hi, adapters) <= free) {
+        lo = hi;
+        hi *= 2;
+    }
+    while (hi - lo > 1) { // bytes grow with tokens: the largest lo that fits
+        const std::int32_t mid = lo + (hi - lo) / 2;
+        (ops::inkling_moe_workspace_bytes(format, mid, adapters) <= free ? lo : hi) = mid;
+    }
+    return lo;
+}
+
+/// The compute stream's persistent state: lane d's MoE counters, then (256-aligned) lane c's attention fold counters.
+std::size_t moe_state_span() { return (ops::inkling_moe_state_bytes() + 255U) & ~std::size_t{255}; }
+
 /// Lane c's key-group cut, passed explicitly (engine and trainer must pass the same value; lane h froze P3).
 constexpr ops::InklingKeyGroups kKeyGroups = ops::InklingKeyGroups::P3;
 
@@ -652,6 +677,10 @@ void run_visit(Round& rd, int v) {
             rows.valid_columns = g.valid;
             rows.kv_table_rows = g.table_rows;
             rows.key_groups    = kKeyGroups;
+            // Lane c's persistent fold counters (zeroed once by the program; the last CTA returns them to zero).
+            if (rd.r.target_state != nullptr) {
+                rows.state = reinterpret_cast<std::int32_t*>(static_cast<std::byte*>(rd.r.target_state) + moe_state_span());
+            }
             // Lane c's early metadata read (c2's metadata_static, e1's Q3 answer 12:41): segments when their ints went
             // in the round's host copy (a full barrier after everything the step wrote before); the ordinary decode
             // block (ingress copy, the step's first node) or any non-verify block behind that barrier; never verify.
@@ -753,6 +782,7 @@ void run_visit(Round& rd, int v) {
         options.adapters = adapters;
         // Lane d's narrow-round router + select fold: the stream's persistent counters (zeroed once at startup).
         options.state = static_cast<std::int32_t*>(rd.r.target_state);
+        options.workspace_tokens = moe_workspace_tokens(rd.work, moe_weights(L).format, adapters != nullptr, T);
         const Tensor x(mlp_in.data, DType::BF16, {D, T});
         ops::inkling_moe(x, moe_weights(L), moe_out, rd.work, s, options);
     }
@@ -899,7 +929,7 @@ void Variant::run_visits(const ModelView& model, family::VisitRound& r) {
     }
 }
 
-std::size_t Variant::visit_target_state_bytes() { return ops::inkling_moe_state_bytes(); }
+std::size_t Variant::visit_target_state_bytes() { return moe_state_span() + ops::inkling_attention_state_bytes(); }
 
 std::size_t Variant::visit_workspace_capacity_bytes(const family::TextGeometry&, family::TextPhase, std::int32_t batch_size,
                                                     std::int32_t max_width, std::int32_t max_columns,

@@ -215,6 +215,106 @@ __global__ __launch_bounds__(kNarrowWarps * 32) void narrow_kernel(const LinearP
     }
 }
 
+// ---- narrow, cell-split: N <= 16 columns, a row tile's cells spread over warps --------------------------------------
+// A CTA owns one n8 tile of weight rows (8 rows) and all N tokens; its Cells / kSplitCpw warps each take kSplitCpw
+// consecutive cells and land ALL their codes in shared memory with cp.async at entry (before the PDL wait), so every
+// code of the kernel is requested at once (wo: 288 tiles x 4 warps, qkvr: 1,075 x 3, instead of one 24 / 18-cell
+// stream per warp). Each warp runs its cells' MMA chains from zero (two cells interleaved) and parks the parts in
+// shared memory; warp 0 then joins them in cell order by cell_end. Every element's operations are narrow_kernel's /
+// gemm_kernel's (a cell's part is the same chain from zero; acc = fmaf(scale, part, acc) in cell order): same bits.
+inline constexpr int kSplitCpw = 6; // cells a warp
+
+template <int K, bool PerRow>
+__global__ __launch_bounds__((K / 128 / kSplitCpw) * 32) void narrow_split_kernel(const LinearParams p) {
+    constexpr int Cells = K / 128;
+    constexpr int CW    = Cells / kSplitCpw; // warps
+    static_assert(Cells % kSplitCpw == 0 && kSplitCpw % 2 == 0, "whole cell pairs per warp");
+    __shared__ __align__(16) std::uint8_t ring_all[CW][kSplitCpw][8 * 128];
+    __shared__ __align__(16) float4 parts[Cells][32];
+    const int block        = static_cast<int>(blockIdx.x);
+    const LinearSegment& s = p.seg[segment_of(p, block)];
+    const int warp         = static_cast<int>(threadIdx.x) >> 5;
+    const int lane         = static_cast<int>(threadIdx.x) & 31;
+    const int gid          = lane >> 2;
+    const int lid          = lane & 3;
+    const int local0       = (block - s.block_begin) * 8;
+    const int cell0        = warp * kSplitCpw;
+    std::uint8_t (*ring)[8 * 128] = ring_all[warp];
+
+    // This warp's cells, slot i = cell cell0 + i: 64 pieces of 16 bytes each, two a lane (a row past the end re-reads
+    // the last row and writes nothing).
+#pragma unroll
+    for (int i = 0; i < kSplitCpw; ++i) {
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int piece = lane + 32 * h;
+            const int r     = piece >> 3;
+            const int q     = piece & 7;
+            const std::uint8_t* src =
+                s.codes + static_cast<std::int64_t>(s.row_begin + min(local0 + r, s.rows - 1)) * K + (cell0 + i) * 128 + q * 16;
+            cp_async<16, Cache::cg>(&ring[i][r * 128 + ((((q >> 1) ^ (r & 3)) << 5) | ((q & 1) << 4))], src);
+        }
+    }
+    cp_commit();
+    // Warp 0's cell scales (it joins the parts): read while the codes are in flight.
+    float sc0[Cells], sc1[Cells];
+#pragma unroll
+    for (int c = 0; c < Cells; ++c) { sc0[c] = sc1[c] = 1.0F; }
+    if constexpr (!PerRow) {
+        if (warp == 0) {
+#pragma unroll
+            for (int c = 0; c < Cells; ++c) {
+                sc0[c] = cell_scale(s, local0 + 2 * lid, c);
+                sc1[c] = cell_scale(s, local0 + 2 * lid + 1, c);
+            }
+        }
+    }
+    pdl::wait_for_dependencies();
+
+    const int n_tok         = p.columns;
+    const bool t0           = gid < n_tok;
+    const bool t1           = gid + 8 < n_tok;
+    const __nv_bfloat16* x0 = s.x + static_cast<std::int64_t>(t0 ? gid : 0) * K + 8 * lid;
+    const __nv_bfloat16* x1 = s.x + static_cast<std::int64_t>(t1 ? gid + 8 : 0) * K + 8 * lid;
+    const auto mask         = [](uint4 v, bool ok) { return ok ? v : make_uint4(0, 0, 0, 0); };
+    const auto codes        = [&](int i, int j) {
+        const uint2 cw = load_vec<uint2>(&ring[i][gid * 128 + ((j ^ (gid & 3)) << 5) + 8 * lid]);
+        return e4m3x8_to_bf16x8(make_int2(static_cast<int>(cw.x), static_cast<int>(cw.y)));
+    };
+    cp_wait<0>();
+    __syncwarp();
+#pragma unroll
+    for (int i = 0; i < kSplitCpw; i += 2) {
+        float part0[4] = {0.0F, 0.0F, 0.0F, 0.0F};
+        float part1[4] = {0.0F, 0.0F, 0.0F, 0.0F};
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int ch0 = 4 * (cell0 + i) + j, ch1 = ch0 + 4;
+            chunk_steps(part0, mask(load_ldg<uint4>(x0 + 32 * ch0), t0), mask(load_ldg<uint4>(x1 + 32 * ch0), t1), codes(i, j));
+            chunk_steps(part1, mask(load_ldg<uint4>(x0 + 32 * ch1), t0), mask(load_ldg<uint4>(x1 + 32 * ch1), t1), codes(i + 1, j));
+        }
+        parts[cell0 + i][lane]     = make_float4(part0[0], part0[1], part0[2], part0[3]);
+        parts[cell0 + i + 1][lane] = make_float4(part1[0], part1[1], part1[2], part1[3]);
+    }
+    __syncthreads();
+    if (warp != 0) { return; }
+    float acc[4] = {0.0F, 0.0F, 0.0F, 0.0F};
+#pragma unroll
+    for (int c = 0; c < Cells; ++c) {
+        const float4 pv = parts[c][lane];
+        float part[4]   = {pv.x, pv.y, pv.z, pv.w};
+        cell_end<PerRow>(acc, part, sc0[c], sc1[c]);
+    }
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+        const int local = local0 + 2 * lid + (e & 1);
+        const int tok   = gid + 8 * (e >> 1);
+        if (local >= s.rows || tok >= n_tok) { continue; }
+        const float y = PerRow ? __fmul_rn(acc[e], s.scales[(s.row_begin + local) / s.rows_per]) : acc[e];
+        s.out[static_cast<std::int64_t>(tok) * s.out_stride + local] = __float2bfloat16_rn(y);
+    }
+}
+
 // ---- GEMM: N > 16 columns ------------------------------------------------------------------------------------------
 // CTA tile 64 tokens x 64 weight rows, K in steps of 64 (two chunks; two steps per 128-column cell). 4 warps in a 2 x 2
 // grid, each 32 tokens (2 m16) x 32 rows (4 n8). Codes and activations land with cp.async (two stages); the codes are
@@ -365,7 +465,7 @@ struct Prepared {
     int blocks = 0;
 };
 
-Prepared prepare(std::span<const InklingProjection> projections, bool gemm, const char* op) {
+Prepared prepare(std::span<const InklingProjection> projections, bool gemm, const char* op, int narrow_rows = kNarrowRows) {
     if (projections.empty() || projections.size() > static_cast<std::size_t>(kMaxSegments)) {
         fail(op, "one to four projections per call");
     }
@@ -413,7 +513,7 @@ Prepared prepare(std::span<const InklingProjection> projections, bool gemm, cons
         s.rows_per       = rows_per;
         s.kcells         = w.k / k_per;
         s.block_begin    = blocks;
-        blocks += gemm ? (rows + kTn - 1) / kTn : (rows + kNarrowRows - 1) / kNarrowRows;
+        blocks += gemm ? (rows + kTn - 1) / kTn : (rows + narrow_rows - 1) / narrow_rows;
     }
     pr.params.segments = static_cast<std::int32_t>(projections.size());
     pr.params.columns  = static_cast<std::int32_t>(columns);
@@ -434,12 +534,26 @@ void inkling_attn_linear(std::span<const InklingProjection> projections, Workspa
     if (projections.empty() || projections[0].x == nullptr) { fail(op, "no projections"); }
     const std::int64_t n = projections[0].x->numel() / std::max<std::int64_t>(projections[0].x->ne[0], 1);
     const bool gemm      = n > 16;
-    const Prepared pr    = prepare(projections, gemm, op);
+    // Narrow route: the cell-split kernel (one 8-row tile a CTA) unless InklingAttentionKnobs::linear_split is off.
+    const bool split     = !gemm && inkling_attention_knobs().linear_split;
+    const Prepared pr    = prepare(projections, gemm, op, split ? 8 : kNarrowRows);
     if (pr.params.columns <= 0) { return; }
     // One cell kind per launch: the accumulator chain is fixed at compile time.
     const bool per_row = pr.params.seg[0].k_per == pr.k;
     for (int i = 1; i < pr.params.segments; ++i) {
         if ((pr.params.seg[i].k_per == pr.k) != per_row) { fail(op, "projections of one call share their scale cell kind"); }
+    }
+    if (split) {
+        const unsigned threads = static_cast<unsigned>(pr.k / 128 / kSplitCpw * 32);
+        const pdl::LaunchConfig launch{dim3(static_cast<unsigned>(pr.blocks)), dim3(threads), 0, stream};
+        if (pr.k == 2304) {
+            CUDA_CHECK(per_row ? pdl::launch_dependent(launch, narrow_split_kernel<2304, true>, pr.params)
+                               : pdl::launch_dependent(launch, narrow_split_kernel<2304, false>, pr.params));
+        } else {
+            CUDA_CHECK(per_row ? pdl::launch_dependent(launch, narrow_split_kernel<3072, true>, pr.params)
+                               : pdl::launch_dependent(launch, narrow_split_kernel<3072, false>, pr.params));
+        }
+        return;
     }
     if (!gemm) {
         const pdl::LaunchConfig launch{dim3(static_cast<unsigned>(pr.blocks)), dim3(kNarrowWarps * 32), 0, stream};

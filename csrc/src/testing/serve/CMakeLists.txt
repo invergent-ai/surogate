@@ -974,3 +974,12 @@ target_compile_options(sinfer_inkling_attention_test PRIVATE
   $<$<COMPILE_LANGUAGE:CXX>:-fno-fast-math> $<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off> -UNDEBUG)
 add_test(NAME sinfer_inkling_attention_test COMMAND sinfer_inkling_attention_test)
 set_tests_properties(sinfer_inkling_attention_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# ENGINE-INKLING lane c, S1: the split full-vocabulary draw vs the one-CTA kernel through ops::sample() (old-vs-new
+# token and count identity) -- compiles the sampling launcher / wrapper itself and links sinfer_core only.
+add_executable(sinfer_sampling_split_test EXCLUDE_FROM_ALL ops/test_sampling_split.cu
+  ${SERVE_ROOT}/ops/launcher/sampling.cu ${SERVE_ROOT}/ops/wrapper/sampling.cpp)
+target_include_directories(sinfer_sampling_split_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR} ${SERVE_ROOT} ${CUDAToolkit_INCLUDE_DIRS})
+target_link_libraries(sinfer_sampling_split_test PRIVATE sinfer_core)
+target_compile_options(sinfer_sampling_split_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)

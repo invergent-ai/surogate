@@ -73,8 +73,8 @@ __device__ __forceinline__ void store_routed_row(const GemmParams& p, int expert
                 value0 = __fadd_rn(value0, lora_expand(down, adapter, n, low));
                 value1 = __fadd_rn(value1, lora_expand(down, adapter, n + 1, low));
             }
-            *reinterpret_cast<__nv_bfloat162*>(p.out + static_cast<std::int64_t>(slot) * kHidden + n) =
-                __floats2bfloat162_rn(value0, value1);
+            *reinterpret_cast<__nv_bfloat162*>(p.out + static_cast<std::int64_t>(slot) * p.out_stride +
+                                               (n - p.out_column0)) = __floats2bfloat162_rn(value0, value1);
         }
     }
 }
@@ -215,6 +215,8 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     }
     const int row_begin = tile_info[1];
     const int row_end   = tile_info[2];
+    const int n_begin       = (static_cast<int>(blockIdx.y) + p.n_tile0) * Schedule::kBlockN;
+    const int weight_begin  = expert * kGateUpRows + n_begin;
     for (int row = static_cast<int>(threadIdx.x); row < Schedule::kBlockM; row += Schedule::kThreads) {
         const int index   = row_begin + row;
         const int slot    = index < row_end ? (FusedYQuant ? __ldcg(p.sorted + index) : p.sorted[index]) : -1;
@@ -223,8 +225,6 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     }
     __syncthreads();
 
-    const int n_begin       = static_cast<int>(blockIdx.y) * Schedule::kBlockN;
-    const int weight_begin  = expert * kGateUpRows + n_begin;
     constexpr int kKTiles   = K / Schedule::kBlockK;
     constexpr int kWaitGroups = kKTiles < Schedule::kStages ? kKTiles - 1 : Schedule::kStages - 1;
     static_assert(K % Schedule::kBlockK == 0);
@@ -469,9 +469,9 @@ struct PersistentItem {
 /// whose first tile is <= the tile (experts without rows have no tiles).
 template <class Schedule>
 __device__ __forceinline__ PersistentItem persistent_item(const int* tile_prefix, const std::int32_t* offsets,
-                                                          int item) {
-    const int tile = item / Schedule::kNTiles;
-    const int n    = item - tile * Schedule::kNTiles;
+                                                          int item, int n_tiles, int n_tile0) {
+    const int tile = item / n_tiles;
+    const int n    = item - tile * n_tiles + n_tile0;
     int lo = 0, hi = kExperts - 1;
     while (lo < hi) {
         const int mid = (lo + hi + 1) >> 1;
@@ -595,7 +595,8 @@ __global__ __launch_bounds__(Schedule::kThreads, 1) void nvfp4_expert_gemm_persi
         asm volatile("fence.mbarrier_init.release.cluster;" : : : "memory");
     }
     __syncthreads();
-    const int total_items = shared.tile_prefix[kExperts] * Schedule::kNTiles;
+    const int n_tiles     = p.n_tiles > 0 ? p.n_tiles : Schedule::kNTiles;
+    const int total_items = shared.tile_prefix[kExperts] * n_tiles;
     const int lane        = thread & 31;
 
     if (thread >= Schedule::kConsumerThreads) {
@@ -604,7 +605,7 @@ __global__ __launch_bounds__(Schedule::kThreads, 1) void nvfp4_expert_gemm_persi
         const int producer = thread - Schedule::kConsumerThreads;
         int fill = 0;
         for (int item = static_cast<int>(blockIdx.x); item < total_items; item += static_cast<int>(gridDim.x)) {
-            const PersistentItem tile = persistent_item<Schedule>(shared.tile_prefix, p.offsets, item);
+            const PersistentItem tile = persistent_item<Schedule>(shared.tile_prefix, p.offsets, item, n_tiles, p.n_tile0);
             asm volatile("bar.sync 2, %0;" : : "n"(Schedule::kProducerThreads) : "memory");
             for (int row = producer; row < Schedule::kBlockM; row += Schedule::kProducerThreads) {
                 const int index = tile.row_begin + row;
@@ -638,7 +639,7 @@ __global__ __launch_bounds__(Schedule::kThreads, 1) void nvfp4_expert_gemm_persi
     const float rcp_denominator = __frcp_rn(__fmul_rn(1536.0F, *p.weights.outer_den));
     int fill = 0;
     for (int item = static_cast<int>(blockIdx.x); item < total_items; item += static_cast<int>(gridDim.x)) {
-        const PersistentItem tile = persistent_item<Schedule>(shared.tile_prefix, p.offsets, item);
+        const PersistentItem tile = persistent_item<Schedule>(shared.tile_prefix, p.offsets, item, n_tiles, p.n_tile0);
         // 16-row groups of this warp that hold routed rows (warp-uniform).
         const int groups = (tile.row_end - tile.row_begin + 15) >> 4;
         const int active = min(max(groups - warp_m * Schedule::kMmaM, 0), Schedule::kMmaM);
@@ -734,9 +735,11 @@ template <class Schedule, int K, bool GateUp, bool FusedYQuant = false>
 void launch_schedule(const GemmParams& params, std::int32_t slots, cudaStream_t stream) {
     const int max_tiles = std::min(kExperts, slots) + slots / Schedule::kBlockM;
     if (max_tiles == 0) { return; }
-    const dim3 grid(static_cast<unsigned>(max_tiles), kGateUpRows / Schedule::kBlockN);
+    GemmParams p = params;
+    set_n_tiles(p, Schedule::kBlockN);
+    const dim3 grid(static_cast<unsigned>(max_tiles), static_cast<unsigned>(p.n_tiles));
     const cudaError_t status = pdl::launch_dependent({grid, dim3(Schedule::kThreads), 0, stream},
-                                                     nvfp4_expert_gemm_kernel<Schedule, K, GateUp, FusedYQuant>, params);
+                                                     nvfp4_expert_gemm_kernel<Schedule, K, GateUp, FusedYQuant>, p);
     if (status != cudaSuccess) {
         throw std::runtime_error(std::string("inkling_moe: nvfp4 expert gemm: ") + cudaGetErrorString(status));
     }
@@ -764,14 +767,16 @@ template <class Schedule, int K, bool GateUp>
 void launch_persistent(const GemmParams& params, std::int32_t slots, cudaStream_t stream) {
     const int max_tiles = std::min(kExperts, slots) + slots / Schedule::kBlockM;
     if (max_tiles == 0) { return; }
-    const int items = max_tiles * Schedule::kNTiles;
+    GemmParams p = params;
+    set_n_tiles(p, Schedule::kBlockN);
+    const int items = max_tiles * p.n_tiles;
     const dim3 grid(static_cast<unsigned>(std::min(items, multiprocessors())));
     constexpr std::size_t kShared = sizeof(PersistentStorage<Schedule>);
     auto* kernel = nvfp4_expert_gemm_persistent<Schedule, K, GateUp>;
     cudaError_t status = ::sinfer::ops::set_func_attribute_per_device(
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kShared));
     if (status == cudaSuccess) {
-        status = pdl::launch_dependent({grid, dim3(Schedule::kThreads), kShared, stream}, kernel, params);
+        status = pdl::launch_dependent({grid, dim3(Schedule::kThreads), kShared, stream}, kernel, p);
     }
     if (status != cudaSuccess) {
         throw std::runtime_error(std::string("inkling_moe: nvfp4 persistent expert gemm: ") + cudaGetErrorString(status));

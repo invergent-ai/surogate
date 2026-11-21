@@ -154,6 +154,10 @@ struct InklingMoeOptions {
     /// counters choose only WHICH CTA selects / places, never the order of any sum: the bits are those of
     /// the call without state. Null = the separate select kernel.
     std::int32_t* state = nullptr;
+    /// The max_tokens the caller passed to `inkling_moe_workspace_bytes` when it booked `workspace` (0 = unknown).
+    /// A prefill call narrower than that may then use a less compact layout that still fits the booking (fewer
+    /// down column passes: faster at small T). Never more than the booking; the bits are the same either way.
+    std::int32_t workspace_tokens = 0;
 };
 
 /// Bytes of `InklingMoeOptions::state`.
@@ -225,5 +229,10 @@ void inkling_softcap_swiglu(const Tensor& gate_up, const Tensor& gamma, Tensor& 
 void inkling_decode_expert_units(const InklingExpertBank& bank, InklingExpertFormat format, std::int32_t k,
                                  std::int32_t first_expert, std::int32_t count, Tensor& unit, Tensor& factor,
                                  cudaStream_t stream);
+
+/// Benchmark helper (sinfer_inkling_moe_test --bench, INKLING_BENCH_PRED_US): one CTA that triggers its PDL
+/// dependents at entry -- as the engine's inkling_mix / gemm_inv kernels do since e1 f9ebe0eb -- and then
+/// spins `nanoseconds` of wall time, so the next kernel (the MoE's route) launches early as in serving.
+void inkling_bench_predecessor(std::int32_t nanoseconds, cudaStream_t stream);
 
 } // namespace sinfer::ops

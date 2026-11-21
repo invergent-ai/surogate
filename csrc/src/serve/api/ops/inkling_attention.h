@@ -129,7 +129,18 @@ struct InklingAttentionRows {
     bool metadata_static = false;
     /// The key-group cut (see InklingKeyGroups); engine and trainer must pass the same value.
     InklingKeyGroups key_groups = InklingKeyGroups::Default;
+    /// Optional persistent state (lane d's InklingMoeOptions::state pattern): device memory of
+    /// inkling_attention_state_bytes() bytes, ZEROED ONCE by the caller when allocated, written by nothing else, never
+    /// shared by two calls in flight (one per stream; calls on one stream are ordered). Not the transient workspace.
+    /// With it the decode / verify split route's last-CTA fold takes its arrival counters from here and the last CTA
+    /// returns each to zero before the grid ends (no per-call zeroing: neither the prologue's nor a zeroing launch; a
+    /// captured graph replays from zeros). The counters pick only WHICH CTA folds, never the order of a sum: same bits
+    /// with or without. Null = counters in the workspace, zeroed per call. Rows with B > 128 ignore it.
+    std::int32_t* state = nullptr;
 };
+
+/// Bytes of InklingAttentionRows::state (arrival counters for up to 128 rows x 8 KV heads: 4 KiB).
+[[nodiscard]] std::size_t inkling_attention_state_bytes();
 
 /**
  * Process-wide tuning knobs of these ops: read ONCE from the environment when the process first uses them
@@ -148,6 +159,20 @@ struct InklingAttentionKnobs {
     int variant                     = 17;   // numerics variant bits (production 17)
     bool early_meta                 = true; // honour InklingAttentionRows::metadata_static
     std::size_t partial_cap_bytes   = std::size_t{1} << 30; // split-route partials above this -> one worker
+    // Prefill route (W > 16) only: split partials above this -> one worker (SUROGATE_INKLING_ATTN_PREFILL_PARTIAL_MB,
+    // default 64). Bounds the workspace an 8,192-column chunk reserves at long context (agent-EN 15:4x: the 1 GiB cap
+    // reserved 1,025 MiB at 262k); a wide chunk has CTAs from its columns, a narrow tail at long context runs unsplit.
+    std::size_t prefill_partial_cap_bytes = std::size_t{64} << 20;
+    // Decode / verify split route: the last worker CTA of a (row, KV head) folds its 3 x W rows (no fold_kernel launch)
+    // when W x slots <= this (SUROGATE_INKLING_ATTN_FUSED_FOLD; 0 = fold_kernel always). Same bits either way.
+    int fused_fold_max = 1 << 30;
+    // inkling_attn_linear, N <= 16: the cell-split narrow kernel (a row tile's cells over several warps, joined in cell
+    // order; SUROGATE_INKLING_LINEAR_SPLIT=0 = the one-warp-per-tile narrow kernel). Same bits either way.
+    bool linear_split = true;
+    // inkling_attention (the fused call) on plain decode rows (W = 1, InPlace, no capture): the decode attention kernel
+    // runs the prologue itself -- q / r per CTA, the K / V conv by the CTA owning the new key -- instead of a prologue
+    // launch (SUROGATE_INKLING_ATTN_FUSED_PROLOGUE=0 = the separate prologue). Same bits either way.
+    bool fused_prologue = true;
 };
 [[nodiscard]] InklingAttentionKnobs& inkling_attention_knobs();
 
@@ -292,10 +317,15 @@ struct InklingAttentionInputs {
 ///   slots   = local: (1023 >> log2(local group)) + 2 (9 at 128-key groups);  global: group_of(max_visible_keys - 1) + 1
 ///             (P3: max_visible_keys <= 65,536 -> ceil(keys / 512); then + ceil((keys - 65,536) / 2,048) up to 131,072,
 ///             then + ceil((keys - 131,072) / 8,192); 176 at 262,144)
-///   bytes   = workers > 1 ? slots * N * 24 * (128 * 4 + 8) + 512 : 0
+///   bytes   = workers > 1 ? slots * N * 24 * (128 * 4 + 8) + 512 + (fused ? 32 * B + 256 : 0) : 0
+///   fused   = W <= 16 (decode / verify) && workers > 1 && W * slots <= InklingAttentionKnobs::fused_fold_max (the last
+///             worker CTA folds; its 8 arrival counters per row live here)
 ///   workers = decode / verify (W <= 16): clamp(floor(2 * SMs / (8 B)), 1, global 64 | local slots);
 ///             prefill: 1 when tiles * 24 * B >= 2 * SMs (tiles = ceil(W / 64)), else clamp(ceil(2 SMs / CTAs), 1, min(32, slots));
-///             1 whenever bytes would exceed the partial cap (InklingAttentionKnobs::partial_cap_bytes, default 1 GiB).
+///             1 whenever bytes would exceed the partial cap: decode / verify InklingAttentionKnobs::partial_cap_bytes
+///             (default 1 GiB), prefill min(that, prefill_partial_cap_bytes (default 64 MiB)). So a prefill call's
+///             partials are <= 64 MiB (+ 512): inkling_attention_workspace_capacity_bytes(kind, 1, 1, 8192, 262k) =
+///             max(qr(8192) = 56.6 MB, max_w qr(w) + partials(w)) <= ~65 MiB.
 /// The plan (workers, cap) changes only the speed and this size, never the output bits. The call must use the same
 /// envelope and key_groups as this query. Throws outside the supported domain.
 [[nodiscard]] std::size_t inkling_rel_attention_workspace_bytes(InklingLayerKind kind,

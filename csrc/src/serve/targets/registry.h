@@ -145,6 +145,7 @@ using Glm5NextPipeline   = runtime::PipelineInstance<Glm5NextInstance>;
 using Qwen38FlashNextPipeline = runtime::PipelineInstance<Qwen38FlashNextInstance>;
 using Qwen3_5Pipeline    = runtime::PipelineInstance<Qwen3_5Instance>;
 using Qwen3_5MoePipeline = runtime::PipelineInstance<Qwen3_5MoeInstance>;
+using Inkling2Pipeline   = runtime::PipelineInstance<Inkling2Instance>; // the 2-card visit split
 
 using ActiveTarget =
     std::variant<std::unique_ptr<MuseGlimmerInstance>, std::unique_ptr<MuseGlimmerPipeline>,
@@ -170,7 +171,8 @@ using ActiveTarget =
                  std::unique_ptr<Qwen3MoePipeline>,
                  std::unique_ptr<Glm5NextPipeline>,
                  std::unique_ptr<Qwen38FlashNextPipeline>, std::unique_ptr<Qwen3_5Pipeline>,
-                 std::unique_ptr<Qwen3_5MoePipeline>>;
+                 std::unique_ptr<Qwen3_5MoePipeline>,
+                 std::unique_ptr<Inkling2Pipeline>>;
 
 struct ConstructedTarget {
     ActiveTarget active;

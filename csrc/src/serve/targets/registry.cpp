@@ -861,8 +861,14 @@ ConstructedTarget construct_pipeline(const EngineOptions& options, artifact::Rea
     ModelSamplingDefaults sampling_defaults{};
     std::uint32_t resolved_kv      = 0;
     std::uint32_t resolved_context = 0;
-    const std::vector<int> bounds =
-        balanced_stage_bounds<Target>(options, reader, layers, stage_count);
+    const std::vector<int> bounds = [&] {
+        // A target whose layers are not additive per stage (Inkling-2's looped core) names its own cut.
+        if constexpr (requires { Target::pipeline_stage_bounds(stage_count); }) {
+            return Target::pipeline_stage_bounds(stage_count);
+        } else {
+            return balanced_stage_bounds<Target>(options, reader, layers, stage_count);
+        }
+    }();
     std::vector<std::uint32_t> stage_host_moe;
     const auto vision_metadata = reader.vision_geometry();
     const auto image_tokens =
@@ -1032,6 +1038,8 @@ ConstructedTarget construct_pipeline_target(const EngineOptions& requested) {
                                  Qwen38FlashNextInstance>(constructed);
     dispatch.template operator()<Qwen3_5, LoadedQwen3_5, Qwen3_5Instance>(constructed);
     dispatch.template operator()<Qwen3_5Moe, LoadedQwen3_5Moe, Qwen3_5MoeInstance>(constructed);
+    // Inkling-2: the stages split the 48 visits (lanes/e1/DESIGN-2card.md).
+    dispatch.template operator()<Inkling2, LoadedInkling2, Inkling2Instance>(constructed);
     if (constructed.has_value()) { return std::move(*constructed); }
     throw std::runtime_error("pipeline parallelism is not wired for artifact '" + identity.model_id + "'");
 }
