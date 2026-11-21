@@ -133,7 +133,7 @@ def run_step(backend, rows: list[Row], version: int | None, cfg: StepConfig, log
     live = [i for i, r in enumerate(rows) if r.loss_mask.any()]
     replays = {}
     for i in live:
-        rp, c = replay_rows(rows[i])
+        rp, c = replay_rows(rows[i], getattr(backend, "visits", 48), getattr(backend, "top_k", 8))
         replays[i] = rp
         for k, v in c.items():
             r3[k] += v

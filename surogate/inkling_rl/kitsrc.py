@@ -40,14 +40,24 @@ def _read_pinned(name: str) -> str:
 
 
 def _load(name: str, names: list[str], env: dict) -> dict:
+    """Exec the named top-level functions / classes of a pinned source in a fresh module (registered in sys.modules:
+    dataclasses resolve string annotations through it), with `env` as its globals."""
+    import sys
+    import types
+
     src = _read_pinned(name)
     tree = ast.parse(src)
     keep = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name in names]
     missing = set(names) - {n.name for n in keep}
     if missing:
         raise RuntimeError(f"{name}: missing {missing}")
-    exec(compile(ast.Module(body=keep, type_ignores=[]), os.path.join(HERE, name), "exec"), env)
-    return env
+    modname = "surogate.inkling_rl._kit_" + name.split(".")[0]
+    mod = types.ModuleType(modname)
+    mod.__dict__.update(env)
+    mod.__dict__["__name__"] = modname
+    sys.modules[modname] = mod
+    exec(compile(ast.Module(body=keep, type_ignores=[]), os.path.join(HERE, name), "exec"), mod.__dict__)
+    return mod.__dict__
 
 
 _cache: dict = {}
@@ -68,10 +78,13 @@ def loss_api():
 def types_api():
     """(TrainingSample, TrainingBatch) structs of the kit's transport schema (needs msgspec)."""
     if "types" not in _cache:
-        import msgspec
+        import sys
+        import types
 
-        env = {"msgspec": msgspec, "__name__": "surogate.inkling_rl.kit_types"}
         src = _read_pinned("sg_types_ow_a102d7f.py.txt")
-        exec(compile(src, os.path.join(HERE, "sg_types_ow_a102d7f.py.txt"), "exec"), env)
-        _cache["types"] = (env["TrainingSample"], env["TrainingBatch"])
+        modname = "surogate.inkling_rl._kit_sg_types"
+        mod = types.ModuleType(modname)
+        sys.modules[modname] = mod
+        exec(compile(src, os.path.join(HERE, "sg_types_ow_a102d7f.py.txt"), "exec"), mod.__dict__)
+        _cache["types"] = (mod.TrainingSample, mod.TrainingBatch)
     return _cache["types"]
