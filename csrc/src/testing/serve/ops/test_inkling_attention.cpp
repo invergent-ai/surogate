@@ -2618,6 +2618,17 @@ void run_bench() {
 } // namespace
 
 int main(int argc, char** argv) {
+    // The environment guard of InklingAttentionKnobs::linear_x_nc (one process per value; no device needed): prints the
+    // mode and exits 0, or prints the refusal and exits 3.
+    if (argc > 1 && std::string(argv[1]) == "linear-x-env") {
+        try {
+            std::cout << "linear_x_nc=" << ops::inkling_attention_knobs().linear_x_nc << "\n";
+            return 0;
+        } catch (const std::invalid_argument& error) {
+            std::cout << "refused: " << error.what() << "\n";
+            return 3;
+        }
+    }
     if (cuda_unavailable()) {
         std::cout << "no CUDA device: skipped\n";
         return 77;
