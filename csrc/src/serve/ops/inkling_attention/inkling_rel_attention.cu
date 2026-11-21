@@ -1527,7 +1527,14 @@ InklingAttentionKnobs& knobs() {
         x.fused_prologue    = env_int("SUROGATE_INKLING_ATTN_FUSED_PROLOGUE", x.fused_prologue ? 1 : 0) != 0;
         x.fold_fast         = env_int("SUROGATE_INKLING_ATTN_FOLD_FAST", 1) != 0;
         x.linear_gemm       = std::clamp(env_int("SUROGATE_INKLING_LINEAR_GEMM", x.linear_gemm), 0, 2);
-        x.decode_raw        = std::clamp(env_int("SUROGATE_INKLING_ATTN_DECODE_RAW", x.decode_raw), 0, 2);
+        // The raw ring stages old K / V blocks before the PDL wait, on a contract nothing enforces: a PDL predecessor may have
+        // written those keys. The environment never selects it, in any binary; the op test sets the knob field directly.
+        if (env_int("SUROGATE_INKLING_ATTN_DECODE_RAW", 0) != 0) {
+            throw std::invalid_argument(
+                std::string("SUROGATE_INKLING_ATTN_DECODE_RAW=") + std::getenv("SUROGATE_INKLING_ATTN_DECODE_RAW") +
+                " is refused: the raw-ring decode path reads K / V keys before its PDL wait, and nothing guarantees that a "
+                "predecessor has finished writing them. Unset it, or use 0 (production).");
+        }
         x.fold_fence_light  = env_int("SUROGATE_INKLING_ATTN_FOLD_FENCE_LIGHT", x.fold_fence_light ? 1 : 0) != 0;
         // Mode 1 (ld.global.nc on x) is a known-broken negative control: FP8-route decode garbage (review R5 minor 10). The
         // environment never selects it, in any binary; the op test sets the knob field directly.

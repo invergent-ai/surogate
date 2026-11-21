@@ -192,6 +192,9 @@ struct InklingAttentionKnobs {
     // SMs, 2 = the ring always. Same bits either way.
     // Measured SLOWER (raw1, gpubox1 card 0, meta 1, us, raw 0 / 2): local 1x8k 6.4 / 7.4, global 1x8k 18.4 / 19.1, local
     // 8x8k 15.6 / 21.0, global 1x64k 94.5 / 106.0, verify W3 local 6.3 / 7.0 -> default 0 (kept, tested bitwise).
+    // The environment accepts 0 only: a nonzero value throws at the knobs' first read (engine load: workspace sizing),
+    // because the ring reads keys before its PDL wait on a contract nothing enforces. Only the op test selects 1 / 2, by
+    // setting this field.
     int decode_raw = 0;
     // Fused fold arrival (fused_fold_max > 0 only; SUROGATE_INKLING_ATTN_FOLD_FENCE_LIGHT): fence.acq_rel.gpu + a relaxed
     // atomic (Marlin's barrier pattern) instead of __threadfence (MEMBAR.SC.GPU + CCTL.IVALL) + atomicAdd. Same bits.

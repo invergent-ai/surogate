@@ -2700,6 +2700,17 @@ int main(int argc, char** argv) {
             return 3;
         }
     }
+    // The environment guard of InklingAttentionKnobs::decode_raw (one process per value; no device needed): prints the
+    // mode and exits 0, or prints the refusal and exits 3.
+    if (argc > 1 && std::string(argv[1]) == "decode-raw-env") {
+        try {
+            std::cout << "decode_raw=" << ops::inkling_attention_knobs().decode_raw << "\n";
+            return 0;
+        } catch (const std::invalid_argument& error) {
+            std::cout << "refused: " << error.what() << "\n";
+            return 3;
+        }
+    }
     if (cuda_unavailable()) {
         std::cout << "no CUDA device: skipped\n";
         return 77;
