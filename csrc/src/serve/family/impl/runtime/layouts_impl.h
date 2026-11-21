@@ -1286,9 +1286,10 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         const std::uint64_t virtual_pages =
             static_cast<std::uint64_t>(inputs.max_concurrency) * page_count(inputs.capacity);
         impl->main_page_virtual = static_cast<std::uint32_t>(
-            std::max<std::uint64_t>(main_page_groups,
-                                    std::min<std::uint64_t>(virtual_pages,
-                                                            std::numeric_limits<std::uint32_t>::max())));
+            std::max<std::uint64_t>({main_page_groups,
+                                     std::min<std::uint64_t>(virtual_pages,
+                                                             std::numeric_limits<std::uint32_t>::max()),
+                                     inputs.main_page_virtual_floor}));
     }
     impl->kv_capacity         = static_cast<std::uint32_t>(checked_i32(
         static_cast<std::uint64_t>(main_page_groups) * static_cast<std::uint32_t>(kPagedKVPageSize),
@@ -1544,6 +1545,12 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
             throw std::overflow_error("maximum Main KV page count exceeds uint32");
         }
         minimum_pages    = static_cast<std::uint32_t>(minimum64);
+        // Every candidate lays out the curve's whole span: with the span following the page count
+        // past lanes x logical_pages, a plane's granule rounding made bytes per page differ between
+        // the minimum, minimum + 1 and the resolved count, and small auto shapes (16,384 x 4,
+        // 32,768 x 4) refused to start: "physical sequence layout is not affine" (M5, lanes h / f2b).
+        inputs.main_page_virtual_floor = static_cast<std::uint32_t>(maximum_pages64);
+        planner->inputs  = inputs;
         planner->minimum = build_sequence_candidate(inputs, minimum_pages);
         if (planner->minimum->persistent.kv_window_lane_charge_pages != charge) {
             throw std::logic_error("KV window lane charge depends on the page count");
