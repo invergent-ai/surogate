@@ -133,8 +133,8 @@ __device__ __forceinline__ float final_lse2(float M, float L, int variant) {
 __device__ __forceinline__ float final_o(float A, float L, int variant) {
     return (variant & 8) ? __fdiv_rn(A, L) : ptx_div_full(A, L);
 }
-__device__ __forceinline__ float gated_sink_factor(float lse2, const __nv_bfloat16* sink) {
-    return ref_sigmoid(__fsub_rn(__fmul_rn(lse2, kLn2), __bfloat162float(*sink)));
+__device__ __forceinline__ float gated_sink_factor(float lse2, float sink) {
+    return ref_sigmoid(__fsub_rn(__fmul_rn(lse2, kLn2), sink));
 }
 __device__ __forceinline__ float gated_value(float o, float gate, float sig_sink) {
     return __fmul_rn(__fmul_rn(o, ref_sigmoid(gate)), sig_sink);
@@ -742,7 +742,7 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
             const int d0         = 8 * kq * DTW + 2 * lid;
             float sig_sink       = 0.0F;
             if constexpr (kWritesGated<Mode>) {
-                if (rvalid[i]) { sig_sink = gated_sink_factor(lse2, p.sink + n * p.sink_stride + h); }
+                if (rvalid[i]) { sig_sink = gated_sink_factor(lse2, __bfloat162float(p.sink[n * p.sink_stride + h])); }
             }
 #pragma unroll
             for (int t = 0; t < DTW; ++t) {
@@ -806,6 +806,18 @@ __global__ __launch_bounds__(128) void fold_kernel(const AttnParams p) {
     float* sm_c = sm_a + p.max_slots;
     const std::int64_t stride = n_columns * Geo::kQHeads;
     const float2* ml          = p.part_ml + n * Geo::kQHeads + h;
+    const float* pa           = p.part_acc + (n * Geo::kQHeads + h) * Geo::kHeadDim + d;
+    // Loads that do not depend on the scan go out first: the epilogue's gate / sink and the first 8 partials.
+    float gate_v = 0.0F, sink_v = 0.0F;
+    if constexpr (kWritesGated<Mode>) {
+        if (ok) {
+            gate_v = __bfloat162float(p.gate[n * p.gate_stride + h * Geo::kHeadDim + d]);
+            sink_v = __bfloat162float(p.sink[n * p.sink_stride + h]);
+        }
+    }
+    float first[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) { first[i] = i < count ? pa[i * stride * Geo::kHeadDim] : 0.0F; }
     for (int s = d; s < count; s += 128) {
         const float2 st = ml[s * stride];
         sm_m[s]         = st.x;
@@ -837,11 +849,12 @@ __global__ __launch_bounds__(128) void fold_kernel(const AttnParams p) {
     }
     __syncthreads();
     float L = 0.0F, A = 0.0F;
-    const float* pa = p.part_acc + (n * Geo::kQHeads + h) * Geo::kHeadDim + d;
     for (int s = 0; s < count; s += 8) {
         float v[8];
 #pragma unroll
-        for (int i = 0; i < 8; ++i) { v[i] = s + i < count ? pa[(s + i) * stride * Geo::kHeadDim] : 0.0F; }
+        for (int i = 0; i < 8; ++i) {
+            v[i] = s == 0 ? first[i] : (s + i < count ? pa[(s + i) * stride * Geo::kHeadDim] : 0.0F);
+        }
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
             if (s + i < count && sm_l[s + i] > 0.0F) {
@@ -856,10 +869,7 @@ __global__ __launch_bounds__(128) void fold_kernel(const AttnParams p) {
     if (poison) { o = CUDART_NAN_F; }
     if constexpr (kWritesGated<Mode>) {
         float y = 0.0F;
-        if (ok) {
-            const float g = __bfloat162float(p.gate[n * p.gate_stride + h * Geo::kHeadDim + d]);
-            y             = gated_value(o, g, gated_sink_factor(lse2, p.sink + n * p.sink_stride + h));
-        }
+        if (ok) { y = gated_value(o, gate_v, gated_sink_factor(lse2, sink_v)); }
         p.out[n * Geo::kAttnWidth + h * Geo::kHeadDim + d] = __float2bfloat16_rn(y);
     }
     if constexpr (kWritesOutLse<Mode>) {
