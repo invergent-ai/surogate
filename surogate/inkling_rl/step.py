@@ -196,8 +196,16 @@ def run_step(backend, rows: list[Row], version: int | None, cfg: StepConfig, log
         scale = float(max(len(trials), 1))
     # update pass (pass 2)
     agg = {"policy_loss": 0.0, "mismatch_kl": [], "is_masked": [], "seq_log_ratio": [], "total_tokens": 0}
-    for i in live:
+    # P4 AMENDMENT 3 (memory only): the row gradients accumulate on the HOST between rows. On the card, the accumulated p.grad (fp32, 1.48 GiB for
+    # Inkling's LoRA) sat under every later row's backward, which T's one-row memory proof does not have; P4 ran out of memory on it. Same additions
+    # in the same order, in the parameters' own dtype; the sum goes back into p.grad after the last row, so the caller's contract is unchanged.
+    params = list(backend.parameters())
+    host_grads = [None] * len(params)
+    on_card = torch.cuda.is_available() and any(p.is_cuda for p in params)
+    for k_row, i in enumerate(live):
         r = rows[i]
+        if on_card:
+            torch.cuda.reset_peak_memory_stats()
         lp_t = backend.logprobs_grad(r, replays[i])
         lp_new = lp_t.detach().double().cpu().numpy()
         adv = np.full(r.T, r.advantage, dtype=np.float64)
@@ -214,6 +222,21 @@ def run_step(backend, rows: list[Row], version: int | None, cfg: StepConfig, log
         agg["is_masked"].append((met["is_masked"], n))
         mk = r.loss_mask
         agg["seq_log_ratio"].append(float(np.mean(lp_new[mk] - starts[i][mk])) if mk.any() else 0.0)
+        for j, p in enumerate(params):
+            if p.grad is not None:
+                g = p.grad.detach().to("cpu", copy=True)
+                host_grads[j] = g if host_grads[j] is None else host_grads[j].add_(g)
+                p.grad = None
+        del lp_t, loss, seeds_t
+        if on_card:
+            peak = torch.cuda.max_memory_allocated() / 2 ** 30
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()                      # as T's memory proof does before each row
+            log(f"update row {k_row + 1} / {len(live)}: batch index {i}, T {r.T}, loss tokens {n}, peak torch memory {peak:.2f} GiB")
+    for p, g in zip(params, host_grads):
+        if g is not None:
+            p.grad = g.to(p.device)
+    del host_grads
     tot = max(agg["total_tokens"], 1)
     m["policy_loss"] = agg["policy_loss"] / tot
     m["mismatch_kl"] = sum(v * n for v, n in agg["mismatch_kl"]) / tot
