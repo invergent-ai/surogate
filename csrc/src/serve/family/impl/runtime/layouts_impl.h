@@ -1627,6 +1627,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
           .maximum_main_page_groups             = maximum_pages,
           .minimum_device_reservation_bytes     = planner->minimum->device_reservation_bytes,
           .bytes_per_additional_main_page_group = 0,
+          .window_lane_charge_pages             = planner->minimum->persistent.kv_window_lane_charge_pages,
     };
     if (minimum_pages < maximum_pages) {
         auto adjacent = build_sequence_candidate(inputs, minimum_pages + 1U);
