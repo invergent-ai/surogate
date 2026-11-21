@@ -56,6 +56,13 @@ struct KvGrowthOutcome {
     return std::max({burst, draft_window + 1U, draft_block}) + 1U;
 }
 
+/// Whether an engine admits on demand. DFlash reserves; a DSpark drafter (draft KV in the text pool) may opt in, only with an
+/// explicit --kv-admission ondemand (lane f1). Without it this is the rule every engine had before the opt-in existed.
+[[nodiscard]] constexpr bool kv_engine_on_demand(bool on_demand_mode, bool pipeline_stage, bool dflash, bool dspark,
+                                                 bool explicit_on_demand) noexcept {
+    return on_demand_mode && !pipeline_stage && (!dflash || (dspark && explicit_on_demand));
+}
+
 /// Whether a DSpark row's committed tokens are independent of its drafts, so a recompute after a preemption goes on with
 /// the tokens it would have produced: a greedy row, or an untruncated sampled row under coupled verification with no
 /// min_p floor (whose coupled draw can differ from ordinary decoding by 1 ulp, review R5 minor 2). A row with top_p < 1 or

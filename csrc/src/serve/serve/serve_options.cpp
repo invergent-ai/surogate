@@ -270,6 +270,7 @@ std::string serve_usage_text(const char* argv0) {
            "         the pool (0.01) free while others run, grows sequences a round at a time and,\n"
            "         when the pool runs short, preempts the running request that arrived last and\n"
            "         recomputes it later; reserve commits prompt + max_tokens at admission.\n"
+           "         A DSpark engine (Inkling, --spec dflash) reserves unless ondemand is given explicitly.\n"
            "       --kv-cache-dtype defaults to auto: BF16 for attention-only models and on "
            "Hopper, FP8 for hybrids elsewhere.\n"
            "         fp8 and fp8_e4m3 select the same format. Skip-layer indices keep BF16.\n"
@@ -477,8 +478,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             const std::string mode = require_value("--kv-admission");
             if (mode == "reserve") {
                 options.kv_admission.mode = KvAdmission::Reserve;
+                options.kv_admission.explicit_on_demand = false;
             } else if (mode == "ondemand" || mode == "on-demand") {
                 options.kv_admission.mode = KvAdmission::OnDemand;
+                options.kv_admission.explicit_on_demand = true;
             } else {
                 throw std::invalid_argument("--kv-admission must be reserve or ondemand");
             }

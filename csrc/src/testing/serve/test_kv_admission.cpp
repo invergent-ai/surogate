@@ -218,6 +218,24 @@ void test_round_reach() {
     check(!kv_dspark_row_recomputes_exactly(1.0F, -1, 1.0F, 0.0F, false), "one-hot verification keeps the reservation");
 }
 
+/// Lane f1: without an explicit --kv-admission ondemand every engine takes the rule it had before the DSpark opt-in; with it, the
+/// only engine that changes is a one-card DSpark engine in on-demand mode.
+void test_engine_on_demand() {
+    using sinfer::runtime::kv_engine_on_demand;
+    int changed = 0;
+    for (int bits = 0; bits < 16; ++bits) {
+        const bool on_demand = bits & 1, pipeline = bits & 2, dflash = bits & 4, dspark = bits & 8;
+        const bool before = on_demand && !pipeline && !dflash;
+        check(kv_engine_on_demand(on_demand, pipeline, dflash, dspark, false) == before,
+              "without the explicit flag every engine keeps its old rule");
+        if (kv_engine_on_demand(on_demand, pipeline, dflash, dspark, true) != before) {
+            ++changed;
+            check(on_demand && !pipeline && dflash && dspark, "the explicit flag changes only a one-card DSpark engine");
+        }
+    }
+    check(changed == 1, "the explicit flag changes exactly one engine kind");
+}
+
 /// Lane f1 (review R5 minors 11 c, 12): what a pipeline stage counts against the run's need, and the page size the
 /// shared pool is converted with.
 void test_pipeline_held_tokens() {
@@ -488,6 +506,7 @@ int main() {
     test_requeue_and_forced();
     test_round_reach();
     test_pipeline_held_tokens();
+    test_engine_on_demand();
     // 483k-token RTX 5090 replica, 16 lanes, BFCL-like short requests at the agentic default.
     test_simulation(1, 400, 16, 483328, {500, 4000, 20, 600});
     // Many 100k+ prompts, no max_tokens, on the same pool and on a small one.

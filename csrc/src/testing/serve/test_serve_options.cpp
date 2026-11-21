@@ -348,6 +348,14 @@ int main() {
         failures += check(parse({"sinfer-serve", "model.sinfer", "--kv-admission", "ondemand"})
                                   .kv_admission.mode == sinfer::KvAdmission::OnDemand,
                           "--kv-admission ondemand not parsed");
+        // Lane f1: only an explicit ondemand opts a DSpark engine in; the default and reserve do not.
+        failures += check(!defaults.kv_admission.explicit_on_demand && !kv.kv_admission.explicit_on_demand &&
+                              parse({"sinfer-serve", "model.sinfer", "--kv-admission", "ondemand"})
+                                  .kv_admission.explicit_on_demand &&
+                              !parse({"sinfer-serve", "model.sinfer", "--kv-admission", "ondemand", "--kv-admission",
+                                      "reserve"})
+                                   .kv_admission.explicit_on_demand,
+                          "explicit_on_demand does not follow the --kv-admission flag");
         for (auto args : {std::vector<std::string>{"sinfer-serve", "model.sinfer", "--kv-admission", "lazy"},
                           std::vector<std::string>{"sinfer-serve", "model.sinfer", "--kv-admission-watermark", "0.9"}}) {
             bool rejected = false;
