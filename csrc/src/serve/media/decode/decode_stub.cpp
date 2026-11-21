@@ -23,6 +23,13 @@ Image decode_image(std::span<const std::uint8_t> /*bytes*/, const Policy& /*poli
     unavailable();
 }
 
+PilImage decode_image_pil(std::span<const std::uint8_t> /*bytes*/, const Policy& /*policy*/,
+                          const PilOptions& /*options*/) {
+    unavailable();
+}
+
+PilHeader probe_image_pil(std::span<const std::uint8_t> /*bytes*/, const PilOptions& /*options*/) { unavailable(); }
+
 Video decode_video(std::span<const std::uint8_t> /*bytes*/, const Policy& /*policy*/,
                    double /*target_fps*/, int /*min_frames*/, int /*max_frames*/, bool /*temporal_pairs*/) {
     unavailable();

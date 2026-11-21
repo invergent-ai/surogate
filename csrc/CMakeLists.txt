@@ -1754,6 +1754,15 @@ if(SINFER_ENABLE_FFMPEG)
     ${SERVE_ROOT}/media/decode/decode.cpp)
   sinfer_internal_includes(sinfer_media_decode)
   target_link_libraries(sinfer_media_decode PRIVATE PkgConfig::FFMPEG)
+  # ENGINE-INKLING lane V-b: Pillow-exact JPEG pixels for the Inkling-2 vision processor (decode_image_pil only;
+  # decode_image / decode_video keep FFmpeg). OFF falls back to FFmpeg's JPEG / WebP pixels (levels off Pillow's).
+  option(SINFER_PIL_DECODERS "Decode JPEG / WebP with Pillow's libraries (libjpeg-turbo, libwebp) for Inkling-2 vision" ON)
+  if(SINFER_PIL_DECODERS)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/serve_pil_decoders.cmake)
+    target_sources(sinfer_media_decode PRIVATE ${SERVE_ROOT}/media/decode/pil_jpeg.cpp ${SERVE_ROOT}/media/decode/pil_webp.cpp)
+    target_compile_definitions(sinfer_media_decode PRIVATE SINFER_PIL_JPEG=1 SINFER_PIL_WEBP=1)
+    target_link_libraries(sinfer_media_decode PRIVATE sinfer_libjpeg_turbo sinfer_libwebpdemux)
+  endif()
 else()
   add_library(sinfer_media_decode STATIC EXCLUDE_FROM_ALL
     ${SERVE_ROOT}/media/decode/decode_stub.cpp)

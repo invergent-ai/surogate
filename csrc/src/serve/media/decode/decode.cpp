@@ -23,6 +23,7 @@ extern "C" {
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -364,6 +365,182 @@ public:
         return rotated;
     }
 
+    // Pillow's 8-bit RGBA view of a decoded frame (decode_image_pil). Formats whose samples FFmpeg hands over
+    // unchanged are unpacked here with Pillow's rules; the rest go through swscale (nearest) and are marked inexact.
+    PilImage pil(const AVFrame* frame, bool source_has_no_alpha, bool lossless_codec) {
+        const int width  = frame->width;
+        const int height = frame->height;
+        if (width <= 0 || height <= 0) {
+            throw std::invalid_argument("decoded media dimensions are invalid");
+        }
+        if (static_cast<std::uint64_t>(width) * height > max_decoded_pixels_) {
+            throw Error(ErrorKind::BudgetExceeded, "decoded media pixels exceed processor limit");
+        }
+        const auto format = static_cast<AVPixelFormat>(frame->format);
+        const AVPixFmtDescriptor* descriptor = av_pix_fmt_desc_get(format);
+        PilImage out;
+        out.width        = width;
+        out.height       = height;
+        out.pixel_format = descriptor != nullptr ? descriptor->name : "unknown";
+        out.rgba.assign(static_cast<std::size_t>(width) * height * 4, 255);
+        bool native = true;
+        bool alpha  = false;
+        const auto row = [&](int plane, int y) {
+            return frame->data[plane] + static_cast<std::ptrdiff_t>(y) * frame->linesize[plane];
+        };
+        const auto put = [&](int x, int y, int r, int g, int b, int a) {
+            std::uint8_t* p = out.rgba.data() + (static_cast<std::size_t>(y) * width + x) * 4;
+            p[0] = static_cast<std::uint8_t>(r);
+            p[1] = static_cast<std::uint8_t>(g);
+            p[2] = static_cast<std::uint8_t>(b);
+            p[3] = static_cast<std::uint8_t>(a);
+        };
+        // 16-bit samples: the high byte (Pillow's "RGB;16B" / "RGBA;16B" / "LA;16B" rawmodes).
+        const auto hi16 = [](const std::uint8_t* s, bool big) { return big ? s[0] : s[1]; };
+        const auto u16  = [](const std::uint8_t* s, bool big) {
+            return big ? (s[0] << 8) | s[1] : (s[1] << 8) | s[0];
+        };
+        switch (format) {
+        case AV_PIX_FMT_RGB24:
+        case AV_PIX_FMT_BGR24:
+            for (int y = 0; y < height; ++y) {
+                const std::uint8_t* s = row(0, y);
+                for (int x = 0; x < width; ++x, s += 3) {
+                    if (format == AV_PIX_FMT_RGB24) { put(x, y, s[0], s[1], s[2], 255); }
+                    else { put(x, y, s[2], s[1], s[0], 255); }
+                }
+            }
+            break;
+        case AV_PIX_FMT_RGBA:
+        case AV_PIX_FMT_BGRA:
+        case AV_PIX_FMT_ARGB:
+        case AV_PIX_FMT_ABGR:
+        case AV_PIX_FMT_RGB0:
+        case AV_PIX_FMT_BGR0:
+        case AV_PIX_FMT_0RGB:
+        case AV_PIX_FMT_0BGR: {
+            // Byte positions of R, G, B, A (A < 0: padding, no alpha).
+            int ri = 0, gi = 1, bi = 2, ai = 3;
+            if (format == AV_PIX_FMT_BGRA || format == AV_PIX_FMT_BGR0) { ri = 2; bi = 0; }
+            if (format == AV_PIX_FMT_ARGB || format == AV_PIX_FMT_0RGB) { ai = 0; ri = 1; gi = 2; bi = 3; }
+            if (format == AV_PIX_FMT_ABGR || format == AV_PIX_FMT_0BGR) { ai = 0; bi = 1; gi = 2; ri = 3; }
+            const bool has_a = format == AV_PIX_FMT_RGBA || format == AV_PIX_FMT_BGRA ||
+                               format == AV_PIX_FMT_ARGB || format == AV_PIX_FMT_ABGR;
+            alpha = has_a;
+            for (int y = 0; y < height; ++y) {
+                const std::uint8_t* s = row(0, y);
+                for (int x = 0; x < width; ++x, s += 4) { put(x, y, s[ri], s[gi], s[bi], has_a ? s[ai] : 255); }
+            }
+            break;
+        }
+        case AV_PIX_FMT_GRAY8:
+            for (int y = 0; y < height; ++y) {
+                const std::uint8_t* s = row(0, y);
+                for (int x = 0; x < width; ++x) { put(x, y, s[x], s[x], s[x], 255); }
+            }
+            break;
+        case AV_PIX_FMT_YA8:
+            alpha = true;
+            for (int y = 0; y < height; ++y) {
+                const std::uint8_t* s = row(0, y);
+                for (int x = 0; x < width; ++x, s += 2) { put(x, y, s[0], s[0], s[0], s[1]); }
+            }
+            break;
+        case AV_PIX_FMT_MONOBLACK:
+        case AV_PIX_FMT_MONOWHITE:
+            for (int y = 0; y < height; ++y) {
+                const std::uint8_t* s = row(0, y);
+                for (int x = 0; x < width; ++x) {
+                    const bool bit = ((s[x >> 3] >> (7 - (x & 7))) & 1) != 0;
+                    const int v    = (bit == (format == AV_PIX_FMT_MONOBLACK)) ? 255 : 0;
+                    put(x, y, v, v, v, 255);
+                }
+            }
+            break;
+        case AV_PIX_FMT_PAL8: {
+            // Palette: 256 x uint32 in native endianness, 0xAARRGGBB; a PNG tRNS / GIF transparent index is its alpha.
+            const auto* palette = reinterpret_cast<const std::uint32_t*>(frame->data[1]);
+            for (int y = 0; y < height; ++y) {
+                const std::uint8_t* s = row(0, y);
+                for (int x = 0; x < width; ++x) {
+                    const std::uint32_t c = palette[s[x]];
+                    const int a           = static_cast<int>(c >> 24);
+                    alpha                 = alpha || a != 255;
+                    put(x, y, (c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff, a);
+                }
+            }
+            break;
+        }
+        case AV_PIX_FMT_RGB48BE:
+        case AV_PIX_FMT_RGB48LE:
+        case AV_PIX_FMT_RGBA64BE:
+        case AV_PIX_FMT_RGBA64LE: {
+            const bool big   = format == AV_PIX_FMT_RGB48BE || format == AV_PIX_FMT_RGBA64BE;
+            const bool has_a = format == AV_PIX_FMT_RGBA64BE || format == AV_PIX_FMT_RGBA64LE;
+            const int stride = has_a ? 8 : 6;
+            alpha            = has_a;
+            for (int y = 0; y < height; ++y) {
+                const std::uint8_t* s = row(0, y);
+                for (int x = 0; x < width; ++x, s += stride) {
+                    put(x, y, hi16(s, big), hi16(s + 2, big), hi16(s + 4, big), has_a ? hi16(s + 6, big) : 255);
+                }
+            }
+            break;
+        }
+        case AV_PIX_FMT_GRAY16BE:
+        case AV_PIX_FMT_GRAY16LE: {
+            // Pillow mode "I;16"; convert("RGB"/"RGBA") clips: values above 255 become 255.
+            const bool big = format == AV_PIX_FMT_GRAY16BE;
+            for (int y = 0; y < height; ++y) {
+                const std::uint8_t* s = row(0, y);
+                for (int x = 0; x < width; ++x, s += 2) {
+                    const int v = std::min(u16(s, big), 255);
+                    put(x, y, v, v, v, 255);
+                }
+            }
+            break;
+        }
+        case AV_PIX_FMT_YA16BE:
+        case AV_PIX_FMT_YA16LE: {
+            const bool big = format == AV_PIX_FMT_YA16BE;
+            alpha          = true;
+            for (int y = 0; y < height; ++y) {
+                const std::uint8_t* s = row(0, y);
+                for (int x = 0; x < width; ++x, s += 4) {
+                    const int v = hi16(s, big);
+                    put(x, y, v, v, v, hi16(s + 2, big));
+                }
+            }
+            break;
+        }
+        default: {
+            native = false;
+            const bool has_a = descriptor != nullptr && (descriptor->flags & AV_PIX_FMT_FLAG_ALPHA) != 0;
+            alpha            = has_a;
+            AvImageBuffer converted(width, height, AV_PIX_FMT_RGBA);
+            sws_ = sws_getCachedContext(sws_, width, height, format, width, height, AV_PIX_FMT_RGBA, SWS_POINT,
+                                        nullptr, nullptr, nullptr);
+            if (sws_ == nullptr) { throw std::runtime_error("failed to create media color converter"); }
+            const int rows = sws_scale(sws_, frame->data, frame->linesize, 0, height, converted.data(),
+                                       converted.linesize());
+            if (rows != height) { throw std::runtime_error("failed to convert media frame to RGBA"); }
+            for (int y = 0; y < height; ++y) {
+                const std::uint8_t* s = converted.data()[0] + static_cast<std::size_t>(y) * converted.linesize()[0];
+                for (int x = 0; x < width; ++x, s += 4) { put(x, y, s[0], s[1], s[2], has_a ? s[3] : 255); }
+            }
+            break;
+        }
+        }
+        if (source_has_no_alpha && alpha) {
+            // Pillow's JPEG modes (L, RGB, CMYK) carry no alpha: an alpha plane FFmpeg reports there is not one.
+            for (std::size_t i = 3; i < out.rgba.size(); i += 4) { out.rgba[i] = 255; }
+            alpha = false;
+        }
+        out.has_alpha = alpha;
+        out.pil_exact = native && lossless_codec;
+        return out;
+    }
+
 private:
     void cleanup() noexcept {
         sws_freeContext(sws_);
@@ -464,6 +641,21 @@ std::vector<int> sample_indices(int total, double source_fps, double target_fps,
 
 } // namespace
 
+#ifdef SINFER_PIL_JPEG
+namespace detail {
+// pil_jpeg.cpp: libjpeg-turbo with Pillow's settings.
+PilImage decode_jpeg_pil(std::span<const std::uint8_t> bytes, std::uint64_t max_pixels);
+std::pair<int, int> probe_jpeg_pil(std::span<const std::uint8_t> bytes);
+} // namespace detail
+#endif
+#ifdef SINFER_PIL_WEBP
+namespace detail {
+// pil_webp.cpp: libwebp's animation decoder, frame 0, as Pillow's WebP plugin.
+PilImage decode_webp_pil(std::span<const std::uint8_t> bytes, std::uint64_t max_pixels);
+std::pair<int, int> probe_webp_pil(std::span<const std::uint8_t> bytes);
+} // namespace detail
+#endif
+
 bool available() noexcept { return true; }
 
 Image decode_image(std::span<const std::uint8_t> bytes, const Policy& policy) {
@@ -485,6 +677,287 @@ Image decode_image(std::span<const std::uint8_t> bytes, const Policy& policy) {
     });
     if (result.rgb.empty()) { throw std::invalid_argument("image contains no decoded frame"); }
     return result;
+}
+
+namespace {
+
+// ---- Pillow's view of orientation (ImageOps.exif_transpose -> Image.getexif) -------------------------------------
+
+// Orientation (tag 0x0112) in IFD0 of the TIFF structure at `tiff`; 0 when absent or unreadable.
+int tiff_orientation(std::span<const std::uint8_t> bytes, std::size_t tiff) {
+    if (tiff + 8 > bytes.size()) { return 0; }
+    const bool little = bytes[tiff] == 'I' && bytes[tiff + 1] == 'I';
+    const bool big    = bytes[tiff] == 'M' && bytes[tiff + 1] == 'M';
+    if (!little && !big) { return 0; }
+    const auto u16 = [&](std::size_t o) -> std::uint32_t {
+        if (o + 2 > bytes.size()) { return 0; }
+        return little ? (bytes[o] | bytes[o + 1] << 8U) : (bytes[o] << 8U | bytes[o + 1]);
+    };
+    const auto u32 = [&](std::size_t o) -> std::uint32_t {
+        if (o + 4 > bytes.size()) { return 0; }
+        return little ? (static_cast<std::uint32_t>(bytes[o]) | bytes[o + 1] << 8U | bytes[o + 2] << 16U |
+                         static_cast<std::uint32_t>(bytes[o + 3]) << 24U)
+                      : (static_cast<std::uint32_t>(bytes[o]) << 24U | bytes[o + 1] << 16U | bytes[o + 2] << 8U |
+                         bytes[o + 3]);
+    };
+    if (u16(tiff + 2) != 42) { return 0; }
+    const std::size_t ifd = tiff + u32(tiff + 4);
+    if (ifd + 2 > bytes.size()) { return 0; }
+    const std::uint32_t count = u16(ifd);
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const std::size_t entry = ifd + 2 + static_cast<std::size_t>(i) * 12;
+        if (entry + 12 > bytes.size()) { return 0; }
+        if (u16(entry) != 0x0112 || u32(entry + 4) != 1) { continue; }
+        const std::uint32_t type = u16(entry + 2);
+        if (type == 3) { return static_cast<int>(u16(entry + 8)); }  // SHORT
+        if (type == 4) { return static_cast<int>(u32(entry + 8)); }  // LONG
+        return 0;
+    }
+    return 0;
+}
+
+// Pillow's XMP fallback (Image.getexif): re.search(r'tiff:Orientation(="|>)([0-9])', xmp).
+int xmp_orientation(std::string_view xmp) {
+    for (std::size_t at = xmp.find("tiff:Orientation"); at != std::string_view::npos;
+         at = xmp.find("tiff:Orientation", at + 1)) {
+        const std::size_t v = at + 16;
+        if (v + 1 < xmp.size() && xmp[v] == '=' && xmp[v + 1] == '"' && v + 2 < xmp.size() &&
+            xmp[v + 2] >= '0' && xmp[v + 2] <= '9') {
+            return xmp[v + 2] - '0';
+        }
+        if (v < xmp.size() && xmp[v] == '>' && v + 1 < xmp.size() && xmp[v + 1] >= '0' && xmp[v + 1] <= '9') {
+            return xmp[v + 1] - '0';
+        }
+    }
+    return 0;
+}
+
+std::string_view as_text(std::span<const std::uint8_t> bytes, std::size_t begin, std::size_t size) {
+    return {reinterpret_cast<const char*>(bytes.data()) + begin, size};
+}
+
+// The orientation Pillow's exif_transpose applies: EXIF first, XMP when EXIF has none; 1 when neither has one or
+// the value is outside 1..8 (exif_transpose maps only 2..8 to a transpose).
+int pil_orientation(std::span<const std::uint8_t> bytes) {
+    int exif = 0;
+    int xmp  = 0;
+    const auto be32 = [&](std::size_t o) {
+        return static_cast<std::uint32_t>(bytes[o]) << 24U | bytes[o + 1] << 16U | bytes[o + 2] << 8U | bytes[o + 3];
+    };
+    if (bytes.size() >= 4 && bytes[0] == 0xff && bytes[1] == 0xd8) {
+        // JPEG: APP1 "Exif\0\0" (the first one, as JpegImagePlugin keeps) and APP1 XMP.
+        std::size_t marker = 2;
+        bool have_exif     = false;
+        while (marker + 4 <= bytes.size() && bytes[marker] == 0xff) {
+            const std::uint8_t kind = bytes[marker + 1];
+            if (kind == 0xda || kind == 0xd9) { break; }
+            const std::size_t length = static_cast<std::size_t>(bytes[marker + 2]) << 8U | bytes[marker + 3];
+            if (length < 2 || marker + 2 + length > bytes.size()) { break; }
+            const std::size_t payload = marker + 4, size = length - 2;
+            if (kind == 0xe1 && size >= 6 && std::memcmp(bytes.data() + payload, "Exif\0\0", 6) == 0 && !have_exif) {
+                have_exif = true;
+                exif      = tiff_orientation(bytes.first(payload + size), payload + 6);
+            } else if (kind == 0xe1 && size >= 29 &&
+                       std::memcmp(bytes.data() + payload, "http://ns.adobe.com/xap/1.0/\0", 29) == 0) {
+                xmp = xmp_orientation(as_text(bytes, payload + 29, size - 29));
+            }
+            marker += 2 + length;
+        }
+    } else if (bytes.size() >= 8 && std::memcmp(bytes.data(), "\x89PNG\r\n\x1a\n", 8) == 0) {
+        // PNG: eXIf (Pillow reads it before or after IDAT: exif_transpose loads the image first) and iTXt XMP.
+        std::size_t pos = 8;
+        while (pos + 8 <= bytes.size()) {
+            const std::size_t length = be32(pos);
+            if (pos + 12 + length > bytes.size()) { break; }
+            const std::size_t data = pos + 8;
+            if (std::memcmp(bytes.data() + pos + 4, "eXIf", 4) == 0) {
+                exif = tiff_orientation(bytes.first(data + length), data);
+            } else if (std::memcmp(bytes.data() + pos + 4, "iTXt", 4) == 0 && length > 18 &&
+                       std::memcmp(bytes.data() + data, "XML:com.adobe.xmp\0", 18) == 0) {
+                xmp = xmp_orientation(as_text(bytes, data + 18, length - 18));
+            } else if (std::memcmp(bytes.data() + pos + 4, "IEND", 4) == 0) {
+                break;
+            }
+            pos += 12 + length;
+        }
+    } else if (bytes.size() >= 12 && std::memcmp(bytes.data(), "RIFF", 4) == 0 &&
+               std::memcmp(bytes.data() + 8, "WEBP", 4) == 0) {
+        // WebP: EXIF and "XMP " chunks (RIFF, little-endian sizes, padded to even).
+        std::size_t pos = 12;
+        while (pos + 8 <= bytes.size()) {
+            const std::size_t length = static_cast<std::size_t>(bytes[pos + 4]) | bytes[pos + 5] << 8U |
+                                       bytes[pos + 6] << 16U | static_cast<std::size_t>(bytes[pos + 7]) << 24U;
+            if (pos + 8 + length > bytes.size()) { break; }
+            const std::size_t data = pos + 8;
+            if (std::memcmp(bytes.data() + pos, "EXIF", 4) == 0) {
+                const std::size_t skip = length >= 6 && std::memcmp(bytes.data() + data, "Exif\0\0", 6) == 0 ? 6 : 0;
+                exif = tiff_orientation(bytes.first(data + length), data + skip);
+            } else if (std::memcmp(bytes.data() + pos, "XMP ", 4) == 0) {
+                xmp = xmp_orientation(as_text(bytes, data, length));
+            }
+            pos += 8 + length + (length & 1U);
+        }
+    } else if (bytes.size() >= 8 && (std::memcmp(bytes.data(), "II*\0", 4) == 0 || std::memcmp(bytes.data(), "MM\0*", 4) == 0)) {
+        exif = tiff_orientation(bytes, 0);
+    }
+    const int orientation = exif != 0 ? exif : xmp;
+    return orientation >= 2 && orientation <= 8 ? orientation : 1;
+}
+
+// Image.transpose for the orientation (2 FLIP_LEFT_RIGHT, 3 ROTATE_180, 4 FLIP_TOP_BOTTOM, 5 TRANSPOSE,
+// 6 ROTATE_270, 7 TRANSVERSE, 8 ROTATE_90), on 4-byte pixels.
+void transpose_rgba(PilImage& image, int orientation) {
+    if (orientation == 1) { return; }
+    const int width = image.width, height = image.height;
+    const bool swap = orientation >= 5;
+    std::vector<std::uint8_t> out(image.rgba.size());
+    const int out_width = swap ? height : width;
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            int rx = x, ry = y;
+            switch (orientation) {
+            case 2: rx = width - 1 - x; break;
+            case 3: rx = width - 1 - x; ry = height - 1 - y; break;
+            case 4: ry = height - 1 - y; break;
+            case 5: rx = y; ry = x; break;
+            case 6: rx = height - 1 - y; ry = x; break;
+            case 7: rx = height - 1 - y; ry = width - 1 - x; break;
+            default: rx = y; ry = width - 1 - x; break;  // 8
+            }
+            std::memcpy(out.data() + (static_cast<std::size_t>(ry) * out_width + rx) * 4,
+                        image.rgba.data() + (static_cast<std::size_t>(y) * width + x) * 4, 4);
+        }
+    }
+    image.rgba   = std::move(out);
+    image.width  = out_width;
+    image.height = swap ? width : height;
+}
+
+bool is_jpeg(std::span<const std::uint8_t> bytes) {
+    return bytes.size() >= 3 && bytes[0] == 0xff && bytes[1] == 0xd8 && bytes[2] == 0xff;
+}
+
+bool is_webp(std::span<const std::uint8_t> bytes) {
+    return bytes.size() >= 12 && std::memcmp(bytes.data(), "RIFF", 4) == 0 && std::memcmp(bytes.data() + 8, "WEBP", 4) == 0;
+}
+
+} // namespace
+
+PilImage decode_image_pil(std::span<const std::uint8_t> bytes, const Policy& policy, const PilOptions& options) {
+    validate_input(bytes, policy);
+    if (policy.checkpoint) { policy.checkpoint(); }
+    const int orientation = options.exif_transpose ? pil_orientation(bytes) : 1;
+    // vLLM's processor path (processing.py decode_image): a JPEG that does not end in its EOI marker gets one before
+    // Pillow opens it.
+    std::vector<std::uint8_t> fixed;
+    if (options.append_jpeg_eoi && bytes.size() >= 2 && bytes[0] == 0xff && bytes[1] == 0xd8 &&
+        !(bytes[bytes.size() - 2] == 0xff && bytes[bytes.size() - 1] == 0xd9)) {
+        fixed.reserve(bytes.size() + 2);
+        fixed.assign(bytes.begin(), bytes.end());
+        fixed.push_back(0xff);
+        fixed.push_back(0xd9);
+        bytes = fixed;
+    }
+    PilImage result;
+#ifdef SINFER_PIL_JPEG
+    // Pillow's JPEG plugin accepts what starts with FF D8 FF and decodes it with libjpeg-turbo: the same library here.
+    if (is_jpeg(bytes)) {
+        result = detail::decode_jpeg_pil(bytes, policy.max_decoded_pixels);
+        transpose_rgba(result, orientation);
+        return result;
+    }
+#endif
+#ifdef SINFER_PIL_WEBP
+    // Pillow's WebP plugin: "RIFF" .... "WEBP".
+    if (is_webp(bytes)) {
+        result = detail::decode_webp_pil(bytes, policy.max_decoded_pixels);
+        transpose_rgba(result, orientation);
+        return result;
+    }
+#endif
+    Decoder decoder(bytes, policy.max_decoded_pixels);
+    const AVCodecParameters* codec = decoder.stream()->codecpar;
+    const bool jpeg = codec->codec_id == AV_CODEC_ID_MJPEG || codec->codec_id == AV_CODEC_ID_JPEGLS;
+    // Codecs whose decoded samples are the file's own (Pillow and FFmpeg agree on them by definition). A lossy WebP
+    // decodes to YUV and lands in the swscale branch, which is inexact anyway.
+    const bool lossless = codec->codec_id == AV_CODEC_ID_PNG || codec->codec_id == AV_CODEC_ID_APNG ||
+                          codec->codec_id == AV_CODEC_ID_GIF || codec->codec_id == AV_CODEC_ID_BMP ||
+                          codec->codec_id == AV_CODEC_ID_WEBP || codec->codec_id == AV_CODEC_ID_TIFF ||
+                          codec->codec_id == AV_CODEC_ID_PPM || codec->codec_id == AV_CODEC_ID_PGM ||
+                          codec->codec_id == AV_CODEC_ID_PAM || codec->codec_id == AV_CODEC_ID_TARGA ||
+                          codec->codec_id == AV_CODEC_ID_QOI;
+    bool decoded = false;
+    decoder.frames([&](int index, const AVFrame* frame) {
+        if (policy.checkpoint) { policy.checkpoint(); }
+        if (index == 0) {
+            result  = decoder.pil(frame, jpeg, lossless);
+            decoded = true;
+            return false;
+        }
+        return true;
+    });
+    if (!decoded) { throw std::invalid_argument("image contains no decoded frame"); }
+    transpose_rgba(result, orientation);
+    return result;
+}
+
+PilHeader probe_image_pil(std::span<const std::uint8_t> bytes, const PilOptions& options) {
+    if (bytes.empty()) { throw std::invalid_argument("media bytes are empty"); }
+    PilHeader header;
+    header.orientation = options.exif_transpose ? pil_orientation(bytes) : 1;
+#ifdef SINFER_PIL_JPEG
+    if (is_jpeg(bytes)) {
+        const auto [width, height] = detail::probe_jpeg_pil(bytes);
+        header.width  = width;
+        header.height = height;
+        return header;
+    }
+#endif
+#ifdef SINFER_PIL_WEBP
+    if (is_webp(bytes)) {
+        const auto [width, height] = detail::probe_webp_pil(bytes);
+        header.width  = width;
+        header.height = height;
+        return header;
+    }
+#endif
+    // The common lossless formats straight from their headers: opening them through FFmpeg would decode the first frame
+    // (avformat_find_stream_info) before any size limit could refuse it.
+    const auto le16 = [&](std::size_t o) { return static_cast<int>(bytes[o] | bytes[o + 1] << 8U); };
+    const auto le32 = [&](std::size_t o) {
+        return static_cast<std::int32_t>(static_cast<std::uint32_t>(bytes[o]) | bytes[o + 1] << 8U | bytes[o + 2] << 16U |
+                                         static_cast<std::uint32_t>(bytes[o + 3]) << 24U);
+    };
+    const auto be32 = [&](std::size_t o) {
+        return static_cast<std::uint32_t>(bytes[o]) << 24U | bytes[o + 1] << 16U | bytes[o + 2] << 8U | bytes[o + 3];
+    };
+    if (bytes.size() >= 24 && std::memcmp(bytes.data(), "\x89PNG\r\n\x1a\n", 8) == 0 &&
+        std::memcmp(bytes.data() + 12, "IHDR", 4) == 0) {
+        const std::uint32_t width = be32(16), height = be32(20);
+        if (width == 0 || height == 0 || width > 0x7fffffffU || height > 0x7fffffffU) {
+            throw std::invalid_argument("decoded media dimensions are invalid");
+        }
+        header.width  = static_cast<int>(width);
+        header.height = static_cast<int>(height);
+        return header;
+    }
+    if (bytes.size() >= 10 && (std::memcmp(bytes.data(), "GIF87a", 6) == 0 || std::memcmp(bytes.data(), "GIF89a", 6) == 0)) {
+        header.width  = le16(6);  // the logical screen: Pillow's size, FFmpeg's canvas
+        header.height = le16(8);
+        if (header.width <= 0 || header.height <= 0) { throw std::invalid_argument("decoded media dimensions are invalid"); }
+        return header;
+    }
+    if (bytes.size() >= 26 && bytes[0] == 'B' && bytes[1] == 'M' && le32(14) >= 40) {
+        header.width  = le32(18);
+        header.height = le32(22) == std::numeric_limits<std::int32_t>::min() ? 0 : std::abs(le32(22));  // < 0: top-down
+        if (header.width <= 0 || header.height <= 0) { throw std::invalid_argument("decoded media dimensions are invalid"); }
+        return header;
+    }
+    Decoder decoder(bytes, std::numeric_limits<std::uint64_t>::max());
+    header.width  = decoder.stream()->codecpar->width;
+    header.height = decoder.stream()->codecpar->height;
+    if (header.width <= 0 || header.height <= 0) { throw std::invalid_argument("decoded media dimensions are invalid"); }
+    return header;
 }
 
 Video decode_video(std::span<const std::uint8_t> bytes, const Policy& policy, double target_fps,
