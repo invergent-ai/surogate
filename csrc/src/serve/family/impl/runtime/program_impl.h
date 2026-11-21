@@ -2978,6 +2978,8 @@ void ProgramImplCore::enqueue_dflash_context_append(std::span<const std::uint32_
         counts.size() != lanes.size()) {
         throw std::logic_error("DFlash context append has invalid membership");
     }
+    // DSpark on a pipeline: only the stage with the head holds the drafter (and its context); the others skip it.
+    if (family::dspark_drafter<Variant>() && pipeline_stage() && !stage_holds_head()) { return; }
 
     std::uint32_t minimum_count = draft_window + 1U;
     std::uint32_t maximum_count = 0;
