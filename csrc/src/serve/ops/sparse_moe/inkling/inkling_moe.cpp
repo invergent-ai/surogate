@@ -323,7 +323,6 @@ void inkling_moe(const Tensor& x, const InklingMoeWeights& weights, Tensor& out,
     gate_up.sorted      = b.sorted;
     gate_up.gammas      = b.gammas;
     gate_up.weights     = weights.w13;
-    gate_up.next        = weights.w2; // L2 slice prefetch of the down rows (kL2SliceNext)
     gate_up.out         = b.y;
     gate_up.lora        = lora;
     gate_up.gate_up_tap = taps != nullptr ? static_cast<__nv_bfloat16*>(taps->gate_up) : nullptr;

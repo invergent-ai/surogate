@@ -18,11 +18,9 @@ namespace sinfer::ops::detail::inkling {
 /// the round's tiles). Every thread of the block calls it; one barrier inside.
 /// `ThroughL2`: read the offsets with ld.global.cg (a kernel reading them before its dependency
 /// wait must not see a stale L1 line).
-/// With a 4-element `result`, result[3] = the round's total tile count (all threads see it after the barrier).
-template <int TileRows, bool ThroughL2 = false, int N = 3>
+template <int TileRows, bool ThroughL2 = false>
 __device__ __forceinline__ void find_expert_tile(const std::int32_t* offsets, int tile,
-                                                 int (&result)[N]) {
-    static_assert(N == 3 || N == 4);
+                                                 int (&result)[3]) {
     if (threadIdx.x < 32) {
         const int lane = static_cast<int>(threadIdx.x);
         int bounds[5];
@@ -43,9 +41,6 @@ __device__ __forceinline__ void find_expert_tile(const std::int32_t* offsets, in
         }
         const int total = __shfl_sync(0xFFFFFFFFU, inclusive, 31);
         if (lane == 0 && tile >= total) { result[0] = -1; }
-        if constexpr (N == 4) {
-            if (lane == 0) { result[3] = total; }
-        }
         int before = inclusive - local;
         if (tile >= before && tile < inclusive) {
 #pragma unroll
@@ -152,39 +147,6 @@ __device__ __forceinline__ void cp_async_cg16_hint(void* smem_dst, const void* g
         asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n" : : "r"(smem_addr(smem_dst)), "l"(gmem_src));
     } else {
         asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" : : "r"(smem_addr(smem_dst)), "l"(gmem_src));
-    }
-}
-
-/// L2 prefetch of a contiguous byte range, CUB's transform-kernel `prefetch_tile` (cccl
-/// cub/device/dispatch/kernels/transform.cuh): one `prefetch.global.L2` per 128-byte line, the block's
-/// threads strided, no unroll (a prefetch does not stall). A hint: nothing reaches the kernel through
-/// it, so no bit can change.
-/// `thread` in [0, Threads): the caller's index among the threads that share the range.
-template <int Threads>
-__device__ __forceinline__ void prefetch_l2(const void* begin, std::int64_t bytes,
-                                            int thread = static_cast<int>(threadIdx.x)) {
-    const char* base = static_cast<const char*>(begin);
-#pragma unroll 1
-    for (std::int64_t offset = static_cast<std::int64_t>(thread) * 128; offset < bytes;
-         offset += static_cast<std::int64_t>(Threads) * 128) {
-        asm volatile("prefetch.global.L2 [%0];" : : "l"(__cvta_generic_to_global(base + offset)) : "memory");
-    }
-}
-
-/// Rows [row, row + rows) of a stacked expert bank ([E * 2304][K]) into L2: NVFP4 codes rows x K/2 + the
-/// 128-row scale tiles that hold them (K/64 x 512 bytes per tile); MXFP8 codes rows x K + exponents rows x K/32.
-template <int Threads>
-__device__ __forceinline__ void prefetch_bank_rows(const InklingExpertBank& bank, bool nvfp4, int k,
-                                                   std::int64_t row, int rows,
-                                                   int thread = static_cast<int>(threadIdx.x)) {
-    if (nvfp4) {
-        prefetch_l2<Threads>(bank.codes + row * (k / 2), static_cast<std::int64_t>(rows) * (k / 2), thread);
-        const std::int64_t first_tile = row / 128;
-        const std::int64_t tiles      = (row + rows + 127) / 128 - first_tile;
-        prefetch_l2<Threads>(bank.scales + first_tile * (k / 64) * 512, tiles * (k / 64) * 512, thread);
-    } else {
-        prefetch_l2<Threads>(bank.codes + row * k, static_cast<std::int64_t>(rows) * k, thread);
-        prefetch_l2<Threads>(bank.scales + row * (k / 32), static_cast<std::int64_t>(rows) * (k / 32), thread);
     }
 }
 
