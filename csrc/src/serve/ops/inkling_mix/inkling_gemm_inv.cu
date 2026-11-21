@@ -236,7 +236,7 @@ __global__ void __launch_bounds__(256) reduce_kernel(const float* partial, OutT*
     }
 }
 
-// ---- wo at decode widths (lanes/e1/NOTES.md 'wo BF16 KERNEL'; default ON, SUROGATE_SERVE_INKLING_WO_NARROW=0 = generic) --
+// ---- wo at decode widths (lanes/e1/NOTES.md 'wo BF16 KERNEL'; default OFF, SUROGATE_SERVE_INKLING_WO_NARROW=1 = on) -----
 // gemm_inv_kernel<Tile16x8Deep, Bf16> for T <= 8, one problem, n % 16 == 0, k % 64 == 0: the same one-warp 16 x 8 tile, the
 // same copy pipeline, the same smem placement, the same m16n8k16 chain and the same store, so the same bits. What differs
 // is when the addresses are computed: each thread's 4 weight + 2 activation pieces and its 8 fragment offsets once, before
@@ -337,15 +337,16 @@ __global__ __launch_bounds__(32) void gemm_inv_narrow_kernel(const __grid_consta
     store(row0 + 8, token0 + 1, c3);
 }
 
-// The switch: default ON (A/B 21:52 on M11: 1x8k +3.57 %, 8x8k +2.89 %, same bits); SUROGATE_SERVE_INKLING_WO_NARROW=0 or
-// inkling_gemm_inv_use_narrow(false) = the generic kernel.
+// The switch: default OFF; SUROGATE_SERVE_INKLING_WO_NARROW=1 or inkling_gemm_inv_use_narrow(true) = the narrow kernel (same bits).
+// MTP off on M11: 1x8k +3.57 %, 8x8k +2.89 %. MTP on at 8x8k on M13 (the served shape): gain -0.13 %, 95 % CI [-0.73, +0.48] %, which
+// the registered line reads as not passed (lanes/e1/NOTES.md 'STEP B RESULT').
 std::atomic<int> g_wo_narrow{-1};
 
 bool use_wo_narrow() {
     int v = g_wo_narrow.load(std::memory_order_relaxed);
     if (v < 0) {
         const char* e = std::getenv("SUROGATE_SERVE_INKLING_WO_NARROW");
-        v             = e != nullptr && e[0] == '0' && e[1] == '\0' ? 0 : 1;
+        v             = e != nullptr && e[0] == '1' && e[1] == '\0' ? 1 : 0;
         g_wo_narrow.store(v, std::memory_order_relaxed);
     }
     return v != 0;

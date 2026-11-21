@@ -289,7 +289,7 @@ void inkling_gemm_inv(const void* weight, std::int32_t n, std::int32_t k, const 
                       void* out, DType out_dtype, std::int32_t ldc, const InklingGemmBatch& batch, void* workspace,
                       std::size_t workspace_bytes, cudaStream_t stream);
 /// Selects the narrow wo kernel (T <= 8, one problem, n % 16 == 0, k % 64 == 0; same bits as the generic kernel) for tests
-/// and A/Bs. Default: on; SUROGATE_SERVE_INKLING_WO_NARROW=0 = the generic kernel (lanes/e1/NOTES.md 'wo BF16 KERNEL').
+/// and A/Bs. Default: off; SUROGATE_SERVE_INKLING_WO_NARROW=1 = the narrow kernel (lanes/e1/NOTES.md 'wo BF16 KERNEL').
 void inkling_gemm_inv_use_narrow(bool on) noexcept;
 
 /// The first phase of a split shape alone: the chunks' FP32 partials, [splits][batch][tokens][n] (chunk-major), the

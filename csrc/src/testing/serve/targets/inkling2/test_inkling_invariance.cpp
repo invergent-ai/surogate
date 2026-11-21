@@ -1143,7 +1143,7 @@ int test_gemm_narrow(std::uint32_t seed) {
     const auto reference = chain(false, true);
     failures += same_bits("I13 narrow wo in a PDL chain of 24 == generic, synchronized", chain(true, false), reference, 2);
     cudaStreamDestroy(stream);
-    ops::inkling_gemm_inv_use_narrow(true); // back to the default: the rest of the suite runs the serving path
+    ops::inkling_gemm_inv_use_narrow(false); // back to the default: the rest of the suite runs the serving path
     return failures;
 }
 
