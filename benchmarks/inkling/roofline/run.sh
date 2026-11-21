@@ -1,7 +1,8 @@
 #!/bin/bash
 # ENGINE-INKLING lane h: run the roofline kit on ONE gpubox2 card, only after agent-EN relayed "go" for that card.
 # Run from node-3. Usage:
-#   run.sh start <card> --go [kit options, e.g. --only gap,dram --quick]   start detached on gpubox2, poll, fetch
+#   run.sh start <card>[,<card2>] --go [kit options, e.g. --only gap,dram]  start detached on gpubox2, poll, fetch
+#                                     (two cards: device 0 = the first; the host part then also times P2P 0 <-> 1)
 #   run.sh stop                                                            kill our running kit (PID + cmdline check)
 #   run.sh fetch <stamp>                                                   copy a finished run back to NFS
 # Guards: refuses a card with any compute process or > 1 GiB used; CUDA_DEVICE_ORDER=PCI_BUS_ID so <card> is the
@@ -30,16 +31,18 @@ set -euo pipefail
 card=$1; stamp=$2; shift 2
 R=/home/densemax2/effrl/build-inkling/h/roofline
 D=$R/runs/$stamp; mkdir -p $D
-uuid=$(nvidia-smi --query-gpu=uuid --format=csv,noheader -i $card)
-used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i $card)
-procs=$(nvidia-smi --query-compute-apps=gpu_uuid,pid --format=csv,noheader | grep -c "$uuid" || true)
-if [ "$procs" -ne 0 ] || [ "$used" -gt 1024 ]; then
-  echo "REFUSED: card $card busy (compute processes $procs, used $used MiB)"; exit 3
-fi
+for c in ${card//,/ }; do   # <card> may be a list, e.g. 6,7 (P2P): every card must be idle
+  uuid=$(nvidia-smi --query-gpu=uuid --format=csv,noheader -i $c)
+  used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i $c)
+  procs=$(nvidia-smi --query-compute-apps=gpu_uuid,pid --format=csv,noheader | grep -c "$uuid" || true)
+  if [ "$procs" -ne 0 ] || [ "$used" -gt 1024 ]; then
+    echo "REFUSED: card $c busy (compute processes $procs, used $used MiB)"; exit 3
+  fi
+done
 if [ -f $R/kit.pid ] && kill -0 "$(cat $R/kit.pid)" 2>/dev/null; then echo "REFUSED: a kit run is still alive"; exit 3; fi
 nvidia-smi -q -i $card -d CLOCK,POWER,PERFORMANCE,TEMPERATURE > $D/gpu-info.txt 2>&1 || true
 nvidia-smi topo -m >> $D/gpu-info.txt 2>&1 || true
-echo "card=$card uuid=$uuid args=$*" >> $D/gpu-info.txt
+echo "cards=$card args=$*" >> $D/gpu-info.txt
 setsid nohup nvidia-smi -i $card --query-gpu=timestamp,clocks.sm,clocks.mem,power.draw,temperature.gpu,utilization.gpu,clocks_throttle_reasons.active \
   --format=csv -lms 500 > $D/smi.csv 2>/dev/null < /dev/null &
 echo $! > $D/smi.pid

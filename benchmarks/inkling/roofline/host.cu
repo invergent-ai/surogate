@@ -92,11 +92,24 @@ void run_host() {
         RF_CHECK(cudaSetDevice(0));
         if (can01) cudaDeviceEnablePeerAccess(1, 0);
         cudaGetLastError();
-        const Timing t = time_it(s, [&] { RF_CHECK(cudaMemcpyPeerAsync(d1, 1, d, 0, b, s)); }, 1,
-                                 options().trial_seconds, 3);
+        // correctness: 0 -> 1 copy of the hashed pattern, read back through the host
+        RF_CHECK(cudaMemcpyAsync(d, h, b, cudaMemcpyHostToDevice, s));
+        RF_CHECK(cudaMemcpyPeerAsync(d1, 1, d, 0, b, s));
+        RF_CHECK(cudaStreamSynchronize(s));
+        std::memset(h2, 0, b);
+        RF_CHECK(cudaSetDevice(1));
+        RF_CHECK(cudaMemcpy(h2, d1, b, cudaMemcpyDeviceToHost));
+        RF_CHECK(cudaSetDevice(0));
+        const bool p2p_ok = std::memcmp(h, h2, b) == 0;
+        const Timing t01 = time_it(s, [&] { RF_CHECK(cudaMemcpyPeerAsync(d1, 1, d, 0, b, s)); }, 1,
+                                   options().trial_seconds, 3);
+        const Timing t10 = time_it(s, [&] { RF_CHECK(cudaMemcpyPeerAsync(d, 0, d1, 1, b, s)); }, 1,
+                                   options().trial_seconds, 3);
         emit("p2p", {kv("devices", n_dev), kv("measured", true), kv("peer_access", can01 && can10), kv("bytes", b),
-                     kv("gbps", b / t.best_ns), kv("ok", true)});
-        note("  p2p 0->1 (peer access %d/%d; else staged by the driver) %.2f GB/s\n", can01, can10, b / t.best_ns);
+                     kv("gbps", b / t01.best_ns), kv("gbps_0to1", b / t01.best_ns), kv("gbps_1to0", b / t10.best_ns),
+                     kv("ok", p2p_ok)});
+        note("  p2p (peer access %d/%d; else staged by the driver) 0->1 %.2f GB/s, 1->0 %.2f GB/s  %s\n", can01,
+             can10, b / t01.best_ns, b / t10.best_ns, p2p_ok ? "ok" : "MISMATCH");
         RF_CHECK(cudaSetDevice(1));
         RF_CHECK(cudaFree(d1));
         RF_CHECK(cudaSetDevice(0));
