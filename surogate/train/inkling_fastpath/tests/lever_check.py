@@ -14,7 +14,7 @@
 
 The verdict names, in arm order, the arms that pass; an arm after a failing one is not accepted (the stack is cumulative).
 Usage: python lever_check.py --bin B --artifact A --prompts DIR --out report.json [--lengths 1024,8192] [--reps 2]
-       [--long 32768] [--long-base A4] [--arms "A0:FLAG=v,...;A1:..."]
+       [--long 32768] [--long-base A2] [--arms "A0:FLAG=v,...;A1:..."]
 """
 
 from __future__ import annotations
@@ -35,16 +35,15 @@ import ift_long as LG  # noqa: E402
 
 COS_LINE, REL_LINE = 0.9999, 0.01
 # every arm names every flag. MOE_DET=1 from A1 on: lev-all-1 showed the MoEGM arms do not repeat (A/A rel err 0.36-0.92 % at 1k,
-# A0 repeats bit for bit), so a lever's difference could not be read below that floor.
+# A0 repeats bit for bit), so a lever's difference could not be read below that floor. The stack holds only the levers that
+# gained at 8k in lev-all-1 (warm, repeats within 0.03 s): MoE group-major 26.95 -> 17.67 s, FAST_GEMM -> 17.14, MOE_FAST
+# 18.01 -> 13.98. Left out: ATTN_ADAPT (+0.38 s), CHUNK 4096 (+0.49 s), ATTN_TC (+1.11 s).
 OFF = "MOE_GM=0,MOE_DET=0,FAST_GEMM=0,ATTN_ADAPT=0,CHUNK=1024,MOE_FAST=0,ATTN_TC=0"
 DEFAULT_ARMS = ";".join((
     "A0:" + OFF,
     "A1:MOE_GM=1,MOE_DET=1,FAST_GEMM=0,ATTN_ADAPT=0,CHUNK=1024,MOE_FAST=0,ATTN_TC=0",
     "A2:MOE_GM=1,MOE_DET=1,FAST_GEMM=1,ATTN_ADAPT=0,CHUNK=1024,MOE_FAST=0,ATTN_TC=0",
-    "A3:MOE_GM=1,MOE_DET=1,FAST_GEMM=1,ATTN_ADAPT=1,CHUNK=1024,MOE_FAST=0,ATTN_TC=0",
-    "A4:MOE_GM=1,MOE_DET=1,FAST_GEMM=1,ATTN_ADAPT=1,CHUNK=4096,MOE_FAST=0,ATTN_TC=0",
-    "A5:MOE_GM=1,MOE_DET=1,FAST_GEMM=1,ATTN_ADAPT=1,CHUNK=4096,MOE_FAST=1,ATTN_TC=0",
-    "A6:MOE_GM=1,MOE_DET=1,FAST_GEMM=1,ATTN_ADAPT=1,CHUNK=4096,MOE_FAST=1,ATTN_TC=1",
+    "A3:MOE_GM=1,MOE_DET=1,FAST_GEMM=1,ATTN_ADAPT=0,CHUNK=1024,MOE_FAST=1,ATTN_TC=0",
 ))
 
 
@@ -97,7 +96,7 @@ def main():
     ap.add_argument("--lengths", default="1024,8192")
     ap.add_argument("--reps", type=int, default=2)
     ap.add_argument("--long", type=int, default=32768)
-    ap.add_argument("--long-base", default="A4")
+    ap.add_argument("--long-base", default="A2")
     a = ap.parse_args()
     arms = parse_arms(a.arms)
     names = [n for n, _ in arms]

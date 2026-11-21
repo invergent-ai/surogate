@@ -71,7 +71,7 @@ def test_plan():
     gen = torch.Generator().manual_seed(1)
     for trial in range(300):
         n = 16
-        cnt = (torch.rand(n, generator=gen) ** 6 * 5000).long().tolist()
+        cnt = (torch.rand(n, generator=gen) ** 6 * (5000 if trial % 2 else 300)).long().tolist()  # both plan layouts
         if trial % 7 == 0:
             cnt[3] = 0
         max_rows = [64, 256, 8192][trial % 3]
@@ -80,9 +80,9 @@ def test_plan():
         seen = []
         for bt in plan:
             assert len(bt) <= B.EG
-            assert all(bt[0][0] >= it[0] for it in bt), "first item of a batch is its longest"
             for ln, e, first in bt:
-                assert 0 < ln <= max_rows and 0 <= e < n
+                assert 0 <= ln <= max_rows and 0 <= e < n  # 0 rows: only in the one-batch id-order layout
+                assert ln > 0 or len(bt) == n
                 seen += list(range(first, first + ln))
         assert sorted(seen) == list(range(sum(cnt))), "every row exactly once"
         # each row's item belongs to its expert's row range
@@ -106,15 +106,16 @@ def test_moe():
             torch.randn(E, RANK, I, generator=gen) / 34, torch.randn(E, D, RANK, generator=gen) * 1e-3]
     res = {}
     names = ("dx", "A13", "B13", "A2", "B2")
-    for rows in (8192, 128):
+    for rows, split in ((8192, 2048), (128, 2048), (8192, 0)):  # split 2048: T = 640 runs one id-order batch per group
+        LG.MOE_SPLIT_MIN = split
         ref = moe_grads(w, ids, x, g, lora, False, rows)
         new = moe_grads(w, ids, x, g, lora, True, rows)
-        res[f"rows_{rows}"] = {n: {"rel": rel(a, b)[0], "cos": rel(a, b)[1]} for n, a, b in zip(names, new, ref)}
+        res[f"rows_{rows}_split{split}"] = {n: {"rel": rel(a, b)[0], "cos": rel(a, b)[1]} for n, a, b in zip(names, new, ref)}
         for fast in (False, True):  # MOE_DET on both MoE paths
             new = moe_grads(w, ids, x, g, lora, fast, rows, det=True)
-            res[f"rows_{rows}_det_fast{int(fast)}"] = {n: {"rel": rel(a, b)[0], "cos": rel(a, b)[1]}
+            res[f"rows_{rows}_split{split}_det_fast{int(fast)}"] = {n: {"rel": rel(a, b)[0], "cos": rel(a, b)[1]}
                                                        for n, a, b in zip(names, new, ref)}
-    LG.MOE_FAST, LG.MOE_ROWS, LG.MOE_DET = False, 8192, False
+    LG.MOE_FAST, LG.MOE_ROWS, LG.MOE_DET, LG.MOE_SPLIT_MIN = False, 8192, False, 2048
     worst = max(v["rel"] for r in res.values() for v in r.values())
     res["worst_rel"] = worst
     res["pass"] = worst < 2e-4

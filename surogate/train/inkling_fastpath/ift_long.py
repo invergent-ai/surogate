@@ -460,6 +460,9 @@ MOE_BATCHES = int(os.environ.get("IFT_MOE_BATCHES", "3"))
 # the card adds repeats in arbitrary order in fp32; the backward's bf16 roundings then amplify the ulp differences. With
 # MOE_DET the rows' dX are summed in fp64 (order-independent for these few terms) and rounded once to fp32 per visit.
 MOE_DET = os.environ.get("IFT_MOE_DET", "0") == "1"
+# lev-all-1: MOE_FAST costs +1.0 s at 1k (3.2 vs 2.2 s; three batches of python ops + unit copies per group, for ~1k rows) and
+# gains 4.0 s at 8k. A group below MOE_SPLIT_MIN rows runs as ONE batch in expert-id order, without copying the units.
+MOE_SPLIT_MIN = int(os.environ.get("IFT_MOE_SPLIT_MIN", "2048"))
 
 
 def _h2d(t, dev):
@@ -473,6 +476,14 @@ def _moe_plan(cnt, max_rows, nb):
     """Batches of one group: lists of items (rows, expert within the group, first row within the group's sorted rows),
     items longest first. An expert above max_rows is cut into several items. The sorted items are partitioned into at
     most nb contiguous batches minimising sum(batch items x its longest item), then batches above EG items are cut."""
+    if sum(cnt) == 0:
+        return []
+    if sum(cnt) < MOE_SPLIT_MIN and max(cnt) <= max_rows and len(cnt) <= B.EG:  # one batch, id order (rows may be 0)
+        off, one = 0, []
+        for e, c in enumerate(cnt):
+            one.append((c, e, off))
+            off += c
+        return [one]
     items = []
     off = 0
     for e, c in enumerate(cnt):
@@ -480,8 +491,6 @@ def _moe_plan(cnt, max_rows, nb):
             items.append((min(max_rows, c - s), e, off + s))
         off += c
     n = len(items)
-    if n == 0:
-        return []
     items.sort(key=lambda t: (-t[0], t[1], t[2]))
     inf = 1 << 62
     f = [[inf] * (n + 1) for _ in range(nb + 1)]
@@ -517,9 +526,11 @@ def _unit_bwd(g3, unit):
 def _moe_fast_batch(items, r0, x, g, tok, gam_r, u13, f13, u2, f2, lora, scale, g0, g1, dx, dgam_r, lgr):
     """One batch of a group: adds its rows' dX to dx, writes their d(gamma) into dgam_r, adds the LoRA gradients."""
     dev = x.device
-    nb, cap = len(items), items[0][0]
+    nb = len(items)
     lens = np.fromiter((it[0] for it in items), dtype=np.int64, count=nb)
+    cap = int(lens.max())
     es = np.fromiter((it[1] for it in items), dtype=np.int64, count=nb)
+    whole = nb == g1 - g0 and bool((es == np.arange(nb)).all())  # the group in id order: the units are used as they are
     firsts = np.fromiter((it[2] for it in items), dtype=np.int64, count=nb)
     kk = np.repeat(np.arange(nb), lens)
     pos = np.arange(int(lens.sum())) - np.repeat(np.cumsum(lens) - lens, lens)
@@ -536,13 +547,13 @@ def _moe_fast_batch(items, r0, x, g, tok, gam_r, u13, f13, u2, f2, lora, scale, 
         return p3.reshape(nb * cap, p3.shape[2]).index_select(0, flat)
 
     tb = tok[rel]
-    U13, U2 = u13.index_select(0, eix), u2.index_select(0, eix)
+    U13, U2 = (u13, u2) if whole else (u13.index_select(0, eix), u2.index_select(0, eix))
     fe13, fe2 = f13[eix][kt][:, None], f2[eix][kt][:, None]
     xp = pad(x[tb])
     gu = unpad(B._bmm_f32(xp, U13)) * fe13
     A13 = B13 = A2 = B2 = la13 = None
     if lora is not None:
-        A13, B13, A2, B2 = [t[g0:g1].index_select(0, eix) for t in lora]
+        A13, B13, A2, B2 = [t[g0:g1] if whole else t[g0:g1].index_select(0, eix) for t in lora]
         la13 = torch.bmm(xp, A13.transpose(1, 2))
         gu = gu + scale * unpad(torch.bmm(la13, B13.transpose(1, 2)))
     gu = RA.rb(gu)
