@@ -93,6 +93,8 @@ struct GenerationOutcome {
     /// ("tool_calls" only for a reply that stopped with calls and no named tool_choice); empty = derived from
     /// finish_reason and tool_calls.
     std::string finish_reason_wire;
+    /// Report reasoning_tokens in the usage (vLLM's completion_tokens_details), as vLLM does under a reasoning parser.
+    bool report_reasoning_tokens = false;
     std::string stop_sequence;
     GenerationMetrics metrics;
 };
@@ -130,8 +132,10 @@ struct DecisionsOutcome {
 
 /// The usage the Chat Completions, Completions and Anthropic Messages endpoints report.
 [[nodiscard]] inline CompletionUsage completion_usage(const GenerationOutcome& outcome) {
-    return completion_usage(outcome.prompt_tokens, outcome.completion_tokens,
-                            outcome.metrics.prefix_cache_hit_tokens);
+    CompletionUsage usage = completion_usage(outcome.prompt_tokens, outcome.completion_tokens,
+                                             outcome.metrics.prefix_cache_hit_tokens);
+    if (outcome.report_reasoning_tokens) { usage.reasoning_tokens = outcome.reasoning_tokens; }
+    return usage;
 }
 
 struct StreamSink {

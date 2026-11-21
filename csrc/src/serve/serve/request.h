@@ -71,6 +71,9 @@ struct CompletionUsage {
     int completion_tokens = 0;
     /// The part of prompt_tokens served from the prefix cache instead of being prefilled.
     int cached_tokens     = 0;
+    /// usage.completion_tokens_details.reasoning_tokens, written only when set: vLLM writes it for a model served with
+    /// a reasoning parser, and Inkling-2's replies report it as vLLM does (the harness's cost record reads it).
+    std::optional<int> reasoning_tokens;
 };
 
 /// Usage from an outcome's counts. The cached part is the prompt tokens the prefix cache supplied

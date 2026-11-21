@@ -911,6 +911,9 @@ static Json chat_completion_payload(const std::string& id, const std::string& mo
                        {"completion_tokens", usage.completion_tokens},
                        {"total_tokens", usage.prompt_tokens + usage.completion_tokens},
                        {"prompt_tokens_details", Json{{"cached_tokens", usage.cached_tokens}}}}}};
+    if (usage.reasoning_tokens) {
+        payload["usage"]["completion_tokens_details"] = Json{{"reasoning_tokens", *usage.reasoning_tokens}};
+    }
     // The prompt's ids sit at the top level, where vLLM puts them, because they
     // belong to the request rather than to any one choice.
     if (detail.include_token_ids) { payload["prompt_token_ids"] = detail.prompt_token_ids; }
@@ -1029,6 +1032,9 @@ std::string make_chat_chunk_usage(const std::string& id, const std::string& mode
                               {"completion_tokens", usage.completion_tokens},
                               {"total_tokens", usage.prompt_tokens + usage.completion_tokens},
                               {"prompt_tokens_details", Json{{"cached_tokens", usage.cached_tokens}}}};
+    if (usage.reasoning_tokens) {
+        payload["usage"]["completion_tokens_details"] = Json{{"reasoning_tokens", *usage.reasoning_tokens}};
+    }
     return sse_event(payload);
 }
 

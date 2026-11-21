@@ -1285,6 +1285,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
         outcome.reasoning             = parsed.reasoning.value_or("");
         outcome.text                  = parsed.content.value_or("");
         outcome.finish_reason_wire    = parsed.finish_reason;
+        outcome.report_reasoning_tokens = true;
         outcome.unstreamed_content.clear();
         if (output_sink) { (void)output_sink->release(outcome.reasoning, outcome.text); }
         return outcome;
