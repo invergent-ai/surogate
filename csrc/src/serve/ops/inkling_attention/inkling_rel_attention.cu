@@ -1328,8 +1328,8 @@ InklingAttentionKnobs& knobs() {
         x.prefill_partial_cap_bytes =
             static_cast<std::size_t>(std::max(0, env_int("SUROGATE_INKLING_ATTN_PREFILL_PARTIAL_MB", 64))) << 20;
         x.fused_fold_max    = std::max(0, env_int("SUROGATE_INKLING_ATTN_FUSED_FOLD", x.fused_fold_max));
-        x.linear_split      = env_int("SUROGATE_INKLING_LINEAR_SPLIT", 1) != 0;
-        x.fused_prologue    = env_int("SUROGATE_INKLING_ATTN_FUSED_PROLOGUE", 1) != 0;
+        x.linear_split      = std::clamp(env_int("SUROGATE_INKLING_LINEAR_SPLIT", x.linear_split), 0, 2);
+        x.fused_prologue    = env_int("SUROGATE_INKLING_ATTN_FUSED_PROLOGUE", x.fused_prologue ? 1 : 0) != 0;
         return x;
     }();
     return k;

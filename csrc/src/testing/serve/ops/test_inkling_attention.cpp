@@ -779,14 +779,14 @@ void run_invariance_case(const InvCase& c, const char* groups, std::uint32_t see
         ops::inkling_attention_knobs().partial_cap_bytes = 0; // the cap forces one worker: a plan change only
         compare("decode B4 partial cap 0", run_inv_route(c.kind, ip, layer, 1, r4));
         ops::inkling_attention_knobs().partial_cap_bytes = std::size_t{1} << 30;
-        // The split route folded by fold_kernel instead of the last worker CTA (the fused fold is the default).
-        ops::inkling_attention_knobs().fused_fold_max = 0;
-        compare("decode B4 fold kernel", run_inv_route(c.kind, ip, layer, 1, r4));
-        compare("decode B8 idle row fold kernel", run_inv_route(c.kind, ip, layer, 1, r8));
+        // The split route folded by the last worker CTA (fused fold) instead of fold_kernel (the default): counters from
+        // the zeroed workspace, then from the persistent state (kept at zero by the last CTAs).
         ops::inkling_attention_knobs().fused_fold_max = 1 << 30;
-        // Counters from the persistent state (kept at zero by the last CTAs) instead of the zeroed workspace.
+        compare("decode B4 fused fold", run_inv_route(c.kind, ip, layer, 1, r4));
+        compare("decode B8 idle row fused fold", run_inv_route(c.kind, ip, layer, 1, r8));
         compare("decode B4 persistent state", run_inv_route(c.kind, ip, layer, 1, r4, false, true));
         compare("decode B8 idle row persistent state", run_inv_route(c.kind, ip, layer, 1, r8, true, true));
+        ops::inkling_attention_knobs().fused_fold_max = 0;
         if (std::string(groups) == "p3" && std::getenv("SUROGATE_INKLING_ATTN_GROUPS") == nullptr) {
             g_key_groups = ops::InklingKeyGroups::Default; // the compiled default must be P3
             compare("decode B4 default key groups", run_inv_route(c.kind, ip, layer, 1, r4));
@@ -804,11 +804,11 @@ void run_invariance_case(const InvCase& c, const char* groups, std::uint32_t see
         compare("verify W8 B1 valid 5", run_inv_route(c.kind, ip, layer, 8, {{0, v, std::min(5, w)}}));
         compare("verify W3 B2", run_inv_route(c.kind, ip, layer, 3, {{r4[0].seq, r4[0].first, std::min(3, r4[0].valid)}, {0, v, std::min(3, w)}}));
         compare("verify W16 B1", run_inv_route(c.kind, ip, layer, 16, {{0, std::max(c.P0, std::min(v, c.L0 - 16)), 16}}));
-        ops::inkling_attention_knobs().fused_fold_max = 0;
-        compare("verify W8 B4 fold kernel", run_inv_route(c.kind, ip, layer, 8, r4));
-        compare("verify W16 B1 fold kernel", run_inv_route(c.kind, ip, layer, 16, {{0, std::max(c.P0, std::min(v, c.L0 - 16)), 16}}));
         ops::inkling_attention_knobs().fused_fold_max = 1 << 30;
+        compare("verify W8 B4 fused fold", run_inv_route(c.kind, ip, layer, 8, r4));
+        compare("verify W16 B1 fused fold", run_inv_route(c.kind, ip, layer, 16, {{0, std::max(c.P0, std::min(v, c.L0 - 16)), 16}}));
         compare("verify W8 B4 persistent state", run_inv_route(c.kind, ip, layer, 8, r4, false, true));
+        ops::inkling_attention_knobs().fused_fold_max = 0;
         ops::inkling_attention_knobs().splits = 1;
         compare("verify W8 B4 workers 1", run_inv_route(c.kind, ip, layer, 8, r4));
         ops::inkling_attention_knobs().splits = 0;
@@ -1295,17 +1295,22 @@ void run_prologue_case(const ProCase& c, std::uint32_t seed) {
             conv4.states = Tensor(dstate4.p, DType::BF16, {kC, 3, S});
             if (c.mode == ops::InklingConvMode::Record) { conv4.records = Tensor(drec4.p, DType::BF16, {kC, Wmax, c.B}); }
             auto view4 = view;
-            if (variant == 0) { view4.state = persistent_state(); } else { ops::inkling_attention_knobs().fused_prologue = false; }
+            ops::inkling_attention_knobs().fused_fold_max = 1 << 30;
+            if (variant == 0) {
+                view4.state = persistent_state();
+                ops::inkling_attention_knobs().fused_prologue = true;
+            }
             WorkspaceArena work4(ops::inkling_attention_workspace_capacity_bytes(c.kind, c.B, c.W, c.W, view.envelope, view.key_groups) + 4096);
             Tensor out4(dout4.p, DType::BF16, {3072, N});
             ops::inkling_attention(in, layer.weights(), c.kind, view4, conv4, plane4.view(), work4, out4, nullptr);
-            ops::inkling_attention_knobs().fused_prologue = true;
+            ops::inkling_attention_knobs().fused_prologue = false;
+            ops::inkling_attention_knobs().fused_fold_max = 0;
             cuda_synchronize();
             plane4.download();
             const bool same = from_device<std::uint16_t>(dout4, sn0 * 3072) == from_device<std::uint16_t>(dout, sn0 * 3072) &&
                               plane4.hk == plane.hk && plane4.hv == plane.hv &&
                               from_device<std::uint16_t>(dstate4, state.size()) == from_device<std::uint16_t>(dstate, state.size());
-            const char* what = variant == 0 ? "fused call with persistent state" : "fused call, separate prologue";
+            const char* what = variant == 0 ? "fused call, in-kernel prologue + state" : "fused call, fused fold";
             std::printf("%-44s %-8s %s == default call (out, KV, slot): %s\n", c.name.c_str(), "route", what, same ? "yes" : "NO");
             check(same, c.name + " " + what);
         }
@@ -1318,10 +1323,10 @@ void run_prologue_case(const ProCase& c, std::uint32_t seed) {
         // call's output (counters zeroed by its prologue), bitwise.
         DeviceBuffer sy(sn * 3072 * 2), fy(sn * 3072 * 2);
         Tensor syt(sy.p, DType::BF16, {3072, N}), fyt(fy.p, DType::BF16, {3072, N});
+        ops::inkling_attention_knobs().fused_fold_max = 1 << 30;
         ops::inkling_rel_attention(ain, c.kind, view, plane3.view(), work3, syt, nullptr);
         ops::inkling_attention_knobs().fused_fold_max = 0;
         ops::inkling_rel_attention(ain, c.kind, view, plane3.view(), work3, fyt, nullptr);
-        ops::inkling_attention_knobs().fused_fold_max = 1 << 30;
         cuda_synchronize();
         const bool same_standalone = from_device<std::uint16_t>(sy, sn * 3072) == from_device<std::uint16_t>(dout, sn * 3072) &&
                                      from_device<std::uint16_t>(fy, sn * 3072) == from_device<std::uint16_t>(dout, sn * 3072);
@@ -1582,12 +1587,13 @@ void run_linear_width_case(const std::string& name, int k, int k_per, int rows_p
     std::size_t bad = 0, total = 0;
     std::string first;
     // Widths 1 .. 64 (narrow: the cell-split kernel), then 1 / 9 / 16 through the one-warp-per-tile narrow kernel.
-    const std::vector<std::pair<int, bool>> widths = {{1, true}, {2, true}, {8, true}, {9, true}, {16, true}, {17, true},
-                                                      {64, true}, {1, false}, {9, false}, {16, false}};
+    // (split mode: 1 = default (wo split, qkvr one-warp), 2 = both split, 0 = both one-warp)
+    const std::vector<std::pair<int, int>> widths = {{1, 1}, {2, 1}, {8, 1}, {9, 1}, {16, 1}, {17, 1}, {64, 1},
+                                                     {1, 2}, {9, 2}, {16, 2}, {1, 0}, {9, 0}, {16, 0}};
     for (const auto& [n, split] : widths) {
         ops::inkling_attention_knobs().linear_split = split;
         const auto got = run(n);
-        ops::inkling_attention_knobs().linear_split = true;
+        ops::inkling_attention_knobs().linear_split = 1;
         for (std::size_t i = 0; i < ranges.size(); ++i) {
             const std::size_t count = static_cast<std::size_t>(ranges[i].second) * n; // columns are contiguous
             total += count;
@@ -1599,7 +1605,7 @@ void run_linear_width_case(const std::string& name, int k, int k_per, int rows_p
             }
         }
     }
-    std::printf("%-44s widths 1 2 8 9 16 17 64 (+ 1 9 16 one-warp narrow) vs 8192: %zu / %zu outputs bit-different%s%s\n",
+    std::printf("%-44s widths 1 2 8 9 16 17 64 (+ 1 9 16 split / one-warp) vs 8192: %zu / %zu outputs bit-different%s%s\n",
                 name.c_str(), bad, total,
                 first.empty() ? "" : "  first: ", first.c_str());
     check(bad == 0, name);
@@ -2168,7 +2174,8 @@ void run_bench_fold() {
         int fold_max;
         bool pro, state;
     };
-    const Mode modes[4] = {{"[sep prologue, fold kernel]", 0, false, false}, {"[sep prologue, fused fold]", 1 << 30, false, false},
+    const Mode modes[5] = {{"[sep prologue, fold kernel]", 0, false, false}, {"[sep prologue, fused fold]", 1 << 30, false, false},
+                           {"[in-kernel prologue, fold kernel]", 0, true, false},
                            {"[in-kernel prologue, state]", 1 << 30, true, true}, {"[in-kernel prologue, zeroing]", 1 << 30, true, false}};
     for (const Mode& m : modes) {
         ops::inkling_attention_knobs().fused_fold_max = m.fold_max;
@@ -2184,11 +2191,11 @@ void run_bench_fold() {
     }
     unsetenv("BENCH_STATE");
     unsetenv("BENCH_META_STATIC");
-    ops::inkling_attention_knobs().fused_fold_max = 1 << 30;
-    ops::inkling_attention_knobs().fused_prologue = true;
+    ops::inkling_attention_knobs().fused_fold_max = 0;
+    ops::inkling_attention_knobs().fused_prologue = false;
     // Narrow attn_linear: one-warp-per-tile (split 0) vs cell-split (split 1).
     for (const int split : {0, 1}) {
-        ops::inkling_attention_knobs().linear_split = split != 0;
+        ops::inkling_attention_knobs().linear_split = split != 0 ? 2 : 0;
         const std::string tag = split != 0 ? " [split]" : " [one-warp]";
         const auto nm = [&](const char* w) { static std::string x; x = std::string(w) + tag; return x.c_str(); };
         bench_linear(nm("attn_linear qkvr narrow N=1 1x128"), 2304, 128, 1);
@@ -2200,7 +2207,7 @@ void run_bench_fold() {
         bench_linear(nm("attn_linear wo narrow N=8 1x128"), 3072, 128, 8);
         bench_linear(nm("attn_linear wo narrow N=16 1x128"), 3072, 128, 16);
     }
-    ops::inkling_attention_knobs().linear_split = true;
+    ops::inkling_attention_knobs().linear_split = 1;
 }
 
 // Decode attention (1 x 8k global, gated) followed by the wo projection (N = 1, 1x128) in ONE CUDA graph with PDL edges:
