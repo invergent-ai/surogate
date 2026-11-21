@@ -699,6 +699,16 @@ void inkling_conv_capture_window(const InklingPlane& x, std::int32_t channels,
     CUDA_CHECK(cudaGetLastError());
 }
 
+void inkling_conv_update_window(const InklingPlane& x, std::int32_t channels, const InklingConvRows& rows,
+                                const InklingConvStateView& state, std::int32_t channel_offset,
+                                cudaStream_t stream) {
+    constexpr const char* op = "inkling_conv_update_window";
+    const ConvArgs a = conv_args(x, channels, nullptr, rows, state, channel_offset, op);
+    conv_window_kernel<<<dim3(grid_count(channels, kConvChannelTile), static_cast<unsigned>(rows.batch)),
+                         kConvChannelTile, 0, stream>>>(a, -1, -1, 1);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void inkling_conv_copy_slot(const InklingConvStateView& state, std::int32_t channel_offset,
                             std::int32_t channels, std::int32_t src, std::int32_t dst,
                             cudaStream_t stream) {

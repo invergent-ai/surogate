@@ -14,6 +14,7 @@
 
 #include <cuda_runtime.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <span>
 
@@ -25,6 +26,16 @@ template <class Variant>
 [[nodiscard]] constexpr bool visit_schedule() {
     if constexpr (requires { Variant::visit_schedule; }) {
         return Variant::visit_schedule;
+    } else {
+        return false;
+    }
+}
+
+/// A target's own `--kv-cache-dtype auto` choice: FP8 e4m3 when it declares `kv_storage_fp8_default`.
+template <class Variant>
+[[nodiscard]] constexpr bool kv_storage_fp8_default() {
+    if constexpr (requires { Variant::kv_storage_fp8_default; }) {
+        return Variant::kv_storage_fp8_default;
     } else {
         return false;
     }
@@ -44,6 +55,9 @@ struct VisitSegment {
     std::int32_t count        = 0;  ///< columns
     std::int32_t kv_base      = 0;  ///< position of its first column (host; device positions are authoritative)
     std::int32_t kv_table_row = 0;  ///< its row in the text pool's block-table matrix
+    /// The row as a device I32 [1] the entry already staged (`io.text_kv_table_row`); used instead of
+    /// `kv_table_row` when set.
+    Tensor table_row{};
     std::int32_t state_slot   = 0;  ///< its state slot
     /// A rewrite checkpoint: copy the state after this segment to that slot before any later segment on the
     /// same slot advances it (mixed rounds, `mixed_split_segments_supported`); -1 none.
@@ -111,5 +125,42 @@ struct VisitRound {
     WorkspaceArena* work           = nullptr;
     cudaStream_t stream            = nullptr;
 };
+
+// Dispatch helpers: the Variant's visit leaves through a dependent name, so a runtime instantiated over any
+// other target never names them (an `if constexpr` on a concrete Variant would still look them up).
+
+template <class V, class Model>
+void run_visits_if(const Model& model, VisitRound& round) {
+    if constexpr (visit_schedule<V>()) {
+        V::run_visits(model, round);
+    } else {
+        (void)model;
+        (void)round;
+    }
+}
+
+template <class V>
+[[nodiscard]] std::size_t visit_workspace_if(const TextGeometry& geometry, TextPhase phase, std::int32_t batch_size,
+                                             std::int32_t max_width, std::int32_t max_columns,
+                                             std::uint32_t max_visible_keys) {
+    if constexpr (visit_schedule<V>()) {
+        return V::visit_workspace_capacity_bytes(geometry, phase, batch_size, max_width, max_columns,
+                                                 max_visible_keys);
+    } else {
+        (void)geometry; (void)phase; (void)batch_size; (void)max_width; (void)max_columns; (void)max_visible_keys;
+        return 0;
+    }
+}
+
+template <class V>
+[[nodiscard]] LinearAttentionStatePoolSpec visit_state_spec_if(const TextGeometry& geometry, std::int32_t slots) {
+    if constexpr (visit_schedule<V>()) {
+        return V::visit_state_spec(geometry, slots);
+    } else {
+        (void)geometry;
+        (void)slots;
+        return {};
+    }
+}
 
 } // namespace sinfer::family

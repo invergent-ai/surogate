@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "family/impl/runtime/residual_policy.h"
+#include "family/impl/runtime/visit_round.h"
 
 namespace sinfer::family::detail {
 class PrefillGraphFamily;
@@ -739,6 +740,11 @@ private:
     void run_layers(Tensor& x, Phase phase, Tap& tap, const Tensor* deepstack = nullptr,
                     std::span<const std::int32_t> visual_indices = {},
                     int first_layer = -1, int last_layer = -1);
+    /// A visit-schedule target's round (family/impl/runtime/visit_round.h): what `run_layers` and the mixed
+    /// bodies hand `Variant::run_visits` in place of the family layer loop. A no-op for every other target.
+    template <class Tap>
+    void run_visit_round(Tensor& x, Tap& tap, std::span<const family::VisitSegment> segments,
+                         const family::VisitBlock* block, bool single_sequence, const Tensor& positions);
     template <class Tap>
     void target_verify_batch_impl(const Tensor& ids, const Tensor& cache_positions,
                                   const Tensor& rope_positions, const Tensor& valid_columns,

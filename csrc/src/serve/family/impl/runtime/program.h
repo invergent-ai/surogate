@@ -583,6 +583,8 @@ public:
     std::int32_t routing_top_k            = 0;
     std::int32_t routing_columns          = 0;
     std::int32_t* routing_device          = nullptr;
+    /// A visit-schedule target's speculative-verify records (io.visit_records_*; empty otherwise).
+    DeviceBuffer visit_records_storage;
     std::vector<std::int32_t> routing_host_scratch;
     /// Ordinary rounds: one [layers][rows][top_k] slot per round of a chained burst.
     std::unique_ptr<PinnedHostBuffer> routing_ordinary_host;

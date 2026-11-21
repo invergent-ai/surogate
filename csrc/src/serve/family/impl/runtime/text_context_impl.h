@@ -2026,6 +2026,43 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, in
     debug_probe<Variant>("post_mlp_residual", x, cfg_.n_layers, s);
 }
 
+// A visit-schedule target's round (ENGINE-INKLING lane e1): the entry staged its columns and embedded into
+// `x`; the target's `run_visits` replaces the layer loop. Discarded for every other target.
+template <class Tap>
+void TextContext::run_visit_round(Tensor& x, Tap& tap, std::span<const family::VisitSegment> segments,
+                                  const family::VisitBlock* block, bool single_sequence,
+                                  const Tensor& positions) {
+    if constexpr (family::visit_schedule<Variant>()) {
+        family::VisitRound round;
+        round.x           = x;
+        round.ids         = active_ids_;
+        round.positions   = positions;
+        round.segments    = segments;
+        round.block       = block;
+        round.first_visit = stage_first_;
+        round.last_visit  = stage_last_;
+        round.text_kv     = batch_text_kv_;
+        if (single_sequence) { round.sequence_kv = kv_; }
+        round.state   = &state_;
+        round.records = family::VisitRecords{io_.visit_records_old, io_.visit_records_inputs,
+                                             io_.visit_records_visits, io_.visit_records_width,
+                                             io_.visit_records_batch};
+        round.routing = family::VisitRoutingCapture{io_.routing_capture, io_.routing_capture_columns,
+                                                    io_.routing_capture_top_k};
+        if constexpr (Tap::enabled) {
+            round.features = family::VisitFeatureCapture{
+                &tap, [](void* context, int feature, const Tensor& value, cudaStream_t stream) {
+                    static_cast<Tap*>(context)->capture_layer(feature, value, stream);
+                }};
+        }
+        round.work   = &work_;
+        round.stream = ctx_.stream;
+        family::run_visits_if<Variant>(weights_, round);
+    } else {
+        (void)x; (void)tap; (void)segments; (void)block; (void)single_sequence; (void)positions;
+    }
+}
+
 // Per-family prefill timing behind SUROGATE_SERVE_PREFILL_TIMING: events
 // around each mixer and MLP, summarised every 32 prefill chunks. It is the
 // instrument for "where does a prefill chunk's time go" when a profiler is
@@ -2036,6 +2073,32 @@ template <class Tap>
 void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap, const Tensor* deepstack,
                               std::span<const std::int32_t> visual_indices,
                               int first_layer, int last_layer) {
+    if constexpr (family::visit_schedule<Variant>()) {
+        // The target walks its own visit schedule over the round (family/impl/runtime/visit_round.h).
+        (void)deepstack; (void)visual_indices; (void)first_layer; (void)last_layer;
+        if (ph == Phase::Prefill) {
+            // One sequence: the row the entry staged in io_.text_kv_table_row, as the family's prefill
+            // attention reads it, and the lane's current state slot.
+            const family::VisitSegment segment{.column = 0, .count = x.ne[1], .kv_base = 0, .kv_table_row = -1,
+                                               .table_row = io_.text_kv_table_row,
+                                               .state_slot = linear_state_current_slot_};
+            run_visit_round(x, tap, std::span<const family::VisitSegment>(&segment, 1), nullptr, false,
+                            *active_cache_positions_);
+        } else {
+            family::VisitBlock block;
+            block.width         = active_sequence_width_;
+            block.batch         = active_sequence_batch_;
+            block.positions     = active_cache_positions_->view({block.width, block.batch});
+            block.kv_table_rows = *active_kv_table_rows_;
+            block.state_slots   = *active_linear_state_slots_;
+            block.valid_columns = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
+            // A row of several columns is a speculative verify: the conv state is recorded for the fold.
+            block.mode     = block.width > 1 ? family::VisitStateMode::Record : family::VisitStateMode::InPlace;
+            block.envelope = *active_gqa_envelope_;
+            run_visit_round(x, tap, {}, &block, false, active_cache_positions_->view({block.width * block.batch}));
+        }
+        return;
+    }
     const bool prefill = ph == Phase::Prefill;
     PrefillFamilyTimer& timer = prefill_family_timer();
     // Event synchronisation is illegal inside stream capture, and a captured
@@ -2618,8 +2681,44 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
         std::fprintf(stderr, "stage-trace: layers [%d, %d) of %d, columns %d\n", stage_first_,
                      stage_last_, cfg_.n_layers, x.ne[1]);
     }
+    // A visit-schedule target runs its own schedule over the round's segments and decode block; the
+    // family loop below then runs no layer (kFamilyLayerLoop is false only for such a target).
+    constexpr bool kFamilyLayerLoop = !family::visit_schedule<Variant>();
+    if constexpr (!kFamilyLayerLoop) {
+        std::vector<family::VisitSegment> visit_segments(segments.size());
+        for (std::size_t i = 0; i < segments.size(); ++i) {
+            // A negative row keeps the row the caller staged in io_.text_kv_table_row.
+            visit_segments[i] = family::VisitSegment{
+                .column       = segment_begin[i],
+                .count        = static_cast<std::int32_t>(segments[i].ids.size()),
+                .kv_base      = segments[i].kv_base,
+                .kv_table_row = segments[i].kv_table_row,
+                .table_row    = segments[i].kv_table_row < 0 ? io_.text_kv_table_row : Tensor{},
+                .state_slot   = segments[i].state_slot,
+                .capture_slot = segments[i].capture_slot,
+            };
+        }
+        family::VisitBlock visit_block;
+        if (batch > 0) {
+            visit_block.column        = prefill_cols;
+            visit_block.width         = width;
+            visit_block.batch         = batch;
+            visit_block.positions     = positions_decode.view({width, batch});
+            visit_block.kv_table_rows = decode.kv_table_rows;
+            visit_block.state_slots   = decode.linear_state_slots;
+            visit_block.valid_columns = decode.valid_columns;
+            visit_block.mode     = width > 1 ? family::VisitStateMode::Record : family::VisitStateMode::InPlace;
+            visit_block.envelope = decode.envelope;
+        }
+        if (sink != nullptr) {
+            run_visit_round(x, *sink, visit_segments, batch > 0 ? &visit_block : nullptr, false, positions);
+        } else {
+            NullTap no_tap;
+            run_visit_round(x, no_tap, visit_segments, batch > 0 ? &visit_block : nullptr, false, positions);
+        }
+    }
     attention_round_.begin();
-    for (int layer = stage_first_; layer < stage_last_; ++layer) {
+    for (int layer = stage_first_; kFamilyLayerLoop && layer < stage_last_; ++layer) {
         Hooks::layer_prologue(weights_, layer, x, prologue_, ple_state_, work_, ctx_.stream);
         if (cfg_.is_full(layer)) {
             const int fidx         = cfg_.full_idx(layer);
@@ -3260,6 +3359,9 @@ void TextContext::prefill_graph_window(std::int32_t bucket) {
 // shared scratch slot (the graphed-prompt discipline), so the slot baked at
 // capture is lane-independent.
 void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t batch_bucket) {
+    if constexpr (family::visit_schedule<Variant>()) {
+        throw std::logic_error("visit schedule: mixed-round graph bodies are not wired (prefill graphs are off)");
+    }
     cudaStream_t s             = ctx_.stream;
     PrefillGraphFamily& family = *prefill_graph_family_;
     if (rope_delta_ != 0) {

@@ -21,6 +21,8 @@
 #include "ops/linear/nvfp4/nvfp4_cublaslt.h"
 #include "api/ops/scatter.h"
 #include "api/ops/speculative_round.h"
+#include "api/ops/inkling_mix.h"
+#include "family/impl/runtime/visit_round.h"
 #include "ops/linear/ggml/ggml_dispatch.h"
 
 #include <cuda_runtime.h>
@@ -526,6 +528,21 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     // graphs it captures for them. The plan decided it from the options, and sized the graph
     // allowance for those graphs; an engine whose store bound nothing has no second flavor.
     base_rounds_ = plan.base_rounds && ops::lora_enabled();
+    // A visit-schedule target's verify records: the per-visit conv state before a speculative round
+    // and the round's conv inputs, which the resolve folds (family/impl/runtime/visit_round.h).
+    if (family::visit_schedule<Variant>() && speculative_backend != SpeculativeBackend::None) {
+        const auto channels = static_cast<std::size_t>(decoder->linear_attention.spec.conv_channels);
+        const auto visits   = static_cast<std::size_t>(decoder->linear_attention.layer_count());
+        const auto width    = static_cast<std::size_t>(speculative_round_width());
+        const auto rows     = static_cast<std::size_t>(batch_capacity);
+        const std::size_t old_bytes = (channels * 3 * visits * rows * 2 + 255) & ~std::size_t{255};
+        visit_records_storage = DeviceBuffer(old_bytes + channels * width * visits * rows * 2);
+        io.visit_records_old    = visit_records_storage.p;
+        io.visit_records_inputs = static_cast<std::byte*>(visit_records_storage.p) + old_bytes;
+        io.visit_records_visits = static_cast<std::int32_t>(visits);
+        io.visit_records_width  = static_cast<std::int32_t>(width);
+        io.visit_records_batch  = static_cast<std::int32_t>(rows);
+    }
     // Rollout Routing Replay: when the engine runs with SUROGATE_SERVE_CAPTURE_ROUTING=1 every
     // main-model forward copies each layer's selected expert ids into a fixed buffer, which the
     // graphs captured below record. Allocated before prepare_graphs() so they bake its address.
@@ -1329,6 +1346,30 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
                                   device.stream);
         }
         if (defer) { flush_deferred_fold_counts(); }
+        // A visit-schedule target's conv state: every row that ran a verify (not a narrow, in-place
+        // round) becomes the last 3 of [state before the round | its committed inputs].
+        if (io.visit_records_old != nullptr) {
+            std::array<ops::InklingConvFoldRow, kMaximumBatchColumns> visit_rows{};
+            std::size_t visit_count = 0;
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                if (requests[lanes[row]].pending.in_place_state) { continue; }
+                visit_rows[visit_count++] = ops::InklingConvFoldRow{
+                    .row = static_cast<std::int32_t>(row), .slot = fold_rows[row].linear_state_slot,
+                    .committed = static_cast<std::int32_t>(cancelled[row] ? 0U : accepted_tokens[row])};
+            }
+            const auto& conv = decoder->linear_attention.conv;
+            const ops::InklingConvPool pool{
+                conv.front().data,
+                conv.size() > 1 ? (static_cast<const std::byte*>(conv[1].data) -
+                                   static_cast<const std::byte*>(conv[0].data)) / 2 : 0,
+                decoder->linear_attention.conv_slot_stride_elements(),
+                static_cast<std::int32_t>(conv.size())};
+            ops::inkling_conv_fold(pool, std::span<const ops::InklingConvFoldRow>(visit_rows.data(), visit_count),
+                                   ops::InklingConvRecords{io.visit_records_old, io.visit_records_inputs,
+                                                           io.visit_records_visits, io.visit_records_width,
+                                                           io.visit_records_batch},
+                                   device.stream);
+        }
         // The n-gram PLE layer wrote its state from the round's last column, rejected drafts
         // included; its snapshots hold the state after each column, and the committed prefix's
         // last one is what the next round must start from.
@@ -2643,7 +2684,9 @@ void ProgramImplCore::prepare_graphs() {
     }();
     // DFlash engines also serve target-only decision readouts. Capture the ordinary
     // target prefill body for those requests; reasoning prefills keep their feature sink.
-    if (!prefill_graph_vetoed && (speculative_backend == SpeculativeBackend::None ||
+    // A visit-schedule target's prefill / mixed graph bodies are not wired yet (lanes/e1 NOTES).
+    if (!prefill_graph_vetoed && !family::visit_schedule<Variant>() &&
+        (speculative_backend == SpeculativeBackend::None ||
                                  speculative_backend == SpeculativeBackend::DFlash)) {
         // The fp4 cutlass epilogue's device alpha scalar initializes lazily
         // with a synchronous copy; force it now so no captured body ever

@@ -1794,6 +1794,7 @@ add_subdirectory(${SERVE_ROOT}/targets/qwen3_moe serve_t_qwen3_moe EXCLUDE_FROM_
 add_subdirectory(${SERVE_ROOT}/targets/qwen3_5 serve_t_qwen3_5 EXCLUDE_FROM_ALL)
 add_subdirectory(${SERVE_ROOT}/targets/qwen3_5_moe serve_t_qwen3_5_moe EXCLUDE_FROM_ALL)
 add_subdirectory(${SERVE_ROOT}/targets/qwen4exp serve_t_qwen4exp EXCLUDE_FROM_ALL)
+add_subdirectory(${SERVE_ROOT}/targets/inkling2 serve_t_inkling2 EXCLUDE_FROM_ALL)
 
 target_link_libraries(sinfer_engine
   PRIVATE

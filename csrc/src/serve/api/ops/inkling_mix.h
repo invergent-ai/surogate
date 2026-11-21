@@ -157,6 +157,13 @@ void inkling_conv_capture_window(const InklingPlane& x, std::int32_t channels,
                                  std::int32_t channel_offset, std::int32_t column,
                                  std::int32_t dst_slot, cudaStream_t stream);
 
+/// The in-place window update alone (no conv): every row's slot := the last 3 inputs of [state | x columns]
+/// after its last valid column, for channels [channel_offset, + channels). For the K / V streams, whose
+/// convolution lane c's prologue (or the naive one) computes from the old window first.
+void inkling_conv_update_window(const InklingPlane& x, std::int32_t channels, const InklingConvRows& rows,
+                                const InklingConvStateView& state, std::int32_t channel_offset,
+                                cudaStream_t stream);
+
 /// Copy channels [channel_offset, + channels) of slot `src` to slot `dst` (all 3 taps).
 void inkling_conv_copy_slot(const InklingConvStateView& state, std::int32_t channel_offset,
                             std::int32_t channels, std::int32_t src, std::int32_t dst,

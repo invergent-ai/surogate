@@ -6,6 +6,7 @@
 #include "family/impl/runtime/attention_workspace.h"
 #include "family/impl/adaptive_dflash.h"
 #include "family/impl/runtime/residual_policy.h"
+#include "family/impl/runtime/visit_round.h"
 #include "api/ops/batch_invariant.h"
 #include "ops/linear/marlin/marlin_plane.h"
 #include "family/impl/runtime/linear_state_slots.h"
@@ -175,6 +176,8 @@ std::int32_t checked_i32(std::uint64_t value, const char* label) {
 KvCacheStorage resolve_kv_storage(KvCacheStorage storage, const family::TextGeometry& geometry,
                                   int sm) {
     if (storage != KvCacheStorage::Auto) { return storage; }
+    // A target that states its own default (Inkling-2: unit-scale e4m3, as its reference serves it).
+    if (family::kv_storage_fp8_default<Variant>()) { return KvCacheStorage::Fp8E4M3; }
     return geometry_gdn_layers(geometry) == 0 || sm == 90 ? KvCacheStorage::BFloat16
                                                           : KvCacheStorage::Fp8E4M3;
 }
@@ -282,29 +285,37 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .text_physical_page_cap    = plan.elastic_kv ? plan.main_page_groups : 0U,
                      .elastic_kv_overcommit     = plan.elastic_kv && plan.elastic_kv_overcommit,
                      .mtp_physical_page_groups  = mtp_physical_pages,
-                     .linear_attention =
-                         {
-                             .layers         = geometry_gdn_layers(plan.geometry),
-                             // A short convolution runs over the residual width itself and
-                             // carries no recurrent image; a delta net convolves its own fused
-                             // q|k|v and the recurrent matrix is the mixer. One pool, two
-                             // shapes, and the mixer kind is what tells them apart.
-                             .conv_channels  = schedule::kLinearMixer == family::LinearMixer::ShortConv
-                                                   ? plan.geometry.hidden
-                                                   : plan.geometry.convolution_dim(),
-                             .conv_width     = plan.geometry.gdn_conv_state_width(),
-                             .value_heads    = schedule::kLinearMixer == family::LinearMixer::ShortConv
-                                                   ? 0
-                                                   : plan.geometry.gdn_value_heads,
-                             .value_head_dim = schedule::kLinearMixer == family::LinearMixer::ShortConv
-                                                   ? 0
-                                                   : plan.geometry.gdn_value_head_dim,
-                             .key_head_dim   = schedule::kLinearMixer == family::LinearMixer::ShortConv
-                                                   ? 0
-                                                   : plan.geometry.gdn_key_head_dim,
-                             .slot_count     = linear_state_slots,
-                             .conv_dtype     = DType::BF16,
-                         },
+                     // A visit-schedule target keeps its per-visit conv state in this pool
+                     // (family/impl/runtime/visit_round.h); every other target's spec is unchanged.
+                     .linear_attention = [&]() -> LinearAttentionStatePoolSpec {
+                         if constexpr (family::visit_schedule<Variant>()) {
+                             return family::visit_state_spec_if<Variant>(plan.geometry, linear_state_slots);
+                         } else {
+                             return LinearAttentionStatePoolSpec
+                             {
+                                 .layers         = geometry_gdn_layers(plan.geometry),
+                                 // A short convolution runs over the residual width itself and
+                                 // carries no recurrent image; a delta net convolves its own fused
+                                 // q|k|v and the recurrent matrix is the mixer. One pool, two
+                                 // shapes, and the mixer kind is what tells them apart.
+                                 .conv_channels  = schedule::kLinearMixer == family::LinearMixer::ShortConv
+                                                       ? plan.geometry.hidden
+                                                       : plan.geometry.convolution_dim(),
+                                 .conv_width     = plan.geometry.gdn_conv_state_width(),
+                                 .value_heads    = schedule::kLinearMixer == family::LinearMixer::ShortConv
+                                                       ? 0
+                                                       : plan.geometry.gdn_value_heads,
+                                 .value_head_dim = schedule::kLinearMixer == family::LinearMixer::ShortConv
+                                                       ? 0
+                                                       : plan.geometry.gdn_value_head_dim,
+                                 .key_head_dim   = schedule::kLinearMixer == family::LinearMixer::ShortConv
+                                                       ? 0
+                                                       : plan.geometry.gdn_key_head_dim,
+                                 .slot_count     = linear_state_slots,
+                                 .conv_dtype     = DType::BF16,
+                             };
+                         }
+                     }(),
                      .ple = speculative_ple_spec(
                          ResidualHooks<Variant>::ple_state_spec(plan.geometry, linear_state_slots),
                          plan),
@@ -630,6 +641,16 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                  std::int32_t last, family::TextPhase phase, GdnWorkspacePath path,
                                  std::int32_t batch_size, std::int32_t min_width,
                                  std::int32_t max_width, ops::GqaExecutionEnvelope envelope) {
+        // A visit-schedule target replaces the layer loop and books its own round
+        // (family/impl/runtime/visit_round.h).
+        if constexpr (family::visit_schedule<Variant>()) {
+            (void)path;
+            (void)min_width;
+            scratch(layout, family::visit_workspace_if<Variant>(
+                                plan.geometry, phase, batch_size, max_width, last,
+                                envelope.max_visible_keys));
+            return;
+        }
         // The embedded input a per-layer-input family keeps beside the residual. The layers
         // write the residual in place, so `capture_per_layer_source` copies the embedding once
         // and holds it from the round's arena for the whole layer loop -- and nothing booked
