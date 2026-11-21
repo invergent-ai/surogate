@@ -1707,7 +1707,8 @@ target_link_libraries(sinfer_ops PUBLIC sinfer_core PRIVATE sinfer_nvfp4_tma sin
 # No fast math: the kernels reproduce the reference's rounding with explicit intrinsics.
 add_library(sinfer_inkling_attention STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/inkling_attention/inkling_prologue.cu
-  ${SERVE_ROOT}/ops/inkling_attention/inkling_rel_attention.cu)
+  ${SERVE_ROOT}/ops/inkling_attention/inkling_rel_attention.cu
+  ${SERVE_ROOT}/ops/inkling_attention/inkling_attn_linear.cu)
 sinfer_internal_includes(sinfer_inkling_attention)
 sinfer_cuda_archive(sinfer_inkling_attention)
 target_link_libraries(sinfer_inkling_attention PUBLIC sinfer_core)

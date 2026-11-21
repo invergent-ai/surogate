@@ -853,6 +853,113 @@ void test_gate_sink() {
     check(worse == 0, "gate_sink");
 }
 
+// ---- the FP8 attention projections ------------------------------------------------------------------
+
+struct Fp8Weight {
+    int n = 0, k = 0, k_per = 0, rows_per = 0;
+    std::vector<std::uint8_t> codes;
+    std::vector<float> scales; // [n / rows_per][k / k_per]
+    DeviceBuffer dcodes, dscales;
+    Weight w{};
+
+    Fp8Weight(int n_in, int k_in, int k_per_in, int rows_per_in, std::uint32_t seed)
+        : n(n_in), k(k_in), k_per(k_per_in), rows_per(rows_per_in) {
+        Rng rng(seed);
+        codes.resize(static_cast<std::size_t>(n) * k);
+        for (auto& c : codes) {
+            std::uint8_t v;
+            do { v = static_cast<std::uint8_t>(rng.pick(0, 255)); } while ((v & 0x7F) == 0x7F);
+            c = v;
+        }
+        scales.resize(static_cast<std::size_t>((n + rows_per - 1) / rows_per) * (k / k_per));
+        for (auto& x : scales) { x = rng.uni(1e-4F, 4e-3F); }
+        dcodes  = to_device(codes);
+        dscales = to_device(scales);
+        w.qtype       = k_per == k ? QType::FP8_E4M3FN_ROW_F32S : QType::FP8_E4M3FN_BLK128_F32S;
+        w.layout      = QuantLayout::Fp8Block128;
+        w.scale_dtype = DType::FP32;
+        w.qdata       = dcodes.p;
+        w.scales      = dscales.p;
+        w.n           = n;
+        w.k           = k;
+        w.scale_ne[0] = k_per;
+        w.scale_ne[1] = rows_per;
+        w.group_size  = 128;
+        w.group       = 128;
+    }
+    double value(int row, int col) const {
+        return static_cast<double>(e4m3_decode(codes[static_cast<std::size_t>(row) * k + col])) *
+               scales[static_cast<std::size_t>(row / rows_per) * (k / k_per) + col / k_per];
+    }
+};
+
+void run_linear_case(const std::string& name, int k, int k_per, int rows_per, int columns,
+                     const std::vector<std::pair<int, int>>& ranges, std::uint32_t seed) {
+    const int n_rows = k == 2304 ? 8600 : 2304;
+    const Fp8Weight fw(n_rows, k, k_per, rows_per, seed);
+    Rng rng(seed + 1);
+    std::vector<std::vector<float>> xs;
+    std::vector<DeviceBuffer> dxs, douts;
+    std::vector<Tensor> xt, ot;
+    for (std::size_t i = 0; i < ranges.size(); ++i) {
+        std::vector<float> x(static_cast<std::size_t>(k) * columns);
+        for (auto& v : x) { v = bf(rng.uni(-3.0F, 3.0F)); }
+        xs.push_back(x);
+    }
+    for (std::size_t i = 0; i < ranges.size(); ++i) {
+        dxs.push_back(to_device_bf16(xs[i]));
+        // Outputs as row slices of one [n_rows + 8, N] buffer each (column stride > rows).
+        douts.emplace_back(static_cast<std::size_t>(n_rows + 8) * columns * 2);
+    }
+    std::vector<ops::InklingProjection> pj(ranges.size());
+    xt.reserve(ranges.size());
+    ot.reserve(ranges.size());
+    for (std::size_t i = 0; i < ranges.size(); ++i) {
+        xt.emplace_back(dxs[i].p, DType::BF16, std::initializer_list<std::int32_t>{k, columns});
+        ot.push_back(strided_bf16(douts[i].p, 0, {ranges[i].second}, columns, n_rows + 8));
+        pj[i].x         = &xt[i];
+        pj[i].weight    = &fw.w;
+        pj[i].row_begin = ranges[i].first;
+        pj[i].out       = &ot[i];
+    }
+    ops::inkling_attn_linear(pj, nullptr, nullptr);
+    cuda_synchronize();
+    for (std::size_t i = 0; i < ranges.size(); ++i) {
+        const int rows = ranges[i].second;
+        const std::vector<std::uint16_t> got =
+            from_device<std::uint16_t>(douts[i], static_cast<std::size_t>(n_rows + 8) * columns);
+        std::vector<double> g, ref;
+        for (int c = 0; c < columns; ++c) {
+            for (int r = 0; r < rows; ++r) {
+                double acc = 0.0;
+                for (int kk = 0; kk < k; ++kk) {
+                    acc += fw.value(ranges[i].first + r, kk) * xs[i][static_cast<std::size_t>(c) * k + kk];
+                }
+                ref.push_back(acc);
+                g.push_back(bf16_to_f32(got[static_cast<std::size_t>(c) * (n_rows + 8) + r]));
+            }
+        }
+        check(verify_reduction(name + " segment " + std::to_string(i), g, ref,
+                               ReductionCriterion{2.0e-3, 1.0e-4, 4.0e-3}) == 0,
+              name + " segment " + std::to_string(i));
+    }
+}
+
+void test_attn_linear() {
+    const int K = 2304;
+    const std::vector<std::pair<int, int>> one   = {{0, 8600}};
+    const std::vector<std::pair<int, int>> three = {{0, G::kRowsK}, {G::kRowsK, 1024}, {G::kRowsV, 1024}};
+    std::uint32_t seed = 4000;
+    for (const int cols : {1, 3, 8, 40, 300}) {
+        run_linear_case("attn_linear qkvr 1x128 N=" + std::to_string(cols), K, 128, 1, cols, one, seed++);
+        run_linear_case("attn_linear qkvr channel N=" + std::to_string(cols), K, K, 1, cols, one, seed++);
+        run_linear_case("attn_linear 3-input 1x128 N=" + std::to_string(cols), K, 128, 1, cols, three, seed++);
+    }
+    run_linear_case("attn_linear wo 1x128 N=2", 3072, 128, 1, 2, {{0, 2304}}, seed++);
+    run_linear_case("attn_linear wo channel N=130", 3072, 3072, 1, 130, {{0, 2304}}, seed++);
+    run_linear_case("attn_linear wo 128x128 N=70", 3072, 128, 128, 70, {{0, 2304}}, seed++);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -868,6 +975,7 @@ int main(int argc, char** argv) {
             test_rel_table_and_logits();
             test_gate_sink();
         }
+        if (want("attn_linear")) { test_attn_linear(); }
         using K = InklingLayerKind;
         using M = ops::InklingConvMode;
         const std::vector<ProCase> pro = {

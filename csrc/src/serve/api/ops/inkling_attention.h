@@ -304,30 +304,32 @@ void inkling_rel_proj_table(const Tensor& rel_proj, Tensor& table, cudaStream_t 
 void inkling_rel_logits(const Tensor& r_out, const Tensor& rel_table, Tensor& rel,
                         cudaStream_t stream);
 
-// ---- PROPOSED (D6): the attention projections. Declared for review; not to be wired until the
-// ---- integrator approves it and DESIGN 10.1 names the FP8 scheme.
+// ---- The FP8 attention projections (D6; agent-EN 08:2x: lane c's, per-channel and 1x128 cells first). ------
 
 /**
- * One projection of a visit: out[0:rows, n] = W[row_begin : row_begin + rows, :] . x[:, n], rows =
- * out.ne[0]. x: contiguous BF16 [K, N] (K = W.k). weight: the layer's `attn/qkvr` or `attn/output` in
- * BF16 (the oracle path) or the FP8 format 10.1 chooses, or a BF16 `attn/{k,v}_conv_proj`.
- * out: BF16 [rows, N], dim 0 contiguous, any 16-byte column stride (a slice of a larger output).
+ * One projection of a visit: out[0:rows, n] = W[row_begin : row_begin + rows, :] . x[:, n], rows = out.ne[0].
+ * x: contiguous, 16-byte aligned BF16 [K, N]. weight: an FP8 attention object as lane b binds it -- the block
+ * route's Weight (QuantLayout::Fp8Block128, e4m3 codes [n][k], fp32 scale grid, cell scale_ne = (k, 1)
+ * per-channel / (128, 1) 1x128 / (128, 128) 128x128). out: BF16 [rows, N], dim 0 contiguous, any column stride
+ * (a slice of a larger output). BF16 weights (the oracle path) are not taken here: ops::linear / linear_rows.
  */
 struct InklingProjection {
-    const Tensor* x       = nullptr;
-    const Weight* weight  = nullptr;
+    const Tensor* x        = nullptr;
+    const Weight* weight   = nullptr;
     std::int32_t row_begin = 0;
-    Tensor* out           = nullptr;
+    Tensor* out            = nullptr;
 };
 
+/// Zero today: both kernels stage in shared memory only.
 [[nodiscard]] std::size_t inkling_attn_linear_workspace_bytes(
     std::span<const InklingProjection> projections, std::int32_t max_columns);
 
 /**
- * Op inkling_attn_linear (PROPOSED, D6): up to five projections in one launch where their formats
- * allow (a 3-input global visit: q-side, K, V, k_dyn, v_dyn). FP8: e4m3 codes x exact BF16 activations
- * (W8A16), fp32 accumulate, scales applied in fp32 (per row after the whole K; per 1x128 / 128x128 cell
- * per 128 of K), output rounded once to bf16. BF16 weights: the engine's existing linear_rows.
+ * Op inkling_attn_linear (D6): one to four projections sharing K (2304 qkvr / 3072 wo_ud) and N in ONE launch
+ * (a 3-input visit: the q-side rows from x_q, K from x_k, V from x_v). W8A16: codes widened exactly, BF16
+ * activations as they are, fp32 accumulation; each scale cell's partial multiplied by its fp32 scale as the cell
+ * ends (per-channel: once, after the whole row); output rounded once to bf16. N <= 8: a GEMV (decode, verify);
+ * N > 8: a tensor-core GEMM. Projections of one GEMM launch share their cell kind (per-channel or not).
  */
 void inkling_attn_linear(std::span<const InklingProjection> projections, WorkspaceArena* workspace,
                          cudaStream_t stream);
