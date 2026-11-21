@@ -7,6 +7,7 @@
 // Design: rl/engine-inkling-2026-11-21/lanes/d/DESIGN-moe.md section 1.
 
 #include "ops/linear/nvfp4/nvfp4_codec.cuh"
+#include "ops/sparse_moe/inkling/inkling_moe_internal.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -16,13 +17,6 @@
 #include <cstdint>
 
 namespace sinfer::ops::detail::inkling {
-
-inline constexpr int kHidden       = 2304;
-inline constexpr int kExperts      = 128;
-inline constexpr int kTopK         = 8;
-inline constexpr int kIntermediate = 1152;
-inline constexpr int kGateUpRows   = 2 * kIntermediate;
-inline constexpr int kRouterGroup  = 1024;
 
 // fp32 words of the reference's constants (a Python double literal rounded to fp32 where Triton
 // multiplies it into an fp32 tensor). Checked against the hex words in the op test.

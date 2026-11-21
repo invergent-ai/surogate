@@ -16,6 +16,13 @@
 
 namespace sinfer::ops::detail::inkling {
 
+inline constexpr int kHidden       = InklingMoeGeometry::kHidden;
+inline constexpr int kExperts      = InklingMoeGeometry::kExperts;
+inline constexpr int kTopK         = InklingMoeGeometry::kTopK;
+inline constexpr int kIntermediate = InklingMoeGeometry::kIntermediate;
+inline constexpr int kGateUpRows   = InklingMoeGeometry::kGateUpRows;
+inline constexpr int kRouterGroup  = InklingMoeGeometry::kRouterKGroup;
+
 /// Live token count of a call: `*live` clamped to `tokens`, or `tokens`.
 struct LiveTokens {
     const std::int32_t* device = nullptr;
