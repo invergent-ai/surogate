@@ -52,7 +52,28 @@ class Fp8BlockFormat:
     block: int = 128
 
 
-NumericFormat: TypeAlias = DirectFormat | QuantFormat | Nvfp4Format | Fp8RowFormat | Fp8BlockFormat
+@dataclass(frozen=True, slots=True)
+class Mxfp8Format:
+    """OCP MX FP8: E4M3FN values with one E8M0 scale (a power of two, ``2^(word - 127)``) per
+    ``group_size`` consecutive values along K, per row. Inkling-2-Mini's MXFP8 experts store one
+    scale per row and group exactly like this (their scales differ between neighbouring rows)."""
+
+    name: str
+    group_size: int
+
+
+@dataclass(frozen=True, slots=True)
+class Fp8GridFormat:
+    """E4M3FN weights with one FP32 multiplier per ``cell_rows x cell_columns`` cell of a scale
+    grid over [n, k]; the grid has ceil(n / cell_rows) rows and k / cell_columns columns."""
+
+    name: str
+    cell_rows: int
+    cell_columns: int
+
+
+NumericFormat: TypeAlias = (DirectFormat | QuantFormat | Nvfp4Format | Fp8RowFormat | Fp8BlockFormat
+                            | Mxfp8Format | Fp8GridFormat)
 
 
 BF16 = DirectFormat("BF16", 2)
@@ -74,6 +95,11 @@ FP8_E4M3FN_BLK128_F32S = Fp8BlockFormat("FP8_E4M3FN_BLK128_F32S")
 #: E4M3FN weights with one FP32 multiplier per row (compressed-tensors per-channel FP8; the
 #: checkpoint's BF16 scales widen exactly). Served by the block route as a [n][1] grid.
 FP8_E4M3FN_ROW_F32S = Fp8BlockFormat("FP8_E4M3FN_ROW_F32S", block=0)
+#: Inkling-2-Mini's MXFP8 experts (layers 20-23): E4M3FN codes [n][k], E8M0 scales [n][k/32].
+MXFP8 = Mxfp8Format("MXFP8", 32)
+#: E4M3FN weights with one FP32 multiplier per row per 128 columns (the Inkling FP8-attention
+#: candidates "1x128", and "128x128" stored exactly with each block's scale repeated per row).
+FP8_E4M3FN_1X128_F32S = Fp8GridFormat("FP8_E4M3FN_1X128_F32S", 1, 128)
 
 @dataclass(frozen=True, slots=True)
 class GgmlBlockFormat:
@@ -144,10 +170,12 @@ GGML_BLOCK_FORMATS = MappingProxyType(
 )
 FP8_BLOCK_FORMATS = {FP8_E4M3FN_BLK128_F32S.name: FP8_E4M3FN_BLK128_F32S,
                      FP8_E4M3FN_ROW_F32S.name: FP8_E4M3FN_ROW_F32S}
+MXFP8_FORMATS = MappingProxyType({MXFP8.name: MXFP8})
+FP8_GRID_FORMATS = MappingProxyType({FP8_E4M3FN_1X128_F32S.name: FP8_E4M3FN_1X128_F32S})
 
 NUMERIC_FORMATS = MappingProxyType(
     {**DIRECT_FORMATS, **QUANT_FORMATS, **NVFP4_FORMATS, **FP8_ROW_FORMATS, **FP8_BLOCK_FORMATS,
-     **GGML_BLOCK_FORMATS}
+     **GGML_BLOCK_FORMATS, **MXFP8_FORMATS, **FP8_GRID_FORMATS}
 )
 
 
@@ -206,6 +234,22 @@ def valid_fp8_row_scale_word(word: int) -> bool:
     return math.isfinite(value)
 
 
+def decode_e8m0_word(word: int) -> float:
+    """Decode one OCP E8M0 scale word: ``2^(word - 127)``; 0 is 2^-127, 255 is NaN."""
+
+    if type(word) is not int or not 0 <= word <= 0xFF:
+        raise ValueError("E8M0 word must be an integer in [0, 255]")
+    if word == 0xFF:
+        return math.nan
+    return math.ldexp(1.0, word - 127)
+
+
+def valid_mxfp8_scale_word(word: int) -> bool:
+    """Return whether *word* is a finite E8M0 scale (every word but the NaN 0xFF)."""
+
+    return type(word) is int and 0 <= word <= 0xFE
+
+
 def valid_positive_fp32_word(word: int) -> bool:
     """Return whether an IEEE binary32 word represents a finite positive value."""
 
@@ -227,6 +271,14 @@ def get_format(name: str) -> NumericFormat:
 __all__ = [
     "GGML_BLOCK_FORMATS",
     "GgmlBlockFormat",
+    "FP8_E4M3FN_1X128_F32S",
+    "FP8_GRID_FORMATS",
+    "Fp8GridFormat",
+    "MXFP8",
+    "MXFP8_FORMATS",
+    "Mxfp8Format",
+    "decode_e8m0_word",
+    "valid_mxfp8_scale_word",
     "Q2_K",
     "Q3_K",
     "Q4_K",

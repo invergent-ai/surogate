@@ -23,7 +23,9 @@ from surogate.serve.artifact.numeric import Fp8BlockFormat
 from .numeric import (
     GgmlBlockFormat,
     DirectFormat,
+    Fp8GridFormat,
     Fp8RowFormat,
+    Mxfp8Format,
     Nvfp4Format,
     NumericFormat,
     QuantFormat,
@@ -100,6 +102,39 @@ class BlockScale128Geometry:
     payload_bytes: int
 
 
+@dataclass(frozen=True, slots=True)
+class Mxfp8Geometry:
+    """mxfp8-k32-v1: E4M3FN codes [n][k] row-major, then, 256-aligned, E8M0 scale words
+    [n][k/group] row-major (natural order, one per row per group)."""
+
+    n: int
+    k: int
+    group_size: int
+    groups_per_row: int
+    code_plane_bytes: int
+    scale_plane_offset: int
+    scale_plane_bytes: int
+    payload_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class Fp8GridGeometry:
+    """fp8-1x128-f32-v1: E4M3FN codes [n][k] row-major, then, 256-aligned, FP32 scales
+    [grid_rows][grid_columns] row-major; cell (r, c) scales rows [r*cell_rows, ...) and columns
+    [c*cell_columns, ...)."""
+
+    n: int
+    k: int
+    cell_rows: int
+    cell_columns: int
+    grid_rows: int
+    grid_columns: int
+    code_plane_bytes: int
+    scale_plane_offset: int
+    scale_plane_bytes: int
+    payload_bytes: int
+
+
 Plane: TypeAlias = bytes | bytearray | memoryview | torch.Tensor
 Payload: TypeAlias = bytes | bytearray | memoryview | torch.Tensor
 
@@ -142,6 +177,16 @@ ROW_SCALE_F32_V1 = Layout(
     256,
     frozenset(("FP8_E4M3FN_ROW_F32S",)),
 )
+MXFP8_K32_V1 = Layout(
+    "mxfp8-k32-v1",
+    256,
+    frozenset(("MXFP8",)),
+)
+FP8_1X128_F32_V1 = Layout(
+    "fp8-1x128-f32-v1",
+    256,
+    frozenset(("FP8_E4M3FN_1X128_F32S",)),
+)
 GGML_BLOCKS_V1 = Layout(
     "ggml-blocks-v1",
     256,
@@ -160,6 +205,8 @@ LAYOUTS = MappingProxyType(
             GGML_BLOCKS_V1,
             BLOCK_SCALE128_FP8_V1,
             ROW_SCALE_F32_V1,
+            MXFP8_K32_V1,
+            FP8_1X128_F32_V1,
         )
     }
 )
@@ -341,6 +388,139 @@ def row_scale_f32_geometry(
     )
 
 
+def mxfp8_geometry(format: str | Mxfp8Format, shape: Sequence[int]) -> Mxfp8Geometry:
+    spec = _format(format)
+    if not isinstance(spec, Mxfp8Format):
+        raise ValueError("mxfp8-k32-v1 requires an MXFP8 format")
+    n, k = _shape(shape, rank=2)
+    if k % spec.group_size:
+        raise ValueError(f"mxfp8-k32-v1 requires k to be a whole number of {spec.group_size}s")
+    code_plane_bytes = n * k
+    scale_plane_offset = align_up(code_plane_bytes, PLANE_ALIGNMENT)
+    scale_plane_bytes = n * (k // spec.group_size)
+    return Mxfp8Geometry(
+        n=n, k=k, group_size=spec.group_size, groups_per_row=k // spec.group_size,
+        code_plane_bytes=code_plane_bytes, scale_plane_offset=scale_plane_offset,
+        scale_plane_bytes=scale_plane_bytes, payload_bytes=scale_plane_offset + scale_plane_bytes,
+    )
+
+
+def _validate_mxfp8_words(codes: torch.Tensor, scales: torch.Tensor) -> None:
+    if bool(((codes & 0x7F) == 0x7F).any()):
+        raise ValueError("MXFP8 codes must be finite E4M3FN words")
+    if bool((scales == 0xFF).any()):
+        raise ValueError("MXFP8 scales must be finite E8M0 words (0xFF is NaN)")
+
+
+def encode_mxfp8(code_words: torch.Tensor, scale_words: torch.Tensor, shape: Sequence[int]) -> bytes:
+    """Encode exact E4M3FN code words [n, k] and E8M0 scale words [n, k/32], as stored."""
+
+    geometry = mxfp8_geometry("MXFP8", shape)
+    codes = _exact_uint8_matrix(code_words, (geometry.n, geometry.k), "MXFP8 codes")
+    scales = _exact_uint8_matrix(scale_words, (geometry.n, geometry.groups_per_row), "MXFP8 scales")
+    _validate_mxfp8_words(codes, scales)
+    payload = bytearray(geometry.payload_bytes)
+    payload[: geometry.code_plane_bytes] = codes.numpy().tobytes()
+    begin = geometry.scale_plane_offset
+    payload[begin : begin + geometry.scale_plane_bytes] = scales.numpy().tobytes()
+    return bytes(payload)
+
+
+def decode_mxfp8_words(payload: Payload, shape: Sequence[int]) -> tuple[torch.Tensor, torch.Tensor]:
+    """Decode exact E4M3FN code words [n, k] and E8M0 scale words [n, k/32]."""
+
+    geometry = mxfp8_geometry("MXFP8", shape)
+    if _payload_length(payload) != geometry.payload_bytes:
+        raise ValueError(f"MXFP8 payload has {_payload_length(payload)} bytes, "
+                         f"expected {geometry.payload_bytes}")
+    raw = _payload_tensor(payload, torch.device("cpu"))
+    codes = raw[: geometry.code_plane_bytes].clone().reshape(geometry.n, geometry.k)
+    begin = geometry.scale_plane_offset
+    scales = raw[begin : begin + geometry.scale_plane_bytes].clone().reshape(
+        geometry.n, geometry.groups_per_row)
+    _validate_mxfp8_words(codes, scales)
+    return codes, scales
+
+
+def dequantize_mxfp8_words(codes: torch.Tensor, scales: torch.Tensor,
+                           group_size: int = 32) -> torch.Tensor:
+    """FP32 values of MXFP8 words: ``e4m3(code) * 2^(scale - 127)`` (``ldexp``: exact)."""
+
+    values = codes.view(torch.float8_e4m3fn).to(torch.float32)
+    exponents = scales.to(torch.int32).repeat_interleave(group_size, dim=-1) - 127
+    return torch.ldexp(values, exponents.to(torch.float32))
+
+
+def dequantize_mxfp8(payload: Payload, shape: Sequence[int]) -> torch.Tensor:
+    codes, scales = decode_mxfp8_words(payload, shape)
+    return dequantize_mxfp8_words(codes, scales, get_format("MXFP8").group_size)
+
+
+def fp8_grid_geometry(format: str | Fp8GridFormat, shape: Sequence[int]) -> Fp8GridGeometry:
+    spec = _format(format)
+    if not isinstance(spec, Fp8GridFormat):
+        raise ValueError("fp8-1x128-f32-v1 requires a grid-scaled FP8 format")
+    n, k = _shape(shape, rank=2)
+    if k % spec.cell_columns:
+        raise ValueError(f"fp8-1x128-f32-v1 requires k to be a whole number of {spec.cell_columns}s")
+    grid_rows = -(-n // spec.cell_rows)
+    grid_columns = k // spec.cell_columns
+    code_plane_bytes = n * k
+    scale_plane_offset = align_up(code_plane_bytes, PLANE_ALIGNMENT)
+    scale_plane_bytes = grid_rows * grid_columns * 4
+    return Fp8GridGeometry(
+        n=n, k=k, cell_rows=spec.cell_rows, cell_columns=spec.cell_columns, grid_rows=grid_rows,
+        grid_columns=grid_columns, code_plane_bytes=code_plane_bytes,
+        scale_plane_offset=scale_plane_offset, scale_plane_bytes=scale_plane_bytes,
+        payload_bytes=scale_plane_offset + scale_plane_bytes,
+    )
+
+
+def encode_fp8_grid(code_words: torch.Tensor, grid_scales: torch.Tensor, shape: Sequence[int],
+                    format: str = "FP8_E4M3FN_1X128_F32S") -> bytes:
+    """Encode exact E4M3FN code words [n, k] and FP32 grid multipliers [grid_rows, grid_columns]."""
+
+    geometry = fp8_grid_geometry(format, shape)
+    codes = _exact_uint8_matrix(code_words, (geometry.n, geometry.k), "grid-scaled FP8 codes")
+    scales = grid_scales.detach().cpu()
+    if scales.dtype != torch.float32 or tuple(scales.shape) != (geometry.grid_rows, geometry.grid_columns):
+        raise ValueError(f"grid-scaled FP8 scales must be FP32 {(geometry.grid_rows, geometry.grid_columns)}")
+    if not bool(torch.isfinite(scales).all()) or bool((scales <= 0).any()):
+        raise ValueError("grid-scaled FP8 scales must be finite and positive")
+    if bool(((codes & 0x7F) == 0x7F).any()):
+        raise ValueError("grid-scaled FP8 codes must be finite E4M3FN words")
+    payload = bytearray(geometry.payload_bytes)
+    payload[: geometry.code_plane_bytes] = codes.numpy().tobytes()
+    begin = geometry.scale_plane_offset
+    payload[begin : begin + geometry.scale_plane_bytes] = scales.contiguous().numpy().tobytes()
+    return bytes(payload)
+
+
+def decode_fp8_grid_words(payload: Payload, shape: Sequence[int],
+                          format: str = "FP8_E4M3FN_1X128_F32S") -> tuple[torch.Tensor, torch.Tensor]:
+    geometry = fp8_grid_geometry(format, shape)
+    if _payload_length(payload) != geometry.payload_bytes:
+        raise ValueError(f"grid-scaled FP8 payload has {_payload_length(payload)} bytes, "
+                         f"expected {geometry.payload_bytes}")
+    raw = _payload_tensor(payload, torch.device("cpu"))
+    codes = raw[: geometry.code_plane_bytes].clone().reshape(geometry.n, geometry.k)
+    begin = geometry.scale_plane_offset
+    scales = raw[begin : begin + geometry.scale_plane_bytes].clone().view(torch.float32).reshape(
+        geometry.grid_rows, geometry.grid_columns)
+    return codes, scales
+
+
+def dequantize_fp8_grid(payload: Payload, shape: Sequence[int],
+                        format: str = "FP8_E4M3FN_1X128_F32S") -> torch.Tensor:
+    """FP32 values ``e4m3(code) * scale[cell]`` of a grid-scaled FP8 matrix."""
+
+    geometry = fp8_grid_geometry(format, shape)
+    codes, scales = decode_fp8_grid_words(payload, shape, format)
+    full = scales.repeat_interleave(geometry.cell_rows, 0)[: geometry.n].repeat_interleave(
+        geometry.cell_columns, 1)
+    return codes.view(torch.float8_e4m3fn).to(torch.float32) * full
+
+
 def encode_fp8_row_f32(
     code_words: torch.Tensor, row_scales: torch.Tensor, shape: Sequence[int]
 ) -> bytes:
@@ -413,6 +593,10 @@ def encoded_size(
         return block_scale128_geometry(numeric_spec, shape).payload_bytes
     if layout_spec is ROW_SCALE_F32_V1:
         return row_scale_f32_geometry(numeric_spec, shape).payload_bytes
+    if layout_spec is MXFP8_K32_V1:
+        return mxfp8_geometry(numeric_spec, shape).payload_bytes
+    if layout_spec is FP8_1X128_F32_V1:
+        return fp8_grid_geometry(numeric_spec, shape).payload_bytes
     if layout_spec is GGML_BLOCKS_V1:
         if not isinstance(numeric_spec, GgmlBlockFormat):
             raise ValueError("ggml-blocks-v1 requires a GGML block format")
@@ -1223,6 +1407,19 @@ __all__ = [
     "ROW_SCALE_F32_V1",
     "row_scale_f32_geometry",
     "encode_fp8_row_f32",
+    "MXFP8_K32_V1",
+    "Mxfp8Geometry",
+    "mxfp8_geometry",
+    "encode_mxfp8",
+    "decode_mxfp8_words",
+    "dequantize_mxfp8_words",
+    "dequantize_mxfp8",
+    "FP8_1X128_F32_V1",
+    "Fp8GridGeometry",
+    "fp8_grid_geometry",
+    "encode_fp8_grid",
+    "decode_fp8_grid_words",
+    "dequantize_fp8_grid",
     "RowPlanes",
     "RowScaleGeometry",
     "RowSplitGeometry",

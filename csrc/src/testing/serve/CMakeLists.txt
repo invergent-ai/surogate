@@ -174,6 +174,13 @@ sinfer_add_test(sinfer_artifact_reader_test
 sinfer_add_test(sinfer_artifact_materialization_test
   SOURCES test_artifact_materialization.cpp
   LIBRARIES sinfer_artifact)
+# Inkling-2 (lane b): the MXFP8 / FP8 1x128 formats; with INKLING2_ARTIFACT, the converted artifact.
+sinfer_add_test(sinfer_inkling2_artifact_formats_test
+  SOURCES test_inkling2_artifact_formats.cpp
+  LIBRARIES sinfer_artifact)
+sinfer_add_test(sinfer_inkling2_bindings_test
+  SOURCES test_inkling2_bindings.cpp ${SERVE_ROOT}/targets/inkling2/impl/load/bindings.cpp
+  LIBRARIES sinfer_artifact)
 # surogate vendor patch (csrc/src/serve/PATCHES.md): the media-decode test
 # exercises real FFmpeg decoding and cannot pass against the stub.
 if(SINFER_ENABLE_FFMPEG)
