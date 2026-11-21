@@ -405,8 +405,9 @@ markov_gate_kernel(const float* ctx, int j, int k, const bf16* bias, const bf16*
 
 __global__ void __launch_bounds__(kThreads)
 markov_vocab_kernel(const bf16* base, std::int64_t base_rows, int row, int batch, const bf16* fold_w,
-                    const bf16* fold_b, const bf16* latent, int domain, const std::int32_t* ids, float* part_val,
-                    std::int32_t* part_id, bf16* bias_out, bf16* logits_out) {
+                    const std::uint8_t* fold_codes, const float* fold_scales, const bf16* fold_b, const bf16* latent,
+                    int domain, const std::int32_t* ids, float* part_val, std::int32_t* part_id, bf16* bias_out,
+                    bf16* logits_out) {
     __shared__ float lat_s[kMaxLanes][G::kRank];
     __shared__ float wv_s[kThreads / 32][kMaxLanes];
     __shared__ int wi_s[kThreads / 32][kMaxLanes];
@@ -427,15 +428,28 @@ markov_vocab_kernel(const bf16* base, std::int64_t base_rows, int row, int batch
     for (int rr = 0; rr < 32; ++rr) {
         const int v = v0 + rr;
         if (v >= domain) { break; }
-        const uint4 packed = reinterpret_cast<const uint4*>(fold_w + static_cast<std::int64_t>(v) * G::kRank)[lane];
-        const bf16* w8     = reinterpret_cast<const bf16*>(&packed);
+        float wf[8];
+        float row_scale = 1.0F;
+        if (fold_codes != nullptr) { // FP8 fold: 8 e4m3 codes per lane, the row scale after the sum
+            const uint2 packed = reinterpret_cast<const uint2*>(fold_codes + static_cast<std::int64_t>(v) * G::kRank)[lane];
+            const __nv_fp8_e4m3* q8 = reinterpret_cast<const __nv_fp8_e4m3*>(&packed);
+#pragma unroll
+            for (int e = 0; e < 8; ++e) { wf[e] = static_cast<float>(q8[e]); }
+            row_scale = fold_scales[v];
+        } else {
+            const uint4 packed = reinterpret_cast<const uint4*>(fold_w + static_cast<std::int64_t>(v) * G::kRank)[lane];
+            const bf16* w8     = reinterpret_cast<const bf16*>(&packed);
+#pragma unroll
+            for (int e = 0; e < 8; ++e) { wf[e] = f(w8[e]); }
+        }
         const float fb     = f(fold_b[v]);
         for (int b = 0; b < batch; ++b) {
             float p = 0.0F;
 #pragma unroll
-            for (int e = 0; e < 8; ++e) { p = fmaf(f(w8[e]), lat_s[b][lane * 8 + e], p); }
+            for (int e = 0; e < 8; ++e) { p = fmaf(wf[e], lat_s[b][lane * 8 + e], p); }
 #pragma unroll
             for (int off = 16; off > 0; off >>= 1) { p = __fadd_rn(p, __shfl_xor_sync(0xffffffffU, p, off)); }
+            if (fold_codes != nullptr) { p = __fmul_rn(p, row_scale); }
             const float bias  = rbf(__fadd_rn(p, fb));
             const float s     = rbf(__fadd_rn(f(base[(static_cast<std::int64_t>(row) + G::kBlock * b) * base_rows + v]),
                                               bias));
@@ -784,16 +798,18 @@ void dspark_markov_gate(const float* ctx, std::int32_t j, std::int32_t k, std::i
 void dspark_markov_vocab(const void* base, std::int32_t base_rows, std::int32_t row, std::int32_t batch,
                          const void* fold_w, const void* fold_b, const void* latent, std::int32_t domain,
                          const std::int32_t* ids, float* part_val, std::int32_t* part_id, void* bias_out,
-                         void* logits_out, cudaStream_t stream) {
+                         void* logits_out, cudaStream_t stream, const void* fold_codes, const float* fold_scales) {
     constexpr const char* op = "dspark_markov_vocab";
-    require(base != nullptr && fold_w != nullptr && fold_b != nullptr && latent != nullptr && part_val != nullptr &&
+    require((fold_codes == nullptr) == (fold_scales == nullptr), op, "FP8 fold needs codes and scales");
+    require(base != nullptr && (fold_w != nullptr || fold_codes != nullptr) && fold_b != nullptr && latent != nullptr && part_val != nullptr &&
                 part_id != nullptr,
             op, "null pointer");
     require(batch > 0 && batch <= kMaxLanes && domain > 0 && base_rows >= domain && row >= 1 && row < G::kBlock, op,
             "bad shape (batch <= 16)");
     markov_vocab_kernel<<<static_cast<unsigned>(dspark_vocab_tiles(domain)), kThreads, 0, stream>>>(
         static_cast<const bf16*>(base), base_rows, row, batch, static_cast<const bf16*>(fold_w),
-        static_cast<const bf16*>(fold_b), static_cast<const bf16*>(latent), domain, ids, part_val, part_id,
+        static_cast<const std::uint8_t*>(fold_codes), fold_scales, static_cast<const bf16*>(fold_b),
+        static_cast<const bf16*>(latent), domain, ids, part_val, part_id,
         static_cast<bf16*>(bias_out), static_cast<bf16*>(logits_out));
     CUDA_CHECK(cudaGetLastError());
 }

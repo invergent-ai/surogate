@@ -127,7 +127,15 @@ void dense(WorkspaceArena& work, const DSparkDerived& d, const Weight& w, const 
 
 } // namespace
 
-void derive_dspark(const load::InklingWeights& w, DSparkDerived& out, bool fp8_weights) {
+bool dspark_fp8_fold_requested() {
+    static const bool requested = [] {
+        const char* raw = std::getenv("SUROGATE_SERVE_DSPARK_FP8_FOLD");
+        return raw != nullptr && raw[0] == '1';
+    }();
+    return requested;
+}
+
+void derive_dspark(const load::InklingWeights& w, DSparkDerived& out, bool fp8_weights, bool fp8_fold) {
     if (!w.has_draft) { throw std::logic_error("inkling2 DSpark: the artifact's drafter is not bound"); }
     const load::InklingDraftWeights& d = w.draft;
     if (d.layers.size() != static_cast<std::size_t>(G::kLayers)) {
@@ -139,7 +147,8 @@ void derive_dspark(const load::InklingWeights& w, DSparkDerived& out, bool fp8_w
     const std::size_t o_sp    = align256(o_norms + D * 4 * 2);
     const std::size_t o_hf    = align256(o_sp + G::kRnnRows * G::kRnnStateCols * 2);
     const std::size_t o_fw    = align256(o_hf + G::kRnnRows * G::kRnnContextCols * 2);
-    const std::size_t o_fb    = align256(o_fw + V * R * 2);
+    // the BF16 fold stays resident only without the FP8 fold (else it is a load-time temporary)
+    const std::size_t o_fb    = align256(o_fw + (fp8_fold ? 0 : V * R * 2));
     const std::size_t o_freq  = align256(o_fb + V * 2);
     const std::size_t total   = align256(o_freq + 64 * sizeof(float));
     out.storage = DeviceBuffer(total);
@@ -176,9 +185,11 @@ void derive_dspark(const load::InklingWeights& w, DSparkDerived& out, bool fp8_w
     CUDA_CHECK(cudaMemcpy2D(base + o_hf, G::kRnnContextCols * 2, rnn + G::kRnnStateCols * 2, pitch,
                             G::kRnnContextCols * 2, G::kRnnRows, cudaMemcpyDeviceToDevice));
     // the fold (fp64 on the device)
+    DeviceBuffer fold_temp(fp8_fold ? static_cast<std::size_t>(V * R * 2) : 0);
+    std::byte* fold_dst = fp8_fold ? static_cast<std::byte*>(fold_temp.p) : base + o_fw;
     ops::dspark_fold(bf16_weight(w.globals.output_head, G::kVocabPadded, G::kHidden, "unembed"), G::kVocabPadded,
                      nullptr, bf16_weight(d.markov_hidden_out, G::kHidden, G::kRank, "mtp/markov/hidden_out"),
-                     bf16_tensor(d.markov_hidden_out_bias, D, "mtp/markov/hidden_out_bias"), base + o_fw, base + o_fb,
+                     bf16_tensor(d.markov_hidden_out_bias, D, "mtp/markov/hidden_out_bias"), fold_dst, base + o_fb,
                      nullptr);
     // RoPE
     float inv_freq[64];
@@ -190,7 +201,19 @@ void derive_dspark(const load::InklingWeights& w, DSparkDerived& out, bool fp8_w
     out.mix_norms = base + o_norms;
     out.w_sp      = base + o_sp;
     out.w_hf      = base + o_hf;
-    out.fold_w    = base + o_fw;
+    out.fold_w    = fp8_fold ? nullptr : base + o_fw;
+    if (fp8_fold) {
+        // the FP8 fold: per-row e4m3 of the BF16 fold (the fp64 product rounded once, then quantised as the M1 lever)
+        out.fold_storage = DeviceBuffer(align256(static_cast<std::size_t>(V) * R) + align256(static_cast<std::size_t>(V) * 4));
+        auto* fs         = static_cast<std::byte*>(out.fold_storage.p);
+        out.fold_codes   = reinterpret_cast<const std::uint8_t*>(fs);
+        out.fold_scales  = reinterpret_cast<const float*>(fs + align256(static_cast<std::size_t>(V) * R));
+        ops::dspark_quantize_rows_e4m3(fold_dst, static_cast<std::int32_t>(V), static_cast<std::int32_t>(R),
+                                       const_cast<std::uint8_t*>(out.fold_codes), const_cast<float*>(out.fold_scales),
+                                       nullptr);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        out.fp8_fold = true;
+    }
     out.fold_b    = base + o_fb;
     out.inv_freq  = reinterpret_cast<const float*>(base + o_freq);
     if (fp8_weights) {
@@ -433,8 +456,9 @@ void dspark_propose(const load::InklingWeights& w, const DSparkDerived& d, const
         const std::int32_t* prev = j == 0 ? p.anchors : p.drafts + (j - 1);
         ops::dspark_markov_gate(ctx, j, K, B, rnn_bias, d.w_sp, w1, prev, j == 0 ? 1 : stride,
                                 j == 0 ? nullptr : state[(j + 1) & 1], state[j & 1], latent, s);
-        ops::dspark_markov_vocab(base, G::kVocabPadded, 1 + j, B, d.fold_w, d.fold_b, latent, G::kVocab, nullptr, part_v,
-                                 part_i, nullptr, nullptr, s);
+        ops::dspark_markov_vocab(base, G::kVocabPadded, 1 + j, B, d.fp8_fold ? nullptr : d.fold_w, d.fold_b, latent,
+                                 G::kVocab, nullptr, part_v, part_i, nullptr, nullptr, s,
+                                 d.fp8_fold ? d.fold_codes : nullptr, d.fp8_fold ? d.fold_scales : nullptr);
         ops::dspark_markov_pick(part_v, part_i, tiles, B, j, stride, p.drafts, s);
     }
 }

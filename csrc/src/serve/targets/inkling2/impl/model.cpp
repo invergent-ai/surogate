@@ -139,7 +139,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     model.queries = &queries;
     if (weights.has_draft) {
         // DSpark (lane e2): the fold and the drafter's derived weights; the runtime's DFlash guards need a payload.
-        derive_dspark(weights, dspark, plan.plan.options.draft_linears_host);
+        derive_dspark(weights, dspark, plan.plan.options.draft_linears_host, dspark_fp8_fold_requested());
         model.dspark = &dspark;
     }
 
