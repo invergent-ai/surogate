@@ -37,6 +37,9 @@ static_assert(kSamplerGreedyChunkItems % (kSamplerBlock * kSamplerItemsPerThread
 // (measured at 15% of device time when the ceiling moved to 64 and this
 // stayed at 32). Never hardcode it again.
 inline constexpr int kSamplerMaxColumns          = kMaximumBatchColumns;
+// Tokens one CTA of the split full-vocabulary draw scans (sampling_full_vocab_partial_kernel):
+// 50 chunks a 201k row, 16 tokens a thread.
+inline constexpr int kSamplerFullVocabChunkItems = 4096;
 
 static_assert(kSamplerPartialsPerGroup * kSamplerCandidateCap <= kSamplerGroupTileItems,
               "group merge tile must hold one group's candidates");
@@ -65,6 +68,7 @@ struct SamplingWorkspace {
     std::int32_t partial_stride              = 0;
     unsigned long long* sort_keys_a = nullptr;
     unsigned long long* sort_keys_b = nullptr;
+    float2* full_vocab_partials     = nullptr; // [columns][chunks] (z or max, id bits); null: one-CTA route
 };
 
 struct SamplingWorkspaceLayout {
@@ -76,6 +80,7 @@ struct SamplingWorkspaceLayout {
     TensorRegion dist_support;
     TensorRegion group_done;
     TensorRegion speculative_finalize_count;
+    TensorRegion full_vocab_partials;
     std::size_t bytes           = 0;
     std::int32_t partial_stride = 0;
     bool multiblock             = false;
@@ -91,6 +96,7 @@ struct SamplingWorkspaceLayout {
             partial_stride,
             sort_keys_a.region.bytes ? static_cast<unsigned long long*>(sort_keys_a.bind(backing).data) : nullptr,
             sort_keys_b.region.bytes ? static_cast<unsigned long long*>(sort_keys_b.bind(backing).data) : nullptr,
+            full_vocab_partials.region.bytes ? static_cast<float2*>(full_vocab_partials.bind(backing).data) : nullptr,
         };
     }
 };
@@ -110,6 +116,9 @@ inline SamplingWorkspaceLayout make_sampling_workspace_layout(std::int32_t token
     if (token_domain > kSamplerSortTile) {
         out.sort_keys_a = layout.add_tensor(DType::I64, {token_domain, columns}, 256, "sampling sort keys A");
         out.sort_keys_b = layout.add_tensor(DType::I64, {token_domain, columns}, 256, "sampling sort keys B");
+        out.full_vocab_partials = layout.add_tensor(
+            DType::I64, {div_up(token_domain, kSamplerFullVocabChunkItems), columns}, 256,
+            "sampling full-vocabulary chunk partials");
     }
     if (out.multiblock) {
         out.partial_keys =

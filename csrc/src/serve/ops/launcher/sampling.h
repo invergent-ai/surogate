@@ -22,4 +22,9 @@ void sample_batch_launch(const Tensor& logits, Tensor& out, std::int32_t token_d
 [[nodiscard]] std::size_t sampling_workspace_exact_bytes(std::int32_t token_domain,
                                                          std::int32_t columns);
 
+/// The untruncated full-vocabulary draw in chunks (sampling_full_vocab_partial_kernel + finalize; true, the default)
+/// or one CTA per row (sampling_full_vocab_kernel). Same tokens. Read once from SUROGATE_SAMPLING_FULL_VOCAB_SPLIT;
+/// tests and benches edit it.
+[[nodiscard]] bool& sampling_full_vocab_split();
+
 } // namespace sinfer::ops::detail
