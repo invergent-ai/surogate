@@ -1245,8 +1245,13 @@ template <bool Local, int Mode>
 __global__ __launch_bounds__(128) void fold_kernel(const AttnParams p) {
     extern __shared__ float fold_smem[]; // [4][max_slots]: m, l, a, c
     __shared__ float seg_max[128];
-    pdl::wait_for_dependencies();
-    if (p.pdl_trigger != 0) { pdl::trigger_dependents(); } // as in rel_attention_kernel
+    // Static metadata (InklingAttentionRows::metadata_static: positions / valid columns complete before the step's first
+    // kernel): the row's slot count is read before the wait, so only the partials' loads follow it.
+    const bool early_meta = p.metadata_static != 0;
+    if (!early_meta) {
+        pdl::wait_for_dependencies();
+        if (p.pdl_trigger != 0) { pdl::trigger_dependents(); } // as in rel_attention_kernel
+    }
     const std::int64_t n         = blockIdx.x;
     const int h                  = static_cast<int>(blockIdx.y);
     const int d                  = static_cast<int>(threadIdx.x);
@@ -1266,6 +1271,10 @@ __global__ __launch_bounds__(128) void fold_kernel(const AttnParams p) {
         const int ns       = group_of(gs, pos) - g0 + 1;
         poison             = ns > p.max_slots;
         count              = poison ? 0 : ns;
+    }
+    if (early_meta) {
+        pdl::wait_for_dependencies();
+        if (p.pdl_trigger != 0) { pdl::trigger_dependents(); }
     }
     const std::int64_t stride = n_columns * Geo::kQHeads;
     const float2* ml          = p.part_ml + n * Geo::kQHeads + h;
