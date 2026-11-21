@@ -1117,8 +1117,14 @@ void PagedKVAllocation::window_prepare(std::uint32_t first, std::uint32_t end,
     if (!window_.active()) { return; }
     if (!valid()) { throw std::logic_error("Cannot prepare window pages of an empty Paged KV allocation"); }
     const std::uint32_t limit = pool_->logical_page_capacity() * static_cast<std::uint32_t>(kPagedKVPageSize);
-    const KvWindowChange change =
-        window_.prepare(first, std::min(end, limit), pool_->window_forward_tokens(), pins, *pool_);
+    KvWindowChange change;
+    try {
+        change = window_.prepare(first, std::min(end, limit), pool_->window_forward_tokens(), pins, *pool_);
+    } catch (...) {
+        // prepare may have given pages back before a take failed: the table must not keep them.
+        publish_window_row(stream);
+        throw;
+    }
     if (window_trace()) {
         std::fprintf(stderr, "kv-window: %p row %d prepare first %u end %u released %zu mapped %zu live %u\n",
                      static_cast<void*>(this), bound_row_, first, end, change.released.size(),
@@ -1166,7 +1172,9 @@ void PagedKVAllocation::window_capture_fill(cudaStream_t stream) {
     if (bound_row_ < 0) { throw std::logic_error("Paged KV allocation is not bound"); }
     if (window_.page_count() == 0) {
         const std::uint32_t first = 0;
-        (void)window_.map_restored(std::span<const std::uint32_t>(&first, 1), *pool_);
+        const KvWindowChange change = window_.map_restored(std::span<const std::uint32_t>(&first, 1), *pool_);
+        // Representative graph runs read it: finite bytes, as the full planes' capture pages get.
+        pool_->zero_window_page(change.mapped.front().physical, stream);
     }
     // Capture profiles exercise arbitrary context envelopes: every logical page of the row reads
     // and writes the row's one private window page, never the sentinel.

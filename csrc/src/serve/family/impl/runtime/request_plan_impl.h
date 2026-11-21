@@ -542,13 +542,6 @@ RequestPlan ProgramImplCore::plan_request_for_sequence(std::uint32_t lane,
         }
     }
 
-    // Window-bounded KV: whatever path was chosen must find its window there (a checkpoint whose
-    // window was not kept, a saved state's inner prefix): otherwise start over.
-    if (plan->reuse != ReusePath::FullReset && !window_reusable(sequence, plan->reuse_base, archived)) {
-        plan->reuse      = ReusePath::FullReset;
-        plan->reuse_base = 0;
-    }
-
     // A fork's borrowed pages are shared and read-only: a reuse that would rewind into them
     // starts over instead. The suffix's first write lands at `reuse_base`, so its page must be
     // owned (rounding up let a rewind into the last borrowed page through); an MTP bridge
@@ -601,6 +594,13 @@ RequestPlan ProgramImplCore::plan_request_for_sequence(std::uint32_t lane,
          (plan->reuse == ReusePath::AppendAtFrontier && !sequence.tail_hidden_valid &&
           plan->reusable_scores == plan->reuse_base))) {
         plan->reuse = ReusePath::FullReset;
+        plan->reuse_base = 0;
+    }
+
+    // Window-bounded KV: whatever path was chosen must find its window there (a checkpoint whose
+    // window was not kept, a saved state's inner prefix, the prompt-logprobs step back): otherwise start over.
+    if (plan->reuse != ReusePath::FullReset && !window_reusable(sequence, plan->reuse_base, archived)) {
+        plan->reuse      = ReusePath::FullReset;
         plan->reuse_base = 0;
     }
 

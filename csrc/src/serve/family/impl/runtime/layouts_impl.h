@@ -296,9 +296,20 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
             const char* raw = std::getenv("SUROGATE_SERVE_KV_WINDOW_IMAGES");
             return raw ? static_cast<std::uint32_t>(std::strtoul(raw, nullptr, 10)) : 8U;
         }();
+        // A pipeline stage holds one round per micro-batch group in flight (PipelineProgram:
+        // one group per stage unless SUROGATE_SERVE_PIPELINE_GROUPS says otherwise); 4 covers
+        // the 2- and 4-card splits, the env value any other.
+        const bool stage = !(plan.pipeline_stage_first == 0 && plan.pipeline_stage_last == 0) &&
+                           (plan.pipeline_stage_first > 0 || plan.pipeline_stage_last < plan.geometry.layers);
+        std::uint32_t rounds = 1;
+        if (stage) {
+            const char* raw = std::getenv("SUROGATE_SERVE_PIPELINE_GROUPS");
+            const long groups = raw != nullptr && *raw != '\0' ? std::strtol(raw, nullptr, 10) : 0;
+            rounds = std::min(plan.max_concurrency, groups >= 1 ? static_cast<std::uint32_t>(groups) : 4U);
+        }
         window_class = plan_kv_window_class(window_tokens, plan.max_concurrency,
                                             static_cast<std::uint32_t>(effective_prefill_chunk),
-                                            image_windows);
+                                            image_windows, rounds);
     }
     LayoutBuilder builder;
     PersistentLayout out;
@@ -537,7 +548,12 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     // cap in whole granules, though, up to one granule past the cap's pages, so that last
     // granule is charged too: one granule less a page, a constant that keeps the curve affine.
     if (out.decoder.text_kv.pool.spec.elastic) {
-        const std::size_t per_page = out.decoder.text_kv.payload_bytes() / physical_pages;
+        // The full-context planes only: window-class planes sit in the arena (a constant).
+        std::size_t full_plane_bytes = 0;
+        for (const auto& plane : out.decoder.text_kv.pool.planes) {
+            if (plane.spec.window == 0) { full_plane_bytes += plane.storage.region.bytes; }
+        }
+        const std::size_t per_page = full_plane_bytes / physical_pages;
         const std::uint32_t granule = std::max(out.decoder.text_kv.pool.elastic_granule_pages, 1U);
         out.elastic_plane_bytes =
             per_page * (static_cast<std::size_t>(plan.main_page_groups) + granule - 1U);

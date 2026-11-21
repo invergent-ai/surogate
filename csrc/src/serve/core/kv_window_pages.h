@@ -227,7 +227,8 @@ struct KvWindowClassSize {
 
 [[nodiscard]] inline KvWindowClassSize plan_kv_window_class(std::uint32_t window_tokens, std::uint32_t rows,
                                                             std::uint32_t prefill_chunk,
-                                                            std::uint32_t image_windows) noexcept {
+                                                            std::uint32_t image_windows,
+                                                            std::uint32_t rounds_in_flight = 1) noexcept {
     KvWindowClassSize out;
     if (window_tokens == 0 || rows == 0) { return out; }
     const std::uint32_t window_pages = KvWindowPages::pages_for(window_tokens) + 1U; // unaligned
@@ -236,7 +237,9 @@ struct KvWindowClassSize {
     out.forward_tokens = prefill_chunk + 128U + 64U;
     const std::uint32_t round_pages =
         KvWindowPages::pages_for(std::uint64_t{prefill_chunk} + 128U) + 2U * std::min(rows, 64U);
-    out.lane_pages  = rows * (2U * window_pages + 1U) + round_pages;
+    // A pipeline stage can hold one round per micro-batch group in flight, each with its own
+    // prefill budget mapped until the round is consumed.
+    out.lane_pages  = rows * (2U * window_pages + 1U) + std::max(rounds_in_flight, 1U) * round_pages;
     out.image_pages = image_windows * window_pages;
     return out;
 }

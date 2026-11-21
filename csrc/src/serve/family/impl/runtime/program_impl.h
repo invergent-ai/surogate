@@ -3072,8 +3072,9 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                     ? std::optional<std::uint32_t>(staged.rewrite_checkpoint_capture->frontier)
                     : std::nullopt;
             // Window-bounded KV maps each chunk's window pages as the chunk runs (admission mapped
-            // only the full-context planes of the whole prompt); the graph path did it above.
-            if (!staged.use_graph && window_paging()) {
+            // only the full-context planes of the whole prompt). On the graph path too: near capacity
+            // the graph window above maps nothing and the eager body runs (prepare is idempotent).
+            if (window_paging()) {
                 materialize_sequence_kv(sequence, staged.cursor + nominal, 0);
             }
             if (staged.vision) {
