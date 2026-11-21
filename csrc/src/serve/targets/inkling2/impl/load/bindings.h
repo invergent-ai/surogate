@@ -113,7 +113,15 @@ struct LayerPlan {
     artifact::ObjectHandle loop_down, loop_gain_forget;     ///< core: BF16 [4, 64, 2D], [4, 2D, 64]
 };
 
+/// Where each group of globals is placed (resolved from BindOptions at bind time).
+struct GlobalsPlacement {
+    artifact::TensorPlacement embedding     = artifact::TensorPlacement::Device; ///< embedding + embedding_norm
+    artifact::TensorPlacement head          = artifact::TensorPlacement::Device; ///< output_head + final_norm
+    artifact::TensorPlacement small_globals = artifact::TensorPlacement::Device; ///< the AttnRes / cross-pass queries
+};
+
 struct GlobalsPlan {
+    GlobalsPlacement placement;
     artifact::LinearBinding embedding;                      ///< BF16 [vocab_padded, D]
     artifact::ObjectHandle embedding_norm, final_norm;      ///< BF16 [D]
     artifact::LinearBinding output_head;                    ///< BF16 [vocab_padded, D]
@@ -132,6 +140,7 @@ struct DraftLayerPlan {
 };
 
 struct DraftPlan {
+    artifact::TensorPlacement placement = artifact::TensorPlacement::ValidateOnly; ///< resolved at bind
     artifact::ObjectHandle fuse_weight;                     ///< BF16 [layers + 1, features]
     artifact::ObjectHandle mask_embed, final_norm;          ///< BF16 [D]
     std::vector<DraftLayerPlan> layers;
@@ -152,6 +161,18 @@ struct BindOptions {
     std::function<artifact::TensorPlacement(std::int32_t layer)> layer_placement;
     /// Placement of the embedding / norms / head / queries. Unset: the placement in force.
     std::optional<artifact::TensorPlacement> globals_placement;
+    /// A pipeline stage's share of the globals (the 2-card path, lanes/e1/DESIGN-2card.md); each unset one takes
+    /// `globals_placement`, so a 1-card engine places exactly what it placed before.
+    ///  embedding:     `text/embedding` + `text/embedding_norm` -- the stage that embeds (the first). A DSpark
+    ///                 drafter reads the anchor's normalized embedding too: its stage needs the rows (or this group).
+    ///  head:          `text/output_head` + `text/final_norm` -- the stage that runs the head (the last).
+    ///  small_globals: the RAW AttnRes attn / mlp / output queries and the cross-pass (kv) queries (~1 MB in all):
+    ///                 every stage by default (each stage's visits, its derived message queries and any cut use them).
+    std::optional<artifact::TensorPlacement> embedding_placement;
+    std::optional<artifact::TensorPlacement> head_placement;
+    std::optional<artifact::TensorPlacement> small_globals_placement;
+    /// The DSpark drafter's objects (`mtp/*`) when `draft` is set. Unset: `head_placement` (it reads the LM head).
+    std::optional<artifact::TensorPlacement> draft_placement;
 };
 
 struct BindingPlan {
@@ -210,6 +231,8 @@ struct InklingLayerWeights {
 };
 
 struct InklingGlobals {
+    /// Which groups this stage holds (BindOptions *_placement): a group on another stage is left empty.
+    bool has_embedding = false, has_head = false, has_small_globals = false;
     Weight embedding, output_head;
     Tensor embedding_norm, final_norm;
     std::vector<Tensor> attn_query;    ///< FP32 ne {D, 1|3}, RAW; index = layer ([0] empty)

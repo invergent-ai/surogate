@@ -4,6 +4,10 @@
 // When the artifact carries the FP8 per-channel attention (the production candidate `*.attn-fp8pc.sinfer`), also for
 // that choice: the FP8 objects go to the device, the BF16 attention is validated only, and the planned device bytes
 // differ from the oracle plan by exactly the attention objects' sizes. A scheme the artifact lacks is refused.
+// The 1-card oracle plan places every tensor but the FP8 variants (19,525,154,400 device bytes, the figure of the code
+// before the per-stage globals split); the 2-stage plan of lanes/e1/DESIGN-2card.md (cut at visit 30) holds the
+// embedding on stage 0 only, the head + final norm and the drafter on stage 1 only, the small globals on both, and
+// each physical layer on the stages that run one of its visits.
 // Needs INKLING2_ARTIFACT (skips otherwise). No device is touched: placements are planned, never materialised.
 
 #include "artifact/binder.h"
@@ -11,7 +15,10 @@
 #include "targets/inkling2/impl/load/bindings.h"
 
 #include <algorithm>
+#include <array>
+#include <cstdint>
 #include <cstdlib>
+#include <set>
 #include <iostream>
 #include <variant>
 #include <stdexcept>
@@ -50,6 +57,105 @@ std::uint64_t stored_bytes(const Reader& reader, const std::string& name) {
     const auto* tensor = std::get_if<TensorDescriptor>(reader.find(name));
     if (tensor == nullptr) { throw std::runtime_error("FAIL: no object " + name); }
     return tensor->bytes;
+}
+
+/// The names a finished plan puts on the device, and their stored bytes.
+struct Placed {
+    std::set<std::string> device;
+    std::uint64_t bytes = 0;
+};
+
+Placed place(const Reader& reader, const load::BindOptions& options) {
+    Binder binder(reader);
+    (void)load::bind_artifact(binder, options);
+    const MaterializationPlan plan = binder.finish();
+    Placed out;
+    for (const auto& object : plan.device_objects) {
+        out.device.insert(std::string(sinfer::artifact::object_name(reader.objects()[object.object.index])));
+        out.bytes += object.bytes;
+    }
+    return out;
+}
+
+bool starts(const std::string& name, const std::string& prefix) { return name.rfind(prefix, 0) == 0; }
+
+/// -1 for a global object, else its physical layer ("text/layers/<L>/...").
+int layer_of(const std::string& name) {
+    if (!starts(name, "text/layers/")) { return -1; }
+    return std::stoi(name.substr(12, name.find('/', 12) - 12));
+}
+
+bool small_global(const std::string& name) {
+    return starts(name, "text/attn_res/") || starts(name, "text/loop/");
+}
+
+void test_one_card_and_two_stages(const Reader& reader, const load::ArtifactConfig& c) {
+    // 1 card, oracle attention, drafter on: every tensor except the FP8 variants, as before the split.
+    load::BindOptions one;
+    one.draft = true;
+    const Placed card = place(reader, one);
+    std::uint64_t expected = 0;
+    std::size_t tensors    = 0;
+    for (const auto& object : reader.objects()) {
+        const auto* t = std::get_if<TensorDescriptor>(&object);
+        if (t == nullptr || t->name.find("/attn/fp8-") != std::string::npos) { continue; }
+        require(card.device.count(t->name) == 1, "1-card plan places " + t->name);
+        expected += t->bytes;
+        ++tensors;
+    }
+    require(card.device.size() == tensors && card.bytes == expected, "1-card plan = every non-FP8 tensor");
+    require(card.bytes == 19525154400ULL, "1-card device bytes unchanged by the split (19,525,154,400)");
+
+    // 2 stages, cut at visit 30 (e1's Package::pipeline_stage_bounds): stage s keeps the layers its visits use.
+    const std::int32_t cut = 30;
+    std::array<std::set<int>, 2> resident;
+    for (std::int32_t v = 0; v < static_cast<std::int32_t>(c.visits.size()); ++v) {
+        resident[v < cut ? 0 : 1].insert(c.visits[v][0]);
+    }
+    std::array<Placed, 2> stage;
+    for (int s = 0; s < 2; ++s) {
+        load::BindOptions o;
+        o.draft             = s == 1;
+        const auto keep     = resident[s];
+        o.layer_placement   = [keep](std::int32_t layer) {
+            return keep.count(layer) ? TensorPlacement::Device : TensorPlacement::ValidateOnly;
+        };
+        o.globals_placement       = TensorPlacement::Device;
+        o.embedding_placement     = s == 0 ? TensorPlacement::Device : TensorPlacement::ValidateOnly;
+        o.head_placement          = s == 1 ? TensorPlacement::Device : TensorPlacement::ValidateOnly;
+        o.small_globals_placement = TensorPlacement::Device;
+        stage[s] = place(reader, o);
+    }
+    std::uint64_t duplicated = 0;
+    for (const std::string& name : card.device) {
+        const int layer = layer_of(name);
+        const bool on0 = stage[0].device.count(name) == 1, on1 = stage[1].device.count(name) == 1;
+        bool want0 = false, want1 = false;
+        if (layer >= 0) {
+            want0 = resident[0].count(layer) == 1;
+            want1 = resident[1].count(layer) == 1;
+        } else if (name == "text/embedding" || name == "text/embedding_norm") {
+            want0 = true;
+        } else if (name == "text/output_head" || name == "text/final_norm" || starts(name, "mtp/")) {
+            want1 = true;
+        } else if (small_global(name)) {
+            want0 = want1 = true;
+        } else {
+            require(false, "unclassified object " + name);
+        }
+        require(on0 == want0 && on1 == want1, "2-stage placement of " + name);
+        if (want0 && want1) { duplicated += stored_bytes(reader, name); }
+    }
+    for (int s = 0; s < 2; ++s) {
+        for (const std::string& name : stage[s].device) {
+            require(card.device.count(name) == 1, "stage " + std::to_string(s) + " places nothing new: " + name);
+        }
+    }
+    require(stage[0].bytes + stage[1].bytes == card.bytes + duplicated, "2-stage bytes = 1 card + duplicates");
+    const std::uint64_t tables = stored_bytes(reader, "text/embedding") + stored_bytes(reader, "text/output_head");
+    std::cout << "2 stages (cut " << cut << "): " << stage[0].bytes << " + " << stage[1].bytes
+              << " device bytes; duplicated (core layers + small globals) " << duplicated
+              << "; the two global tables (" << tables << " bytes) held once\n";
 }
 
 bool refuses(const Reader& reader, load::BindOptions options) {
@@ -92,6 +198,7 @@ int main() {
         std::uint64_t oracle_bytes = 0;
         const auto plan = bind(reader, device, true, &oracle_bytes);
         test_config(plan.config);
+        test_one_card_and_two_stages(reader, plan.config);
         require(plan.layers.size() == 24 && plan.has_draft && plan.draft.layers.size() == 3, "plan shape");
         require(plan.layers[5].k_conv_proj.has_value() && !plan.layers[4].k_conv_proj.has_value(), "conv kinds");
         require(plan.layers[0].w13.amax.has_value() && !plan.layers[20].w13.amax.has_value(), "bank kinds");
