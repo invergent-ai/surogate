@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <stdexcept>
 
 namespace sinfer::ops::detail::inkling {
 
@@ -160,6 +161,13 @@ struct GemmParams {
     /// [T][kArrivalTiles] (zeroed by the select kernel). Null = rows only.
     std::int32_t* arrivals     = nullptr;
     __nv_bfloat16* combined    = nullptr;
+    /// Down output buffer (prefill column passes): `out` holds output columns [out_column0, out_column0 +
+    /// out_stride) of every slot row, row stride out_stride elements. Default = whole rows. The launchers derive
+    /// the N-tile range (n_tile0, n_tiles) of the launch from it; the combine reads the rows back the same way.
+    std::int32_t out_stride  = kHidden;
+    std::int32_t out_column0 = 0;
+    std::int32_t n_tile0     = 0;
+    std::int32_t n_tiles     = 0; ///< 0 = every N tile
     // Adapter (table null = none).
     LoraRound lora;
     /// L2 prefetch-size hint for the weight-code loads (0 none, 128, 256): same bytes (with_l2_prefetch).
@@ -220,6 +228,15 @@ inline GemmParams wide_l2_slice(GemmParams params) {
     params.l2_slice = ((bits & kL2SliceWide) != 0 ? kL2SliceOwn | kL2SliceOwnBeforeWait : 0) | (bits & kL2SliceNextItem);
     params.next_max_tiles = 0;
     return params;
+}
+
+/// The N-tile range of a launch with `block_n`-row output tiles (from out_column0 / out_stride; whole rows = all).
+inline void set_n_tiles(GemmParams& params, int block_n) {
+    if (params.out_column0 % block_n != 0 || params.out_stride % block_n != 0) {
+        throw std::invalid_argument("inkling_moe: a down column pass must cover whole N tiles");
+    }
+    params.n_tile0 = params.out_column0 / block_n;
+    params.n_tiles = params.out_stride / block_n;
 }
 
 /// Tile schedules: Narrow for decode / verify widths, Wide for prefill. Same arithmetic.

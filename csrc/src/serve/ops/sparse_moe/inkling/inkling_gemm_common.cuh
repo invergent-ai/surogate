@@ -121,7 +121,7 @@ __device__ __forceinline__ void combine_arrive(const GemmParams& p, int rows, in
 #pragma unroll
         for (int s = 0; s < kTopK; ++s) {
             const uint4 v = __ldcg(reinterpret_cast<const uint4*>(
-                p.out + (static_cast<std::int64_t>(token) * kTopK + s) * kHidden + column));
+                p.out + (static_cast<std::int64_t>(token) * kTopK + s) * p.out_stride + (column - p.out_column0)));
             const std::uint32_t words[4] = {v.x, v.y, v.z, v.w};
 #pragma unroll
             for (int i = 0; i < 4; ++i) {

@@ -133,7 +133,7 @@ __global__ __launch_bounds__(Schedule::kThreads) void mxfp8_expert_gemm_kernel(G
     if (threadIdx.x == 0) { done_count = 0; }
     find_expert_tile<Schedule::kBlockN, !GateUp>(p.offsets, static_cast<int>(blockIdx.x), tile_info);
     const int expert = tile_info[0];
-    const int n_begin = static_cast<int>(blockIdx.y) * Schedule::kBlockM;
+    const int n_begin = (static_cast<int>(blockIdx.y) + p.n_tile0) * Schedule::kBlockM;
     const std::int64_t weight_row = static_cast<std::int64_t>(expert) * kGateUpRows + n_begin;
     // L2 slice prefetch (GemmParams::l2_slice; hints, no bit changes).
     if (expert >= 0 && (GateUp ? (p.l2_slice & kL2SliceOwn) != 0 : early)) {
@@ -268,7 +268,7 @@ __global__ __launch_bounds__(Schedule::kThreads) void mxfp8_expert_gemm_kernel(G
                         first  = __fadd_rn(first, lora_expand(down, adapter, n_first, low));
                         second = __fadd_rn(second, lora_expand(down, adapter, n_second, low));
                     }
-                    __nv_bfloat16* row = p.out + static_cast<std::int64_t>(slot) * kHidden;
+                    __nv_bfloat16* row = p.out + static_cast<std::int64_t>(slot) * p.out_stride - p.out_column0;
                     row[n_first]       = __float2bfloat16_rn(first);
                     row[n_second]      = __float2bfloat16_rn(second);
                 }
@@ -298,11 +298,13 @@ template <class Schedule, int K, bool GateUp>
 void launch_schedule(const GemmParams& params, std::int32_t slots, cudaStream_t stream) {
     const int max_tiles = std::min(kExperts, slots) + slots / Schedule::kBlockN;
     if (max_tiles == 0) { return; }
-    const dim3 grid(static_cast<unsigned>(max_tiles), kGateUpRows / Schedule::kBlockM);
+    GemmParams params_tiles = params;
+    set_n_tiles(params_tiles, Schedule::kBlockM);
+    const dim3 grid(static_cast<unsigned>(max_tiles), static_cast<unsigned>(params_tiles.n_tiles));
     // One fragment layout at every width (canonical, KWidth 2). M3 run 3 measured the alternatives against
     // the vLLM capture (layer 20): KWidth 4 = the same 27 / 4.7 M gate_up elements off (same K set per MMA),
     // 8 -> 25, 16 -> 44: none reproduces Triton's K grouping; the residual is recorded, not chased.
-    const cudaError_t status = launch_kwidth<Schedule, K, GateUp, kMxfp8KWidth>(grid, params, stream);
+    const cudaError_t status = launch_kwidth<Schedule, K, GateUp, kMxfp8KWidth>(grid, params_tiles, stream);
     if (status != cudaSuccess) {
         throw std::runtime_error(std::string("inkling_moe: mxfp8 expert gemm: ") + cudaGetErrorString(status));
     }

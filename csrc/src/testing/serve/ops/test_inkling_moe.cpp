@@ -1177,7 +1177,19 @@ int test_moe(ops::InklingExpertFormat format) {
     const DeviceRun huge = run_moe(l, huge_x, kHuge);
     width_bad += !std::equal(base.out.begin(), base.out.end(), huge.out.begin());
     width_bad += !std::equal(wide.out.begin(), wide.out.end(), huge.out.begin());
-    failures += report("width invariance T=1 / 24 / 300 / 4096 / padded 32 (bit-exact)", width_bad);
+    // The engine's prefill chunk (8,192 tokens; the down GEMM in column passes over the aliased workspace): its
+    // first 4,096 rows == the 4,096-token round, its last 64 rows == a narrow round of the same tokens.
+    constexpr int kChunk = 8192;
+    std::vector<float> chunk_x(static_cast<std::size_t>(kChunk) * H);
+    std::copy(huge_x.begin(), huge_x.end(), chunk_x.begin());
+    for (std::size_t i = huge_x.size(); i < chunk_x.size(); ++i) { chunk_x[i] = huge_rng.uniform(-2.0F, 2.0F); }
+    round_to_bf16(chunk_x);
+    const DeviceRun chunk = run_moe(l, chunk_x, kChunk);
+    width_bad += !std::equal(huge.out.begin(), huge.out.end(), chunk.out.begin());
+    const std::vector<float> chunk_tail(chunk_x.end() - static_cast<std::ptrdiff_t>(64) * H, chunk_x.end());
+    const DeviceRun tail = run_moe(l, chunk_tail, 64);
+    width_bad += !std::equal(tail.out.begin(), tail.out.end(), chunk.out.end() - static_cast<std::ptrdiff_t>(64) * H);
+    failures += report("width invariance T=1 / 24 / 300 / 4096 / 8192 / padded 32 (bit-exact)", width_bad);
 
     // Expert LoRA: zero adapter neutral; base tokens untouched; delta vs host.
     Adapter zero, adapter;
@@ -1230,6 +1242,18 @@ int test_moe(ops::InklingExpertFormat format) {
                                          lora_run.out.begin() + static_cast<std::size_t>(t) * H);
     }
     failures += report("LoRA: adapted rows width invariant (T=1 vs 24, bit-exact)", adapted_width_bad);
+    // ... and inside a prefill-width round (T = 300: the down shrink runs before the y quantisation, the down
+    // GEMM in column passes): its first 24 rows == the narrow adapter round.
+    {
+        std::vector<int> wide_slots(kWide);
+        for (int t = 0; t < kWide; ++t) { wide_slots[t] = t % 3 == 2 ? -1 : t % 2; }
+        DeviceBuffer dwide_slots = to_device(wide_slots);
+        ops::InklingMoeAdapters aw{static_cast<const ops::LoraBank*>(adapter.d_table.p),
+                                   static_cast<const std::int32_t*>(dwide_slots.p), nullptr, 16};
+        const DeviceRun lora_wide = run_moe(l, x, kWide, nullptr, &aw);
+        failures += report("LoRA: adapted rows width invariant (T=24 vs 300 prefill, bit-exact)",
+                           std::equal(lora_run.out.begin(), lora_run.out.end(), lora_wide.out.begin()) ? 0 : 1);
+    }
     failures += report("LoRA: adapted output vs host pipeline (cos >= 0.9999, rel-L2 <= 1e-2)",
                        (worst_lora_cos >= 0.9999 && worst_lora_rel <= 1e-2) ? 0 : 1);
     // The delta is the difference of two bf16-rounded outputs: an indexing check (a wrong expert / slot / port gives
