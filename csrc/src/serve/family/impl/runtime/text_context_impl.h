@@ -2071,6 +2071,12 @@ void TextContext::run_visit_round(Tensor& x, Tap& tap, std::span<const family::V
                     static_cast<Tap*>(context)->capture_layer(feature, value, stream);
                 }};
         }
+        // The prompt segments' visible keys (a segment's last position + 1; the block brings its own envelope). Lane
+        // c's attention plans its split partials from it: 0 would give a segment of <= 16 columns one partial slot.
+        for (const family::VisitSegment& seg : segments) {
+            round.max_visible_keys =
+                std::max(round.max_visible_keys, static_cast<std::uint32_t>(std::max(seg.kv_base + seg.count, 0)));
+        }
         round.work   = &work_;
         round.stream = ctx_.stream;
         family::run_visits_if<Variant>(weights_, round);
@@ -2095,7 +2101,8 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap, const Tensor* deepst
         if (ph == Phase::Prefill) {
             // One sequence: the row the entry staged in io_.text_kv_table_row, as the family's prefill
             // attention reads it, and the lane's current state slot.
-            const family::VisitSegment segment{.column = 0, .count = x.ne[1], .kv_base = 0, .kv_table_row = -1,
+            const family::VisitSegment segment{.column = 0, .count = x.ne[1],
+                                               .kv_base = static_cast<std::int32_t>(text_kv_base_), .kv_table_row = -1,
                                                .table_row = io_.text_kv_table_row,
                                                .state_slot = linear_state_current_slot_};
             run_visit_round(x, tap, std::span<const family::VisitSegment>(&segment, 1), nullptr, false,

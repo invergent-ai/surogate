@@ -19,3 +19,6 @@ set_source_files_properties(
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/naive/naive_moe.cu
   TARGET_DIRECTORY sinfer_ops
   PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:-fmad=false>")
+
+# Lane c's attention ops (an archive of their own): the target calls them.
+target_link_libraries(sinfer_engine PRIVATE sinfer_inkling_attention)

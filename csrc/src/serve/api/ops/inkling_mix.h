@@ -118,6 +118,22 @@ void inkling_blend_inputs(const InklingAttnResSources& dest_sources, const Tenso
 void inkling_blend_rms_norm(const Tensor& dest, const Tensor& message, const Tensor& gain_forget,
                             const Tensor& norm_weight, float eps, Tensor& out, cudaStream_t stream);
 
+/**
+ * The controller tail of a looped blend in ONE launch (decode / verify widths): h = bf16(the `down` split partials
+ * added in chunk order) [inkling_gemm_inv's reduce], gain / forget = the invariant GEMM of h with the stream's
+ * [4608, 64] weights [inkling_gemm_inv FP32], x = (1 - tanh f) dest + tanh(g) msg and out = bf16(x * rstd(x) * w)
+ * [inkling_blend_rms_norm] -- bit-identical to those three launches. A thread-block cluster of 8 CTAs (288 channels
+ * each) per 8 columns and stream; the norm's sum of squares goes through distributed shared memory in
+ * blend_rms_norm's thread layout. `down_partials` = inkling_gemm_inv_partials of the 64 x 4608 `down` over the S
+ * streams; `gain_forget_weight` = the first stream's [4608, 64] (the next streams follow contiguously).
+ * inkling_controller_tail_supported: cluster launch available and 1 <= T <= 32 (wider rounds take the three ops:
+ * each CTA reads 72 KB of weights, which only pays at small T); SUROGATE_SERVE_INKLING_NO_TAIL=1 turns it off.
+ */
+[[nodiscard]] bool inkling_controller_tail_supported(std::int32_t columns) noexcept;
+void inkling_controller_tail(const float* down_partials, const void* gain_forget_weight, const Tensor& dest,
+                             const Tensor& message, const Tensor& norm_weight, float eps, Tensor& out,
+                             cudaStream_t stream);
+
 /// One visit's conv state in the target's LinearAttentionStatePool: slot s, tap j (oldest first),
 /// channel c at `base + s * slot_stride + j * tap_stride + c` (BF16, elements).
 struct InklingConvStateView {
@@ -238,8 +254,9 @@ void inkling_gemm_f32_prepare(std::int32_t n, std::int32_t k, std::int32_t token
 /// contiguous, out has `ldc` elements per token column.
 ///
 /// Every output element is fixed by (n, k) alone, never by `tokens`, the batch, or the tile:
-/// - the k range is cut into `inkling_gemm_split(n, k)` equal chunks (one chunk unless n is small and k long: the
-///   controller `down` 64 x 4608 runs as 18 x 256, the dynamic taps 32 x 2304 as 9 x 256);
+/// - the k range is cut into `inkling_gemm_split(n, k)` equal chunks: k / 256 chunks of 256 when n <= 64, k >= 1024 and
+///   k % 256 == 0, else ONE chunk (in inkling2: the controller `down` 64 x 4608 = 18 x 256; every other projection,
+///   and every problem of inkling_gemm_inv_group -- the dynamic taps 32 x 2304 included -- runs as one chunk);
 /// - each chunk is ONE accumulator from zero running the m16n8k16 BF16 MMA over its k in increasing 16-wide steps
 ///   (k padded with zeros to a multiple of 64) -- the chain of ops/linear/bf16/bf16_invariant_gemm;
 /// - the chunks' FP32 partials are added in chunk order (p0 + p1 + ... ) and the sum is stored.
@@ -263,9 +280,16 @@ void inkling_gemm_inv(const void* weight, std::int32_t n, std::int32_t k, const 
                       void* out, DType out_dtype, std::int32_t ldc, const InklingGemmBatch& batch, void* workspace,
                       std::size_t workspace_bytes, cudaStream_t stream);
 
-/// Up to 4 problems of one k, token count and store type in ONE launch, each with its own weights, row count, input
-/// and output (the q-side / K / V row ranges of a 3-input qkvr). Each element runs exactly the chain of
-/// inkling_gemm_inv; shapes that split (inkling_gemm_split > 1) are refused here.
+/// The first phase of a split shape alone: the chunks' FP32 partials, [splits][batch][tokens][n] (chunk-major), the
+/// operand of inkling_controller_tail (which adds them in chunk order exactly as inkling_gemm_inv's reduce does).
+void inkling_gemm_inv_partials(const void* weight, std::int32_t n, std::int32_t k, const void* x, std::int32_t tokens,
+                               const InklingGemmBatch& batch, float* partials, std::size_t partials_bytes,
+                               cudaStream_t stream);
+
+/// Up to 6 problems of one k, token count and store type in ONE launch, each with its own weights, row count, input
+/// and output (a global / looped visit's q-side / K / V row ranges and, on a global visit, the dynamic K / V taps).
+/// Every problem runs as ONE chunk -- the chain of inkling_gemm_inv for an unsplit shape -- whatever
+/// inkling_gemm_split says for its shape: a shape that a caller sends through a group must always take this entry.
 struct InklingGemmProblem {
     const void* weight = nullptr; ///< [n, k]
     std::int32_t n     = 0;
@@ -275,6 +299,19 @@ struct InklingGemmProblem {
 };
 void inkling_gemm_inv_group(std::span<const InklingGemmProblem> problems, std::int32_t k, std::int32_t tokens,
                             DType out_dtype, cudaStream_t stream);
+
+/// ---- The trainer's log-prob (agent-EN 11:3x; g1b's ENGINE-OP IR) ----
+///
+/// out[t] = log softmax(softcap(W_head . hidden[:, t]))[token_ids[t]] over the first `token_domain` rows, bit for bit
+/// the value every log-prob the engine returns carries (completion token_logprobs and prompt_logprobs are
+/// RawTokenScores.selected): the FP32 head of inkling_gemm_inv + inkling_softcap_f32 (Variant::lm_head), then the
+/// kernel of ops::score_logprobs_device (the raw logits, temperature 1: a 512-thread max tree, per-thread expf sums,
+/// a tree add, max + log(sum)). `hidden` BF16 [hidden_size, T]; `out` FP32 [T] (NaN for an id outside the domain).
+[[nodiscard]] std::size_t inkling_head_logprob_workspace_bytes(std::int32_t vocab_rows, std::int32_t tokens) noexcept;
+void inkling_head_logprob(const void* head_weight, std::int32_t vocab_rows, std::int32_t hidden_size,
+                          std::int32_t token_domain, float softcap, const void* hidden, std::int32_t tokens,
+                          const std::int32_t* token_ids, float* out, void* workspace, std::size_t workspace_bytes,
+                          cudaStream_t stream);
 
 /// In place: x = (tanh(x / cap)) * cap in fp32 (vLLM LogitsProcessor soft_cap), FP32 [rows, T] with
 /// `ldc` elements per column, first `rows` rows of each column.

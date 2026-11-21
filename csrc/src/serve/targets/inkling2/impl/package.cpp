@@ -125,6 +125,9 @@ family::TextGeometry Package::declared_geometry(const artifact::Reader& reader) 
 std::unique_ptr<Package::Program> Package::create_program(const LoadedModel& model, SequencePlan&& plan,
                                                           DeviceContext& device) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
+    // Lane c's key-group size: P3 by default (agent-EN 12:5x, until lane h's price session decides); the
+    // environment still overrides (p1 / p2 / p3).
+    ::setenv("SUROGATE_INKLING_ATTN_GROUPS", "p3", 0);
     detail::Variant::prepare_lm_head(16);
     return family::create_program<detail::Variant>(model.impl_->data.runtime, model.impl_->weights_profile,
                                                    std::move(plan), device);

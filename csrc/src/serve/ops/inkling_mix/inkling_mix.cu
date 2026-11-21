@@ -6,12 +6,17 @@
 #include "api/ops/inkling_mix.h"
 
 #include "core/device.h" // CUDA_CHECK
+#include "core/pdl.cuh"
+#include "ops/common/mma.cuh"
+#include "ops/kernel/func_attribute.cuh"
 
+#include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -158,6 +163,7 @@ __device__ __forceinline__ void mix_query(const float (&x)[N][kPer], const float
 
 template <int N>
 __global__ void __launch_bounds__(kThreads) attn_res_kernel(const __grid_constant__ AttnResArgs a) {
+    pdl::wait_for_dependencies(); // PDL: every read / write after the producer grid completes
     __shared__ float scratch[(kThreads / 32) * (N > 2 ? N : 2)];
     const std::int64_t t = blockIdx.x;
     float x[N][kPer];
@@ -210,6 +216,7 @@ struct BlendInputsArgs {
 /// the same device code and order as the three separate kernels: bit-identical to them.
 template <int N>
 __global__ void __launch_bounds__(kThreads) blend_inputs_kernel(const __grid_constant__ BlendInputsArgs a) {
+    pdl::wait_for_dependencies(); // PDL: every read / write after the producer grid completes
     __shared__ float scratch[(kThreads / 32) * (N > 2 ? N : 2)];
     const std::int64_t t = blockIdx.x;
     float x[N][kPer];
@@ -281,6 +288,7 @@ __global__ void __launch_bounds__(kThreads)
 __global__ void __launch_bounds__(kThreads)
     rms_norm_kernel(PlaneDev x_plane, const bf16* w, int num_weights, float eps, bf16* out,
                     std::int64_t columns) {
+    pdl::wait_for_dependencies();
     __shared__ float scratch[kThreads / 32];
     const std::int64_t t = blockIdx.x;
     float x[kPer];
@@ -307,6 +315,7 @@ __global__ void __launch_bounds__(kThreads)
 __global__ void __launch_bounds__(kThreads)
     pair_rms_norm_kernel(const float* dest, std::int64_t dest_stream_stride, const float* msg,
                          bf16* out, std::int64_t columns) {
+    pdl::wait_for_dependencies();
     __shared__ float scratch[(kThreads / 32) * 2];
     const std::int64_t t = blockIdx.x;
     const std::int64_t s = blockIdx.y;
@@ -338,6 +347,7 @@ __global__ void __launch_bounds__(kThreads)
     blend_rms_norm_kernel(const float* dest, std::int64_t dest_stream_stride, const float* msg,
                           const float* gain_forget, const bf16* w, int w_stream_stride, float eps,
                           bf16* out, std::int64_t columns) {
+    pdl::wait_for_dependencies();
     __shared__ float scratch[kThreads / 32];
     const std::int64_t t   = blockIdx.x;
     const std::int64_t s   = blockIdx.y;
@@ -364,6 +374,149 @@ __global__ void __launch_bounds__(kThreads)
         const int d = threadIdx.x + i * kThreads;
         o[d]        = __float2bfloat16_rn((xv[i] * rstd) * __bfloat162float(ws[d]));
     }
+}
+
+// ---------------------------------------------------- controller tail (one cluster: split reduce + gain/forget + blend)
+
+namespace cg = cooperative_groups;
+
+constexpr int kTailCtas     = 8;                 // cluster size
+constexpr int kTailChannels = kD / kTailCtas;    // 288 channels per CTA: 18 m16 tiles of gain rows, 18 of forget
+constexpr int kTailRows     = 2 * kTailChannels; // 576 rows of the gain/forget weights per CTA
+constexpr int kTailTokens   = 8;                 // one n8 tile of columns per cluster
+constexpr int kRank         = 64;                // the controllers' rank (k of gain/forget)
+constexpr int kTailSplits   = 18;                // `down` 64 x 4608 in chunks of 256 (inkling_gemm_split)
+constexpr int kTailSmem     = kTailRows * kRank * 2 + kTailTokens * kRank * 2 + kTailTokens * kTailChannels * 4;
+static_assert(kTailRows * kTailTokens * 4 <= kTailRows * kRank * 2, "G aliases the A tile");
+
+__device__ __forceinline__ int tail_swizzle(int row, int col) {
+    return (col & ~63) + ((((col & 63) >> 3) ^ (row & 7)) << 3) + (col & 7);
+}
+
+struct TailArgs {
+    const float* partials       = nullptr; // [splits][S][T][64], inkling_gemm_inv_partials' layout
+    const bf16* gf_weight       = nullptr; // stream 0's [4608][64]; stream s at + s * 4608 * 64
+    const float* dest           = nullptr;
+    std::int64_t dest_stream    = 0;       // 0 (broadcast) or T * 2304
+    const float* msg            = nullptr; // [2304, T, S]
+    const bf16* norm_weight     = nullptr;
+    int w_stream                = 0;       // 0 (broadcast) or 2304
+    float eps                   = 0.0F;
+    bf16* out                   = nullptr; // [2304, T, S]
+    std::int64_t columns        = 0;
+    int streams                 = 1;
+};
+
+/// inkling_gemm_inv's split reduce (h = bf16(p0 + p1 + ... + p17)) + inkling_gemm_inv FP32 of the gain/forget weights
+/// (the same m16n8k16 fragments at the same row / column positions, k = 64 in 4 steps from zero) +
+/// blend_rms_norm_kernel (the same expressions; the sum of squares recomputed by every CTA in that kernel's thread
+/// layout from the cluster's x through distributed shared memory): bit-identical to the three launches.
+__global__ void __cluster_dims__(kTailCtas, 1, 1) __launch_bounds__(kThreads)
+    controller_tail_kernel(const __grid_constant__ TailArgs a) {
+    pdl::wait_for_dependencies();
+    extern __shared__ __align__(16) unsigned char tail_smem[];
+    auto* As = reinterpret_cast<bf16*>(tail_smem);                      // [576][64] swizzled (then G: fp32 [576][8])
+    auto* Bs = As + kTailRows * kRank;                                 // [8][64] swizzled
+    auto* X  = reinterpret_cast<float*>(Bs + kTailTokens * kRank);     // [8][288]
+    auto* G  = reinterpret_cast<float*>(tail_smem);
+    __shared__ float scratch[kThreads / 32];
+    cg::cluster_group cluster = cg::this_cluster();
+    const int rank = static_cast<int>(cluster.block_rank());
+    const int s    = static_cast<int>(blockIdx.y);
+    const int t0   = (static_cast<int>(blockIdx.x) / kTailCtas) * kTailTokens;
+    const int nt   = min(kTailTokens, static_cast<int>(a.columns) - t0);
+    const int c0   = rank * kTailChannels;
+    const int tid  = static_cast<int>(threadIdx.x);
+    // 1. A: gain rows c0 .. c0 + 287 and forget rows 2304 + c0 .. of stream s
+    const bf16* W = a.gf_weight + static_cast<std::int64_t>(s) * (2 * kD) * kRank;
+    for (int item = tid; item < kTailRows * (kRank / 8); item += kThreads) {
+        const int row = item / (kRank / 8), kk = (item - row * (kRank / 8)) * 8;
+        const int src = row < kTailChannels ? c0 + row : kD + c0 + (row - kTailChannels);
+        cp_async_zfill<16, Cache::cg>(&As[row * kRank + tail_swizzle(row, kk)],
+                                      &W[static_cast<std::int64_t>(src) * kRank + kk], 16);
+    }
+    cp_commit();
+    // 2. B: h = bf16(the partials added in chunk order), zero past the last column (the GEMM's zero fill)
+    const std::int64_t plane = static_cast<std::int64_t>(a.streams) * a.columns * kRank;
+    for (int item = tid; item < kTailTokens * kRank; item += kThreads) {
+        const int j = item / kRank, r = item - j * kRank;
+        float h     = 0.0F;
+        if (j < nt) {
+            const std::int64_t i = (static_cast<std::int64_t>(s) * a.columns + t0 + j) * kRank + r;
+            h                    = a.partials[i];
+            for (int c = 1; c < kTailSplits; ++c) { h += a.partials[c * plane + i]; }
+        }
+        Bs[j * kRank + tail_swizzle(j, r)] = __float2bfloat16_rn(h);
+    }
+    cp_wait<0>();
+    __syncthreads();
+    // 3. the gain/forget GEMM of the 36 m16 tiles: warp w takes w, w + 8, ...
+    const int warp = tid >> 5, lane = tid & 31, gid = lane >> 2, lid = lane & 3;
+    const int a_matrix = lane >> 3, a_inner = lane & 7;
+    const int a_row_off = a_inner + ((a_matrix & 1) << 3), a_col_off = (a_matrix >> 1) << 3;
+    const int b_inner = lane & 7, b_k_off = ((lane >> 3) & 1) << 3;
+    constexpr int kTiles = kTailRows / 16, kWarps = kThreads / 32, kPerWarp = (kTiles + kWarps - 1) / kWarps;
+    float acc[kPerWarp][4];
+#pragma unroll
+    for (int u = 0; u < kPerWarp; ++u) {
+        acc[u][0] = acc[u][1] = acc[u][2] = acc[u][3] = 0.0F;
+        const int mt = warp + u * kWarps;
+        if (mt >= kTiles) { continue; }
+#pragma unroll
+        for (int k_step = 0; k_step < kRank / 16; ++k_step) {
+            unsigned af[4], bfr[2];
+            const int row = mt * 16 + a_row_off, col = k_step * 16 + a_col_off;
+            ldmatrix_x4(af[0], af[1], af[2], af[3], smem_addr(&As[row * kRank + tail_swizzle(row, col)]));
+            const int bcol = k_step * 16 + b_k_off;
+            ldmatrix_x2(bfr[0], bfr[1], smem_addr(&Bs[b_inner * kRank + tail_swizzle(b_inner, bcol)]));
+            mma_bf16(acc[u][0], acc[u][1], acc[u][2], acc[u][3], af[0], af[1], af[2], af[3], bfr[0], bfr[1]);
+        }
+    }
+    __syncthreads(); // G overwrites A
+#pragma unroll
+    for (int u = 0; u < kPerWarp; ++u) {
+        const int mt = warp + u * kWarps;
+        if (mt >= kTiles) { continue; }
+        const int r0 = mt * 16 + gid;
+        G[r0 * kTailTokens + 2 * lid]           = acc[u][0];
+        G[r0 * kTailTokens + 2 * lid + 1]       = acc[u][1];
+        G[(r0 + 8) * kTailTokens + 2 * lid]     = acc[u][2];
+        G[(r0 + 8) * kTailTokens + 2 * lid + 1] = acc[u][3];
+    }
+    __syncthreads();
+    // 4. x of this CTA's channels (blend_rms_norm_kernel's expression)
+    for (int item = tid; item < nt * kTailChannels; item += kThreads) {
+        const int j = item / kTailChannels, c = item - j * kTailChannels;
+        const int d = c0 + c;
+        const std::int64_t t = t0 + j;
+        const float gain     = tanhf(G[c * kTailTokens + j]);
+        const float forget   = tanhf(G[(kTailChannels + c) * kTailTokens + j]);
+        const float dv       = a.dest[s * a.dest_stream + t * kD + d];
+        const float mv       = a.msg[(s * a.columns + t) * kD + d];
+        X[j * kTailChannels + c] = (1.0F - forget) * dv + gain * mv;
+    }
+    cluster.sync();
+    // 5. per column: the norm's sum of squares in blend_rms_norm_kernel's layout (thread tid sums d = tid + 256 i),
+    //    reading x where it lives; then this CTA's outputs
+    for (int j = 0; j < nt; ++j) {
+        float ss[1] = {0.0F};
+#pragma unroll
+        for (int i = 0; i < kPer; ++i) {
+            const int d     = tid + i * kThreads;
+            const float* rx = cluster.map_shared_rank(X, d / kTailChannels);
+            const float x   = rx[j * kTailChannels + d % kTailChannels];
+            ss[0]           = ss[0] + x * x;
+        }
+        block_sum<1>(ss, scratch);
+        const float rstd = rsqrt_approx(__fdiv_rn(ss[0], 2304.0F) + a.eps);
+        const bf16* ws   = a.norm_weight + static_cast<std::int64_t>(s) * a.w_stream;
+        bf16* o          = a.out + (static_cast<std::int64_t>(s) * a.columns + t0 + j) * kD;
+        for (int c = tid; c < kTailChannels; c += kThreads) {
+            const int d = c0 + c;
+            o[d]        = __float2bfloat16_rn((X[j * kTailChannels + c] * rstd) * __bfloat162float(ws[d]));
+        }
+    }
+    cluster.sync(); // the other CTAs may still read this CTA's x
 }
 
 // ------------------------------------------------------------------------------------- short conv
@@ -405,6 +558,7 @@ __device__ __forceinline__ float conv_seq(const ConvArgs& a, int b, std::int64_t
 
 __global__ void __launch_bounds__(kConvChannelTile)
     short_conv_kernel(const __grid_constant__ ConvArgs a) {
+    pdl::wait_for_dependencies(); // PDL: every read / write after the producer grid completes
     const int c = blockIdx.x * kConvChannelTile + threadIdx.x;
     const int b = blockIdx.z;
     if (c >= a.channels) { return; }
@@ -455,6 +609,7 @@ __global__ void __launch_bounds__(kConvChannelTile)
 __global__ void __launch_bounds__(kConvChannelTile)
     conv_window_kernel(const __grid_constant__ ConvArgs a, int capture_column, int capture_slot,
                        int update_slots) {
+    pdl::wait_for_dependencies();
     const int c = blockIdx.x * kConvChannelTile + threadIdx.x;
     const int b = blockIdx.y;
     if (c >= a.channels) { return; }
@@ -548,6 +703,7 @@ __global__ void conv_fold_kernel(const __grid_constant__ FoldArgs f, bf16* pool,
 }
 
 __global__ void softcap_f32_kernel(float* logits, int rows, int tokens, std::int64_t ldc, float cap) {
+    pdl::wait_for_dependencies();
     const std::int64_t i     = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::int64_t total = static_cast<std::int64_t>(rows) * tokens;
     if (i >= total) { return; }
@@ -663,12 +819,12 @@ void inkling_attn_res(const InklingAttnResSources& sources, std::int32_t columns
     a.columns = columns;
     const dim3 grid(static_cast<unsigned>(columns));
     switch (sources.stack_count + 1) {
-    case 1: attn_res_kernel<1><<<grid, kThreads, 0, stream>>>(a); break;
-    case 2: attn_res_kernel<2><<<grid, kThreads, 0, stream>>>(a); break;
-    case 3: attn_res_kernel<3><<<grid, kThreads, 0, stream>>>(a); break;
-    case 4: attn_res_kernel<4><<<grid, kThreads, 0, stream>>>(a); break;
-    case 5: attn_res_kernel<5><<<grid, kThreads, 0, stream>>>(a); break;
-    case 6: attn_res_kernel<6><<<grid, kThreads, 0, stream>>>(a); break;
+    case 1: CUDA_CHECK(pdl::launch_dependent({grid, dim3(kThreads), 0, stream}, attn_res_kernel<1>, a)); break;
+    case 2: CUDA_CHECK(pdl::launch_dependent({grid, dim3(kThreads), 0, stream}, attn_res_kernel<2>, a)); break;
+    case 3: CUDA_CHECK(pdl::launch_dependent({grid, dim3(kThreads), 0, stream}, attn_res_kernel<3>, a)); break;
+    case 4: CUDA_CHECK(pdl::launch_dependent({grid, dim3(kThreads), 0, stream}, attn_res_kernel<4>, a)); break;
+    case 5: CUDA_CHECK(pdl::launch_dependent({grid, dim3(kThreads), 0, stream}, attn_res_kernel<5>, a)); break;
+    case 6: CUDA_CHECK(pdl::launch_dependent({grid, dim3(kThreads), 0, stream}, attn_res_kernel<6>, a)); break;
     default: fail(op, "unsupported source count");
     }
     CUDA_CHECK(cudaGetLastError());
@@ -761,14 +917,61 @@ void inkling_blend_inputs(const InklingAttnResSources& dest_sources, const Tenso
     a.columns      = columns;
     const dim3 grid(static_cast<unsigned>(columns));
     switch (dest_sources.stack_count + 1) {
-    case 1: blend_inputs_kernel<1><<<grid, kThreads, 0, stream>>>(a); break;
-    case 2: blend_inputs_kernel<2><<<grid, kThreads, 0, stream>>>(a); break;
-    case 3: blend_inputs_kernel<3><<<grid, kThreads, 0, stream>>>(a); break;
-    case 4: blend_inputs_kernel<4><<<grid, kThreads, 0, stream>>>(a); break;
-    case 5: blend_inputs_kernel<5><<<grid, kThreads, 0, stream>>>(a); break;
-    case 6: blend_inputs_kernel<6><<<grid, kThreads, 0, stream>>>(a); break;
+    case 1: CUDA_CHECK(pdl::launch_dependent({grid, dim3(kThreads), 0, stream}, blend_inputs_kernel<1>, a)); break;
+    case 2: CUDA_CHECK(pdl::launch_dependent({grid, dim3(kThreads), 0, stream}, blend_inputs_kernel<2>, a)); break;
+    case 3: CUDA_CHECK(pdl::launch_dependent({grid, dim3(kThreads), 0, stream}, blend_inputs_kernel<3>, a)); break;
+    case 4: CUDA_CHECK(pdl::launch_dependent({grid, dim3(kThreads), 0, stream}, blend_inputs_kernel<4>, a)); break;
+    case 5: CUDA_CHECK(pdl::launch_dependent({grid, dim3(kThreads), 0, stream}, blend_inputs_kernel<5>, a)); break;
+    case 6: CUDA_CHECK(pdl::launch_dependent({grid, dim3(kThreads), 0, stream}, blend_inputs_kernel<6>, a)); break;
     default: fail(op, "unsupported source count");
     }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+bool inkling_controller_tail_supported(std::int32_t columns) noexcept {
+    static const bool available = [] {
+        if (std::getenv("SUROGATE_SERVE_INKLING_NO_TAIL") != nullptr) { return false; }
+        int device = 0, cluster = 0;
+        if (cudaGetDevice(&device) != cudaSuccess) { return false; }
+        if (cudaDeviceGetAttribute(&cluster, cudaDevAttrClusterLaunch, device) != cudaSuccess) { return false; }
+        return cluster != 0;
+    }();
+    return available && columns > 0 && columns <= 32;
+}
+
+void inkling_controller_tail(const float* down_partials, const void* gain_forget_weight, const Tensor& dest,
+                             const Tensor& message, const Tensor& norm_weight, float eps, Tensor& out,
+                             cudaStream_t stream) {
+    constexpr const char* op = "inkling_controller_tail";
+    const int t = message.ne[1];
+    const int s = message.ne[2];
+    require(down_partials != nullptr && gain_forget_weight != nullptr, op, "partials and weights are required");
+    require(contiguous_shape(message, DType::FP32, kD, t, s) && t > 0 && s > 0 && s <= 65535, op,
+            "message must be FP32 [2304, T, S]");
+    require(contiguous_shape(dest, DType::FP32, kD, t, s) || contiguous_shape(dest, DType::FP32, kD, t, 1),
+            op, "dest must be FP32 [2304, T, S] or [2304, T, 1]");
+    require(contiguous_shape(norm_weight, DType::BF16, kD, s, 1) ||
+                contiguous_shape(norm_weight, DType::BF16, kD, 1, 1),
+            op, "norm_weight must be BF16 [2304, S] or [2304, 1]");
+    require(contiguous_shape(out, DType::BF16, kD, t, s), op, "out must be BF16 [2304, T, S]");
+    require((reinterpret_cast<std::uintptr_t>(gain_forget_weight) & 15u) == 0, op, "weights must be 16-byte aligned");
+    TailArgs a;
+    a.partials    = down_partials;
+    a.gf_weight   = static_cast<const bf16*>(gain_forget_weight);
+    a.dest        = static_cast<const float*>(dest.data);
+    a.dest_stream = dest.ne[2] == 1 ? 0 : static_cast<std::int64_t>(t) * kD;
+    a.msg         = static_cast<const float*>(message.data);
+    a.norm_weight = static_cast<const bf16*>(norm_weight.data);
+    a.w_stream    = norm_weight.ne[1] == 1 ? 0 : kD;
+    a.eps         = eps;
+    a.out         = static_cast<bf16*>(out.data);
+    a.columns     = t;
+    a.streams     = s;
+    CUDA_CHECK(set_func_attribute_per_device(controller_tail_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                             kTailSmem));
+    const dim3 grid(static_cast<unsigned>(kTailCtas * ((t + kTailTokens - 1) / kTailTokens)), static_cast<unsigned>(s));
+    CUDA_CHECK(pdl::launch_dependent({grid, dim3(kThreads), static_cast<std::size_t>(kTailSmem), stream},
+                                     controller_tail_kernel, a));
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -789,10 +992,11 @@ void inkling_blend_rms_norm(const Tensor& dest, const Tensor& message, const Ten
     require(contiguous_shape(out, DType::BF16, kD, t, s), op, "out must be BF16 [2304, T, S]");
     const std::int64_t dest_stream = dest.ne[2] == 1 ? 0 : static_cast<std::int64_t>(t) * kD;
     const int w_stream             = norm_weight.ne[1] == 1 ? 0 : kD;
-    blend_rms_norm_kernel<<<dim3(static_cast<unsigned>(t), static_cast<unsigned>(s)), kThreads, 0, stream>>>(
+    CUDA_CHECK(pdl::launch_dependent(
+        {dim3(static_cast<unsigned>(t), static_cast<unsigned>(s)), dim3(kThreads), 0, stream}, blend_rms_norm_kernel,
         static_cast<const float*>(dest.data), dest_stream, static_cast<const float*>(message.data),
-        static_cast<const float*>(gain_forget.data), static_cast<const bf16*>(norm_weight.data),
-        w_stream, eps, static_cast<bf16*>(out.data), t);
+        static_cast<const float*>(gain_forget.data), static_cast<const bf16*>(norm_weight.data), w_stream, eps,
+        static_cast<bf16*>(out.data), static_cast<std::int64_t>(t)));
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -824,11 +1028,13 @@ void inkling_short_conv(const InklingPlane& x, std::int32_t channels, const Tens
     const dim3 grid(grid_count(channels, kConvChannelTile), grid_count(rows.width, kConvColumnTile),
                     static_cast<unsigned>(rows.batch));
     a.fuse_window = capture_slot < 0 && rows.width <= kConvColumnTile ? 1 : 0;
-    short_conv_kernel<<<grid, kConvChannelTile, 0, stream>>>(a);
+    CUDA_CHECK(pdl::launch_dependent({grid, dim3(kConvChannelTile), 0, stream}, short_conv_kernel, a));
     CUDA_CHECK(cudaGetLastError());
     if (!a.fuse_window) {
-        conv_window_kernel<<<dim3(grid_count(channels, kConvChannelTile), static_cast<unsigned>(rows.batch)),
-                             kConvChannelTile, 0, stream>>>(a, capture_column, capture_slot, 1);
+        CUDA_CHECK(pdl::launch_dependent(
+            {dim3(grid_count(channels, kConvChannelTile), static_cast<unsigned>(rows.batch)), dim3(kConvChannelTile), 0,
+             stream},
+            conv_window_kernel, a, capture_column, capture_slot, 1));
         CUDA_CHECK(cudaGetLastError());
     }
 }

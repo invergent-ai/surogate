@@ -9,6 +9,7 @@
 // I1 also checks the GEMM against a float64 host product (a loose bound: a wrong chain is off by O(1)).
 
 #include "api/ops/inkling_mix.h"
+#include "api/ops/sampled_logprob.h"
 #include "core/device.h"
 #include "ops/op_tester.h"
 
@@ -186,24 +187,34 @@ int test_gemm(const GemmShape& g, std::uint32_t seed) {
     return failures;
 }
 
-/// The 3-input qkvr of a global / looped visit: one grouped launch == three separate invariant calls, and a window of
-/// the grouped launch == the full round.
+/// The 3-input qkvr of a global visit with its dynamic taps: one grouped launch of 5 == the 3 row ranges as separate
+/// invariant calls + the 2 taps as a group of their own (every group problem runs unsplit), and a window of the
+/// grouped launch == the full round.
 int test_gemm_group(std::uint32_t seed) {
-    constexpr int kRows = 8600, kQ = 6552, kK = 6552, kV = 7576;
+    constexpr int kRows = 8600, kQ = 6552, kK = 6552, kV = 7576, kTap = 32;
     const auto w_bits = hash_bf16(static_cast<std::size_t>(kRows) * kD, seed, 0.06F);
+    const auto t_bits = hash_bf16(static_cast<std::size_t>(2) * kTap * kD, seed + 2, 0.06F);
+    DeviceBuffer d_t = to_device(t_bits);
+    const auto* tk = static_cast<const std::uint16_t*>(d_t.p);
+    const auto* tv = tk + static_cast<std::size_t>(kTap) * kD;
     const auto x_bits = hash_bf16(static_cast<std::size_t>(3) * kAll * kD, seed + 1, 1.0F);
     DeviceBuffer d_w = to_device(w_bits), d_x = to_device(x_bits);
     const auto* w = static_cast<const std::uint16_t*>(d_w.p);
     const auto x  = [&](int stream, int c0) {
         return static_cast<const std::uint16_t*>(d_x.p) + (static_cast<std::size_t>(stream) * kAll + c0) * kD;
     };
+    // out: [T][kRows] qkvr, then [T][32] k taps, then [T][32] v taps
     const auto grouped = [&](int c0, int T) {
-        DeviceBuffer out(static_cast<std::size_t>(T) * kRows * 2);
+        DeviceBuffer out(static_cast<std::size_t>(T) * (kRows + 2 * kTap) * 2);
         out.fill(0);
-        auto* o = static_cast<std::uint16_t*>(out.p);
+        auto* o  = static_cast<std::uint16_t*>(out.p);
+        auto* ok = o + static_cast<std::size_t>(T) * kRows;
+        auto* ov = ok + static_cast<std::size_t>(T) * kTap;
         const ops::InklingGemmProblem pr[] = {{w, kQ, x(0, c0), o, kRows},
                                               {w + static_cast<std::size_t>(kK) * kD, kV - kK, x(1, c0), o + kK, kRows},
-                                              {w + static_cast<std::size_t>(kV) * kD, kRows - kV, x(2, c0), o + kV, kRows}};
+                                              {w + static_cast<std::size_t>(kV) * kD, kRows - kV, x(2, c0), o + kV, kRows},
+                                              {tk, kTap, x(1, c0), ok, kTap},
+                                              {tv, kTap, x(2, c0), ov, kTap}};
         ops::inkling_gemm_inv_group(pr, kD, T, DType::BF16, nullptr);
         cuda_synchronize();
         return raw(out.p, out.bytes);
@@ -211,21 +222,36 @@ int test_gemm_group(std::uint32_t seed) {
     int failures = 0;
     const auto full = grouped(0, kAll);
     {
-        DeviceBuffer out(static_cast<std::size_t>(kAll) * kRows * 2);
+        DeviceBuffer out(static_cast<std::size_t>(kAll) * (kRows + 2 * kTap) * 2);
         out.fill(0);
-        auto* o = static_cast<std::uint16_t*>(out.p);
+        auto* o  = static_cast<std::uint16_t*>(out.p);
+        auto* ok = o + static_cast<std::size_t>(kAll) * kRows;
+        auto* ov = ok + static_cast<std::size_t>(kAll) * kTap;
         const int begin[] = {0, kK, kV}, rows[] = {kQ, kV - kK, kRows - kV};
         for (int i = 0; i < 3; ++i) {
             ops::inkling_gemm_inv(w + static_cast<std::size_t>(begin[i]) * kD, rows[i], kD, x(i, 0), kAll, o + begin[i],
                                   DType::BF16, kRows, {}, nullptr, 0, nullptr);
         }
+        const ops::InklingGemmProblem taps[] = {{tk, kTap, x(1, 0), ok, kTap}, {tv, kTap, x(2, 0), ov, kTap}};
+        ops::inkling_gemm_inv_group(taps, kD, kAll, DType::BF16, nullptr);
         cuda_synchronize();
-        failures += same_bits("I1 qkvr 3-input grouped launch == 3 separate calls (T=300)", full, raw(out.p, out.bytes), 2);
+        failures += same_bits("I1 qkvr + taps grouped (5) == 3 separate calls + the taps grouped alone (T=300)", full,
+                              raw(out.p, out.bytes), 2);
     }
+    // windows: the qkvr part and the two tap parts of the compact outputs
+    const auto part = [](const std::vector<std::uint8_t>& all, int T, std::size_t off_rows, int rows) {
+        return std::vector<std::uint8_t>(all.begin() + static_cast<std::ptrdiff_t>(T) * off_rows * 2,
+                                         all.begin() + static_cast<std::ptrdiff_t>(T) * (off_rows + rows) * 2);
+    };
     for (const auto& win : {std::pair<int, int>{0, 1}, std::pair<int, int>{299, 1}, std::pair<int, int>{100, 37}}) {
-        failures += same_bits("I1 qkvr grouped T=" + std::to_string(win.second) + " at " + std::to_string(win.first) +
-                                  " == T=300",
-                              grouped(win.first, win.second), gather(full, kRows, kAll, 1, win.first, win.second, 2), 2);
+        const auto sub          = grouped(win.first, win.second);
+        const std::string where = " T=" + std::to_string(win.second) + " at " + std::to_string(win.first) + " == T=300";
+        failures += same_bits("I1 grouped qkvr" + where, part(sub, win.second, 0, kRows),
+                              gather(part(full, kAll, 0, kRows), kRows, kAll, 1, win.first, win.second, 2), 2);
+        failures += same_bits("I1 grouped k taps" + where, part(sub, win.second, kRows, kTap),
+                              gather(part(full, kAll, kRows, kTap), kTap, kAll, 1, win.first, win.second, 2), 2);
+        failures += same_bits("I1 grouped v taps" + where, part(sub, win.second, kRows + kTap, kTap),
+                              gather(part(full, kAll, kRows + kTap, kTap), kTap, kAll, 1, win.first, win.second, 2), 2);
     }
     return failures;
 }
@@ -529,6 +555,102 @@ int test_conv_paths(std::uint32_t seed) {
     return failures;
 }
 
+// ------------------------------------------------------------------------------------- I6 controller tail
+
+/// inkling_controller_tail (one cluster launch) == inkling_gemm_inv (down, split + reduce) + inkling_gemm_inv (gain /
+/// forget, FP32) + inkling_blend_rms_norm, bit for bit.
+int test_controller_tail(std::uint32_t seed, int streams, int dq, int n) {
+    constexpr int kR = 64;
+    const std::string tag = "I6 controller tail S=" + std::to_string(streams) + " DQ=" + std::to_string(dq) +
+                            " T=" + std::to_string(n);
+    if (!ops::inkling_controller_tail_supported(n)) {
+        std::cout << "SKIP " << tag << ": no cluster launch on this device\n";
+        return 0;
+    }
+    const auto down_bits = hash_bf16(static_cast<std::size_t>(streams) * kR * 2 * kD, seed, 0.03F);
+    const auto gf_bits   = hash_bf16(static_cast<std::size_t>(streams) * 2 * kD * kR, seed + 1, 0.2F);
+    const auto pair      = randn_bf16(static_cast<std::size_t>(2 * kD) * n * streams, seed + 2, 1.0F);
+    const auto dest      = randn_f32(static_cast<std::size_t>(kD) * n * dq, seed + 3, 0.7F);
+    const auto msg       = randn_f32(static_cast<std::size_t>(kD) * n * streams, seed + 4, 0.7F);
+    const auto w         = randn_bf16(static_cast<std::size_t>(kD) * streams, seed + 5, 1.0F);
+    DeviceBuffer d_down = to_device(down_bits), d_gf = to_device(gf_bits), d_pair = dev_bf16(pair),
+                 d_dest = to_device(dest), d_msg = to_device(msg), d_w = dev_bf16(w);
+    Tensor t_dest(d_dest.p, DType::FP32, {kD, n, dq}), t_msg(d_msg.p, DType::FP32, {kD, n, streams});
+    Tensor t_w(d_w.p, DType::BF16, {kD, streams});
+    const ops::InklingGemmBatch down_batch{streams, static_cast<std::int64_t>(kR) * 2 * kD,
+                                           static_cast<std::int64_t>(n) * 2 * kD, static_cast<std::int64_t>(n) * kR};
+    const ops::InklingGemmBatch gf_batch{streams, static_cast<std::int64_t>(2) * kD * kR, static_cast<std::int64_t>(n) * kR,
+                                         static_cast<std::int64_t>(n) * 2 * kD};
+    const std::size_t ws = ops::inkling_gemm_inv_workspace_bytes(kR, 2 * kD, n, streams);
+    DeviceBuffer d_ws(ws), d_h(static_cast<std::size_t>(kR) * n * streams * 2),
+        d_gfo(static_cast<std::size_t>(2 * kD) * n * streams * 4), d_u(static_cast<std::size_t>(kD) * n * streams * 2),
+        d_f(static_cast<std::size_t>(kD) * n * streams * 2);
+    // unfused
+    ops::inkling_gemm_inv(d_down.p, kR, 2 * kD, d_pair.p, n, d_h.p, DType::BF16, kR, down_batch, d_ws.p, ws, nullptr);
+    ops::inkling_gemm_inv(d_gf.p, 2 * kD, kR, d_h.p, n, d_gfo.p, DType::FP32, 2 * kD, gf_batch, nullptr, 0, nullptr);
+    Tensor t_gf(d_gfo.p, DType::FP32, {2 * kD, n, streams}), t_u(d_u.p, DType::BF16, {kD, n, streams});
+    ops::inkling_blend_rms_norm(t_dest, t_msg, t_gf, t_w, 1e-6F, t_u, nullptr);
+    // fused
+    ops::inkling_gemm_inv_partials(d_down.p, kR, 2 * kD, d_pair.p, n, down_batch, static_cast<float*>(d_ws.p), ws,
+                                   nullptr);
+    Tensor t_f(d_f.p, DType::BF16, {kD, n, streams});
+    ops::inkling_controller_tail(static_cast<const float*>(d_ws.p), d_gf.p, t_dest, t_msg, t_w, 1e-6F, t_f, nullptr);
+    cuda_synchronize();
+    return same_bits(tag + " fused == reduce + gain/forget + blend norm", raw(d_f.p, d_f.bytes), raw(d_u.p, d_u.bytes),
+                     2);
+}
+
+// ------------------------------------------------------------------------------------- I5 trainer log-prob
+
+/// inkling_head_logprob == the engine's own path (invariant FP32 head + softcap, then the scoring kernel through
+/// score_logprobs_batch) bit for bit; one column alone == in the round; an id outside the domain gives NaN.
+int test_head_logprob(std::uint32_t seed) {
+    constexpr int kRows = 32768, kDomain = 32000, T = 64;
+    const auto w_bits = hash_bf16(static_cast<std::size_t>(kRows) * kD, seed, 0.06F);
+    const auto h_bits = hash_bf16(static_cast<std::size_t>(T) * kD, seed + 1, 1.0F);
+    std::vector<int> ids(T);
+    std::mt19937 g(seed + 2);
+    for (auto& id : ids) { id = static_cast<int>(g() % kDomain); }
+    ids[T - 1] = kDomain + 5; // outside the domain
+    DeviceBuffer d_w = to_device(w_bits), d_h = to_device(h_bits), d_ids = to_device(ids);
+    const auto run = [&](int c0, int n) {
+        const std::size_t ws = ops::inkling_head_logprob_workspace_bytes(kRows, n);
+        DeviceBuffer d_ws(ws), d_out(static_cast<std::size_t>(n) * 4);
+        ops::inkling_head_logprob(d_w.p, kRows, kD, kDomain, 30.0F,
+                                  static_cast<const std::uint16_t*>(d_h.p) + static_cast<std::size_t>(c0) * kD, n,
+                                  static_cast<const std::int32_t*>(d_ids.p) + c0, static_cast<float*>(d_out.p), d_ws.p,
+                                  ws, nullptr);
+        cuda_synchronize();
+        return from_device<float>(d_out.p, static_cast<std::size_t>(n));
+    };
+    const auto full = run(0, T);
+    // the engine's path for the T - 1 in-domain columns
+    DeviceBuffer d_logits(static_cast<std::size_t>(kRows) * T * 4);
+    ops::inkling_gemm_inv(d_w.p, kRows, kD, d_h.p, T, d_logits.p, DType::FP32, kRows, {}, nullptr, 0, nullptr);
+    ops::inkling_softcap_f32(static_cast<float*>(d_logits.p), kRows, T, kRows, 30.0F, nullptr);
+    cuda_synchronize();
+    const Tensor logits(d_logits.p, DType::FP32, {kRows, T});
+    std::vector<TokenId> valid(ids.begin(), ids.end() - 1);
+    const auto ref = ops::score_logprobs_batch(logits, valid, kDomain, 0, nullptr);
+    std::size_t bad = 0;
+    for (int t = 0; t + 1 < T; ++t) { bad += std::memcmp(&full[t], &ref[t].selected.logprob, 4) != 0; }
+    int failures = 0;
+    std::cout << (bad ? "FAIL " : "ok   ") << "I5 inkling_head_logprob == head + score_logprobs_batch (" << T - 1
+              << " columns): " << bad << " differ\n";
+    failures += bad ? 1 : 0;
+    const bool nan_last = std::isnan(full[T - 1]);
+    std::cout << (nan_last ? "ok   " : "FAIL ") << "I5 an id outside the domain gives NaN\n";
+    failures += nan_last ? 0 : 1;
+    std::size_t bad_w = 0;
+    for (const int c : {0, 17, T - 2}) {
+        const auto one = run(c, 1);
+        bad_w += std::memcmp(&one[0], &full[c], 4) != 0;
+    }
+    std::cout << (bad_w ? "FAIL " : "ok   ") << "I5 one column alone == in the round (3 columns): " << bad_w << " differ\n";
+    failures += bad_w ? 1 : 0;
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -554,6 +676,12 @@ int main() {
     failures += test_blend_inputs(3102, 4, false, 3, 3, 0); // looped global layer: 3 dest queries
     failures += test_blend_inputs(3103, 3, true, 1, 1, 3);  // MLP blend: partial + attn_out addend, mlp stream
     failures += test_conv_paths(3003);
+    failures += test_head_logprob(3201);
+    for (const int n : {1, 5, 8, 13, 32}) {
+        failures += test_controller_tail(3300 + n, 3, 1, n);
+        failures += test_controller_tail(3400 + n, 3, 3, n);
+        failures += test_controller_tail(3500 + n, 1, 1, n);
+    }
     std::cout << (failures ? "FAIL" : "PASS") << " inkling_invariance (" << failures << " failures)\n";
     return failures ? 1 : 0;
 }

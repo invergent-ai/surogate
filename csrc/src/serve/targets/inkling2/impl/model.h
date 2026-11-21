@@ -34,6 +34,10 @@ struct DerivedQueries {
     /// Per core layer j (layer 6 + j): FP32 [D, 4] = (cross[2j], kv[2j], kv[2j + 1], cross[2j + 1]) x scale:
     /// the message queries of the streams attn, k, v, mlp.
     std::array<Tensor, TextConfig::core_end - TextConfig::core_start> message{};
+    /// Lane c's relative-bias tables, one per physical layer (inkling_rel_proj_table of `attn/rel_proj` at load):
+    /// BF16 [16, kRelTableRows], shared by the passes of a core layer.
+    DeviceBuffer rel_storage;
+    std::array<Tensor, TextConfig::physical_layers> rel_table{};
 };
 
 /// What every visit payload points at.

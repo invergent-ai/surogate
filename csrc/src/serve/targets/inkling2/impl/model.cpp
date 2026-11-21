@@ -4,6 +4,7 @@
 #include "targets/inkling2/impl/model.h"
 #include "targets/inkling2/impl/visits.h"
 
+#include "api/ops/inkling_attention.h"
 #include "artifact/reader.h"
 #include "core/device.h"
 
@@ -79,6 +80,22 @@ void derive_queries(const load::InklingGlobals& g, DerivedQueries& out) {
     }
 }
 
+void derive_rel_tables(const load::InklingWeights& weights, DerivedQueries& out) {
+    constexpr std::int64_t kRows = ops::InklingAttentionGeometry::kRelTableRows;
+    constexpr int kRel           = TextConfig::d_rel;
+    const std::size_t per        = static_cast<std::size_t>(kRel) * kRows * 2;
+    out.rel_storage              = DeviceBuffer(per * TextConfig::physical_layers);
+    for (int layer = 0; layer < TextConfig::physical_layers; ++layer) {
+        const load::InklingLayerWeights& L = weights.layers.at(static_cast<std::size_t>(layer));
+        if (L.rel_proj.data == nullptr) { continue; } // a layer bound ValidateOnly (another pipeline stage's)
+        Tensor table(static_cast<std::byte*>(out.rel_storage.p) + per * layer, DType::BF16,
+                     {kRel, static_cast<std::int32_t>(kRows)});
+        ops::inkling_rel_proj_table(L.rel_proj, table, nullptr);
+        out.rel_table[static_cast<std::size_t>(layer)] = table;
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
 } // namespace
 
 family::TextGeometry visit_geometry(const artifact::Reader& reader) {
@@ -110,6 +127,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     frontend.chat_template_jinja.clear();
     weights  = load::load_weights(plan.plan, backing);
     derive_queries(weights.globals, queries);
+    derive_rel_tables(weights, queries);
     model.weights = &weights;
     model.queries = &queries;
 
