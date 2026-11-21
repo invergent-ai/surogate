@@ -1,5 +1,6 @@
 #include "api/ops/speculative_round.h"
 #include "ops/launcher/speculative_round.h"
+#include "ops/common/sampling_workspace.h"
 
 #include <algorithm>
 #include <limits>
@@ -55,13 +56,15 @@ std::size_t speculative_accept_greedy_drafts_workspace_capacity_bytes(std::int32
                                                                       std::int32_t min_drafts,
                                                                       std::int32_t max_drafts,
                                                                       std::int32_t min_batch,
-                                                                      std::int32_t max_batch) {
+                                                                      std::int32_t max_batch,
+                                                                      bool split_routes) {
     if (token_domain <= 0 || min_drafts < 0 || max_drafts < min_drafts || min_batch <= 0 ||
         max_batch < min_batch || max_drafts == std::numeric_limits<std::int32_t>::max()) {
         throw std::invalid_argument("speculative accept workspace: invalid draft interval");
     }
-    const std::size_t row_bytes =
+    std::size_t row_bytes =
         sampling_workspace_capacity_bytes(token_domain, min_drafts + 1, max_drafts + 1);
+    if (split_routes) { row_bytes += speculative_split_partial_row_bytes(token_domain, max_drafts + 1); }
     if (row_bytes != 0 &&
         static_cast<std::size_t>(max_batch) > std::numeric_limits<std::size_t>::max() / row_bytes) {
         throw std::overflow_error("speculative accept workspace capacity overflows size_t");
@@ -112,7 +115,7 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
                                       Tensor& licensed_counts, Tensor& accepted,
                                       std::int32_t token_domain, const SamplingConfig* configs,
                                       WorkspaceArena& workspace, cudaStream_t stream,
-                                      bool no_drafts) {
+                                      bool no_drafts, bool split_routes) {
     constexpr const char* op = "speculative_accept_greedy_drafts";
     const std::int32_t k     = no_drafts ? 0 : drafts.ne[0];
     const std::int32_t batch = drafts.ne[1];
@@ -147,11 +150,11 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
     }
     auto scratch_scope = workspace.scope();
     const std::size_t bytes =
-        speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, batch, batch);
+        speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, batch, batch, split_routes);
     const DeviceSpan scratch = bytes == 0 ? DeviceSpan{} : workspace.alloc_bytes(bytes);
     detail::speculative_accept_greedy_drafts_launch(
         target_tokens, logits, drafts, current_extents, lengths, anchors, licensed_tokens,
-        licensed_counts, accepted, token_domain, configs, scratch, stream, k);
+        licensed_counts, accepted, token_domain, configs, scratch, stream, k, split_routes);
 }
 
 void speculative_select_accepted_hidden(const Tensor& hidden, const Tensor& selectors, Tensor& out,

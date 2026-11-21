@@ -1069,6 +1069,10 @@ private:
     launch_dflash_round(std::span<const std::uint32_t> lanes,
                          std::span<const runtime::RoundBudget> budgets,
                          std::span<const std::uint32_t> prefill_lanes = {});
+    /// The decode-readiness check of row `row` of a DFlash round (launch_dflash_round and the DSpark pipeline
+    /// proposal share it): a valid, unique lane, active with budget, KV bound, frontier below capacity, ledgers aligned.
+    void check_dflash_row(std::span<const std::uint32_t> lanes, std::size_t row,
+                          const runtime::RoundBudget& budget, const char* what) const;
     [[nodiscard]] runtime::BatchedGeneratedRound consume_dflash_round(runtime::RoundHandle handle);
     void reserve_sequence_kv(SequenceState& sequence, std::uint32_t text_pages,
                              std::uint32_t backend_pages);

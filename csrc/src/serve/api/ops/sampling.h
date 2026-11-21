@@ -59,6 +59,11 @@ struct SamplingConfig {
     /// the token it feeds -- so the request's random stream goes on as if it had not been
     /// preempted. Every other purpose ignores it.
     std::int32_t continue_decode_key        = 0;
+    /// Nonzero (set by the runtime for a DSpark target, lane e2): a speculative verify of an UNTRUNCATED stochastic row
+    /// draws each column's token exactly as ordinary decoding draws it (Gumbel-max keyed by the fed token's cache
+    /// position and kSamplePurposeDecode) and accepts a draft iff it equals that token -- the committed tokens are
+    /// those of MTP-off decoding with the same seed. Zero: the one-hot rejection rule. Ignored outside verification.
+    std::int32_t speculative_coupled        = 0;
 };
 
 /// The (position, purpose) a row's draw is keyed by; see SamplingConfig::continue_decode_key.

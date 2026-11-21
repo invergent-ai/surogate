@@ -122,6 +122,8 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
 
 std::size_t Package::extra_derived_residency_bytes(const EngineOptions& options) {
     if (options.speculative.backend != SpeculativeBackend::DFlash) { return 0; }
+    // the drafter lives on the stage holding the last visit only (plan_load's draft_placement; M8b review)
+    if (options.pipeline_stage_last != 0 && options.pipeline_stage_last < detail::TextConfig::layers) { return 0; }
     return detail::dspark_derived_device_bytes(detail::dspark_fp8_weights_requested(), detail::dspark_fp8_fold_requested());
 }
 
@@ -153,9 +155,9 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
     }
     // DSpark (lane e2): `--speculative dflash` binds the artifact's drafter and runs it through the DFlash runtime.
     bind.draft = options.speculative.backend == SpeculativeBackend::DFlash;
-    // FP8 drafter weights by default (fp8ab2 16:34: identity, tokens / round within noise, -0.29 GiB with the FP8
-    // fold): the BF16 dense linears sit in the host bank (attached in LoadedModelData) and are re-quantised at load;
-    // SUROGATE_SERVE_DSPARK_BF16_WEIGHTS=1 keeps them BF16 on the device. Not on a drafter-less pipeline stage.
+    // BF16 drafter weights by default since M9 (h2's A/B: the FP8 route is ~9.5 % slower at 8 streams); with
+    // SUROGATE_SERVE_DSPARK_FP8_WEIGHTS=1 the BF16 dense linears sit in the host bank (attached in LoadedModelData,
+    // released after derive) and are re-quantised at load. Not on a drafter-less pipeline stage.
     bind.draft_linears_host = bind.draft && detail::dspark_fp8_weights_requested() &&
                               bind.draft_placement != artifact::TensorPlacement::ValidateOnly;
     detail::ArtifactLoadPlan plan;
