@@ -118,17 +118,31 @@ template <class Schedule, int K, bool GateUp, int KWidth>
 __global__ __launch_bounds__(Schedule::kThreads) void mxfp8_expert_gemm_kernel(GemmParams p) {
     extern __shared__ __align__(16) unsigned char mxfp8_shared_bytes[];
     auto& shared = *reinterpret_cast<Mxfp8Shared<Schedule>*>(mxfp8_shared_bytes);
-    __shared__ int tile_info[3];
+    __shared__ int tile_info[4];
     __shared__ int slots[Schedule::kBlockN];
     __shared__ int source_rows[Schedule::kBlockN];
     __shared__ int done[Schedule::kBlockN];
     __shared__ int done_count;
 
-    pdl::wait_for_dependencies();
+    // kL2SliceOwnBeforeWait (down): the routing (offsets / sorted, final since the select kernel completed two
+    // launches back, before gate_up's wait returned) is read through L2 BEFORE the dependency wait, and the CTA's
+    // w2 slice is prefetched while the y quantisation still runs. Otherwise the wait comes first, as before.
+    const bool early = !GateUp && (p.l2_slice & kL2SliceOwnBeforeWait) != 0;
+    if (!early) { pdl::wait_for_dependencies(); }
     pdl::trigger_dependents();
     if (threadIdx.x == 0) { done_count = 0; }
-    find_expert_tile<Schedule::kBlockN>(p.offsets, static_cast<int>(blockIdx.x), tile_info);
+    find_expert_tile<Schedule::kBlockN, !GateUp>(p.offsets, static_cast<int>(blockIdx.x), tile_info);
     const int expert = tile_info[0];
+    const int n_begin = static_cast<int>(blockIdx.y) * Schedule::kBlockM;
+    const std::int64_t weight_row = static_cast<std::int64_t>(expert) * kGateUpRows + n_begin;
+    // L2 slice prefetch (GemmParams::l2_slice; hints, no bit changes).
+    if (expert >= 0 && (GateUp ? (p.l2_slice & kL2SliceOwn) != 0 : early)) {
+        prefetch_bank_rows<Schedule::kThreads>(p.weights, false, K, weight_row, Schedule::kBlockM);
+    }
+    if (expert >= 0 && GateUp && (p.l2_slice & kL2SliceNext) != 0 && tile_info[3] <= p.next_max_tiles) {
+        prefetch_bank_rows<Schedule::kThreads>(p.next, false, kIntermediate, weight_row, Schedule::kBlockM);
+    }
+    if (early) { pdl::wait_for_dependencies(); }
     if (expert < 0) { return; }
     const int row_begin = tile_info[1];
     const int row_end   = tile_info[2];
@@ -140,8 +154,6 @@ __global__ __launch_bounds__(Schedule::kThreads) void mxfp8_expert_gemm_kernel(G
     }
     __syncthreads();
 
-    const int n_begin = static_cast<int>(blockIdx.y) * Schedule::kBlockM;
-    const std::int64_t weight_row = static_cast<std::int64_t>(expert) * kGateUpRows + n_begin;
     const std::uint8_t* weight_codes  = p.weights.codes + weight_row * K;
     const std::uint8_t* weight_scales = p.weights.scales + weight_row * (K / 32);
     constexpr int kKTiles     = K / Schedule::kBlockK;
@@ -307,7 +319,8 @@ void require(const GemmParams& params) {
 void launch_mxfp8_gate_up(const GemmParams& params, std::int32_t slots, GemmSchedule schedule,
                           cudaStream_t stream) {
     require(params);
-    const GemmParams p = with_l2_prefetch(params);
+    GemmParams p = with_l2_prefetch(params, false);
+    if (schedule != GemmSchedule::Narrow) { p.l2_slice = 0; } // slice prefetches: narrow schedules only
     if (schedule == GemmSchedule::Narrow) {
         launch_schedule<NarrowSchedule, kHidden, true>(p, slots, stream);
     } else {
@@ -318,7 +331,8 @@ void launch_mxfp8_gate_up(const GemmParams& params, std::int32_t slots, GemmSche
 void launch_mxfp8_down(const GemmParams& params, std::int32_t slots, GemmSchedule schedule,
                        cudaStream_t stream) {
     require(params);
-    const GemmParams p = with_l2_prefetch(params);
+    GemmParams p = with_l2_prefetch(params, false);
+    if (schedule != GemmSchedule::Narrow) { p.l2_slice = 0; }
     if (schedule == GemmSchedule::Narrow) {
         launch_schedule<NarrowSchedule, kIntermediate, false>(p, slots, stream);
     } else {

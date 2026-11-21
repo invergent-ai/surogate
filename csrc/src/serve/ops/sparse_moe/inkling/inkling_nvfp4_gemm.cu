@@ -191,7 +191,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
 #else
     using Geometry = Nvfp4Geometry<K>;
     __shared__ Nvfp4W4a4SharedStorage<Schedule> shared;
-    __shared__ int tile_info[3];
+    __shared__ int tile_info[4];
     __shared__ int slots[Schedule::kBlockM];
     __shared__ int source_rows[Schedule::kBlockM];
     __shared__ int done[Schedule::kBlockM];
@@ -215,6 +215,16 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     }
     const int row_begin = tile_info[1];
     const int row_end   = tile_info[2];
+    const int n_begin       = static_cast<int>(blockIdx.y) * Schedule::kBlockN;
+    const int weight_begin  = expert * kGateUpRows + n_begin;
+    // L2 slice prefetch (GemmParams::l2_slice; hints, no bit changes): the whole weight slice of this CTA is
+    // requested now; gate_up CTAs may also request the down slice of the same (expert, N tile).
+    if (GateUp ? (p.l2_slice & kL2SliceOwn) != 0 : (p.l2_slice & kL2SliceOwnBeforeWait) != 0) {
+        prefetch_bank_rows<Schedule::kThreads>(p.weights, true, K, weight_begin, Schedule::kBlockN);
+    }
+    if (GateUp && (p.l2_slice & kL2SliceNext) != 0 && tile_info[3] <= p.next_max_tiles) {
+        prefetch_bank_rows<Schedule::kThreads>(p.next, true, kIntermediate, weight_begin, Schedule::kBlockN);
+    }
     for (int row = static_cast<int>(threadIdx.x); row < Schedule::kBlockM; row += Schedule::kThreads) {
         const int index   = row_begin + row;
         const int slot    = index < row_end ? (FusedYQuant ? __ldcg(p.sorted + index) : p.sorted[index]) : -1;
@@ -223,8 +233,6 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     }
     __syncthreads();
 
-    const int n_begin       = static_cast<int>(blockIdx.y) * Schedule::kBlockN;
-    const int weight_begin  = expert * kGateUpRows + n_begin;
     constexpr int kKTiles   = K / Schedule::kBlockK;
     constexpr int kWaitGroups = kKTiles < Schedule::kStages ? kKTiles - 1 : Schedule::kStages - 1;
     static_assert(K % Schedule::kBlockK == 0);
@@ -826,7 +834,8 @@ void require(const GemmParams& params) {
 void launch_nvfp4_gate_up(const GemmParams& params, std::int32_t slots, GemmSchedule schedule,
                           cudaStream_t stream) {
     require(params);
-    const GemmParams p = with_l2_prefetch(params);
+    GemmParams p = with_l2_prefetch(params, true);
+    if (schedule != GemmSchedule::Narrow) { p.l2_slice = 0; } // slice prefetches: narrow schedules only
     if (schedule == GemmSchedule::Narrow) {
         launch_schedule<NarrowSchedule, kHidden, true>(p, slots, stream);
     } else {
@@ -837,7 +846,8 @@ void launch_nvfp4_gate_up(const GemmParams& params, std::int32_t slots, GemmSche
 void launch_nvfp4_down(const GemmParams& params, std::int32_t slots, GemmSchedule schedule,
                        cudaStream_t stream) {
     require(params);
-    const GemmParams p = with_l2_prefetch(params);
+    GemmParams p = with_l2_prefetch(params, true);
+    if (schedule != GemmSchedule::Narrow) { p.l2_slice = 0; }
     if (schedule == GemmSchedule::Narrow) {
         // The y quantisation runs in this kernel's prologue (a_bf16 = y rows); w2 streams before the wait.
         if (p.a_bf16 == nullptr) { throw std::invalid_argument("inkling_moe: narrow NVFP4 down needs the y rows"); }

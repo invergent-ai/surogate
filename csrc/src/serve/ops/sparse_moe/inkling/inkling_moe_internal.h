@@ -159,12 +159,27 @@ struct GemmParams {
     LoraRound lora;
     /// L2 prefetch-size hint for the weight-code loads (0 none, 128, 256): same bytes (with_l2_prefetch).
     std::int32_t l2_prefetch = 0;
+    /// Narrow schedules: whole-slice L2 prefetches (kL2Slice* bits; with_l2_prefetch). Hints only: the MMAs read
+    /// the same bytes, no bit changes.
+    std::int32_t l2_slice = 0;
+    /// gate_up only (kL2SliceNext): the down projection's bank; its rows of this CTA's (expert, N tile) are
+    /// prefetched when the round has at most `next_max_tiles` tiles (they must still be in L2 when down runs).
+    InklingExpertBank next;
+    std::int32_t next_max_tiles = 0;
 };
+
+/// GemmParams::l2_slice bits. Own: a narrow CTA prefetches its whole weight slice (codes + scales) into L2 when
+/// it knows its expert, so every byte of it is requested at once instead of a few ring stages at a time.
+/// Next: gate_up CTAs also prefetch the down slice of the same (expert, N tile), so w2 streams from DRAM while
+/// gate_up still runs. OwnBeforeWait: down CTAs prefetch their slice before their dependency wait.
+inline constexpr int kL2SliceOwn           = 1;
+inline constexpr int kL2SliceNext          = 2;
+inline constexpr int kL2SliceOwnBeforeWait = 4;
 
 /// The weight loads' L2 prefetch hint (`GemmParams::l2_prefetch`): 128 bytes. Measured 12:54 (card 7, cold,
 /// layer 0 NVFP4): T = 8 151.6 -> 131.0 us, T = 64 336.9 -> 291.1, T = 1 36.9 -> 35.7; 256 B the same; T = 4,096
 /// and MXFP8 unchanged. SUROGATE_INKLING_L2_PREFETCH = 0 | 256 overrides it (A/B only). Same bytes, same bits.
-inline GemmParams with_l2_prefetch(GemmParams params) {
+inline GemmParams with_l2_prefetch(GemmParams params, bool nvfp4) {
     static const int value = [] {
         const char* text = std::getenv("SUROGATE_INKLING_L2_PREFETCH");
         if (text == nullptr) { return 128; }
@@ -172,6 +187,19 @@ inline GemmParams with_l2_prefetch(GemmParams params) {
         return v == 128 || v == 256 ? v : 0;
     }();
     params.l2_prefetch = value;
+    // TIMING KNOBS (A/B on card 7; defaults set from the measurement): SUROGATE_INKLING_L2_SLICE = kL2Slice* bit
+    // mask (default 0), SUROGATE_INKLING_L2_NEXT_MB = the L2 budget of the w2 prefetch (default 64; tiles allowed =
+    // budget / one expert's bytes: NVFP4 4.48 MB, MXFP8 8.21 MB).
+    static const int slice = [] {
+        const char* text = std::getenv("SUROGATE_INKLING_L2_SLICE");
+        return text == nullptr ? 0 : std::atoi(text) & 7;
+    }();
+    static const int next_mb = [] {
+        const char* text = std::getenv("SUROGATE_INKLING_L2_NEXT_MB");
+        return text == nullptr ? 64 : std::atoi(text);
+    }();
+    params.l2_slice = slice;
+    params.next_max_tiles = next_mb * 1000 / (nvfp4 ? 4479 : 8211);
     return params;
 }
 
