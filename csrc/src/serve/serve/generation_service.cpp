@@ -3,6 +3,7 @@
 #include "api/ops/sparse_moe.h"
 #include "serve/vllm_max_tokens.h"
 #include "serve/vllm_qwen3_parser.h"
+#include "family/impl/frontend/inkling_parse.h"
 #include <set>
 
 #include "product/media_acquire/acquire.h"
@@ -27,6 +28,7 @@
 #include <fstream>
 #include <limits>
 #include <optional>
+#include <span>
 #include <string_view>
 #include <thread>
 #include <cstddef>
@@ -364,7 +366,7 @@ public:
           tool_filter_(json_tools, muse_tools, gemma_tools, qwen3_coder) {}
 
     void publish(sinfer::OutputDelta delta) override {
-        if (delta.text.empty()) { return; }
+        if (delta.text.empty() || held_) { return; }
         if (delta.channel == sinfer::OutputChannel::Reasoning) {
             if (sink_->on_reasoning) { sink_->on_reasoning(delta.text); }
         } else {
@@ -395,6 +397,16 @@ public:
     /// The content published so far.
     [[nodiscard]] const std::string& streamed_content() const noexcept { return streamed_; }
 
+    /// Inkling-2: nothing of the reply reaches the stream while it is generated; release() sends vLLM's reading of
+    /// the whole reply at the end -- what the harness was served through agent-IK's gateway, which answered every
+    /// call, streamed or not, from one non-streaming vLLM call. (vLLM's own incremental deltas are not reproduced.)
+    void hold() noexcept { held_ = true; }
+    std::size_t release(const std::string& reasoning, const std::string& content) {
+        if (!reasoning.empty() && sink_->on_reasoning) { sink_->on_reasoning(reasoning); }
+        publish_content(content);
+        return content_bytes_;
+    }
+
     /// Ends the stream with `tail` as the rest of the content, instead of what the filter held back.
     std::size_t finish_with(const std::string& tail) {
         if (filter_tool_calls_) { tool_filter_.discard(); }
@@ -413,6 +425,7 @@ private:
     Engine* engine_ = nullptr;
     const StreamSink* sink_ = nullptr;
     bool filter_tool_calls_ = false;
+    bool held_ = false;
     bool muse_tools_ = false;
     ToolCallStreamFilter tool_filter_;
     std::size_t content_bytes_ = 0;
@@ -587,6 +600,17 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
         for (const auto& special : engine_->named_special_tokens()) { vocabulary.special_tokens.push_back(special.second); }
         qwen3_vocabulary_ = std::move(vocabulary);
     }
+    // Inkling-2 renders from the request body and every reply is read back with vLLM's Inkling parser.
+    if (prompt_capabilities_.inkling2_chat) {
+        namespace ink = sinfer::family::frontend_internal::inkling;
+        const ink::SpecialTokens tokens = ink::SpecialTokens::resolve([this](std::string_view spelling) {
+            const std::optional<sinfer::TokenId> id = engine_->token_id(spelling);
+            return id ? std::optional<int>(static_cast<int>(*id)) : std::nullopt;
+        });
+        std::vector<std::string> named;
+        for (const auto& special : engine_->named_special_tokens()) { named.push_back(special.second); }
+        inkling_vocabulary_ = ink::ParserVocabulary::from(tokens, named);
+    }
     // --thinking-loop-guard / --thinking-answer-reserve: a thought the guard ends is closed the way Qwen3's thinking
     // budget closes one (Qwen3 Technical Report, 2025, "thinking budget"), with the model's own close token and, for
     // </think>, the blank line its answers start after. A model with no single close token is served without it.
@@ -603,6 +627,11 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
             if (close_text == "</think>") {
                 const std::vector<sinfer::TokenId> separator = engine_->encode_fragment("\n\n");
                 thinking_guard_close_.insert(thinking_guard_close_.end(), separator.begin(), separator.end());
+            } else if (inkling_vocabulary_ && close_text == "<|end_message|>") {
+                // Inkling-2 opens every block after a thought with <|message_model|>: in agent-IK's 24,609 real
+                // replies with a thinking block the model never ended right after it, and vLLM's own token counts
+                // match that header before every block (rl/engine-inkling-2026-11-21/lanes/f2/guard/).
+                thinking_guard_close_.push_back(inkling_vocabulary_->tokens.message_model);
             }
         } else {
             std::fprintf(stderr, "thinking-guard: this model has no single reasoning close token; the guard is off\n");
@@ -686,6 +715,21 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& original,
         throw ApiException(std::move(error));
     }
     PreparedRequest prepared;
+    if (inkling_vocabulary_ && !request.raw_prompt.has_value()) {
+        if (!request.raw_chat_body) {
+            throw ApiException(ApiError{
+                .status  = 400,
+                .message = "this model renders its prompt from the chat-completions request itself; ask it through "
+                           "/v1/chat/completions",
+                .code    = "endpoint_not_supported"});
+        }
+        try {
+            prepared.inkling_request = std::make_shared<const sinfer::family::frontend_internal::inkling::ChatRequest>(
+                sinfer::family::frontend_internal::inkling::parse_chat_request(*request.raw_chat_body));
+        } catch (const std::invalid_argument& error) {
+            throw ApiException(ApiError{.status = 400, .message = error.what()});
+        }
+    }
     sinfer::RequestOptions request_options = to_request_options(request, options_);
     // A minimum length is honoured by barring the stop ids until it is reached, and
     // the round only knows numbers -- so resolve which ids those are here, where
@@ -1133,6 +1177,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
             options_.tool_call_format == ToolCallFormat::MuseAtem,
             options_.tool_call_format == ToolCallFormat::Gemma4,
             options_.tool_call_format == ToolCallFormat::Qwen3Coder);
+        if (prepared.inkling_request) { output_sink->hold(); }
     }
     sinfer::OutputSink* public_sink = output_sink.get();
     sinfer::CancellationView cancellation;
@@ -1211,6 +1256,40 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.metrics.speculative_accepted_per_position =
         std::move(result.speculative.accepted_per_position);
 
+    // Inkling-2: vLLM's Inkling parser, exactly, on the generated token ids (family/impl/frontend/inkling_parse.h).
+    if (prepared.inkling_request && inkling_vocabulary_ && outcome.finish_reason != sinfer::FinishReason::Cancelled) {
+        namespace ink = sinfer::family::frontend_internal::inkling;
+        const std::vector<std::string> bytes = engine_->token_texts(result.generated_token_ids);
+        std::string text = ink::detokenize_output(std::span<const std::string>(bytes),
+                                                  result.finish_reason == sinfer::FinishReason::StopToken);
+        if (result.finish_reason == sinfer::FinishReason::StopString && !result.stop_sequence.empty()) {
+            if (const std::size_t at = text.find(result.stop_sequence); at != std::string::npos) { text.resize(at); }
+        }
+        const char* engine_finish = "stop";
+        switch (result.finish_reason) {
+        case sinfer::FinishReason::OutputLimit:
+        case sinfer::FinishReason::ContextCapacity:
+        case sinfer::FinishReason::ThinkingGuard: engine_finish = "length"; break;
+        default: break;
+        }
+        const ink::ParsedOutput parsed =
+            ink::parse_output(text, *prepared.inkling_request, engine_finish, *inkling_vocabulary_);
+        std::vector<ToolCall> calls;
+        for (const ink::ParsedToolCall& call : parsed.tool_calls) {
+            calls.push_back({.id = new_tool_call_id(), .name = call.name, .arguments_json = call.arguments});
+        }
+        std::vector<int> ids(result.generated_token_ids.begin(), result.generated_token_ids.end());
+        outcome.reasoning_tokens      = ink::count_reasoning_tokens(ids, inkling_vocabulary_->tokens);
+        outcome.tool_calls            = std::move(calls);
+        outcome.content_null_if_empty = true;
+        outcome.reasoning             = parsed.reasoning.value_or("");
+        outcome.text                  = parsed.content.value_or("");
+        outcome.finish_reason_wire    = parsed.finish_reason;
+        outcome.report_reasoning_tokens = true;
+        outcome.unstreamed_content.clear();
+        if (output_sink) { (void)output_sink->release(outcome.reasoning, outcome.text); }
+        return outcome;
+    }
     // vLLM 0.31's qwen3_coder parser, exactly, on the generated token ids (serve/vllm_qwen3_parser.h): every request
     // with tools, except calls the tool grammar wrote (tool_choice required / named, strict tools), which keep the
     // reading below.

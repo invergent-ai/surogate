@@ -668,6 +668,11 @@ struct PromptCapabilities {
     /// Qwen3-Coder's `<function=NAME><parameter=KEY>` calls (Qwen3.5 / Qwen3.6): served with vLLM's qwen3_coder
     /// parser unless told otherwise (serve/vllm_qwen3_parser.h).
     bool qwen3_coder_tool_calls = false;
+    /// Inkling-2: no chat template; the prompt is rendered token by token from the request body
+    /// (PromptOptions::raw_chat_request, family/impl/frontend/inkling_render.h) and the reply is read back with vLLM's
+    /// Inkling parser (inkling_parse.h), both token-exact to vLLM. Set when the vocabulary spells Inkling's framing
+    /// tokens and the artifact carries no chat template.
+    bool inkling2_chat = false;
     /// The template is handed a message's text parts as a list and writes them one after the other,
     /// as Qwen's `render_content` does -- so "a" and "b" render as "ab", which is what vLLM and
     /// transformers produce. Without it the parts are joined with a newline first, as vLLM does for
@@ -682,6 +687,10 @@ struct PromptOptions {
     bool preserve_thinking = false;
     bool add_vision_id     = false;
     std::vector<std::string> tool_jsons;
+    /// The chat-completions request body exactly as the client sent it, for a checkpoint that renders its prompt from
+    /// the request itself rather than through a chat template (PromptCapabilities::inkling2_chat). Filled by the
+    /// serving layer only for such a checkpoint; null for every other one, whose prompt is the messages above.
+    std::shared_ptr<const std::string> raw_chat_request;
 };
 
 struct PromptInput {
