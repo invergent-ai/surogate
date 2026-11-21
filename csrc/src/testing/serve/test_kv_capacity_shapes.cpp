@@ -12,6 +12,7 @@
 //     never fit); printed as minimum - logical pages, which is the charge whenever that term binds;
 //   - the explicit-capacity path at the same shapes (a pipeline stage builds with one) plans too.
 // Planning only: a device context for DeviceContext, no weights, no KV allocation.
+// Plus the 2-card visit split (check_stages): each stage under auto, then built with the shared explicit capacity.
 // Usage: sinfer_kv_capacity_shapes_test [--inkling <artifact>] [--gemma3 <artifact>]; 77 without a device or
 // without any artifact.
 #include <api/targets/gemma3/package.h>
@@ -121,6 +122,101 @@ void check_target(const char* name, const std::filesystem::path& artifact, Devic
     }
 }
 
+// The 2-card visit split under --kv-capacity auto, as construct_pipeline builds it: every stage plans its own
+// curve under auto (the preflight), the pool every stage then gets is the smallest stage's resolution, and each
+// stage is built with that count as an EXPLICIT capacity marked resolved-from-auto. Before 0da5c31b /
+// 5c6a3502 validate_target_options capped that explicit count at lanes x logical pages and refused every
+// --max-num-seqs 1 engine (the preflight resolves logical + window charge; e1b 17:27). Budgets: unlimited
+// (the curve maximum) and a tight one (minimum + 2 GiB) per stage.
+template <class Target>
+void check_stages(const char* name, const std::filesystem::path& artifact, DeviceContext& device, Totals& totals) {
+    if constexpr (requires { Target::pipeline_stage_bounds(2); }) {
+        artifact::Reader reader(artifact);
+        const family::TextGeometry geometry = Target::declared_geometry(reader);
+        const auto profile                  = Target::resolve_weights(reader.identity());
+        const std::vector<int> bounds       = Target::pipeline_stage_bounds(2);
+        const auto native                   = static_cast<std::uint32_t>(geometry.max_context);
+        for (const std::uint32_t context : {16384U, 131072U, 262144U, 1048576U}) {
+            if (native != 0 && context > native) { continue; }
+            for (const std::uint32_t lanes : {1U, 2U, 4U, 8U}) {
+                for (const std::uint32_t chunk : {2048U, 8192U}) {
+                    for (const bool tight : {false, true}) {
+                        ++totals.shapes;
+                        const std::string shape = std::string(name) + " 2 stages " + std::to_string(context) + " x " +
+                                                  std::to_string(lanes) + " chunk " + std::to_string(chunk) +
+                                                  (tight ? " tight" : " unlimited");
+                        const auto stage_options = [&](int s) {
+                            EngineOptions options;
+                            options.artifact_path        = artifact;
+                            options.max_context          = context;
+                            options.max_concurrency      = lanes;
+                            options.prefill_chunk        = std::min(chunk, context);
+                            options.use_cuda_graph       = true;
+                            options.kv_capacity          = KvCapacityPolicy::automatic(0);
+                            options.pipeline_stage_first = bounds[static_cast<std::size_t>(s)];
+                            options.pipeline_stage_last  = bounds[static_cast<std::size_t>(s) + 1];
+                            options.pipeline_boundary_columns = options.prefill_chunk + lanes + 128;
+                            return options;
+                        };
+                        try {
+                            // the preflight: each stage under auto, the pool = the smallest stage's
+                            std::uint32_t common = 0;
+                            for (int s = 0; s < 2; ++s) {
+                                const auto curve =
+                                    Target::make_sequence_planner(device, stage_options(s), profile, geometry)
+                                        .capacity_curve();
+                                const std::size_t budget =
+                                    tight ? curve.minimum_device_reservation_bytes + (2ULL << 30) : ~std::size_t{0} / 2;
+                                const auto resolved =
+                                    runtime::resolve_kv_capacity(KvCapacityPolicy::automatic(0), curve, budget)
+                                        .resolved_tokens;
+                                common = common == 0 ? resolved : std::min(common, resolved);
+                            }
+                            // the build: the shared count as an explicit capacity resolved from auto
+                            for (int s = 0; s < 2; ++s) {
+                                EngineOptions options                    = stage_options(s);
+                                options.kv_capacity                      = KvCapacityPolicy::explicit_capacity(common);
+                                options.kv_capacity_resolved_automatically = true;
+                                auto planner = Target::make_sequence_planner(device, options, profile, geometry);
+                                const auto curve = planner.capacity_curve();
+                                const std::uint32_t pages =
+                                    runtime::resolve_kv_capacity(options.kv_capacity, curve, ~std::size_t{0})
+                                        .resolved_tokens / 64U;
+                                const std::size_t expected = curve.reservation_bytes(pages);
+                                auto plan = std::move(planner).finalize(pages);
+                                ++totals.plans;
+                                if (plan.device_reservation_bytes() != expected) {
+                                    std::printf("FAIL %s stage %d: reservation %zu != curve %zu\n", shape.c_str(), s,
+                                                plan.device_reservation_bytes(), expected);
+                                    ++totals.failed;
+                                }
+                                // one full-context request with its charge fits the stage's ledger
+                                if (pages < curve.minimum_main_page_groups) {
+                                    std::printf("FAIL %s stage %d: %u pages under the curve minimum %u\n", shape.c_str(),
+                                                s, pages, curve.minimum_main_page_groups);
+                                    ++totals.failed;
+                                }
+                                if (lanes == 1 && !tight) {
+                                    std::printf("ok   %s stage %d [%d, %d): shared pool %u tokens, stage pages %u "
+                                                "(curve %u..%u)\n",
+                                                shape.c_str(), s, bounds[static_cast<std::size_t>(s)],
+                                                bounds[static_cast<std::size_t>(s) + 1], common, pages,
+                                                curve.minimum_main_page_groups, curve.maximum_main_page_groups);
+                                }
+                            }
+                        } catch (const std::exception& error) {
+                            std::printf("FAIL %s: %s\n", shape.c_str(), error.what());
+                            ++totals.failed;
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        (void)name; (void)artifact; (void)device; (void)totals;
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -142,7 +238,10 @@ int main(int argc, char** argv) {
     DeviceContext device(0);
     Totals totals;
     const auto started = std::chrono::steady_clock::now();
-    if (!inkling.empty()) { check_target<targets::inkling2::Package>("inkling2", inkling, device, true, totals); }
+    if (!inkling.empty()) {
+        check_target<targets::inkling2::Package>("inkling2", inkling, device, true, totals);
+        check_stages<targets::inkling2::Package>("inkling2", inkling, device, totals);
+    }
     if (!gemma3.empty()) { check_target<targets::gemma3_270m::Package>("gemma3", gemma3, device, true, totals); }
     std::printf("%s: %d shapes, %d plans, %d failures (%.1f s)\n", totals.failed == 0 ? "PASS" : "FAIL",
                 totals.shapes, totals.plans, totals.failed,

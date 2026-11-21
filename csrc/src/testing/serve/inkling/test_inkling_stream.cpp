@@ -157,6 +157,83 @@ int main() {
     for (const auto& [id, spelling] : tokenizer.named_special_tokens()) { named.push_back(spelling); }
     const ink::ParserVocabulary vocabulary = ink::ParserVocabulary::from(special, named);
 
+    // INKLING_STREAM_REPLAY=<dir>: replies a live server generated (same JSON shape as the parser vectors, without
+    // `expected`), replayed in 1-token rounds: which rounds the stream sends something in, and where and why it stays
+    // silent (block kind of each silent token, the longest silent span). A live stream with as many payload chunks as
+    // the replay has sending rounds was not merged by the server. Exactness is checked against our own final reading.
+    if (const char* replay_dir = std::getenv("INKLING_STREAM_REPLAY")) {
+        int items = 0, inconsistent = 0;
+        for (const fs::path& f : vector_files(replay_dir)) {
+            const ink::PyValue vec = ink::py_json_loads(read_file(f));
+            const std::string name = vec.find("case")->text;
+            const std::string body = ink::py_json_dumps(*vec.find("body"), ink::PyDumpStyle{.ensure_ascii = false});
+            const std::vector<int> ids = ints(vec.find("output_token_ids"));
+            const std::string finish = vec.find("engine_finish_reason")->text;
+            const ink::ChatRequest request = ink::parse_chat_request(body);
+            std::vector<std::string> bytes;
+            for (const int id : ids) { bytes.push_back(tokenizer.decode_token_bytes(id, false)); }
+            const std::size_t fed = finish == "stop" && !bytes.empty() ? bytes.size() - 1 : bytes.size();
+            ink::StreamParser parser(request, vocabulary);
+            Assembled got;
+            int emit_any = 0, emit_text = 0, emit_calls = 0;
+            std::map<std::string, int> silent_by_block;
+            std::string block = "start";
+            std::size_t run_start = 0, run_len = 0, best_start = 0, best_len = 0;
+            std::string best_block;
+            for (std::size_t i = 0; i < fed; ++i) {
+                const int id = ids[i];
+                if (id == special.content_thinking) { block = "thinking"; }
+                else if (id == special.content_text) { block = "text"; }
+                else if (id == special.content_invoke_tool_json) { block = "tool"; }
+                else if (id == special.content_invoke_tool_text || id == special.content_tool_error) { block = "tooltext"; }
+                else if (id == special.message_model) { block = "header"; }
+                else if (id == special.end_message || id == special.content_model_end_sampling) { block = "between"; }
+                else if (id == special.message_user || id == special.message_system || id == special.message_tool) {
+                    block = "other-role";
+                }
+                const ink::StreamDelta d = parser.feed(std::span<const std::string>(bytes).subspan(i, 1));
+                got.add(d);
+                const bool text = !d.reasoning.empty() || !d.content.empty();
+                emit_text += text;
+                emit_calls += !d.tool_calls.empty();
+                if (!d.empty()) {
+                    ++emit_any;
+                    run_len = 0;
+                } else {
+                    ++silent_by_block[block];
+                    if (run_len == 0) { run_start = i; }
+                    if (++run_len > best_len) {
+                        best_len = run_len;
+                        best_start = run_start;
+                        best_block = block;
+                    }
+                }
+            }
+            const std::string all = ink::detokenize_output(std::span<const std::string>(bytes), finish == "stop");
+            const ink::ParsedOutput final = ink::parse_output(all, request, finish, vocabulary);
+            bool consistent = true;
+            got.add(parser.finish(final, &consistent));
+            const std::string problem = compare(got, final);
+            if (!consistent || !problem.empty()) { ++inconsistent; }
+            std::string excerpt;
+            for (std::size_t k = best_start; k < best_start + best_len && k < fed && excerpt.size() < 240; ++k) { excerpt += bytes[k]; }
+            std::cout << "REPLAY " << name << " tokens=" << fed << " rounds_sending=" << emit_any
+                      << " rounds_sending_text=" << emit_text << " rounds_sending_calls=" << emit_calls << " silent_by_block={";
+            bool first = true;
+            for (const auto& [b, c] : silent_by_block) {
+                std::cout << (first ? "" : ",") << b << ":" << c;
+                first = false;
+            }
+            std::cout << "} longest_silent=" << best_len << "@" << best_start << "(" << best_block << ") "
+                      << shown(excerpt) << " final: reasoning=" << final.reasoning.value_or("").size()
+                      << "B content=" << final.content.value_or("").size() << "B calls=" << final.tool_calls.size()
+                      << (consistent && problem.empty() ? " exact" : " NOT-EXACT" + problem) << "\n";
+            ++items;
+        }
+        std::cout << "replay: " << items << " replies, " << inconsistent << " not exact\n";
+        return inconsistent == 0 && items > 0 ? 0 : 1;
+    }
+
     int n = 0, bad_exact = 0, bad_consistent = 0, runs = 0;
     int stop_cases = 0, bad_stop = 0;
     // (b) incrementality over 1-token rounds

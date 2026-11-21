@@ -43,7 +43,7 @@ struct DSparkDerived {
     const void* w_sp       = nullptr; ///< BF16 [768, 512]   = rnn_proj[:, 0:512]    ([state | w1[prev]])
     const void* w_hf       = nullptr; ///< BF16 [768, 4608]  = rnn_proj[:, 512:5120] ([hidden | f_rnn])
     const void* fold_w     = nullptr; ///< BF16 [201024, 256] = bf16(unembed . hidden_out), fp64 (null with fp8_fold)
-    /// FP8 fold (opt-in, SUROGATE_SERVE_DSPARK_FP8_FOLD=1; M1 `fp8fold`: no acceptance loss): per-row e4m3 codes of the
+    /// FP8 fold (default since 8a146482; SUROGATE_SERVE_DSPARK_BF16_FOLD=1 keeps the BF16 fold; M1 `fp8fold`: no acceptance loss): per-row e4m3 codes of the
     /// BF16 fold + fp32 row scales; half the bytes of every Markov vocabulary pass.
     bool fp8_fold                   = false;
     const std::uint8_t* fold_codes  = nullptr; ///< U8 [201024, 256]
@@ -72,6 +72,10 @@ void derive_dspark(const load::InklingWeights& w, DSparkDerived& out, bool fp8_w
 [[nodiscard]] bool dspark_bf16_weights_forced();
 /// The FP8 drafter weights (default; SUROGATE_SERVE_DSPARK_BF16_WEIGHTS=1 keeps BF16).
 [[nodiscard]] bool dspark_fp8_weights_requested();
+/// Device bytes derive_dspark allocates beside the materialized weights (storage + FP8 fold + FP8 linears), resident for
+/// the engine's life; the registry books them before the KV is sized (Package::extra_derived_residency_bytes).
+/// derive_dspark checks its own allocations against this.
+[[nodiscard]] std::size_t dspark_derived_device_bytes(bool fp8_weights, bool fp8_fold);
 
 /// The draft KV: planes of draft layers 0 / 1 / 2 (text-pool layers 48 / 49 / 50).
 struct DSparkKv {

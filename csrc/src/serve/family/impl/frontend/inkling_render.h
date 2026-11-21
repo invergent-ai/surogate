@@ -65,7 +65,8 @@ struct ChatRequest {
                                            const SpecialTokens& special);
 
 /// The reasoning effort the renderer uses for this request (chat_template_kwargs / top-level reasoning_effort, named
-/// levels, numeric strings; default 0.9). Throws RequestError for values the reference refuses.
+/// levels, numeric strings; default 0.99 by the owner's rule of 2026-11-21 -- vLLM's is 0.9). Throws RequestError for
+/// values the reference refuses.
 [[nodiscard]] double resolve_reasoning_effort(const ChatRequest& request);
 /// "Thinking effort level: ..." for an effort in [0, 0.99]. Throws RequestError outside it.
 [[nodiscard]] std::string effort_text(double effort);

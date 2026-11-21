@@ -141,6 +141,12 @@ public:
             boundary.resize(groups_);
         }
         width_ = std::max<std::uint32_t>(1, stages_.front()->program->speculative_round_width());
+        // DSpark (ENGINE-INKLING lane e1): the drafter lives on the stage with the head and proposes each round's
+        // drafts before the first stage launches (prepare_drafts). One group, so that stage is idle at that moment.
+        if constexpr (requires(Stage& st) { st.program->pipeline_drafts_on_head(); }) {
+            drafts_on_head_ = stages_.size() > 1 && stages_.back()->program->pipeline_drafts_on_head();
+        }
+        if (drafts_on_head_) { groups_ = 1; }
         assembled_tokens_.resize(static_cast<std::size_t>(kMaximumBatchColumns) * width_);
         assembled_counts_.resize(kMaximumBatchColumns);
         flights_.resize(groups_);
@@ -582,6 +588,7 @@ private:
             f.verifying = kind == FlightKind::Decode ? !stages_[0]->program->speculative_round_is_narrow(lanes.size())
                 : !stages_[0]->program->speculative_round_is_narrow(0);
             f.dflash_window = stages_[0]->program->select_dflash_draft_window(lanes);
+            prepare_drafts(lanes, budgets, f.dflash_window);
         }
         f.result       = GroupResult{};
         // A decode round's residual is exactly `width` columns per lane (one, or the verify's
@@ -711,6 +718,29 @@ private:
 
     void select(std::size_t stage) const noexcept { (void)cudaSetDevice(devices_[stage]); }
 
+    /// DSpark on a pipeline: the stage with the head appends the lanes' context and proposes the round's drafts now,
+    /// and the stages without an import (the first) take the verify ids from it; the later stages read them from the
+    /// boundary packet as before.
+    bool drafts_on_head_ = false;
+    void prepare_drafts(std::span<const std::uint32_t> lanes, std::span<const RoundBudget> budgets,
+                        std::uint32_t window) {
+        if (!drafts_on_head_ || lanes.empty()) { return; }
+        if constexpr (requires(Stage& st, std::span<const std::uint32_t> l, std::span<const RoundBudget> b) {
+                          st.program->prepare_pipeline_drafts(l, b, 0U);
+                          st.program->pipeline_draft_import_buffer();
+                      }) {
+            const std::size_t last = stages_.size() - 1;
+            select(last);
+            trace("prepare_drafts", last, lanes.size());
+            const std::span<const std::byte> drafts = stages_[last]->program->prepare_pipeline_drafts(lanes, budgets, window);
+            for (std::size_t s = 0; s < last; ++s) {
+                if (void* import = stages_[s]->program->pipeline_draft_import_buffer()) {
+                    std::memcpy(import, drafts.data(), drafts.size());
+                }
+            }
+        }
+    }
+
     /// SUROGATE_SERVE_PIPELINE_CHECKSUM=N: for the first N parked residuals, one line per
     /// column of the carry -- sum and absmax of the BF16 values -- so a graph replay's crossing
     /// can be read on the host, column by column, where the runtime's own checksum (which runs
@@ -798,6 +828,7 @@ private:
             stage->program->set_round_width_hint(width_hint);
             stage->program->set_dflash_draft_window(dflash_window);
         }
+        if (width_ > 1) { prepare_drafts(lanes, budgets, dflash_window); }
         for (std::size_t t = 0; t + 1 < G + N + 1; ++t) {
             for (std::size_t s = 0; s < N; ++s) {
                 if (t >= s + 1 && t - s - 1 < G) {

@@ -530,6 +530,10 @@ void HostBank::attach(artifact::MaterializedArtifact& backing) const {
     }
 }
 
+void HostBank::detach(artifact::MaterializedArtifact& backing) const {
+    for (const auto& [index, object] : objects_) { backing.detach_host_object(artifact::ObjectHandle{index}); }
+}
+
 HostObjectPlan host_plan(artifact::Binder& binder, artifact::ObjectHandle handle,
                          const std::string& name) {
     const auto runs = binder.runs(handle);

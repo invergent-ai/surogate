@@ -440,6 +440,23 @@ void Program<Variant>::adopt_pipeline_decode_features(std::span<const std::uint3
 }
 
 template <>
+bool Program<Variant>::pipeline_drafts_on_head() const noexcept {
+    return impl_->pipeline_drafts_on_head();
+}
+
+template <>
+std::span<const std::byte> Program<Variant>::prepare_pipeline_drafts(std::span<const std::uint32_t> lanes,
+                                                                     std::span<const runtime::RoundBudget> budgets,
+                                                                     std::uint32_t window) {
+    return impl_->prepare_pipeline_drafts(lanes, budgets, window);
+}
+
+template <>
+void* Program<Variant>::pipeline_draft_import_buffer() const noexcept {
+    return impl_->pipeline_draft_import_buffer();
+}
+
+template <>
 std::span<const std::byte> Program<Variant>::speculative_outcome() const noexcept {
     return impl_->speculative_outcome();
 }

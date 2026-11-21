@@ -758,6 +758,93 @@ int test_lora_delta(std::uint32_t seed) {
     return failures;
 }
 
+/// I10 PDL chain (agent-EN 17:5x, after lane c's FP8 decode finding): the decode-shaped chain of e1's split GEMMs as the
+/// engine runs it -- per visit, the dynamic-tap GEMM 32 x 2304 (split 9: split kernel -> reduce_kernel) then a 2304 x 32
+/// GEMM back to the stream -- 24 visits with ONE reused workspace, ONE reused tap buffer and two alternating stream
+/// buffers, launched back to back on one stream (every launch a PDL dependent of the previous kernel), eager and as a
+/// CUDA graph replayed twice; vs a reference with a device synchronize after every launch and FRESH buffers per visit.
+/// Bitwise. A non-coherent (ld.global.nc) read of a predecessor's output in the reused buffers is what it is built to
+/// catch (probabilistic: the SASS audit is the proof; this guards against a regression).
+int test_pdl_chain(std::uint32_t seed) {
+    constexpr int kVisits = 24, kTaps = 32, T = 4;
+    std::vector<DeviceBuffer> w_taps, w_up;
+    for (int v = 0; v < kVisits; ++v) {
+        w_taps.push_back(to_device(hash_bf16(static_cast<std::size_t>(kTaps) * kD, seed + 2 * v, 0.036F)));
+        w_up.push_back(to_device(hash_bf16(static_cast<std::size_t>(kD) * kTaps, seed + 2 * v + 1, 0.30F)));
+    }
+    const auto x0 = hash_bf16(static_cast<std::size_t>(T) * kD, seed + 999, 1.7F);
+    const std::size_t ws_taps = ops::inkling_gemm_inv_workspace_bytes(kTaps, kD, T, 1);
+    const std::size_t ws_up   = ops::inkling_gemm_inv_workspace_bytes(kD, kTaps, T, 1);
+    const std::size_t ws      = std::max<std::size_t>({ws_taps, ws_up, 16});
+    const ops::InklingGemmBatch one_taps{1, static_cast<std::int64_t>(kTaps) * kD, static_cast<std::int64_t>(T) * kD,
+                                         static_cast<std::int64_t>(T) * kTaps};
+    const ops::InklingGemmBatch one_up{1, static_cast<std::int64_t>(kD) * kTaps, static_cast<std::int64_t>(T) * kTaps,
+                                       static_cast<std::int64_t>(T) * kD};
+    // Reference: a synchronize after every launch, fresh buffers per visit.
+    std::vector<std::uint8_t> ref_x, ref_t;
+    {
+        std::vector<DeviceBuffer> keep;
+        keep.push_back(to_device(x0));
+        const void* x = keep.back().p;
+        for (int v = 0; v < kVisits; ++v) {
+            DeviceBuffer w1(ws), t(static_cast<std::size_t>(T) * kTaps * 2), w2(ws), y(static_cast<std::size_t>(T) * kD * 2);
+            ops::inkling_gemm_inv(w_taps[v].p, kTaps, kD, x, T, t.p, DType::BF16, kTaps, one_taps, w1.p, ws, nullptr);
+            cuda_synchronize();
+            ops::inkling_gemm_inv(w_up[v].p, kD, kTaps, t.p, T, y.p, DType::BF16, kD, one_up, w2.p, ws, nullptr);
+            cuda_synchronize();
+            if (v + 1 == kVisits) { ref_t = raw(t.p, t.bytes); }
+            x = y.p;
+            keep.push_back(std::move(w1)); keep.push_back(std::move(t)); keep.push_back(std::move(w2));
+            keep.push_back(std::move(y));
+        }
+        ref_x = raw(x, static_cast<std::size_t>(T) * kD * 2);
+    }
+    // The engine's shape: one stream, back-to-back PDL launches, reused buffers.
+    cudaStream_t stream = nullptr;
+    cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
+    DeviceBuffer d_ws(ws), d_t(static_cast<std::size_t>(T) * kTaps * 2), d_a(static_cast<std::size_t>(T) * kD * 2),
+        d_b(static_cast<std::size_t>(T) * kD * 2);
+    const std::vector<std::uint16_t> x0_bits(x0.begin(), x0.end());
+    const auto chain = [&] {
+        void* in = d_a.p;
+        void* out = d_b.p;
+        for (int v = 0; v < kVisits; ++v) {
+            ops::inkling_gemm_inv(w_taps[v].p, kTaps, kD, in, T, d_t.p, DType::BF16, kTaps, one_taps, d_ws.p, ws, stream);
+            ops::inkling_gemm_inv(w_up[v].p, kD, kTaps, d_t.p, T, out, DType::BF16, kD, one_up, d_ws.p, ws, stream);
+            std::swap(in, out);
+        }
+        return in; // the last output
+    };
+    int failures = 0;
+    const auto reset = [&] {
+        cuda_check(cudaMemcpy(d_a.p, x0_bits.data(), x0_bits.size() * 2, cudaMemcpyHostToDevice), "x0");
+    };
+    reset();
+    const void* last = chain();
+    cuda_synchronize(stream);
+    failures += same_bits("I10 pdl chain eager, 24 visits, reused buffers: stream == synchronized fresh-buffer reference",
+                          raw(last, ref_x.size()), ref_x, 2);
+    failures += same_bits("I10 pdl chain eager: last tap output", raw(d_t.p, ref_t.size()), ref_t, 2);
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t exec = nullptr;
+    reset();
+    cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "capture");
+    last = chain();
+    cuda_check(cudaStreamEndCapture(stream, &graph), "end capture");
+    cuda_check(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
+    for (int replay = 0; replay < 2; ++replay) {
+        reset();
+        cuda_check(cudaGraphLaunch(exec, stream), "graph launch");
+        cuda_synchronize(stream);
+        failures += same_bits("I10 pdl chain graph replay " + std::to_string(replay) + " == reference", raw(last, ref_x.size()),
+                              ref_x, 2);
+    }
+    cudaGraphExecDestroy(exec);
+    cudaGraphDestroy(graph);
+    cudaStreamDestroy(stream);
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -785,6 +872,7 @@ int main() {
     failures += test_conv_paths(3003);
     failures += test_head_logprob(3201);
     failures += test_lora_delta(3601);
+    failures += test_pdl_chain(3701);
     for (const int n : {1, 5, 8, 13, 32}) {
         failures += test_controller_tail(3300 + n, 3, 1, n);
         failures += test_controller_tail(3400 + n, 3, 3, n);

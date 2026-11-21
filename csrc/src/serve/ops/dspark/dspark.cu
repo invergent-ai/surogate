@@ -106,7 +106,10 @@ head_norm_rope_kernel(const bf16* x, std::int64_t x_stride, const bf16* weight, 
         __syncthreads();
         constexpr int half = G::kHeadDim / 2;
         const int i        = d & (half - 1);
-        const float angle  = __fmul_rn(static_cast<float>(positions[t]), inv_freq[i]);
+        // positions is a per-round buffer written by an earlier node of the round's graph: read it with ld.cg (the
+        // compiler emitted ld.global.nc here on type-based alias grounds; PDL audit 17:48). inv_freq is a load-time
+        // constant. Same bits.
+        const float angle  = __fmul_rn(static_cast<float>(__ldcg(positions + t)), inv_freq[i]);
         const float c      = cosf(angle);
         const float s      = sinf(angle);
         const float y1     = y_s[i];

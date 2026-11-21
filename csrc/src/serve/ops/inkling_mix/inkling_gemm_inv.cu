@@ -206,9 +206,12 @@ __global__ __launch_bounds__(S::kThreads) void gemm_inv_kernel(const __grid_cons
     }
 }
 
-/// out = p[0] + p[1] + ... + p[splits - 1], added in that order, one thread per output element.
+/// out = p[0] + p[1] + ... + p[splits - 1], added in that order, one thread per output element. The partials are read
+/// through L2 (ld.global.cg), never the non-coherent read-only path: they are written by the split GEMM just before this
+/// kernel in the PDL chain (this grid may be resident while it runs) and the visit arena reuses their address every
+/// visit, which breaks ld.global.nc's read-only-for-the-kernel's-lifetime contract (lane c's FP8 decode finding 17:47).
 template <typename OutT>
-__global__ void __launch_bounds__(256) reduce_kernel(const float* __restrict__ partial, OutT* __restrict__ out,
+__global__ void __launch_bounds__(256) reduce_kernel(const float* partial, OutT* __restrict__ out,
                                                      std::int32_t rows, std::int32_t tokens, std::int32_t batch,
                                                      std::int32_t splits, std::int32_t ldc, std::int64_t out_stride) {
     pdl::wait_for_dependencies();
@@ -217,8 +220,8 @@ __global__ void __launch_bounds__(256) reduce_kernel(const float* __restrict__ p
     const std::int64_t i     = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= total) { return; }
     const std::int64_t plane = static_cast<std::int64_t>(batch) * tokens * rows;
-    float sum                = partial[i];
-    for (int s = 1; s < splits; ++s) { sum += partial[s * plane + i]; }
+    float sum                = __ldcg(partial + i);
+    for (int s = 1; s < splits; ++s) { sum += __ldcg(partial + s * plane + i); }
     const std::int32_t row   = static_cast<std::int32_t>(i % rows);
     const std::int64_t rest  = i / rows;
     const std::int32_t token = static_cast<std::int32_t>(rest % tokens);

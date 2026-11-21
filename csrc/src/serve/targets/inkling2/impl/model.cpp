@@ -141,13 +141,32 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
         // DSpark (lane e2): the fold and the drafter's derived weights; the runtime's DFlash guards need a payload.
         derive_dspark(weights, dspark, plan.plan.options.draft_linears_host, dspark_fp8_fold_requested());
         model.dspark = &dspark;
+        if (host_bank && dspark.fp8) {
+            // The host bank holds only the drafter's BF16 dense linears (~0.49 GiB pinned), read once above to quantise
+            // them; the FP8 drafter never reads them again (dspark.cpp dense()). Release it (M7 review): detach the
+            // objects from the artifact and null their views first, so nothing can dereference freed memory.
+            host_bank->detach(backing);
+            for (auto& L : weights.draft.layers) {
+                for (Weight* wt : {&L.q, &L.k, &L.v, &L.o, &L.k_ctx, &L.v_ctx, &L.gate, &L.up, &L.down}) {
+                    wt->qdata = nullptr;
+                    wt->payload = nullptr;
+                }
+            }
+            host_bank.reset();
+        }
     }
 
     runtime.geometry        = plan.geometry;
     runtime.weights_arena   = &backing.device_arena();
     runtime.features        = plan.features;
     if (plan.features.dflash()) {
-        if (!weights.has_draft) { throw std::invalid_argument("inkling2: --speculative dflash needs the DSpark drafter"); }
+        // The 2-card split keeps the drafter on the stage with the head (package.cpp); a stage without the head runs
+        // the DFlash round's target half only (verify columns from the drafter stage) and binds no drafter.
+        const bool drafter_elsewhere = plan.plan.options.draft_placement.has_value() &&
+                                       *plan.plan.options.draft_placement == artifact::TensorPlacement::ValidateOnly;
+        if (!weights.has_draft && !drafter_elsewhere) {
+            throw std::invalid_argument("inkling2: --speculative dflash needs the DSpark drafter");
+        }
         runtime.dflash.emplace();
     }
     runtime.token_embedding = weights.globals.embedding;

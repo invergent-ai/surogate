@@ -1234,7 +1234,13 @@ void validate_target_options(const EngineOptions& options,
             throw std::invalid_argument("kv_capacity must be at least max_context");
         }
         const std::uint32_t requested_pages = page_count(options.kv_capacity.explicit_tokens);
-        if (requested_pages < minimum_pages || requested_pages > maximum_pages64) {
+        // Lane f1: a pipeline stage's explicit capacity that is the shared resolution of auto came
+        // from the capacity curve itself, whose maximum counts an elastic window class's charge per
+        // lane (lanes x (logical + charge)); the planner clamps it to that curve. Capping it at
+        // lanes x logical refused every 2-stage --kv-capacity auto --max-num-seqs 1 engine (the
+        // preflight resolves logical + charge: 1,059,776 tokens at 1M; e1b, BOARD 17:27).
+        if (requested_pages < minimum_pages ||
+            (requested_pages > maximum_pages64 && !options.kv_capacity_resolved_automatically)) {
             throw std::invalid_argument(
                 "kv_capacity is outside the usable range for max_context and max_concurrency");
         }

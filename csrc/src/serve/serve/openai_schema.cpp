@@ -1180,6 +1180,9 @@ std::string make_completion_response(const std::string& id, const std::string& m
         payload["choices"][0]["token_ids"] = detail.completion_token_ids;
     }
     if (!detail.lora_versions.empty()) { payload["choices"][0]["lora_versions"] = detail.lora_versions; }
+    // Rollout Routing Replay (return_routed_experts): the same choice.routed_experts object as the chat routes
+    // ({"data", "shape" [n, layers, top_k], "start", "dtype" "int16"}). Absent unless requested.
+    if (detail.include_routed_experts) { payload["choices"][0]["routed_experts"] = chat["choices"][0]["routed_experts"]; }
     if (detail.include_logprobs) {
         Json tokens = Json::array(), probabilities = Json::array(), top = Json::array(), offsets = Json::array();
         std::size_t offset = detail.text_offset;
