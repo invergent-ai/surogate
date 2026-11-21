@@ -63,6 +63,19 @@ std::vector<int> ints(const ink::PyValue* v) {
     return out;
 }
 
+// The renderer vectors to check against: renderer-099 (owner rule 2026-11-21 17:40: a request that sets no reasoning
+// effort renders at 0.99; those vectors expect vLLM's ids for the same body with chat_template_kwargs.reasoning_effort
+// = 0.99, every other vector is vLLM's own as in renderer/). renderer/ (vLLM's default 0.9) only where 099 is missing.
+fs::path renderer_set(const fs::path& vectors) {
+    const fs::path set = fs::is_directory(vectors / "renderer-099") ? vectors / "renderer-099" : vectors / "renderer";
+    static bool said = false;
+    if (!said) {
+        said = true;
+        std::cout << "renderer vectors: " << set.filename().string() << "\n";
+    }
+    return set;
+}
+
 std::vector<fs::path> vector_files(const fs::path& dir) {
     std::vector<fs::path> files;
     for (const auto& e : fs::directory_iterator(dir)) {
@@ -120,7 +133,7 @@ int main() {
     // 1. prompts: body -> serving layer -> Frontend::prepare / count_tokens
     {
         int n = 0, bad = 0, refused_by_schema = 0, errors = 0;
-        for (const fs::path& f : vector_files(vectors / "renderer")) {
+        for (const fs::path& f : vector_files(renderer_set(vectors))) {
             const ink::PyValue vec = ink::py_json_loads(read_file(f));
             const std::string name = vec.find("case")->text;
             const std::string body = ink::py_json_dumps(*vec.find("body"), ink::PyDumpStyle{.ensure_ascii = false});
