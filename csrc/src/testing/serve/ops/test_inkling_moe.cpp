@@ -32,6 +32,7 @@
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <stdexcept>
 #include <string>
 #include <iostream>
 #include <vector>

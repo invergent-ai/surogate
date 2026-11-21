@@ -188,8 +188,9 @@ __device__ __forceinline__ Nvfp4Block nvfp4_quantize_block_4o6(const float (&x)[
 /// rounding.
 __device__ __forceinline__ std::uint32_t mxfp8_block_exponent(float amax, float& inverse) {
     const float raw = __fmul_rn(amax, kInv448);
+    // `((bits(raw) + 0x7FFFFF) & 0x7F800000) >> 23` (raw >= 0; unsigned so a NaN cannot overflow).
     std::int32_t exponent =
-        ((static_cast<std::int32_t>(__float_as_uint(raw)) + 0x007FFFFF) & 0x7F800000) >> 23;
+        static_cast<std::int32_t>(((__float_as_uint(raw) + 0x007FFFFFU) & 0x7F800000U) >> 23);
     exponent = raw <= kTwoPowMinus127 ? 0 : min(exponent, 254);
     if (raw != raw) { exponent = 255; }
     const float scale = fmaxf(__uint_as_float(static_cast<std::uint32_t>(exponent) << 23),
