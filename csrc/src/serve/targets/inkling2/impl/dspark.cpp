@@ -104,11 +104,9 @@ bool dspark_bf16_weights_forced() {
 }
 
 bool dspark_fp8_weights_requested() {
-    static const bool requested = [] {
-        const char* raw = std::getenv("SUROGATE_SERVE_DSPARK_FP8_WEIGHTS");
-        return raw != nullptr && raw[0] == '1';
-    }();
-    return requested && !dspark_bf16_weights_forced();
+    // DEFAULT since fp8ab2 (card 7 16:34): identity 16 / 16, tokens / round 3.59 vs 3.56 (BF16), -0.29 GiB device
+    // with the FP8 fold. SUROGATE_SERVE_DSPARK_BF16_WEIGHTS=1 keeps the BF16 drafter weights.
+    return !dspark_bf16_weights_forced();
 }
 
 namespace {
@@ -128,11 +126,13 @@ void dense(WorkspaceArena& work, const DSparkDerived& d, const Weight& w, const 
 } // namespace
 
 bool dspark_fp8_fold_requested() {
-    static const bool requested = [] {
-        const char* raw = std::getenv("SUROGATE_SERVE_DSPARK_FP8_FOLD");
+    // DEFAULT since fp8ab2 (with the FP8 weights; CPU r1+r2: no acceptance loss). SUROGATE_SERVE_DSPARK_BF16_FOLD=1
+    // keeps the BF16 fold.
+    static const bool bf16 = [] {
+        const char* raw = std::getenv("SUROGATE_SERVE_DSPARK_BF16_FOLD");
         return raw != nullptr && raw[0] == '1';
     }();
-    return requested;
+    return !bf16;
 }
 
 void derive_dspark(const load::InklingWeights& w, DSparkDerived& out, bool fp8_weights, bool fp8_fold) {

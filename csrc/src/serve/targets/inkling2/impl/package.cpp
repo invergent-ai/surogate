@@ -130,8 +130,9 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
     }
     // DSpark (lane e2): `--speculative dflash` binds the artifact's drafter and runs it through the DFlash runtime.
     bind.draft = options.speculative.backend == SpeculativeBackend::DFlash;
-    // FP8 drafter weights are OPT-IN until the target attaches a host bank (m6b 16:11: a HostBank-placed linear has
-    // no materialised pointer without family::collect_host_bank + HostBank::attach): SUROGATE_SERVE_DSPARK_FP8_WEIGHTS=1.
+    // FP8 drafter weights by default (fp8ab2 16:34: identity, tokens / round within noise, -0.29 GiB with the FP8
+    // fold): the BF16 dense linears sit in the host bank (attached in LoadedModelData) and are re-quantised at load;
+    // SUROGATE_SERVE_DSPARK_BF16_WEIGHTS=1 keeps them BF16 on the device.
     bind.draft_linears_host = bind.draft && detail::dspark_fp8_weights_requested();
     detail::ArtifactLoadPlan plan;
     plan.bindings.plan     = load::bind_artifact(binder, bind);
