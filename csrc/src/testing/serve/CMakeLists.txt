@@ -300,6 +300,17 @@ sinfer_add_test(sinfer_kv_cache_test
 sinfer_add_test(sinfer_kv_admission_test
   SOURCES test_kv_admission.cpp
   LIBRARIES sinfer_core)
+# Window-bounded KV pages (lane f1): the host-only page manager; needs no device. Header-only
+# (core/kv_window_pages.h), so it links nothing and builds in seconds without libsinfer.so.
+add_executable(sinfer_kv_window_pages_test test_kv_window_pages.cpp)
+target_include_directories(sinfer_kv_window_pages_test PRIVATE ${SERVE_ROOT})
+target_compile_options(sinfer_kv_window_pages_test PRIVATE -UNDEBUG)
+add_test(NAME sinfer_kv_window_pages_test COMMAND sinfer_kv_window_pages_test)
+set_property(GLOBAL APPEND PROPERTY SINFER_SERVE_TEST_TARGETS sinfer_kv_window_pages_test)
+# The pool's window class on a device (exits 77 without one).
+sinfer_add_test(sinfer_kv_window_pool_test
+  SOURCES test_kv_window_pool.cpp
+  LIBRARIES sinfer_core)
 sinfer_add_test(sinfer_elastic_kv_region_test
   SOURCES test_elastic_kv_region.cpp
   LIBRARIES sinfer_core)

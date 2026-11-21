@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
@@ -85,6 +86,38 @@ geometry_global_geometry_layers(const family::TextGeometry& g) {
         ++kv_layer;
     }
     return out;
+}
+
+/// Window-bounded KV pages (lane f1, rl/engine-inkling-2026-11-21/lanes/f1/DESIGN-window-kv.md):
+/// on unless SUROGATE_SERVE_KV_WINDOW_PAGING=0, which keeps every windowed layer on full-context
+/// pages as before (the A/B for token identity).
+[[nodiscard]] inline bool kv_window_paging_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SUROGATE_SERVE_KV_WINDOW_PAGING");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+/// The sliding window of each KV-owning attention layer, in the pool's numbering (0 = whole
+/// context), or empty when no layer has one -- which leaves the pool exactly as it was. The
+/// window is the one attention runs with (layer_sliding_window, residual_policy.h), so a page the
+/// kernels can read is never released. A target whose KV planes are not one per layer (Inkling's
+/// per-visit planes) states them itself: `static std::vector<std::int32_t> kv_layer_windows(g)`.
+template <class V>
+[[nodiscard]] std::vector<std::int32_t> variant_kv_layer_windows(const family::TextGeometry& g) {
+    if (!kv_window_paging_enabled()) { return {}; }
+    std::vector<std::int32_t> out;
+    if constexpr (requires { V::kv_layer_windows(g); }) {
+        out = V::kv_layer_windows(g);
+    } else {
+        for (std::int32_t layer = 0; layer < g.layers; ++layer) {
+            if (!g.layer_attends(layer) || !g.layer_owns_kv(layer)) { continue; }
+            out.push_back(layer_sliding_window(layer, g));
+        }
+    }
+    const bool any = std::any_of(out.begin(), out.end(), [](std::int32_t w) { return w > 0; });
+    return any ? out : std::vector<std::int32_t>{};
 }
 
 } // namespace
@@ -255,6 +288,40 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     const std::uint32_t mtp_physical_pages = static_cast<std::uint32_t>(
         checked_i32(static_cast<std::uint64_t>(plan.main_page_groups) + mtp_extra_pages,
                     "MTP Paged KV physical pages exceed int32"));
+    // Window class of the text pool: a constant, so the capacity curve stays affine in the
+    // full-context pages, and its stride counts only the planes that keep the whole context.
+    std::vector<std::int32_t> layer_windows = variant_kv_layer_windows<Variant>(plan.geometry);
+    KvWindowClassSize window_class;
+    if (!layer_windows.empty()) {
+        const auto window_tokens =
+            static_cast<std::uint32_t>(*std::max_element(layer_windows.begin(), layer_windows.end()));
+        static const std::uint32_t image_windows = [] {
+            const char* raw = std::getenv("SUROGATE_SERVE_KV_WINDOW_IMAGES");
+            return raw ? static_cast<std::uint32_t>(std::strtoul(raw, nullptr, 10)) : 8U;
+        }();
+        // A pipeline stage holds one round per micro-batch group in flight (PipelineProgram:
+        // one group per stage unless SUROGATE_SERVE_PIPELINE_GROUPS says otherwise); 4 covers
+        // the 2- and 4-card splits, the env value any other.
+        const bool stage = !(plan.pipeline_stage_first == 0 && plan.pipeline_stage_last == 0) &&
+                           (plan.pipeline_stage_first > 0 || plan.pipeline_stage_last < plan.geometry.layers);
+        std::uint32_t rounds = 1;
+        if (stage) {
+            const char* raw = std::getenv("SUROGATE_SERVE_PIPELINE_GROUPS");
+            const long groups = raw != nullptr && *raw != '\0' ? std::strtol(raw, nullptr, 10) : 0;
+            rounds = std::min(plan.max_concurrency, groups >= 1 ? static_cast<std::uint32_t>(groups) : 4U);
+        }
+        window_class = plan_kv_window_class(window_tokens, plan.max_concurrency,
+                                            static_cast<std::uint32_t>(effective_prefill_chunk),
+                                            image_windows, rounds);
+        if (plan.kv_window_elastic && plan.elastic_kv) {
+            // M3-C (lanes/f1/DESIGN-M3-kv-lever.md C): the static bound above becomes the virtual
+            // span; the device holds the round transient (+ a granule) and what holders are charged.
+            window_class.elastic         = true;
+            window_class.lane_charge     = kv_window_lane_charge(window_tokens);
+            const std::uint32_t steady   = plan.max_concurrency * window_class.lane_charge;
+            window_class.transient_pages = window_class.lane_pages > steady ? window_class.lane_pages - steady : 1U;
+        }
+    }
     LayoutBuilder builder;
     PersistentLayout out;
     out.decoder = family::plan_decoder_state(
@@ -285,6 +352,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .text_physical_page_cap    = plan.elastic_kv ? plan.main_page_groups : 0U,
                      .elastic_kv_overcommit     = plan.elastic_kv && plan.elastic_kv_overcommit,
                      .mtp_physical_page_groups  = mtp_physical_pages,
+                     .layer_windows             = std::move(layer_windows),
+                     .window_class              = window_class,
                      // A visit-schedule target keeps its per-visit conv state in this pool
                      // (family/impl/runtime/visit_round.h); every other target's spec is unchanged.
                      .linear_attention = [&]() -> LinearAttentionStatePoolSpec {
@@ -499,10 +568,25 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     // cap in whole granules, though, up to one granule past the cap's pages, so that last
     // granule is charged too: one granule less a page, a constant that keeps the curve affine.
     if (out.decoder.text_kv.pool.spec.elastic) {
-        const std::size_t per_page = out.decoder.text_kv.payload_bytes() / physical_pages;
+        // The full-context planes only: window-class planes sit in the arena (a constant).
+        std::size_t full_plane_bytes = 0;
+        for (const auto& plane : out.decoder.text_kv.pool.planes) {
+            if (plane.spec.window == 0) { full_plane_bytes += plane.storage.region.bytes; }
+        }
+        const std::size_t per_page = full_plane_bytes / physical_pages;
         const std::uint32_t granule = std::max(out.decoder.text_kv.pool.elastic_granule_pages, 1U);
         out.elastic_plane_bytes =
             per_page * (static_cast<std::size_t>(plan.main_page_groups) + granule - 1U);
+        // M3-C: an elastic window class's floor (whole granules) is held for the engine's life;
+        // its other pages come out of the main pages above through the ledger. A constant.
+        const auto& text_pool = out.decoder.text_kv.pool;
+        if (text_pool.spec.window_elastic && text_pool.window_elastic_bytes != 0) {
+            std::size_t window_page_bytes = 0;
+            for (const auto& plane : text_pool.planes) {
+                if (plane.spec.window > 0) { window_page_bytes += plane.storage.region.bytes / plane.storage.shape[3]; }
+            }
+            out.elastic_plane_bytes += window_page_bytes * text_pool.spec.window_floor_pages;
+        }
     }
     return out;
 }
@@ -1195,6 +1279,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->kv_skip_layers      = inputs.kv_skip_layers;
     impl->elastic_kv          = inputs.elastic_kv;
     impl->elastic_kv_overcommit = inputs.elastic_kv_overcommit;
+    impl->kv_window_elastic     = inputs.kv_window_elastic;
     impl->prefix_cache_host_bytes = inputs.prefix_cache_host_bytes;
     impl->weights_identity        = inputs.weights_identity;
     impl->persistent          = persistent_layout(*impl);
@@ -1350,6 +1435,12 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .kv_skip_layers = family::detail::kv_precision_layers(geometry, options.kv_cache_skip_layers),
         .elastic_kv                = options.elastic_kv,
         .elastic_kv_overcommit     = options.elastic_kv_overcommit,
+        .kv_window_elastic         = [&] {
+            // Lane f1 M3-C: the window class follows demand when the cache is sized to the device.
+            const char* raw = std::getenv("SUROGATE_SERVE_KV_WINDOW_ELASTIC");
+            if (raw != nullptr && *raw != '\0') { return options.elastic_kv && std::strcmp(raw, "0") != 0; }
+            return options.elastic_kv && options.kv_capacity.mode == KvCapacityMode::Automatic;
+        }(),
         .proposal_head             = options.speculative.proposal_head,
         .features                  = family::startup_features(options),
         .use_cuda_graph            = options.use_cuda_graph,
