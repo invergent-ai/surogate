@@ -91,6 +91,7 @@ def main():
         torch.cuda.reset_peak_memory_stats()
         ids = torch.tensor(pool[:T], dtype=torch.int32, device=eng.dev)
         row = {"T": T}
+        B.PROFILE["t"].clear()
         try:
             t0 = time.time()
             lp, res = tf.build(ids, lora, banks)
@@ -105,6 +106,8 @@ def main():
             row["loss"] = float(loss.detach())
             row["finite"] = all(bool(torch.isfinite(p.grad).all()) for p in params if p.grad is not None)
             row["tok_per_s"] = T / (row["forward_s"] + row["backward_s"])
+            if B.PROFILE["on"]:
+                row["profile_s"] = {k: round(v, 2) for k, v in sorted(B.PROFILE["t"].items())}
             del lp, res, loss
         except torch.OutOfMemoryError as e:
             row["oom"] = str(e).split(". ")[0][:200]

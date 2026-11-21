@@ -123,6 +123,8 @@ class TokenChunked(torch.autograd.Function):
         gin = [torch.zeros(toks[i].shape, dtype=F32, device=dev)
                if (need[i] and sinks[i] is None and toks[i].is_floating_point()) else None for i in range(n_tok)]
         pgr = [None] * len(params)
+        tick = B._tick("bwd.tc." + getattr(ctx.fn, "__name__", "fn"))
+        tick.__enter__()
         for c0 in range(0, T, chunk):
             n = min(chunk, T - c0)
             with torch.enable_grad(), torch.device(dev):
@@ -154,6 +156,7 @@ class TokenChunked(torch.autograd.Function):
                     g = next(it)
                     if g is not None:
                         pgr[i] = g if pgr[i] is None else pgr[i] + g
+        tick.__exit__(None, None, None)
         res = [None if g is None else g.to(ctx.in_dtypes[i]) for i, g in enumerate(gin)]
         res += [None if g is None else g.to(ctx.in_dtypes[n_tok + i]) for i, g in enumerate(pgr)]
         return (None, None, None, None, None, None, None, None, *res, *([None] * ctx.nd))
@@ -219,6 +222,8 @@ class RelAttentionR(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, dlse):
+        tick = B._tick("bwd.attention")
+        tick.__enter__()
         q, k, v, r_out, rel_proj, out, lse = ctx.saved_tensors
         q, k, v, r_out = q.float(), k.float(), v.float(), r_out.float()
         window, qb, scale = ctx.window, ctx.q_block, ctx.scale
@@ -258,6 +263,7 @@ class RelAttentionR(torch.autograd.Function):
             drel = torch.zeros(hq, nq, 1024, dtype=F32, device=q.device)
             drel.scatter_add_(2, gi[None].expand(hq, -1, -1), dsr)
             dr[b0:b1] += torch.einsum("hbd,jd->bhj", drel, projf)
+        tick.__exit__(None, None, None)
         return dq, dk, dv, dr, None, None, None
 
 
@@ -679,7 +685,8 @@ class LongModel(torch.autograd.Function):
 
 def build_manual(tf: "TrainForwardLong", ids, lora=None, banks=None):
     """The engine forward + ONE autograd node (LongModel) over the LoRA tensors: lp [T - 1] with grad."""
-    res = forward_host(tf.eng, ids, None if banks is None else [L["adapters"] for L in banks.layers])
+    with B._tick("fwd.engine"):
+        res = forward_host(tf.eng, ids, None if banks is None else [L["adapters"] for L in banks.layers])
     lt = [lo[k] for lo in lora for k in B.LORA_KEYS] if lora is not None else []
     scale = lora[0]["scale"] if lora is not None else None
     return LongModel.apply(tf, ids, res, scale, *lt), res
