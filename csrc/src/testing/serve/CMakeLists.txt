@@ -76,6 +76,27 @@ target_link_libraries(sinfer_inkling_frontend_test PRIVATE sinfer_text Threads::
 add_test(NAME sinfer_inkling_frontend_test COMMAND sinfer_inkling_frontend_test)
 set_tests_properties(sinfer_inkling_frontend_test PROPERTIES SKIP_RETURN_CODE 77)
 set_property(GLOBAL APPEND PROPERTY SINFER_SERVE_TEST_TARGETS sinfer_inkling_frontend_test)
+# The same sources: Inkling-2 streaming (inkling::StreamParser) -- the concatenated deltas equal the non-streamed
+# message for every parser vector, and deltas come as the tokens do. The frontend gate's streaming check.
+add_executable(sinfer_inkling_stream_test
+  inkling/test_inkling_stream.cpp
+  ${SERVE_ROOT}/family/impl/frontend/inkling_json.cpp
+  ${SERVE_ROOT}/family/impl/frontend/inkling_render.cpp
+  ${SERVE_ROOT}/family/impl/frontend/inkling_parse.cpp
+  ${SERVE_ROOT}/family/impl/frontend/tokenizer.cpp
+  ${SERVE_ROOT}/../tokenizer/tokenizer.cpp
+  ${SERVE_ROOT}/../tokenizer/tok_profile.cpp
+  ${SERVE_ROOT}/../tokenizer/unicode.cpp
+  ${SERVE_ROOT}/../tokenizer/unicode_data.cpp)
+target_include_directories(sinfer_inkling_stream_test PRIVATE
+  ${SERVE_ROOT} ${SERVE_ROOT}/.. ${SERVE_ROOT}/../tokenizer ${SINFER_JSON_INCLUDE}
+  ${SUROGATE_VENDOR_DIR} ${SUROGATE_VENDOR_DIR}/utf8proc ${minja_SOURCE_DIR}/include ${fmt_SOURCE_DIR}/include)
+target_compile_definitions(sinfer_inkling_stream_test PRIVATE FMT_HEADER_ONLY=1)
+target_compile_options(sinfer_inkling_stream_test PRIVATE -UNDEBUG)
+target_link_libraries(sinfer_inkling_stream_test PRIVATE sinfer_text Threads::Threads)
+add_test(NAME sinfer_inkling_stream_test COMMAND sinfer_inkling_stream_test)
+set_tests_properties(sinfer_inkling_stream_test PROPERTIES SKIP_RETURN_CODE 77)
+set_property(GLOBAL APPEND PROPERTY SINFER_SERVE_TEST_TARGETS sinfer_inkling_stream_test)
 
 function(sinfer_add_test name)
   cmake_parse_arguments(arg "NEEDS_SOURCE_DIR" "" "SOURCES;LIBRARIES" ${ARGN})
@@ -155,6 +176,12 @@ sinfer_add_op_test(sinfer_ngram_ple_segments_test SOURCES ops/test_ngram_ple_seg
 # Inkling-2-Mini hidden-stream ops (ENGINE-INKLING lane e1): T1-T5 of lanes/e1/DESIGN-target.md 8.
 sinfer_add_op_test(sinfer_inkling_mix_test SOURCES targets/inkling2/test_inkling_mix.cpp LIBRARIES sinfer_ops)
 sinfer_add_op_test(sinfer_inkling_invariance_test SOURCES targets/inkling2/test_inkling_invariance.cpp LIBRARIES sinfer_ops)
+# Lane e1: CUDA graph launch cost by graph shape (plain / PDL / memcpy nodes / split); a bench (exit 77 without a GPU).
+sinfer_add_test(sinfer_inkling_graph_launch_bench SOURCES targets/inkling2/bench_graph_launch.cu LIBRARIES CUDA::cudart)
+# Inkling-2-Mini DSpark drafter ops (ENGINE-INKLING lane e2) vs ref/dspark_ref.py's golden vectors (argument: the
+# vector dir with mtp.safetensors; lanes/e2/card_dspark_test.sh stages it).
+sinfer_add_op_test(sinfer_dspark_test SOURCES targets/inkling2/test_dspark.cpp
+  ${SERVE_ROOT}/targets/inkling2/impl/dspark.cpp LIBRARIES sinfer_ops sinfer_inkling_attention)
 # Inkling-2-Mini's mixture (ENGINE-INKLING lane d): quantisers bit-exact, SiTU, router, MoE vs a host
 # pipeline, width invariance, capture rows, expert LoRA (rl/engine-inkling-2026-11-21/lanes/d/DESIGN-moe.md 9).
 sinfer_add_op_test(sinfer_inkling_moe_test SOURCES ops/test_inkling_moe.cpp LIBRARIES sinfer_ops)
@@ -183,6 +210,11 @@ target_compile_options(sinfer_qwen4exp_mtp_workspace_test PRIVATE -UNDEBUG)
 # head, MTP's bound unchanged.
 sinfer_add_test(sinfer_lora_graph_plan_test SOURCES test_lora_graph_plan.cpp)
 target_compile_options(sinfer_lora_graph_plan_test PRIVATE -UNDEBUG)
+# Lane f1 (ENGINE-INKLING): every serving shape of the windowed targets plans and finalizes affinely under
+# --kv-capacity auto (and as a pipeline stage), and the curve's minimum holds one full request + its window
+# charge. Needs a device context only; artifacts by --inkling / --gemma3 (77 without them).
+sinfer_add_test(sinfer_kv_capacity_shapes_test SOURCES test_kv_capacity_shapes.cpp)
+target_compile_options(sinfer_kv_capacity_shapes_test PRIVATE -UNDEBUG)
 add_executable(sinfer_radix_prefix_cache_test test_radix_prefix_cache.cpp)
 target_include_directories(sinfer_radix_prefix_cache_test PRIVATE ${SERVE_ROOT})
 target_compile_options(sinfer_radix_prefix_cache_test PRIVATE -UNDEBUG)

@@ -14,6 +14,7 @@
 #include "api/ops/inkling_moe.h"
 #include "api/ops/lora_store.h"
 #include "family/impl/lora_bind_inkling.h"
+#include "targets/inkling2/impl/lora_attention.h"
 #include "core/device.h"
 
 #include <algorithm>
@@ -124,7 +125,73 @@ struct Round {
     std::vector<Group> groups;
     ops::InklingConvRecords records{};
     ops::InklingConvPool pool{};
+    /// The segments' ints went in one host copy this round: everything the step wrote before is complete.
+    bool seg_barrier = false;
 };
+
+/// S10 attention LoRA: the round's adapter selection on the bank table registered under `key` (a layer's qkvr or
+/// wo_ud weight; package.cpp), or no table (no adapters, a base round, no published round).
+struct AttnLoraSelection {
+    const ops::LoraBank* table     = nullptr;
+    const std::int32_t* token_slot = nullptr;
+    const std::int32_t* uniform    = nullptr;
+    std::int32_t rank              = 0;
+};
+
+AttnLoraSelection attn_lora_selection(const void* key, std::int32_t tokens) {
+    AttnLoraSelection sel;
+    if (!ops::lora_active()) { return sel; }
+    const ops::LoraRound& round = ops::lora_current_round();
+    if (!round.valid()) { return sel; }
+    const ops::LoraStore& store = ops::lora_store_for_current_device();
+    sel.table = store.bank_table(key);
+    if (sel.table == nullptr) { return sel; }
+    if (round.slots != nullptr) {
+        if (round.slots->numel() < static_cast<std::int64_t>(tokens)) {
+            throw std::logic_error("inkling2: the round's adapter slots are narrower than the round");
+        }
+        sel.token_slot = static_cast<const std::int32_t*>(round.slots->data);
+    } else {
+        sel.uniform = round.uniform_cell;
+    }
+    sel.rank = store.max_rank();
+    return sel;
+}
+
+void apply_attn_lora(WorkspaceArena& work, const AttnLoraSelection& sel, const ops::InklingLoraSlice* slices,
+                     int count, std::int32_t tokens, cudaStream_t s) {
+    const std::size_t bytes = ops::inkling_lora_delta_workspace_bytes(count, sel.rank, tokens);
+    Tensor low = work.alloc(DType::FP32, {static_cast<std::int32_t>(bytes / sizeof(float))});
+    ops::inkling_lora_delta(sel.table, slices, count, sel.rank, tokens, sel.token_slot, sel.uniform, low.data, bytes, s);
+}
+
+/// Lane d's InklingMoeOptions::workspace_tokens: the widest call the arena's free bytes still book (the visit
+/// workspace was planned for the phase's widest round, so the free space at the MoE step is at least that call's
+/// layout), so a narrower prefill call may take fewer down column passes. Speed only: the bits are the same.
+std::int32_t moe_workspace_tokens(const WorkspaceArena& work, ops::InklingExpertFormat format, bool adapters,
+                                  std::int32_t tokens) {
+    constexpr std::size_t kSlack = std::size_t{1} << 16; // the carve's per-buffer alignment, generously
+    const std::size_t used = work.used(), capacity = work.capacity();
+    if (capacity <= used + kSlack) { return 0; }
+    const std::size_t free = capacity - used - kSlack;
+    if (ops::inkling_moe_workspace_bytes(format, tokens, adapters) > free) { return 0; }
+    std::int32_t lo = tokens, hi = std::max<std::int32_t>(tokens, 1) * 2;
+    while (hi <= (1 << 20) && ops::inkling_moe_workspace_bytes(format, hi, adapters) <= free) {
+        lo = hi;
+        hi *= 2;
+    }
+    while (hi - lo > 1) { // bytes grow with tokens: the largest lo that fits
+        const std::int32_t mid = lo + (hi - lo) / 2;
+        (ops::inkling_moe_workspace_bytes(format, mid, adapters) <= free ? lo : hi) = mid;
+    }
+    return lo;
+}
+
+/// The compute stream's persistent state: lane d's MoE counters, then (256-aligned) lane c's attention fold counters.
+std::size_t moe_state_span() { return (ops::inkling_moe_state_bytes() + 255U) & ~std::size_t{255}; }
+
+/// Lane c's key-group cut, passed explicitly (engine and trainer must pass the same value; lane h froze P3).
+constexpr ops::InklingKeyGroups kKeyGroups = ops::InklingKeyGroups::P3;
 
 ops::InklingConvStateView state_view(const Round& rd, int visit) {
     const Tensor& conv = rd.r.state->conv.at(static_cast<std::size_t>(visit));
@@ -431,7 +498,13 @@ void run_visit(Round& rd, int v) {
     cudaStream_t s                      = rd.s;
     auto scope                          = rd.work.scope();
     if (vi.feature >= 0 && rd.r.features.active()) {
-        rd.r.features.capture(rd.r.features.context, vi.feature, slot_tensor(rd.r.x, vi.partial, T), s);
+        // DSpark (lane e2): a contiguous [2304, T] copy -- the sink's verify path views the value it is given.
+        Tensor feature   = rd.work.alloc(DType::BF16, {D, T});
+        const Tensor src = slot_tensor(rd.r.x, vi.partial, T);
+        CUDA_CHECK(cudaMemcpy2DAsync(feature.data, static_cast<std::size_t>(D) * 2, src.data,
+                                     static_cast<std::size_t>(src.nb[1]), static_cast<std::size_t>(D) * 2,
+                                     static_cast<std::size_t>(T), cudaMemcpyDeviceToDevice, s));
+        rd.r.features.capture(rd.r.features.context, vi.feature, feature, s);
     }
     // 1. attention inputs
     const int Q    = (vi.global || vi.looped) ? 3 : 1;
@@ -510,6 +583,17 @@ void run_visit(Round& rd, int v) {
         }
         ops::inkling_gemm_inv_group(std::span<const ops::InklingGemmProblem>(problems, static_cast<std::size_t>(count)),
                                     static_cast<std::int32_t>(k), T, DType::BF16, s);
+    }
+    // 2b. S10 attention LoRA on the six qkvr slices, each from its own input (q-side from x_q, K from x_k, V from x_v on a
+    //     3-input visit, as vLLM's _project), after the base projection and before anything reads qkvr.
+    if (const AttnLoraSelection sel = attn_lora_selection(L.qkvr.qdata, T); sel.table != nullptr) {
+        ops::InklingLoraSlice slices[6];
+        for (int i = 0; i < 6; ++i) {
+            const AttnLoraSlice& d = kQkvrLoraSlices[i];
+            const int stream       = Q == 3 ? (i < 4 ? 0 : i - 3) : 0;
+            slices[i]              = {i, d.rows, in(stream), D, bf16_ptr(qkvr) + d.begin, C::qkvr_rows};
+        }
+        apply_attn_lora(rd.work, sel, slices, 6, T, s);
     }
     // 3. attention per group: lane c's invariant op (prologue: K / V conv + cache write; relative attention; gate and
     //    sink). The K / V conv state is its: in place, recorded (verify), or captured at a rewrite checkpoint.
@@ -598,6 +682,16 @@ void run_visit(Round& rd, int v) {
             rows.positions     = g.positions;
             rows.valid_columns = g.valid;
             rows.kv_table_rows = g.table_rows;
+            rows.key_groups    = kKeyGroups;
+            // Lane c's persistent fold counters (zeroed once by the program; the last CTA returns them to zero).
+            if (rd.r.target_state != nullptr) {
+                rows.state = reinterpret_cast<std::int32_t*>(static_cast<std::byte*>(rd.r.target_state) + moe_state_span());
+            }
+            // Lane c's early metadata read (c2's metadata_static, e1's Q3 answer 12:41): segments when their ints went
+            // in the round's host copy (a full barrier after everything the step wrote before); the ordinary decode
+            // block (ingress copy, the step's first node) or any non-verify block behind that barrier; never verify.
+            rows.metadata_static = seg != nullptr ? rd.seg_barrier
+                                                  : !g.record && (rd.r.block->metadata_static || rd.seg_barrier);
             if (rd.r.block != nullptr && seg == nullptr) {
                 rows.envelope = rd.r.block->envelope;
             } else {
@@ -631,6 +725,10 @@ void run_visit(Round& rd, int v) {
         ops::inkling_attn_linear(pr, &rd.work, s);
     } else {
         gemm_bf16(rd.work, L.output, 0, D, gated.data, T, attn_partial.data, D, s);
+    }
+    if (const AttnLoraSelection sel = attn_lora_selection(L.output.qdata, T); sel.table != nullptr) {
+        const ops::InklingLoraSlice wo[] = {{0, D, gated.data, C::attn_width, attn_partial.data, D}};
+        apply_attn_lora(rd.work, sel, wo, 1, T, s);
     }
     // 5. attention-output conv
     Tensor attn_out = rd.work.alloc(DType::BF16, {D, T});
@@ -690,6 +788,7 @@ void run_visit(Round& rd, int v) {
         options.adapters = adapters;
         // Lane d's narrow-round router + select fold: the stream's persistent counters (zeroed once at startup).
         options.state = static_cast<std::int32_t*>(rd.r.target_state);
+        options.workspace_tokens = moe_workspace_tokens(rd.work, moe_weights(L).format, adapters != nullptr, T);
         const Tensor x(mlp_in.data, DType::BF16, {D, T});
         ops::inkling_moe(x, moe_weights(L), moe_out, rd.work, s, options);
     }
@@ -776,6 +875,7 @@ void Variant::run_visits(const ModelView& model, family::VisitRound& r) {
         if (seg_capture == cudaStreamCaptureStatusNone) {
             CUDA_CHECK(cudaMemcpyAsync(seg_dev.data, seg_ints.data(), seg_ints.size() * sizeof(std::int32_t),
                                        cudaMemcpyHostToDevice, rd.s));
+            rd.seg_barrier = true;
         } else {
             for (std::size_t i = 0; i < seg_ints.size(); ++i) {
                 naive::fill_i32(static_cast<std::int32_t*>(seg_dev.data) + i, 1, seg_ints[i], rd.s);
@@ -829,13 +929,21 @@ void Variant::run_visits(const ModelView& model, family::VisitRound& r) {
     d.active = d.dir != nullptr && !dumped && capturing == cudaStreamCaptureStatusNone && !r.segments.empty() &&
                rd.T >= min_columns;
     for (int v = r.first_visit; v < r.last_visit; ++v) { run_visit(rd, v); }
+    // DSpark's fourth feature (lane e2): the final-norm output, the BF16 hidden the LM head reads, captured before the
+    // runtime checks the round's features are complete; the same invariant mix finish() runs.
+    if (r.features.active() && r.last_visit == C::layers) {
+        auto scope    = rd.work.scope();
+        Tensor hidden = rd.work.alloc(DType::BF16, {D, rd.T});
+        final_residual_mix(model, r.x, hidden, rd.work, rd.s);
+        r.features.capture(r.features.context, 3, hidden, rd.s);
+    }
     if (d.active) {
         dumped   = true;
         d.active = false;
     }
 }
 
-std::size_t Variant::visit_target_state_bytes() { return ops::inkling_moe_state_bytes(); }
+std::size_t Variant::visit_target_state_bytes() { return moe_state_span() + ops::inkling_attention_state_bytes(); }
 
 std::size_t Variant::visit_workspace_capacity_bytes(const family::TextGeometry&, family::TextPhase, std::int32_t batch_size,
                                                     std::int32_t max_width, std::int32_t max_columns,
@@ -850,6 +958,7 @@ std::size_t Variant::visit_workspace_capacity_bytes(const family::TextGeometry&,
     bytes += 2 * up(T * 32 * 2);                             // dynamic taps
     bytes += up(T * C::attn_width * 2) * 2 + up(T * 384 * 2); // q_out, gated, r_out
     bytes += up(T * D * 2) * 4;                              // attn_partial, attn_out, mlp_in, moe_out
+    bytes += up(T * D * 2);                                  // a DSpark feature copy (lane e2)
     // the looped blend tile: dest + msg fp32, pair, h, gf fp32, blended
     bytes += up(tile * D * 3 * 4) + up(tile * D * 3 * 4) + up(tile * 2 * D * 3 * 2) + up(tile * C::gate_rank * 3 * 2) +
              up(tile * 2 * D * 3 * 4) + up(tile * D * 3 * 2);
@@ -861,11 +970,12 @@ std::size_t Variant::visit_workspace_capacity_bytes(const family::TextGeometry&,
     std::size_t attention     = 0;
     for (const auto kind : {ops::InklingLayerKind::Local, ops::InklingLayerKind::Global}) {
         if (max_columns > 0) {
-            attention = std::max(attention, ops::inkling_attention_workspace_capacity_bytes(kind, 1, 1, max_columns, envelope));
+            attention = std::max(attention, ops::inkling_attention_workspace_capacity_bytes(kind, 1, 1, max_columns, envelope,
+                                                                                            kKeyGroups));
         }
         if (batch_size > 0 && max_width > 0) {
             attention = std::max(attention, ops::inkling_attention_workspace_capacity_bytes(kind, batch_size, 1, max_width,
-                                                                                            envelope));
+                                                                                            envelope, kKeyGroups));
         }
     }
     // An engine started with adapters (--enable-lora / --lora-modules) books the expert LoRA buffers.
@@ -875,6 +985,11 @@ std::size_t Variant::visit_workspace_capacity_bytes(const family::TextGeometry&,
                                                                        static_cast<std::int32_t>(T), lora_enabled),
                                       naive::moe_workspace_bytes(static_cast<std::int32_t>(T))});
     bytes += up(attention) + up(moe);
+    // S10 attention LoRA: the fp32 low-rank buffers of the qkvr (6 slices) and wo_ud calls, at the kernels' rank bound 64
+    if (lora_enabled) {
+        bytes += up(ops::inkling_lora_delta_workspace_bytes(6, 64, static_cast<std::int32_t>(T))) +
+                 up(ops::inkling_lora_delta_workspace_bytes(1, 64, static_cast<std::int32_t>(T)));
+    }
     return bytes + (1U << 20);
 }
 

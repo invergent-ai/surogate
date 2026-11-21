@@ -217,6 +217,10 @@ public:
     /// conversation to the host while the copy stream is free.
     void background_offload() noexcept;
     void evict_archived_prefixes() noexcept;
+    /// Lane f1: the shared-prefix cache's entries go (their pages return once no running or
+    /// retained fork borrows them). Admission calls it when a head is short and no retained lane
+    /// is left to evict, which is otherwise the only thing that drops them.
+    void drop_shared_prefixes() noexcept;
     [[nodiscard]] HostKvStats host_kv_stats() const noexcept;
     TokenScoreDelta logprob_delta(std::uint32_t lane, std::size_t first, std::size_t end, bool prompt) const;
     void cache_logprobs(std::uint32_t lane, const GenerationResult& result);

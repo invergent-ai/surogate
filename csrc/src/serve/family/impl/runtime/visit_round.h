@@ -94,6 +94,10 @@ struct VisitBlock {
     Tensor valid_columns;    ///< I32 [B], or empty (all W valid)
     VisitStateMode mode = VisitStateMode::InPlace;
     ops::GqaExecutionEnvelope envelope{};
+    /// The runtime's promise: positions, valid columns, KV table rows and the block tables were written by host
+    /// copies complete before the step's first kernel (the ordinary decode ingress), so a target's kernels may read
+    /// them before their programmatic-dependency wait. False wherever a kernel inside the step writes them (verify).
+    bool metadata_static = false;
 };
 
 /// Where a Record-mode round keeps its backup and inputs (planned per program; see DESIGN-target.md 2).

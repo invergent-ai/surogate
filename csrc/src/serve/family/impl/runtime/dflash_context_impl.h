@@ -13,6 +13,7 @@ DFlashPersistentState::DFlashPersistentState(DeviceSpan backing,
       prefill_positions(layout.prefill_positions.bind(backing)),
       pending_features(layout.pending_features.bind(backing)) {
     if (layout.full) { full.emplace(backing, *layout.full); }
+    if (layout.dspark_f_rnn) { dspark_f_rnn = layout.dspark_f_rnn->bind(backing); }
     if (local.layer_count() != layout.geometry.local_layers ||
         local.capacity() != layout.geometry.local_capacity ||
         local.num_kv_heads() != layout.geometry.kv_heads ||

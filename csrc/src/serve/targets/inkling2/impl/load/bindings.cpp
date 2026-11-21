@@ -280,24 +280,30 @@ BindingPlan bind_artifact(artifact::Binder& binder, const BindOptions& options) 
     const std::int32_t D = c.hidden;
     const TensorPlacement gp = options.globals_placement.value_or(artifact::ScopedPlacement::current());
     GlobalsPlan& g    = out.globals;
-    g.embedding       = b.linear("text/embedding", c.vocab_padded, D, gp, NumericFormat::BF16);
-    g.embedding_norm  = b.tensor("text/embedding_norm", NumericFormat::BF16, {u64(D)}, gp);
-    g.final_norm      = b.tensor("text/final_norm", NumericFormat::BF16, {u64(D)}, gp);
-    g.output_head     = b.linear("text/output_head", c.vocab_padded, D, gp, NumericFormat::BF16);
+    g.placement       = GlobalsPlacement{
+              .embedding     = options.embedding_placement.value_or(gp),
+              .head          = options.head_placement.value_or(gp),
+              .small_globals = options.small_globals_placement.value_or(gp),
+    };
+    const TensorPlacement ep = g.placement.embedding, hp = g.placement.head, sp = g.placement.small_globals;
+    g.embedding       = b.linear("text/embedding", c.vocab_padded, D, ep, NumericFormat::BF16);
+    g.embedding_norm  = b.tensor("text/embedding_norm", NumericFormat::BF16, {u64(D)}, ep);
+    g.final_norm      = b.tensor("text/final_norm", NumericFormat::BF16, {u64(D)}, hp);
+    g.output_head     = b.linear("text/output_head", c.vocab_padded, D, hp, NumericFormat::BF16);
     g.attn_query.resize(c.layers);
     g.mlp_query.resize(c.layers);
     for (std::int32_t layer = 1; layer < c.layers; ++layer) {
         g.attn_query[layer] = b.tensor("text/attn_res/attn_query/" + std::to_string(layer), NumericFormat::FP32,
-                                       {c.global[layer] ? 3u : 1u, u64(D)}, gp);
+                                       {c.global[layer] ? 3u : 1u, u64(D)}, sp);
     }
     for (std::int32_t layer = 0; layer < c.layers; ++layer) {
         g.mlp_query[layer] = b.tensor("text/attn_res/mlp_query/" + std::to_string(layer), NumericFormat::FP32,
-                                      {1, u64(D)}, gp);
+                                      {1, u64(D)}, sp);
     }
-    g.output_query = b.tensor("text/attn_res/output_query", NumericFormat::FP32, {1, u64(D)}, gp);
+    g.output_query = b.tensor("text/attn_res/output_query", NumericFormat::FP32, {1, u64(D)}, sp);
     const std::uint64_t core_rows = 2 * u64(c.core_end - c.core_start);
-    g.cross_pass_queries    = b.tensor("text/loop/cross_pass_queries", NumericFormat::FP32, {core_rows, u64(D)}, gp);
-    g.cross_pass_kv_queries = b.tensor("text/loop/cross_pass_kv_queries", NumericFormat::FP32, {core_rows, u64(D)}, gp);
+    g.cross_pass_queries    = b.tensor("text/loop/cross_pass_queries", NumericFormat::FP32, {core_rows, u64(D)}, sp);
+    g.cross_pass_kv_queries = b.tensor("text/loop/cross_pass_kv_queries", NumericFormat::FP32, {core_rows, u64(D)}, sp);
 
     out.layers.resize(c.layers);
     const std::int32_t I = c.expert_intermediate, E = c.experts, K = c.conv_kernel;
@@ -365,7 +371,10 @@ BindingPlan bind_artifact(artifact::Binder& binder, const BindOptions& options) 
     }
     if (out.has_draft) {
         const DraftConfig& d = *c.dspark;
-        const TensorPlacement dp = options.draft ? gp : TensorPlacement::ValidateOnly;
+        const TensorPlacement dp = options.draft ? options.draft_placement.value_or(hp) : TensorPlacement::ValidateOnly;
+        out.draft.placement      = dp;
+        // lane e2: the dense linears may live in a mapped host bank (re-quantised to FP8 on the device at load)
+        const TensorPlacement lp = options.draft && options.draft_linears_host ? TensorPlacement::HostBank : dp;
         const std::int32_t Dd = d.hidden, q = d.query_heads * d.head_dim, kv = d.kv_heads * d.head_dim;
         DraftPlan& m = out.draft;
         m.fuse_weight = b.tensor("mtp/fuse_weight", NumericFormat::BF16,
@@ -379,18 +388,18 @@ BindingPlan bind_artifact(artifact::Binder& binder, const BindOptions& options) 
             l.feature_norm        = b.tensor(p + "feature_norm", NumericFormat::BF16, {u64(Dd)}, dp);
             l.input_norm          = b.tensor(p + "input_norm", NumericFormat::BF16, {u64(Dd)}, dp);
             l.post_attention_norm = b.tensor(p + "post_attention_norm", NumericFormat::BF16, {u64(Dd)}, dp);
-            l.q     = b.linear(p + "attn/q", q, Dd, dp, NumericFormat::BF16);
-            l.k     = b.linear(p + "attn/k", kv, Dd, dp, NumericFormat::BF16);
-            l.v     = b.linear(p + "attn/v", kv, Dd, dp, NumericFormat::BF16);
-            l.o     = b.linear(p + "attn/o", Dd, q, dp, NumericFormat::BF16);
-            l.k_ctx = b.linear(p + "attn/k_ctx", kv, Dd, dp, NumericFormat::BF16);
-            l.v_ctx = b.linear(p + "attn/v_ctx", kv, Dd, dp, NumericFormat::BF16);
+            l.q     = b.linear(p + "attn/q", q, Dd, lp, NumericFormat::BF16);
+            l.k     = b.linear(p + "attn/k", kv, Dd, lp, NumericFormat::BF16);
+            l.v     = b.linear(p + "attn/v", kv, Dd, lp, NumericFormat::BF16);
+            l.o     = b.linear(p + "attn/o", Dd, q, lp, NumericFormat::BF16);
+            l.k_ctx = b.linear(p + "attn/k_ctx", kv, Dd, lp, NumericFormat::BF16);
+            l.v_ctx = b.linear(p + "attn/v_ctx", kv, Dd, lp, NumericFormat::BF16);
             l.q_norm     = b.tensor(p + "attn/q_norm", NumericFormat::BF16, {u64(d.head_dim)}, dp);
             l.k_norm     = b.tensor(p + "attn/k_norm", NumericFormat::BF16, {u64(d.head_dim)}, dp);
             l.k_ctx_norm = b.tensor(p + "attn/k_ctx_norm", NumericFormat::BF16, {u64(d.head_dim)}, dp);
-            l.gate = b.linear(p + "mlp/gate", d.intermediate, Dd, dp, NumericFormat::BF16);
-            l.up   = b.linear(p + "mlp/up", d.intermediate, Dd, dp, NumericFormat::BF16);
-            l.down = b.linear(p + "mlp/down", Dd, d.intermediate, dp, NumericFormat::BF16);
+            l.gate = b.linear(p + "mlp/gate", d.intermediate, Dd, lp, NumericFormat::BF16);
+            l.up   = b.linear(p + "mlp/up", d.intermediate, Dd, lp, NumericFormat::BF16);
+            l.down = b.linear(p + "mlp/down", Dd, d.intermediate, lp, NumericFormat::BF16);
         }
         const std::int32_t r = d.markov_rank;
         m.markov_feature_norm    = b.tensor("mtp/markov/feature_norm", NumericFormat::BF16, {u64(Dd)}, dp);
@@ -411,26 +420,33 @@ InklingWeights load_weights(const BindingPlan& plan, const artifact::Materialize
     const auto linear = [&](const artifact::LinearBinding& binding, std::int32_t rows, std::int32_t columns) {
         return artifact::materialized_linear(m, binding, rows, columns);
     };
-    const bool globals = plan.options.globals_placement.value_or(TensorPlacement::Device) != TensorPlacement::ValidateOnly;
-    if (globals) {
-        InklingGlobals& g = w.globals;
-        const GlobalsPlan& s = plan.globals;
-        g.embedding      = linear(s.embedding, c.vocab_padded, D);
-        g.output_head    = linear(s.output_head, c.vocab_padded, D);
-        g.embedding_norm = tensor_of(m, s.embedding_norm, NumericFormat::BF16, {D});
-        g.final_norm     = tensor_of(m, s.final_norm, NumericFormat::BF16, {D});
+    // Each group of globals is read only where this stage placed it (a 1-card engine places all of them).
+    InklingGlobals& g    = w.globals;
+    const GlobalsPlan& gs = plan.globals;
+    g.has_embedding      = gs.placement.embedding != TensorPlacement::ValidateOnly;
+    g.has_head           = gs.placement.head != TensorPlacement::ValidateOnly;
+    g.has_small_globals  = gs.placement.small_globals != TensorPlacement::ValidateOnly;
+    if (g.has_embedding) {
+        g.embedding      = linear(gs.embedding, c.vocab_padded, D);
+        g.embedding_norm = tensor_of(m, gs.embedding_norm, NumericFormat::BF16, {D});
+    }
+    if (g.has_head) {
+        g.output_head = linear(gs.output_head, c.vocab_padded, D);
+        g.final_norm  = tensor_of(m, gs.final_norm, NumericFormat::BF16, {D});
+    }
+    if (g.has_small_globals) {
         g.attn_query.resize(c.layers);
         g.mlp_query.resize(c.layers);
         for (std::int32_t layer = 1; layer < c.layers; ++layer) {
-            g.attn_query[layer] = tensor_of(m, s.attn_query[layer], NumericFormat::FP32, {D, c.global[layer] ? 3 : 1});
+            g.attn_query[layer] = tensor_of(m, gs.attn_query[layer], NumericFormat::FP32, {D, c.global[layer] ? 3 : 1});
         }
         for (std::int32_t layer = 0; layer < c.layers; ++layer) {
-            g.mlp_query[layer] = tensor_of(m, s.mlp_query[layer], NumericFormat::FP32, {D, 1});
+            g.mlp_query[layer] = tensor_of(m, gs.mlp_query[layer], NumericFormat::FP32, {D, 1});
         }
-        g.output_query = tensor_of(m, s.output_query, NumericFormat::FP32, {D, 1});
+        g.output_query = tensor_of(m, gs.output_query, NumericFormat::FP32, {D, 1});
         const std::int32_t core_rows = 2 * (c.core_end - c.core_start);
-        g.cross_pass_queries    = tensor_of(m, s.cross_pass_queries, NumericFormat::FP32, {D, core_rows});
-        g.cross_pass_kv_queries = tensor_of(m, s.cross_pass_kv_queries, NumericFormat::FP32, {D, core_rows});
+        g.cross_pass_queries    = tensor_of(m, gs.cross_pass_queries, NumericFormat::FP32, {D, core_rows});
+        g.cross_pass_kv_queries = tensor_of(m, gs.cross_pass_kv_queries, NumericFormat::FP32, {D, core_rows});
     }
     w.layers.resize(c.layers);
     const std::int32_t I = c.expert_intermediate, E = c.experts, K = c.conv_kernel;
@@ -469,7 +485,7 @@ InklingWeights load_weights(const BindingPlan& plan, const artifact::Materialize
             t.loop_gain_forget = tensor_of(m, s.loop_gain_forget, NumericFormat::BF16, {c.gate_rank, 2 * D, 4});
         }
     }
-    w.has_draft = plan.has_draft && plan.options.draft;
+    w.has_draft = plan.has_draft && plan.options.draft && plan.draft.placement != TensorPlacement::ValidateOnly;
     if (w.has_draft) {
         const DraftConfig& d = *c.dspark;
         const DraftPlan& s   = plan.draft;

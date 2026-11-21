@@ -29,6 +29,8 @@ struct DFlashPersistentLayout {
     TensorLayout prefill_features;
     TensorLayout prefill_positions;
     TensorLayout pending_features;
+    /// DSpark only (family/impl/runtime/dspark_round.h): BF16 [hidden, lanes], each lane's Markov feature.
+    std::optional<TensorLayout> dspark_f_rnn;
 
     [[nodiscard]] std::size_t kv_payload_bytes() const noexcept {
         return local.payload_bytes() + (full ? full->payload_bytes() : 0);
@@ -59,6 +61,12 @@ struct PersistentLayout {
     /// Bytes of the Main pool's planes living outside the arena (elastic pools), counted in the
     /// device reservation as their worst case; zero otherwise.
     std::size_t elastic_plane_bytes = 0;
+    /// Lane f1 M3-C: the main-ledger pages every text allocation is charged for an elastic window
+    /// class (PagedKVPool::window_lane_charge_pages), so the capacity curve can count them; zero
+    /// without an elastic window class (every model but a windowed one sized automatically).
+    std::uint32_t kv_window_lane_charge_pages = 0;
+    /// ... and the main-ledger pages one window page stands for (a graph-capture row's charge).
+    std::uint32_t kv_window_page_charge_pages = 0;
 };
 
 struct WorkspacePlan {
@@ -107,6 +115,11 @@ struct SequencePlanningInputs {
     /// Which weights these are (artifact path, size and modification time): part of the host KV
     /// tier's key namespace, the same for every replica of one artifact.
     std::uint64_t weights_identity = 0;
+    /// Lane f1 M3-C: the Main pool's laid-out (virtual) span is at least this many pages -- the
+    /// capacity curve's maximum when an elastic window class widened it -- so every candidate
+    /// between the curve's minimum and maximum lays out the same span and the reservation stays
+    /// affine in the page count (finalize_sequence_plan_impl). 0 = the span as before.
+    std::uint32_t main_page_virtual_floor = 0;
 };
 
 } // namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS

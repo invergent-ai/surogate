@@ -116,15 +116,24 @@ public:
     Engine(St initial, bool skip_tool_parsing) : state_(initial), skip_tool_(skip_tool_parsing) {}
 
     std::vector<Event> run(std::string_view text, const std::vector<Literal>& literals) {
-        for (Lexeme& lx : lex(text, literals)) {
-            if (lx.terminal) {
-                on_terminal(lx.term, lx.text);
-            } else if (!lx.text.empty()) {
-                emit_for_state(lx.text);
-            }
-        }
+        for (Lexeme& lx : lex(text, literals)) { lexeme(lx); }
         finish();
         return std::move(events_);
+    }
+
+    // Incremental use (StreamParser): lexemes in order, then close(); take() hands out the events so far.
+    void lexeme(const Lexeme& lx) {
+        if (lx.terminal) {
+            on_terminal(lx.term, lx.text);
+        } else if (!lx.text.empty()) {
+            emit_for_state(lx.text);
+        }
+    }
+    void close() { finish(); }
+    std::vector<Event> take() {
+        std::vector<Event> out;
+        out.swap(events_);
+        return out;
     }
 
 private:
@@ -218,6 +227,59 @@ private:
         }
         state_ = St::Content;
     }
+};
+
+// The lexer above over a text that arrives in pieces: a position is decided once the text after it cannot still grow
+// into a literal (a '<' whose rest is a proper prefix of a literal waits). Decisions are the batch lexer's; content
+// runs come out in pieces, which the state machine treats as the one run (it appends them).
+class StreamLexer {
+public:
+    explicit StreamLexer(const std::vector<Literal>& literals) : literals_(&literals) {}
+
+    void feed(std::string_view text, std::vector<Lexeme>& out) {
+        pending_.append(text);
+        std::string content;
+        std::size_t i = 0;
+        while (i < pending_.size()) {
+            if (pending_[i] == '<') {
+                const std::string_view rest = std::string_view(pending_).substr(i);
+                bool partial = false;
+                const Literal* hit = nullptr;
+                for (const Literal& lit : *literals_) {
+                    if (rest.size() < lit.text.size()) {
+                        if (std::string_view(lit.text).substr(0, rest.size()) == rest) { partial = true; }
+                    } else if (rest.substr(0, lit.text.size()) == lit.text &&
+                               (hit == nullptr || lit.text.size() > hit->text.size())) {
+                        hit = &lit;
+                    }
+                }
+                if (partial) { break; }
+                if (hit != nullptr) {
+                    if (!content.empty()) {
+                        out.push_back({false, Term::Drop, std::move(content)});
+                        content.clear();
+                    }
+                    out.push_back({true, hit->term, hit->text});
+                    i += hit->text.size();
+                    continue;
+                }
+            }
+            content.push_back(pending_[i]);
+            ++i;
+        }
+        if (!content.empty()) { out.push_back({false, Term::Drop, std::move(content)}); }
+        pending_.erase(0, i);
+    }
+
+    /// The text ends: what was held is lexed as the batch lexer lexes a text's end.
+    void finish(std::vector<Lexeme>& out) {
+        for (Lexeme& lx : lex(pending_, *literals_)) { out.push_back(std::move(lx)); }
+        pending_.clear();
+    }
+
+private:
+    const std::vector<Literal>* literals_;
+    std::string pending_;
 };
 
 // ------------------------------------------------------------------ tool-call JSON helpers (vllm/parser/utils.py)
@@ -565,6 +627,27 @@ struct Slot {
     bool name_sent = false;
 };
 
+// One slot of _build_extracted_result(): the call it becomes, if any. Depends on the slot's final args only.
+std::optional<ParsedToolCall> build_call(const Slot& slot, const ChatRequest& request) {
+    if (slot.name.empty() && slot.args.empty()) { return std::nullopt; }
+    std::string name(py_strip(slot.name));
+    std::string args_json;
+    if (name.empty() && !py_strip(slot.args).empty()) {
+        std::tie(name, args_json) = extract_name_and_args(slot.args);
+    } else if (!py_strip(slot.args).empty()) {
+        try {
+            const auto span = extract_json_member_object(slot.args, "args");
+            args_json = span ? *span : "{}";
+        } catch (const RequestError&) {
+            args_json = extract_args_json(slot.args);
+        }
+    } else {
+        args_json = "{}";
+    }
+    if (name.empty()) { return std::nullopt; }
+    return ParsedToolCall{name, fix_arg_types(args_json, name, request)};
+}
+
 // ParserEngine.extract_tool_calls_from_content (InklingParser._single_pass_parse from CONTENT)
 ToolInfo tool_pass(std::string_view content, const ChatRequest& request, const std::vector<Literal>& literals) {
     const bool suppress = request.tool_choice == ToolChoice::None && request.tools.has_value();
@@ -640,24 +723,7 @@ ToolInfo tool_pass(std::string_view content, const ChatRequest& request, const s
     // _build_extracted_result()
     ToolInfo info;
     for (const Slot& slot : slots) {
-        if (slot.name.empty() && slot.args.empty()) { continue; }
-        std::string name(py_strip(slot.name));
-        std::string args_json;
-        if (name.empty() && !py_strip(slot.args).empty()) {
-            std::tie(name, args_json) = extract_name_and_args(slot.args);
-        } else if (!py_strip(slot.args).empty()) {
-            try {
-                const auto span = extract_json_member_object(slot.args, "args");
-                args_json = span ? *span : "{}";
-            } catch (const RequestError&) {
-                args_json = extract_args_json(slot.args);
-            }
-        } else {
-            args_json = "{}";
-        }
-        if (!name.empty()) {
-            info.calls.push_back({name, fix_arg_types(args_json, name, request)});
-        }
+        if (std::optional<ParsedToolCall> call = build_call(slot, request)) { info.calls.push_back(std::move(*call)); }
     }
     info.tools_called = !info.calls.empty();
 
@@ -673,6 +739,18 @@ ToolInfo tool_pass(std::string_view content, const ChatRequest& request, const s
 std::optional<std::string> nonempty(const std::string& s) {
     if (s.empty()) { return std::nullopt; }
     return s;
+}
+
+// The parser's terminals (the Inkling config's markers) and the special tokens it drops.
+std::vector<Literal> make_literals(const ParserVocabulary& vocabulary) {
+    std::vector<Literal> literals = {
+        {"<|message_model|>", Term::MsgModel},         {"<|content_text|>", Term::TextStart},
+        {"<|content_thinking|>", Term::ThinkStart},    {"<|end_message|>", Term::ThinkEnd},
+        {"<|content_model_end_sampling|>", Term::EndSampling},
+        {"<|content_invoke_tool_json|>", Term::ToolStart}, {"<|content_invoke_tool_text|>", Term::ToolText},
+        {"<|content_tool_error|>", Term::ToolError}};
+    for (const std::string& s : vocabulary.drop_spellings) { literals.push_back({s, Term::Drop}); }
+    return literals;
 }
 
 } // namespace
@@ -701,13 +779,22 @@ std::string detokenize_output(std::span<const int> output_ids, bool stop_termina
     return detokenize_output(std::span<const std::string>(bytes), stop_terminated);
 }
 
+// vLLM's per-token detokenization step: the token's bytes join what is held; the lossy decode goes out unless it
+// ends in U+FFFD (an unfinished character), in which case everything stays held.
+void detokenize_push(std::string& pending, const std::string& token_bytes, std::string& out);
+
 std::string detokenize_output(std::span<const std::string> per_token_bytes, bool stop_terminated) {
     std::size_t n = per_token_bytes.size();
     if (stop_terminated && n > 0) { --n; }
     std::string out;
     std::string pending;
-    for (std::size_t k = 0; k < n; ++k) {
-        pending += per_token_bytes[k];
+    for (std::size_t k = 0; k < n; ++k) { detokenize_push(pending, per_token_bytes[k], out); }
+    return out;
+}
+
+void detokenize_push(std::string& pending, const std::string& token_bytes, std::string& out) {
+    {
+        pending += token_bytes;
         // Lossy-decode the pending bytes (maximal invalid subparts -> U+FFFD); hold them while the result ends in U+FFFD.
         std::string decoded;
         bool ends_replacement = false;
@@ -759,7 +846,6 @@ std::string detokenize_output(std::span<const std::string> per_token_bytes, bool
             pending.clear();
         }
     }
-    return out;
 }
 
 int count_reasoning_tokens(std::span<const int> output_ids, const SpecialTokens& t) {
@@ -781,13 +867,7 @@ int count_reasoning_tokens(std::span<const int> output_ids, const SpecialTokens&
 
 ParsedOutput parse_output(std::string_view output_text, const ChatRequest& request,
                           std::string_view engine_finish_reason, const ParserVocabulary& vocabulary) {
-    std::vector<Literal> literals = {
-        {"<|message_model|>", Term::MsgModel},         {"<|content_text|>", Term::TextStart},
-        {"<|content_thinking|>", Term::ThinkStart},    {"<|end_message|>", Term::ThinkEnd},
-        {"<|content_model_end_sampling|>", Term::EndSampling},
-        {"<|content_invoke_tool_json|>", Term::ToolStart}, {"<|content_invoke_tool_text|>", Term::ToolText},
-        {"<|content_tool_error|>", Term::ToolError}};
-    for (const std::string& s : vocabulary.drop_spellings) { literals.push_back({s, Term::Drop}); }
+    const std::vector<Literal> literals = make_literals(vocabulary);
 
     // pass 1: the reasoning adapter's extract_reasoning (skip_tool_parsing, the config's MESSAGE_HEADER start)
     std::string reasoning_raw, content_raw;
@@ -834,6 +914,446 @@ ParsedOutput parse_output(std::string_view output_text, const ChatRequest& reque
     if (!out.tool_calls.empty() && out.finish_reason == "stop" && request.tool_choice != ToolChoice::Named) {
         out.finish_reason = "tool_calls";
     }
+    return out;
+}
+
+// ------------------------------------------------------------------ StreamParser
+
+namespace {
+
+bool starts_with(std::string_view text, std::string_view prefix) {
+    return text.size() >= prefix.size() && text.substr(0, prefix.size()) == prefix;
+}
+
+// The longest suffix of `text` that is a proper prefix of `marker`.
+std::size_t suffix_prefix(std::string_view text, std::string_view marker) {
+    for (std::size_t size = std::min(text.size(), marker.size() - 1); size != 0; --size) {
+        if (text.substr(text.size() - size) == marker.substr(0, size)) { return size; }
+    }
+    return 0;
+}
+
+// extract_json_member_object's scan, returning where the member's value starts (the '{'); nullopt while it has not
+// started; throws RequestError (as it does) when the value is not an object.
+std::optional<std::size_t> member_object_start(std::string_view raw, std::string_view key) {
+    int depth = 0;
+    bool in_string = false, escape = false;
+    std::size_t string_start = 0;
+    std::optional<std::string_view> last_string;
+    for (std::size_t i = 0; i < raw.size(); ++i) {
+        const char ch = raw[i];
+        if (escape) {
+            escape = false;
+            continue;
+        }
+        if (in_string) {
+            if (ch == '\\') {
+                escape = true;
+            } else if (ch == '"') {
+                in_string = false;
+                if (depth == 1) { last_string = raw.substr(string_start + 1, i - string_start - 1); }
+            }
+            continue;
+        }
+        if (ch == '"') {
+            in_string = true;
+            string_start = i;
+        } else if (ch == ':' && depth == 1 && last_string && *last_string == key) {
+            std::size_t value_start = i + 1;
+            while (value_start < raw.size() && json_ws(raw[value_start])) { ++value_start; }
+            if (value_start >= raw.size()) { return std::nullopt; }
+            if (raw[value_start] != '{') { throw RequestError("member must be a JSON object"); }
+            return value_start;
+        } else if (ch == '{' || ch == '[') {
+            ++depth;
+        } else if (ch == '}' || ch == ']') {
+            --depth;
+        }
+    }
+    return std::nullopt;
+}
+
+// scan_json_object_end, resumable.
+struct ObjectEndScan {
+    std::size_t pos = 0;
+    int depth = 0;
+    bool in_string = false, escape = false;
+    std::optional<std::size_t> end;
+
+    void advance(std::string_view raw) {
+        for (; !end && pos < raw.size(); ++pos) {
+            const char ch = raw[pos];
+            if (escape) {
+                escape = false;
+                continue;
+            }
+            if (in_string) {
+                if (ch == '\\') { escape = true; }
+                else if (ch == '"') { in_string = false; }
+                continue;
+            }
+            if (ch == '"') { in_string = true; }
+            else if (ch == '{') { ++depth; }
+            else if (ch == '}') {
+                if (--depth == 0) { end = pos + 1; }
+            }
+        }
+    }
+};
+
+// Where the next name search may start after a failed one: a match that was still incomplete holds at most three
+// quotes and reaches the end of the text, so it starts at one of the last three quotes.
+std::size_t name_resume(std::string_view args) {
+    std::size_t at = args.size();
+    for (int k = 0; k < 3; ++k) {
+        const std::size_t q = at == 0 ? std::string_view::npos : args.rfind('"', at - 1);
+        if (q == std::string_view::npos) { return 0; }
+        at = q;
+    }
+    return at;
+}
+
+void push_tool_delta(std::vector<StreamToolDelta>& out, StreamToolDelta d) {
+    for (StreamToolDelta& e : out) {
+        if (e.index != d.index) { continue; }
+        if (d.opens) {
+            e.opens = true;
+            e.name = std::move(d.name);
+        }
+        if (d.arguments) { e.arguments = e.arguments.value_or("") + *d.arguments; }
+        return;
+    }
+    out.push_back(std::move(d));
+}
+
+} // namespace
+
+struct StreamParser::Impl {
+    // An argument object larger than this whose "args" member has not started is not probed again until its block
+    // closes (the probe rescans the whole text).
+    static constexpr std::size_t kArgsProbeLimit = 1u << 16;
+
+    struct SlotState {
+        Slot slot;
+        bool closed = false;
+        std::size_t name_from = 0;
+        bool name_blocked = false;  // the leftmost "name" match is empty: the reading never names it from the stream
+        bool args_off = false;      // no argument streaming for this call
+        std::optional<std::size_t> value_start;
+        ObjectEndScan object;
+    };
+    struct Sent {
+        std::string name;
+        std::string arguments;
+    };
+    enum class Mode { Hold, All, Post };
+
+    const ChatRequest* request;
+    std::vector<Literal> literals;
+    std::vector<std::string> stops;
+    bool keeps_calls = false;
+    std::size_t max_calls = 0;
+    bool suppress = false;
+
+    std::string detok_pending;
+    std::string stop_hold;
+    bool stopped = false;
+
+    StreamLexer lex1;
+    Engine p1{St::Header, /*skip_tool_parsing=*/true};
+    std::string reasoning_raw;
+    std::size_t reasoning_sent = 0;
+
+    StreamLexer lex2;
+    Engine p2{St::Content, /*skip_tool_parsing=*/false};
+    bool seen_tool_event = false, any_delta = false, pre_has_nonws = false, post_has_nonws = false;
+    std::string t_pre, t_post;
+    Mode mode = Mode::Hold;
+    std::size_t content_sent = 0;
+
+    std::vector<SlotState> slots;
+    std::size_t calls_closed = 0;
+    std::vector<Sent> sent_calls;
+    std::vector<StreamToolDelta> pending_calls;
+    bool inconsistent = false;
+
+    Impl(const ChatRequest& r, const ParserVocabulary& vocabulary, std::vector<std::string> stop_strings)
+        : request(&r), literals(make_literals(vocabulary)), lex1(literals), lex2(literals) {
+        for (std::string& s : stop_strings) {
+            if (!s.empty()) { stops.push_back(std::move(s)); }
+        }
+        const bool forced = r.tool_choice == ToolChoice::Required || r.tool_choice == ToolChoice::Named;
+        const bool keeps = forced || (r.tool_choice == ToolChoice::Auto && r.tools && !r.tools->items.empty());
+        keeps_calls = keeps && r.tool_choice != ToolChoice::None;
+        max_calls = r.parallel_tool_calls ? static_cast<std::size_t>(-1) : 1;
+        suppress = r.tool_choice == ToolChoice::None && r.tools.has_value();
+    }
+
+    void push_text(std::string_view text) {
+        if (stopped || text.empty()) { return; }
+        if (stops.empty()) {
+            parse_text(text);
+            return;
+        }
+        stop_hold.append(text);
+        std::size_t cut = std::string::npos;
+        for (const std::string& s : stops) { cut = std::min(cut, stop_hold.find(s)); }
+        if (cut != std::string::npos) {
+            parse_text(std::string_view(stop_hold).substr(0, cut));
+            stop_hold.clear();
+            stopped = true;
+            return;
+        }
+        std::size_t hold = 0;
+        for (const std::string& s : stops) { hold = std::max(hold, suffix_prefix(stop_hold, s)); }
+        const std::size_t ready = stop_hold.size() - hold;
+        parse_text(std::string_view(stop_hold).substr(0, ready));
+        stop_hold.erase(0, ready);
+    }
+
+    void parse_text(std::string_view text) {
+        if (text.empty()) { return; }
+        std::vector<Lexeme> lexemes;
+        lex1.feed(text, lexemes);
+        for (const Lexeme& lx : lexemes) { p1.lexeme(lx); }
+        std::string content_piece;
+        for (Event& e : p1.take()) {
+            if (e.type == Ev::ReasoningChunk) { reasoning_raw += e.value; }
+            else if (e.type == Ev::Text) { content_piece += e.value; }
+        }
+        if (content_piece.empty()) { return; }
+        lexemes.clear();
+        lex2.feed(content_piece, lexemes);
+        for (const Lexeme& lx : lexemes) { p2.lexeme(lx); }
+        for (Event& e : p2.take()) { on_event(e); }
+    }
+
+    // tool_pass's event loop, one event at a time.
+    void on_event(const Event& e) {
+        switch (e.type) {
+        case Ev::Text:
+            if (seen_tool_event) {
+                t_post += e.value;
+                if (!post_has_nonws && !py_strip(e.value).empty()) { post_has_nonws = true; }
+            } else {
+                t_pre += e.value;
+                if (!pre_has_nonws && !py_strip(e.value).empty()) { pre_has_nonws = true; }
+            }
+            break;
+        case Ev::ToolCallStart:
+            if (!suppress) {
+                seen_tool_event = true;
+                while (static_cast<int>(slots.size()) <= e.tool_index) { slots.emplace_back(); }
+            }
+            break;
+        case Ev::ArgChunk:
+            if (!suppress) {
+                seen_tool_event = true;
+                SlotState& st = slots[static_cast<std::size_t>(e.tool_index)];
+                if (!e.value.empty()) { st.slot.args += e.value; }
+                if (!st.slot.name_sent && !st.name_blocked && !e.value.empty()) {
+                    const auto name = search_name(std::string_view(st.slot.args).substr(st.name_from));
+                    if (name && !name->empty()) {
+                        st.slot.name = *name;
+                        st.slot.name_sent = true;
+                        any_delta = true;
+                    } else if (name) {
+                        st.name_blocked = true;  // the batch search keeps finding this empty name
+                    } else {
+                        st.name_from = name_resume(st.slot.args);
+                    }
+                }
+            }
+            break;
+        case Ev::ToolCallEnd:
+            if (!suppress) {
+                seen_tool_event = true;
+                if (e.tool_index >= 0 && static_cast<std::size_t>(e.tool_index) < slots.size()) {
+                    SlotState& st = slots[static_cast<std::size_t>(e.tool_index)];
+                    if (!st.slot.name_sent) {
+                        std::string name = st.slot.name;
+                        if (name.empty()) { name = search_name(st.slot.args).value_or(""); }
+                        if (!name.empty()) {
+                            st.slot.name = name;
+                            st.slot.name_sent = true;
+                            any_delta = true;
+                        }
+                    }
+                    close_slot(st);
+                }
+            }
+            break;
+        default: break;
+        }
+    }
+
+    // A closed block's call is final: it goes out whole (or the rest of it, if it went out while open).
+    void close_slot(SlotState& st) {
+        if (st.closed) { return; }
+        st.closed = true;
+        const std::optional<ParsedToolCall> call = build_call(st.slot, *request);
+        if (!call) { return; }
+        const std::size_t index = calls_closed++;
+        if (!keeps_calls || index >= max_calls) { return; }
+        if (index < sent_calls.size()) {
+            Sent& sent = sent_calls[index];
+            if (sent.name != call->name || !starts_with(call->arguments, sent.arguments)) {
+                inconsistent = true;
+                return;
+            }
+            if (call->arguments.size() > sent.arguments.size()) {
+                push_tool_delta(pending_calls, {static_cast<int>(index), false, {},
+                                                call->arguments.substr(sent.arguments.size())});
+                sent.arguments = call->arguments;
+            }
+            return;
+        }
+        if (index != sent_calls.size()) {
+            inconsistent = true;
+            return;
+        }
+        sent_calls.push_back({call->name, call->arguments});
+        push_tool_delta(pending_calls, {static_cast<int>(index), true, call->name, call->arguments});
+    }
+
+    // fix_arg_types leaves this call's arguments verbatim whatever they hold.
+    bool verbatim_arguments(const std::string& name) const {
+        if (!request->tools || name.empty()) { return true; }
+        const PyValue* properties = tool_properties(*request, name);
+        return properties == nullptr || properties->keys.empty();
+    }
+
+    // The open block's call: its name as soon as it is written; its verbatim argument text where nothing can change it.
+    void open_slot() {
+        if (slots.empty() || slots.back().closed || !keeps_calls) { return; }
+        SlotState& st = slots.back();
+        const std::size_t index = calls_closed;
+        if (index >= max_calls || !st.slot.name_sent) { return; }
+        const std::string name(py_strip(st.slot.name));
+        if (name.empty()) { return; }
+        if (sent_calls.size() == index) {
+            sent_calls.push_back({name, {}});
+            push_tool_delta(pending_calls, {static_cast<int>(index), true, name, std::nullopt});
+        }
+        if (sent_calls.size() != index + 1 || st.args_off || !verbatim_arguments(name)) { return; }
+        const std::string_view args = st.slot.args;
+        if (!st.value_start) {
+            if (args.size() > kArgsProbeLimit) {
+                st.args_off = true;
+                return;
+            }
+            try {
+                st.value_start = member_object_start(args, "args");
+            } catch (const RequestError&) {
+                st.args_off = true;
+                return;
+            }
+            if (!st.value_start) { return; }
+            st.object.pos = *st.value_start;
+        }
+        st.object.advance(args);
+        const std::size_t end = st.object.end ? *st.object.end : args.size();
+        Sent& sent = sent_calls[index];
+        const std::size_t have = *st.value_start + sent.arguments.size();
+        if (end > have) {
+            std::string piece(args.substr(have, end - have));
+            sent.arguments += piece;
+            push_tool_delta(pending_calls, {static_cast<int>(index), false, {}, std::move(piece)});
+        }
+    }
+
+    void emit(StreamDelta& out) {
+        if (request->include_reasoning && reasoning_sent < reasoning_raw.size()) {
+            const std::string_view ready = py_rstrip(std::string_view(reasoning_raw).substr(reasoning_sent));
+            out.reasoning.assign(ready);
+            reasoning_sent += ready.size();
+        }
+        if (mode == Mode::Hold) {
+            if (pre_has_nonws) {
+                mode = Mode::All;
+            } else if (seen_tool_event && any_delta && post_has_nonws) {
+                mode = Mode::Post;
+            }
+        }
+        if (mode == Mode::All) {
+            if (content_sent < t_pre.size()) {
+                out.content = t_pre.substr(content_sent) + t_post;
+            } else {
+                out.content = t_post.substr(content_sent - t_pre.size());
+            }
+            content_sent = t_pre.size() + t_post.size();
+        } else if (mode == Mode::Post) {
+            out.content = t_post.substr(content_sent);
+            content_sent = t_post.size();
+        }
+        open_slot();
+        for (StreamToolDelta& d : pending_calls) { push_tool_delta(out.tool_calls, std::move(d)); }
+        pending_calls.clear();
+    }
+
+    std::string sent_content() const {
+        if (mode == Mode::All) { return (t_pre + t_post).substr(0, content_sent); }
+        if (mode == Mode::Post) { return t_post.substr(0, content_sent); }
+        return {};
+    }
+};
+
+StreamParser::StreamParser(const ChatRequest& request, const ParserVocabulary& vocabulary,
+                           std::vector<std::string> stop_strings)
+    : impl_(std::make_unique<Impl>(request, vocabulary, std::move(stop_strings))) {}
+StreamParser::~StreamParser() = default;
+StreamParser::StreamParser(StreamParser&&) noexcept = default;
+StreamParser& StreamParser::operator=(StreamParser&&) noexcept = default;
+
+StreamDelta StreamParser::feed(std::span<const std::string> token_bytes) {
+    Impl& s = *impl_;
+    std::string text;
+    for (const std::string& bytes : token_bytes) { detokenize_push(s.detok_pending, bytes, text); }
+    s.push_text(text);
+    StreamDelta out;
+    s.emit(out);
+    return out;
+}
+
+StreamDelta StreamParser::finish(const ParsedOutput& final, bool* consistent) {
+    Impl& s = *impl_;
+    bool ok = !s.inconsistent;
+    StreamDelta out;
+    const std::string sent_reasoning = s.reasoning_raw.substr(0, s.reasoning_sent);
+    const std::string want_reasoning = final.reasoning.value_or("");
+    if (!s.request->include_reasoning && s.reasoning_sent != 0) { ok = false; }
+    if (s.request->include_reasoning) {
+        if (starts_with(want_reasoning, sent_reasoning)) {
+            out.reasoning = want_reasoning.substr(sent_reasoning.size());
+        } else {
+            ok = false;
+        }
+    }
+    const std::string sent_content = s.sent_content();
+    const std::string want_content = final.content.value_or("");
+    if (starts_with(want_content, sent_content)) {
+        out.content = want_content.substr(sent_content.size());
+    } else {
+        ok = false;
+    }
+    if (s.sent_calls.size() > final.tool_calls.size()) { ok = false; }
+    for (std::size_t i = 0; i < final.tool_calls.size(); ++i) {
+        const ParsedToolCall& call = final.tool_calls[i];
+        if (i < s.sent_calls.size()) {
+            const Impl::Sent& sent = s.sent_calls[i];
+            if (sent.name != call.name || !starts_with(call.arguments, sent.arguments)) {
+                ok = false;
+                continue;
+            }
+            if (call.arguments.size() > sent.arguments.size()) {
+                push_tool_delta(out.tool_calls, {static_cast<int>(i), false, {}, call.arguments.substr(sent.arguments.size())});
+            }
+        } else {
+            push_tool_delta(out.tool_calls, {static_cast<int>(i), true, call.name, call.arguments});
+        }
+    }
+    s.reasoning_sent = s.reasoning_raw.size();
+    if (consistent != nullptr) { *consistent = ok; }
     return out;
 }
 

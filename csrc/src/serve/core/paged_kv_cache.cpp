@@ -1507,7 +1507,13 @@ std::uint32_t PagedKVPool::compact_window_class(std::span<const PagedKVAllocatio
         }
     }
     const auto in_use = static_cast<std::uint32_t>(used.size());
-    if (granules <= (in_use + granule - 1U) / granule + 1U) { return 0; }
+    // Granules of waste tolerated before pages move (default 1, the floor's slack).
+    // SUROGATE_SERVE_KV_WINDOW_COMPACT_SLACK=0 (tests) compacts at every granule of waste.
+    static const std::uint32_t slack = [] {
+        const char* raw = std::getenv("SUROGATE_SERVE_KV_WINDOW_COMPACT_SLACK");
+        return raw != nullptr && *raw != '\0' ? static_cast<std::uint32_t>(std::strtoul(raw, nullptr, 10)) : 1U;
+    }();
+    if (granules <= (in_use + granule - 1U) / granule + slack) { return 0; }
     // The lane range and the sentinel (immovable, but its granule is always mapped: holes there are free to fill).
     std::vector<std::int32_t> lane_used;
     for (const std::int32_t page : used) {

@@ -4,7 +4,8 @@ target_sources(sinfer_engine PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/model.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/forward.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/load/bindings.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/impl/variant.cpp)
+  ${CMAKE_CURRENT_SOURCE_DIR}/impl/variant.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/impl/dspark.cpp)
 
 target_include_directories(sinfer_engine PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/impl

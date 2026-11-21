@@ -366,7 +366,13 @@ public:
           tool_filter_(json_tools, muse_tools, gemma_tools, qwen3_coder) {}
 
     void publish(sinfer::OutputDelta delta) override {
-        if (delta.text.empty() || held_) { return; }
+        if (inkling_) {
+            // Inkling-2 reads its reply from the ids (OutputOptions::report_token_ids), as vLLM's parser does; the
+            // engine's own channel text is not the reading and is not sent.
+            if (!delta.token_ids.empty()) { send_inkling(inkling_->feed(engine_->token_texts(delta.token_ids))); }
+            return;
+        }
+        if (delta.text.empty()) { return; }
         if (delta.channel == sinfer::OutputChannel::Reasoning) {
             if (sink_->on_reasoning) { sink_->on_reasoning(delta.text); }
         } else {
@@ -397,14 +403,30 @@ public:
     /// The content published so far.
     [[nodiscard]] const std::string& streamed_content() const noexcept { return streamed_; }
 
-    /// Inkling-2: nothing of the reply reaches the stream while it is generated; release() sends vLLM's reading of
-    /// the whole reply at the end -- what the harness was served through agent-IK's gateway, which answered every
-    /// call, streamed or not, from one non-streaming vLLM call. (vLLM's own incremental deltas are not reproduced.)
-    void hold() noexcept { held_ = true; }
-    std::size_t release(const std::string& reasoning, const std::string& content) {
-        if (!reasoning.empty() && sink_->on_reasoning) { sink_->on_reasoning(reasoning); }
-        publish_content(content);
-        return content_bytes_;
+    /// Inkling-2: the reply streams as it is read (inkling::StreamParser over the generated ids): reasoning, content
+    /// and tool calls go out as soon as the final reading of the whole reply can no longer change them, so the stream
+    /// adds up to exactly the non-streamed message. finish_inkling() sends the rest of that reading and gives the
+    /// calls the ids they were streamed with.
+    void stream_inkling(const sinfer::family::frontend_internal::inkling::ChatRequest& request,
+                        const sinfer::family::frontend_internal::inkling::ParserVocabulary& vocabulary,
+                        std::vector<std::string> stop_strings) {
+        inkling_ = std::make_unique<sinfer::family::frontend_internal::inkling::StreamParser>(request, vocabulary,
+                                                                                            std::move(stop_strings));
+    }
+    /// Returns whether the calls went out through the stream (StreamSink::on_tool_call_delta).
+    bool finish_inkling(const sinfer::family::frontend_internal::inkling::ParsedOutput& final,
+                        std::vector<ToolCall>& calls) {
+        if (!inkling_) { return false; }
+        bool consistent = true;
+        send_inkling(inkling_->finish(final, &consistent));
+        if (!consistent) {
+            write_console_log(ConsoleLogLevel::Error,
+                              "inkling stream: a streamed piece is not part of the final reading of the reply");
+        }
+        for (std::size_t i = 0; i < calls.size(); ++i) {
+            if (i < inkling_call_ids_.size() && !inkling_call_ids_[i].empty()) { calls[i].id = inkling_call_ids_[i]; }
+        }
+        return static_cast<bool>(sink_->on_tool_call_delta);
     }
 
     /// Ends the stream with `tail` as the rest of the content, instead of what the filter held back.
@@ -422,10 +444,31 @@ private:
         streamed_ += text;
     }
 
+    void send_inkling(const sinfer::family::frontend_internal::inkling::StreamDelta& delta) {
+        if (!delta.reasoning.empty() && sink_->on_reasoning) { sink_->on_reasoning(delta.reasoning); }
+        publish_content(delta.content);
+        if (delta.tool_calls.empty() || !sink_->on_tool_call_delta) { return; }
+        std::vector<ToolCallDelta> calls;
+        calls.reserve(delta.tool_calls.size());
+        for (const auto& piece : delta.tool_calls) {
+            ToolCallDelta call{.index = piece.index, .opens = piece.opens, .arguments = piece.arguments};
+            if (piece.opens) {
+                const auto at = static_cast<std::size_t>(piece.index);
+                if (inkling_call_ids_.size() <= at) { inkling_call_ids_.resize(at + 1); }
+                inkling_call_ids_[at] = new_tool_call_id();
+                call.id   = inkling_call_ids_[at];
+                call.name = piece.name;
+            }
+            calls.push_back(std::move(call));
+        }
+        sink_->on_tool_call_delta(calls);
+    }
+
     Engine* engine_ = nullptr;
     const StreamSink* sink_ = nullptr;
     bool filter_tool_calls_ = false;
-    bool held_ = false;
+    std::unique_ptr<sinfer::family::frontend_internal::inkling::StreamParser> inkling_;
+    std::vector<std::string> inkling_call_ids_;
     bool muse_tools_ = false;
     ToolCallStreamFilter tool_filter_;
     std::size_t content_bytes_ = 0;
@@ -731,6 +774,13 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& original,
         }
     }
     sinfer::RequestOptions request_options = to_request_options(request, options_);
+    if (prepared.inkling_request && request.stream) {
+        // Inkling-2 streams by reading the generated ids as they come (ServiceOutputSink::stream_inkling).
+        request_options.output.report_token_ids = true;
+        for (const sinfer::StopString& stop : request_options.stop.strings) {
+            prepared.inkling_stop_strings.push_back(stop.text);
+        }
+    }
     // A minimum length is honoured by barring the stop ids until it is reached, and
     // the round only knows numbers -- so resolve which ids those are here, where
     // the model's own stops and the request's are both in reach.
@@ -1177,7 +1227,9 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
             options_.tool_call_format == ToolCallFormat::MuseAtem,
             options_.tool_call_format == ToolCallFormat::Gemma4,
             options_.tool_call_format == ToolCallFormat::Qwen3Coder);
-        if (prepared.inkling_request) { output_sink->hold(); }
+        if (prepared.inkling_request && inkling_vocabulary_) {
+            output_sink->stream_inkling(*prepared.inkling_request, *inkling_vocabulary_, prepared.inkling_stop_strings);
+        }
     }
     sinfer::OutputSink* public_sink = output_sink.get();
     sinfer::CancellationView cancellation;
@@ -1287,7 +1339,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
         outcome.finish_reason_wire    = parsed.finish_reason;
         outcome.report_reasoning_tokens = true;
         outcome.unstreamed_content.clear();
-        if (output_sink) { (void)output_sink->release(outcome.reasoning, outcome.text); }
+        if (output_sink) { outcome.tool_calls_streamed = output_sink->finish_inkling(parsed, outcome.tool_calls); }
         return outcome;
     }
     // vLLM 0.31's qwen3_coder parser, exactly, on the generated token ids (serve/vllm_qwen3_parser.h): every request
@@ -1400,6 +1452,10 @@ void GenerationService::answer_after_thinking_guard(PreparedRequest& prepared, s
     }
     if (sink != nullptr) {
         sink->publish(sinfer::OutputDelta{.channel = sinfer::OutputChannel::Reasoning, .text = thinking_guard_note_});
+        if (prepared.inkling_request) {
+            // An Inkling-2 stream reads ids: the close the guard inserted is part of the reply it reads.
+            sink->publish(sinfer::OutputDelta{.token_ids = thinking_guard_close_});
+        }
     }
     std::optional<ContinuationOutputSink> stream;
     if (sink != nullptr) { stream.emplace(*sink); }

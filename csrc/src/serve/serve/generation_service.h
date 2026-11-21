@@ -95,6 +95,8 @@ struct GenerationOutcome {
     std::string finish_reason_wire;
     /// Report reasoning_tokens in the usage (vLLM's completion_tokens_details), as vLLM does under a reasoning parser.
     bool report_reasoning_tokens = false;
+    /// The stream already carried every tool call (StreamSink::on_tool_call_delta): the end of the stream sends none.
+    bool tool_calls_streamed = false;
     std::string stop_sequence;
     GenerationMetrics metrics;
 };
@@ -145,6 +147,9 @@ struct StreamSink {
     std::function<void(const GenerationOutcome&)> on_scores;
     std::function<void(const std::string& delta_text)> on_content;
     std::function<void(const std::string& delta_text)> on_reasoning;
+    /// Tool calls as they are read (Inkling-2 streaming only; other models send their calls whole at the end). Set,
+    /// the calls of an Inkling-2 reply go out here and GenerationOutcome::tool_calls_streamed says so.
+    std::function<void(const std::vector<ToolCallDelta>& deltas)> on_tool_call_delta;
     std::function<bool()> is_cancelled;
 };
 
@@ -205,6 +210,8 @@ struct PreparedRequest {
     /// Inkling-2: the request as vLLM's request model holds it (PromptCapabilities::inkling2_chat), for reading the
     /// reply back with vLLM's Inkling parser.
     std::shared_ptr<const sinfer::family::frontend_internal::inkling::ChatRequest> inkling_request;
+    /// Inkling-2 streaming: the request's stop strings (the stream holds back what may be cut by one).
+    std::vector<std::string> inkling_stop_strings;
     std::shared_ptr<RequestLifetime> lifetime;
 };
 

@@ -116,6 +116,16 @@ struct ToolCall {
     std::string arguments_json;
 };
 
+/// One streamed piece of a tool call (Chat Completions `delta.tool_calls[]`, as vLLM streams them): the call's first
+/// piece carries its id, type and name; later pieces append to its arguments.
+struct ToolCallDelta {
+    int index = 0;
+    bool opens = false;                   // first piece: id + type "function" + function.name
+    std::string id;                       // when opens
+    std::string name;                     // when opens
+    std::optional<std::string> arguments; // function.arguments appended (absent = none)
+};
+
 enum class ToolChoiceMode {
     Auto,
     None,

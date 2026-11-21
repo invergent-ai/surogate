@@ -10,14 +10,19 @@
 #include "artifact/reader.h"
 #include "family/impl/lora_bind.h"
 #include "family/impl/lora_bind_inkling.h"
+#include "targets/inkling2/impl/lora_attention.h"
 #include "targets/inkling2/impl/model.h"
 #include "targets/inkling2/impl/variant.h"
+#include "targets/inkling2/impl/visits.h"
+#include "artifact/typed_binding.h"
 
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <array>
 #include <utility>
+#include <vector>
 
 namespace sinfer::targets::inkling2::detail {
 
@@ -72,6 +77,27 @@ void bind_lora(const detail::LoadedModelData& data, const EngineOptions& options
         ops::InklingMoeWeights key;
         key.router = L.router.qdata;
         family::bind_lora_inkling_moe(store, static_cast<int>(index), key);
+        // Attention (vLLM parity): the six qkvr slices under their checkpoint names, the fused `attn.qkvr` twin, wo_ud.
+        using Binding = ops::LoraStore::ModuleBinding;
+        using C       = detail::TextConfig;
+        if (L.qkvr.qdata == nullptr || L.output.qdata == nullptr) {
+            throw std::logic_error("inkling2: attention LoRA needs the layer's qkvr / wo_ud weights bound");
+        }
+        std::vector<Binding> slices;
+        for (int s = 0; s < 6; ++s) {
+            const detail::AttnLoraSlice& sl = detail::kQkvrLoraSlices[s];
+            const Binding b{L.qkvr.qdata, detail::kQkvrLoraPort + s, C::hidden, sl.rows};
+            store.register_module(static_cast<int>(index), sl.name, b);
+            Binding fused    = b;
+            fused.source_out = C::qkvr_rows;
+            fused.row_offset = sl.begin;
+            store.register_module(static_cast<int>(index), detail::kQkvrLoraFusedName, fused);
+            slices.push_back(b);
+        }
+        store.register_bank_table(L.qkvr.qdata, slices);
+        const Binding wo{L.output.qdata, detail::kWoLoraPort, C::attn_width, C::hidden};
+        store.register_module(static_cast<int>(index), detail::kWoLoraName, wo);
+        store.register_bank_table(L.output.qdata, {wo});
     }
     family::finish_lora_bind(store, options);
 }
@@ -96,21 +122,39 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
 
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
                                      WeightsProfile weights_profile) {
-    if (options.pipeline_stage_first != 0 || options.pipeline_stage_last != 0) {
-        // The visit split (DESIGN-target.md 1.4, DESIGN.md S12) is not wired yet.
-        throw std::invalid_argument("inkling2: pipeline stages are not supported yet");
-    }
     load::BindOptions bind;
+    // The 2-card visit split (lanes/e1/DESIGN-2card.md): a pipeline stage runs visits [first, last) of the 48 and
+    // keeps on its device the physical layers those visits use (a core layer is on every stage that runs one of its
+    // passes); the other layers are validated only. The family hands the residual (the whole AttnRes stack, 7 x 2304
+    // per column) across the boundary and keeps each stage's KV planes and conv states.
+    if (options.pipeline_stage_first != 0 || options.pipeline_stage_last != 0) {
+        const int first = options.pipeline_stage_first, last = options.pipeline_stage_last;
+        if (first < 0 || last <= first || last > detail::TextConfig::layers) {
+            throw std::invalid_argument("inkling2: a pipeline stage covers visits [first, last) of 0..48");
+        }
+        std::array<bool, detail::TextConfig::physical_layers> resident{};
+        for (int v = first; v < last; ++v) { resident[static_cast<std::size_t>(detail::kVisits[v].layer)] = true; }
+        const artifact::TensorPlacement in_force = artifact::ScopedPlacement::current();
+        bind.layer_placement = [resident, in_force](std::int32_t layer) {
+            return resident[static_cast<std::size_t>(layer)] ? in_force : artifact::TensorPlacement::ValidateOnly;
+        };
+    }
     bind.attention = attention_choice();
     if (bind.attention.fp8 != (weights_profile == WeightsProfile::Fp8Attention)) {
         throw std::logic_error("inkling2: the weights profile and the attention choice disagree");
     }
-    bind.draft = false; // DSpark: lane e2
+    // DSpark (lane e2): `--speculative dflash` binds the artifact's drafter and runs it through the DFlash runtime.
+    bind.draft = options.speculative.backend == SpeculativeBackend::DFlash;
+    // FP8 drafter weights by default (fp8ab2 16:34: identity, tokens / round within noise, -0.29 GiB with the FP8
+    // fold): the BF16 dense linears sit in the host bank (attached in LoadedModelData) and are re-quantised at load;
+    // SUROGATE_SERVE_DSPARK_BF16_WEIGHTS=1 keeps them BF16 on the device.
+    bind.draft_linears_host = bind.draft && detail::dspark_fp8_weights_requested();
     detail::ArtifactLoadPlan plan;
     plan.bindings.plan     = load::bind_artifact(binder, bind);
     plan.bindings.geometry = detail::visit_geometry(binder.reader());
     plan.bindings.features = family::startup_features(options);
     plan.materialization   = binder.finish();
+    plan.bindings.host_bank = family::collect_host_bank(binder, plan.materialization);
     return LoadPlan(std::make_unique<LoadPlan::Impl>(weights_profile, std::move(plan)));
 }
 
@@ -139,6 +183,22 @@ Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device, c
     return family::make_sequence_planner<detail::Variant>(device, options, weights_profile, geometry, vision_geometry);
 }
 
+std::vector<int> Package::pipeline_stage_bounds(int stage_count) {
+    // 2 stages: cut after visit 30 (the end of core pass 1; f1c's DESIGN-2card-1M.md 3, counting KV, not only weights).
+    // Card 0 = prelude + core passes 0-1 (layers 0-17, 5 global visits, embedding); card 1 = core pass 2 + coda + head
+    // (+ DSpark's planes / drafter): layers 6-23, 3 global visits. At 1M both cards land near 22 GiB (f1c's estimate).
+    // SUROGATE_SERVE_INKLING_STAGE_CUT=<visit> overrides the cut (measurement only).
+    if (stage_count != 2) { throw std::invalid_argument("inkling2: the visit split is defined for 2 stages"); }
+    int cut = 30;
+    if (const char* raw = std::getenv("SUROGATE_SERVE_INKLING_STAGE_CUT"); raw != nullptr && *raw != '\0') {
+        cut = std::atoi(raw);
+        if (cut <= 0 || cut >= detail::TextConfig::layers) {
+            throw std::invalid_argument("SUROGATE_SERVE_INKLING_STAGE_CUT must be a visit in 1..47");
+        }
+    }
+    return {0, cut, detail::TextConfig::layers};
+}
+
 family::TextGeometry Package::declared_geometry(const artifact::Reader& reader) {
     return detail::visit_geometry(reader);
 }
@@ -146,9 +206,6 @@ family::TextGeometry Package::declared_geometry(const artifact::Reader& reader) 
 std::unique_ptr<Package::Program> Package::create_program(const LoadedModel& model, SequencePlan&& plan,
                                                           DeviceContext& device) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
-    // Lane c's key-group size: P3 by default (agent-EN 12:5x, until lane h's price session decides); the
-    // environment still overrides (p1 / p2 / p3).
-    ::setenv("SUROGATE_INKLING_ATTN_GROUPS", "p3", 0);
     detail::Variant::prepare_lm_head(16);
     return family::create_program<detail::Variant>(model.impl_->data.runtime, model.impl_->weights_profile,
                                                    std::move(plan), device);

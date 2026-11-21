@@ -1407,7 +1407,8 @@ public:
     Impl(std::shared_ptr<const fi::Tokenizer> tokenizer_, StopPolicy policy_, OutputOptions output,
          bool starts_in_reasoning, fi::ReasoningSyntax reasoning)
         : tokenizer(std::move(tokenizer_)), policy(std::move(policy_)),
-          preserve_special(output.raw || output.preserve_special_tokens) {
+          preserve_special(output.raw || output.preserve_special_tokens),
+          report_token_ids(output.report_token_ids) {
         state.in_reasoning = starts_in_reasoning && !output.raw && !output.structured;
         // The raw path publishes the stream as the model wrote it, markers included, so it
         // is given no pair to act on.
@@ -1422,6 +1423,8 @@ public:
     std::shared_ptr<const fi::Tokenizer> tokenizer;
     StopPolicy policy;
     bool preserve_special = false;
+    /// OutputOptions::report_token_ids: each preview also publishes the ids it accepted (stop token excluded).
+    bool report_token_ids = false;
     DecoderState state;
     DecoderState preview_state;
     PublishedOutput preview_output;
@@ -1584,6 +1587,14 @@ runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
     impl_->preview_output.clear();
 
     const auto complete = [&](std::uint32_t count, FinishReason reason) {
+        if (impl_->report_token_ids) {
+            // The ids the round accepted, as the reply's text has them: a stop token is not part of it.
+            const std::size_t kept = reason == FinishReason::StopToken && count != 0 ? count - 1 : count;
+            if (kept != 0) {
+                impl_->preview_output.push_back(
+                    OutputDelta{.token_ids = std::vector<TokenId>(tokens.begin(), tokens.begin() + kept)});
+            }
+        }
         impl_->preview_ready = true;
         return runtime::OutputDecision{.accepted_tokens = count, .finish_reason = reason};
     };

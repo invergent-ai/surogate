@@ -17,6 +17,7 @@ struct DFlashPersistentState {
     Tensor prefill_features;
     Tensor prefill_positions;
     Tensor pending_features;
+    Tensor dspark_f_rnn; ///< DSpark only: BF16 [hidden, lanes]; empty for DFlash
 
     DFlashPersistentState(DeviceSpan backing, const DFlashPersistentLayout& layout,
                           family::DecoderState& decoder_state);

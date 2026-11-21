@@ -7,6 +7,8 @@
 
 #include "targets/inkling2/impl/config.h"
 #include "targets/inkling2/impl/load/bindings.h"
+#include "targets/inkling2/impl/dspark.h"
+#include "family/impl/load/host_bank.h"
 
 #include "artifact/materializer.h"
 #include "core/arena.h"
@@ -44,6 +46,7 @@ struct DerivedQueries {
 struct InklingModel {
     const load::InklingWeights* weights   = nullptr;
     const DerivedQueries* queries         = nullptr;
+    const DSparkDerived* dspark           = nullptr; ///< set when the drafter is bound (lane e2)
 };
 
 /// The `FullAttentionProjectionWeights` of a visit: its physical layer and where it sits in the schedule.
@@ -69,6 +72,8 @@ struct BindingPlan {
     load::BindingPlan plan;
     family::TextGeometry geometry; ///< the served (48-visit) geometry
     family::StartupFeatures features;
+    /// Objects bound HostBank (today only the DSpark dense linears under FP8 drafter weights, lane e2).
+    family::HostBankPlan host_bank;
 };
 
 struct ArtifactLoadPlan {
@@ -89,9 +94,11 @@ public:
     LoadedModelData& operator=(LoadedModelData&&)      = delete;
 
     artifact::MaterializedArtifact backing;
+    std::shared_ptr<family::HostBank> host_bank; ///< pinned host objects, attached to `backing` before weights load
     family::FrontendResources frontend;
     load::InklingWeights weights;
     DerivedQueries queries;
+    DSparkDerived dspark; ///< the drafter's load-time derivations (lane e2); empty without `--speculative dflash`
     InklingModel model;
     RuntimeModelView runtime;
 };

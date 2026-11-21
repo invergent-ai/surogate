@@ -18,6 +18,7 @@
 #include "family/impl/frontend/inkling_render.h"
 
 #include <functional>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -63,5 +64,64 @@ struct ParserVocabulary {
 
 /// usage.completion_tokens_details.reasoning_tokens: tokens inside thinking blocks.
 [[nodiscard]] int count_reasoning_tokens(std::span<const int> output_ids, const SpecialTokens& tokens);
+
+// ------------------------------------------------------------------ streaming (stream=true)
+//
+// StreamParser reads the reply while it is generated and hands out what may be sent now, under one invariant: every
+// piece it returns is a prefix-extension of the FINAL reading (parse_output of the whole generation), so the
+// concatenated stream equals the non-streamed message byte for byte. It runs the same two passes incrementally (an
+// incremental lexer in front of the same state machine; vLLM's DelegatingParser reads the same events per delta) and
+// holds back only what the final reading can still change:
+//   - text that may be the start of a marker (`<|...`) or of a stop string;
+//   - a block's header text (`<|message_model|>NAME<|content_...|>`: dropped or kept by the next marker);
+//   - trailing whitespace of the reasoning (the reading rstrips it; released when more reasoning follows);
+//   - content that is whitespace only so far (dropped before tool calls, kept otherwise), and, after a tool block
+//     that followed whitespace-only content, the content after it until a call has a name (vLLM's deferred
+//     content rule decides between the two readings only then);
+//   - tool calls: a call goes out (index, name) as soon as its "name" is written; its arguments stream as written
+//     when the request's schema for that tool cannot change them (no tools / no properties), and otherwise arrive
+//     whole when the call's block closes -- schema coercion (ParserEngine._fix_arg_types) re-serialises the whole
+//     argument object when it changes any value, which only the complete object can tell (vLLM streams the verbatim
+//     text there and its stream then disagrees with its own non-streamed message).
+// finish() returns the rest of the final reading.
+
+/// One streamed tool-call piece; `index` is the call's position in the response's tool_calls.
+struct StreamToolDelta {
+    int index = 0;
+    bool opens = false;                   // the call's first piece: carries its name (and the caller's id / type)
+    std::string name;                     // when opens
+    std::optional<std::string> arguments; // argument text appended by this piece
+};
+
+struct StreamDelta {
+    std::string reasoning;
+    std::string content;
+    std::vector<StreamToolDelta> tool_calls;
+    [[nodiscard]] bool empty() const noexcept { return reasoning.empty() && content.empty() && tool_calls.empty(); }
+};
+
+class StreamParser {
+public:
+    /// `request` and `vocabulary` must outlive the parser. `stop_strings` = the request's stop strings (text after
+    /// the first occurrence of any of them is never sent before finish()).
+    StreamParser(const ChatRequest& request, const ParserVocabulary& vocabulary,
+                 std::vector<std::string> stop_strings = {});
+    ~StreamParser();
+    StreamParser(StreamParser&&) noexcept;
+    StreamParser& operator=(StreamParser&&) noexcept;
+
+    /// The next generated tokens, one string of raw bytes per token (special tokens spelled out), in order. The stop
+    /// token that ends a generation is not fed (vLLM does not detokenize it).
+    [[nodiscard]] StreamDelta feed(std::span<const std::string> token_bytes);
+
+    /// The rest of `final` (= parse_output of the whole generation) after everything fed() returned. `consistent` (if
+    /// given) is false when something already returned is not a prefix of `final` -- never, by construction; the
+    /// streaming test checks it on every vector.
+    [[nodiscard]] StreamDelta finish(const ParsedOutput& final, bool* consistent = nullptr);
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
 
 } // namespace sinfer::family::frontend_internal::inkling

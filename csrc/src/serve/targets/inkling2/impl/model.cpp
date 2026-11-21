@@ -109,6 +109,10 @@ family::TextGeometry visit_geometry(const artifact::Reader& reader) {
     std::vector<std::string> types(C::layers);
     for (int v = 0; v < C::layers; ++v) { types[v] = kVisits[v].global ? "full_attention" : "sliding_attention"; }
     family::TextGeometry g = family::TextGeometry::resolved_moe(values, types);
+    // The DSpark drafter's geometry for the DFlash runtime (lane e2), whenever the artifact carries the drafter; it
+    // is used only under `--speculative dflash`.
+    const load::ArtifactConfig config = load::parse_artifact_config(reader.payload("inkling2/config.json").data);
+    if (config.dspark) { g.dflash = dspark_dflash_geometry(config); }
     if (g.hidden != C::hidden || g.query_heads != C::query_heads || g.kv_heads != C::kv_heads ||
         g.head_dim != C::head_dim || g.sliding_window != C::window || g.output_rows != C::output_rows ||
         g.token_domain != C::token_domain || g.experts != C::experts || g.experts_per_token != C::experts_per_token) {
@@ -118,7 +122,10 @@ family::TextGeometry visit_geometry(const artifact::Reader& reader) {
 }
 
 LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized)
-    : backing(std::move(materialized)) {
+    : backing(std::move(materialized)),
+      host_bank(plan.host_bank.objects.empty() ? nullptr : family::HostBank::shared(plan.host_bank)) {
+    // HostBank objects (the FP8 drafter's BF16 sources) resolve to their pinned host bytes from here on.
+    if (host_bank) { host_bank->attach(backing); }
     // Lane b binds the text-only set (no pixel configs): take exactly that set.
     frontend = family::take_text_only_frontend_resources(backing, plan.plan.frontend);
     // The release's chat_template.jinja is for HF tooling: vLLM renders Inkling prompts natively from the request
@@ -130,10 +137,19 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     derive_rel_tables(weights, queries);
     model.weights = &weights;
     model.queries = &queries;
+    if (weights.has_draft) {
+        // DSpark (lane e2): the fold and the drafter's derived weights; the runtime's DFlash guards need a payload.
+        derive_dspark(weights, dspark, plan.plan.options.draft_linears_host, dspark_fp8_fold_requested());
+        model.dspark = &dspark;
+    }
 
     runtime.geometry        = plan.geometry;
     runtime.weights_arena   = &backing.device_arena();
     runtime.features        = plan.features;
+    if (plan.features.dflash()) {
+        if (!weights.has_draft) { throw std::invalid_argument("inkling2: --speculative dflash needs the DSpark drafter"); }
+        runtime.dflash.emplace();
+    }
     runtime.token_embedding = weights.globals.embedding;
     runtime.final_norm      = weights.globals.final_norm;
     runtime.output_head     = weights.globals.output_head;

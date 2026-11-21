@@ -213,6 +213,80 @@ int main() {
         if (n == 0) { ++failures; }
     }
 
+    // 3. OutputOptions::report_token_ids (Inkling-2 streaming): the engine's output session reports exactly the ids
+    //    each round accepted, without the stop token, and its text deltas are the same with the option on or off (every
+    //    other request runs with it off: nothing changes for them).
+    {
+        int n = 0, bad = 0;
+        const sinfer::family::PreparedPrompt prompt = frontend.prepare_tokens({1, 2, 3});
+        for (const fs::path& f : vector_files(vectors / "parser")) {
+            const ink::PyValue vec = ink::py_json_loads(read_file(f));
+            const std::string name = vec.find("case")->text;
+            const std::vector<int> out_ids = ints(vec.find("output_token_ids"));
+            if (out_ids.empty()) { continue; }
+            ++n;
+            std::vector<sinfer::TokenId> ids(out_ids.begin(), out_ids.end());
+            struct Seen {
+                std::string text[3];
+                std::vector<sinfer::TokenId> reported;
+                sinfer::FinishReason finish = sinfer::FinishReason::None;
+                std::size_t empty_text_deltas = 0;
+            };
+            const auto run = [&](bool report_ids, std::size_t round) {
+                Seen seen;
+                sinfer::OutputOptions options;
+                options.report_token_ids = report_ids;
+                sinfer::family::OutputSession session = frontend.make_output_session(prompt, sinfer::StopPolicy{}, options);
+                const auto budget = static_cast<std::uint32_t>(ids.size());
+                std::size_t at = 0;
+                while (at < ids.size()) {
+                    const std::size_t take = std::min(round, ids.size() - at);
+                    const auto decision = session.preview(
+                        std::span<const sinfer::TokenId>(ids).subspan(at, take), budget - static_cast<std::uint32_t>(at),
+                        sinfer::FinishReason::OutputLimit);
+                    for (const sinfer::OutputDelta& delta : session.commit_preview()) {
+                        if (!delta.token_ids.empty()) {
+                            if (!delta.text.empty()) { ++seen.empty_text_deltas; }  // ids ride in a delta of their own
+                            seen.reported.insert(seen.reported.end(), delta.token_ids.begin(), delta.token_ids.end());
+                            continue;
+                        }
+                        seen.text[delta.channel == sinfer::OutputChannel::Reasoning ? 0
+                                  : delta.channel == sinfer::OutputChannel::Tool    ? 2 : 1] += delta.text;
+                    }
+                    at += decision.accepted_tokens;
+                    if (decision.finish_reason != sinfer::FinishReason::None) {
+                        seen.finish = decision.finish_reason;
+                        break;
+                    }
+                }
+                return std::make_pair(seen, at);
+            };
+            for (const std::size_t round : {std::size_t{1}, std::size_t{3}}) {
+                const auto [off, off_used] = run(false, round);
+                const auto [on, on_used] = run(true, round);
+                std::vector<sinfer::TokenId> want(ids.begin(), ids.begin() + static_cast<std::ptrdiff_t>(on_used));
+                if (on.finish == sinfer::FinishReason::StopToken && !want.empty()) { want.pop_back(); }
+                std::string problem;
+                if (off.text[0] != on.text[0] || off.text[1] != on.text[1] || off.text[2] != on.text[2] ||
+                    off.finish != on.finish || off_used != on_used) {
+                    problem += " text deltas differ with the option on";
+                }
+                if (!off.reported.empty()) { problem += " ids reported with the option off"; }
+                if (on.reported != want) { problem += " reported ids differ from the accepted ids"; }
+                if (on.empty_text_deltas != 0) { problem += " an id delta carried text"; }
+                if (!problem.empty()) {
+                    ++bad;
+                    report("report_token_ids " + name + " round " + std::to_string(round) + problem);
+                    break;
+                }
+            }
+        }
+        std::cout << "report_token_ids through OutputSession: " << n << " vectors x rounds of 1 and 3, " << bad
+                  << " mismatches\n";
+        failures += bad;
+        if (n == 0) { ++failures; }
+    }
+
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " sinfer_inkling_wiring_test\n";
     return failures == 0 ? 0 : 1;
 }
