@@ -868,6 +868,11 @@ int forced_splits() {
     return raw == nullptr ? 0 : std::max(0, std::atoi(raw));
 }
 
+bool decode_v1_forced() {
+    const char* raw = std::getenv("SUROGATE_INKLING_DECODE_V1"); // A/B against the M2 decode kernel
+    return raw != nullptr && raw[0] == '1';
+}
+
 Plan make_plan(InklingLayerKind kind, std::int32_t width, std::int32_t batch, std::int32_t max_keys) {
     Plan plan;
     const int sms = device_sms();
@@ -918,11 +923,6 @@ void launch_kernel(const Plan& plan, const AttnParams& p, cudaStream_t stream) {
     (void)configured;
     const pdl::LaunchConfig launch{plan.grid, dim3(MTiles * 32), static_cast<std::size_t>(bytes), stream};
     CUDA_CHECK(pdl::launch_dependent(launch, kernel, p));
-}
-
-bool decode_v1_forced() {
-    const char* raw = std::getenv("SUROGATE_INKLING_DECODE_V1"); // A/B against the M2 decode kernel
-    return raw != nullptr && raw[0] == '1';
 }
 
 template <bool Local, int MTiles, int Mode>
