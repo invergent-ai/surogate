@@ -148,7 +148,7 @@ class TokenChunked(torch.autograd.Function):
                     if g is None:
                         continue
                     if sinks[i] is not None:  # straight into the caller's accumulator (card or host)
-                        sinks[i].narrow(tdi[i], c0, n).add_(g.to(sinks[i].device))
+                        sink_add(sinks[i].narrow(tdi[i], c0, n), g)
                     else:
                         gin[i].narrow(tdi[i], c0, n).copy_(g)
             for i, p in enumerate(params):
@@ -182,6 +182,17 @@ def tc(fn, tok, tdims_in, tdims_out, params=(), store_bf16=None, chunk=None, val
 
 # the dummy leaves of the sink-carrying TokenChunked nodes built since the last clear (see tc)
 SINK_DUMMIES = []
+
+
+def sink_add(dst, g):
+    """dst += g for a gradient accumulator on the card or in PINNED host memory. A host accumulator is added to ON THE
+    CARD (pinned H2D, add, pinned D2H, all non-blocking on the stream): no host sync and no pageable copy."""
+    if dst.device == g.device:
+        dst.add_(g)
+        return
+    tmp = dst.to(g.device, non_blocking=True)
+    tmp.add_(g)
+    dst.copy_(tmp, non_blocking=True)
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -931,7 +942,7 @@ class LongModel(torch.autograd.Function):
                 gr = gr[:len(leaves)]
                 SINK_DUMMIES.clear()
             if not vi.first and sinks[n] is not None:  # the MLP-output conv's residual: d partial += d out (STE)
-                sinks[n].add_(g_out.to(sinks[n].device))
+                sink_add(sinks[n], g_out)
             del out, g_out
             for j, gj in enumerate(gr):
                 if gj is None:
