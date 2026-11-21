@@ -21,6 +21,7 @@
 #include "artifact/reader.h"
 #include "core/device.h"
 #include "runtime/engine/kv_capacity.h"
+#include "runtime/engine/pipeline_kv_share.h"
 
 #include <cuda_runtime.h>
 
@@ -122,12 +123,15 @@ void check_target(const char* name, const std::filesystem::path& artifact, Devic
     }
 }
 
-// The 2-card visit split under --kv-capacity auto, as construct_pipeline builds it: every stage plans its own
-// curve under auto (the preflight), the pool every stage then gets is the smallest stage's resolution, and each
-// stage is built with that count as an EXPLICIT capacity marked resolved-from-auto. Before 0da5c31b /
-// 5c6a3502 validate_target_options capped that explicit count at lanes x logical pages and refused every
-// --max-num-seqs 1 engine (the preflight resolves logical + window charge; e1b 17:27). Budgets: unlimited
-// (the curve maximum) and a tight one (minimum + 2 GiB) per stage.
+// The 2-card visit split under --kv-capacity auto, as construct_pipeline builds it (targets/registry.cpp
+// preflight_pipeline + runtime/engine/pipeline_kv_share.h): every stage resolves its own curve under auto,
+// the stages share REAL KV (the pages left when every lane holds its window charge: min over stages of
+// resolved - lanes x charge), each stage is built with that plus its own lanes' charge as an explicit
+// capacity marked resolved-from-auto. Asserted per stage, exactly: the plan holds shared + lanes x charge
+// pages (not clamped), and at an unlimited budget the shared real KV is lanes x max_context (no context
+// lost to a larger charge on another stage). Also: one page past a stage's curve maximum is refused.
+// With and without DSpark (--spec dflash, K = 7: its drafter planes and a 1,032-token window class on the
+// last stage give that stage a different charge), 16k..1M x 1-8 lanes x chunk 2k / 8k, unlimited / tight.
 template <class Target>
 void check_stages(const char* name, const std::filesystem::path& artifact, DeviceContext& device, Totals& totals) {
     if constexpr (requires { Target::pipeline_stage_bounds(2); }) {
@@ -136,103 +140,127 @@ void check_stages(const char* name, const std::filesystem::path& artifact, Devic
         const auto profile                  = Target::resolve_weights(reader.identity());
         const std::vector<int> bounds       = Target::pipeline_stage_bounds(2);
         const auto native                   = static_cast<std::uint32_t>(geometry.max_context);
-        for (const std::uint32_t context : {16384U, 131072U, 262144U, 1048576U}) {
-            if (native != 0 && context > native) { continue; }
-            for (const std::uint32_t lanes : {1U, 2U, 4U, 8U}) {
-                for (const std::uint32_t chunk : {2048U, 8192U}) {
-                    for (const bool tight : {false, true}) {
-                        ++totals.shapes;
-                        const std::string shape = std::string(name) + " 2 stages " + std::to_string(context) + " x " +
-                                                  std::to_string(lanes) + " chunk " + std::to_string(chunk) +
-                                                  (tight ? " tight" : " unlimited");
-                        const auto stage_options = [&](int s) {
-                            EngineOptions options;
-                            options.artifact_path        = artifact;
-                            options.max_context          = context;
-                            options.max_concurrency      = lanes;
-                            options.prefill_chunk        = std::min(chunk, context);
-                            options.use_cuda_graph       = true;
-                            options.kv_capacity          = KvCapacityPolicy::automatic(0);
-                            options.pipeline_stage_first = bounds[static_cast<std::size_t>(s)];
-                            options.pipeline_stage_last  = bounds[static_cast<std::size_t>(s) + 1];
-                            options.pipeline_boundary_columns = options.prefill_chunk + lanes + 128;
-                            return options;
-                        };
-                        try {
-                            // the preflight: each stage under auto, the pool = the smallest stage's
-                            std::uint32_t common = 0;
-                            for (int s = 0; s < 2; ++s) {
-                                const auto curve =
-                                    Target::make_sequence_planner(device, stage_options(s), profile, geometry)
-                                        .capacity_curve();
-                                const std::size_t budget =
-                                    tight ? curve.minimum_device_reservation_bytes + (2ULL << 30) : ~std::size_t{0} / 2;
-                                const auto resolved =
-                                    runtime::resolve_kv_capacity(KvCapacityPolicy::automatic(0), curve, budget)
-                                        .resolved_tokens;
-                                common = common == 0 ? resolved : std::min(common, resolved);
-                            }
-                            // the build: the shared count as an explicit capacity resolved from auto
-                            for (int s = 0; s < 2; ++s) {
-                                EngineOptions options                    = stage_options(s);
-                                options.kv_capacity                      = KvCapacityPolicy::explicit_capacity(common);
-                                options.kv_capacity_resolved_automatically = true;
-                                auto planner = Target::make_sequence_planner(device, options, profile, geometry);
-                                const auto curve = planner.capacity_curve();
-                                const std::uint32_t pages =
-                                    runtime::resolve_kv_capacity(options.kv_capacity, curve, ~std::size_t{0})
-                                        .resolved_tokens / 64U;
-                                const std::size_t expected = curve.reservation_bytes(pages);
-                                auto plan = std::move(planner).finalize(pages);
-                                ++totals.plans;
-                                if (plan.device_reservation_bytes() != expected) {
-                                    std::printf("FAIL %s stage %d: reservation %zu != curve %zu\n", shape.c_str(), s,
-                                                plan.device_reservation_bytes(), expected);
+        for (const bool dspark : {false, true}) {
+            if (dspark && geometry.dflash.layers == 0) { continue; }
+            for (const std::uint32_t context : {16384U, 131072U, 262144U, 1048576U}) {
+                if (native != 0 && context > native) { continue; }
+                for (const std::uint32_t lanes : {1U, 2U, 4U, 8U}) {
+                    for (const std::uint32_t chunk : {2048U, 8192U}) {
+                        for (const bool tight : {false, true}) {
+                            ++totals.shapes;
+                            const std::string shape = std::string(name) + (dspark ? " dspark" : "") + " 2 stages " +
+                                                      std::to_string(context) + " x " + std::to_string(lanes) +
+                                                      " chunk " + std::to_string(chunk) +
+                                                      (tight ? " tight" : " unlimited");
+                            const auto stage_options = [&](int s) {
+                                EngineOptions options;
+                                options.artifact_path        = artifact;
+                                options.max_context          = context;
+                                options.max_concurrency      = lanes;
+                                options.prefill_chunk        = std::min(chunk, context);
+                                options.use_cuda_graph       = true;
+                                options.kv_capacity          = KvCapacityPolicy::automatic(0);
+                                options.pipeline_stage_first = bounds[static_cast<std::size_t>(s)];
+                                options.pipeline_stage_last  = bounds[static_cast<std::size_t>(s) + 1];
+                                if (dspark) {
+                                    options.speculative.backend      = SpeculativeBackend::DFlash;
+                                    options.speculative.draft_tokens = 7;
+                                }
+                                options.pipeline_boundary_columns =
+                                    std::max(options.prefill_chunk + lanes + 128,
+                                             lanes * (options.speculative.draft_tokens + 1) + 128);
+                                return options;
+                            };
+                            try {
+                                // the preflight: each stage under auto
+                                std::vector<runtime::PipelineStageKvFit> fits;
+                                for (int s = 0; s < 2; ++s) {
+                                    const auto curve =
+                                        Target::make_sequence_planner(device, stage_options(s), profile, geometry)
+                                            .capacity_curve();
+                                    const std::size_t budget = tight ? curve.minimum_device_reservation_bytes +
+                                                                           (2ULL << 30)
+                                                                     : ~std::size_t{0} / 2;
+                                    const auto resolved =
+                                        runtime::resolve_kv_capacity(KvCapacityPolicy::automatic(0), curve, budget)
+                                            .resolved_tokens;
+                                    fits.push_back({.resolved_pages = resolved / 64U,
+                                                    .minimum_pages  = curve.minimum_main_page_groups,
+                                                    .charge_pages   = curve.window_lane_charge_pages});
+                                }
+                                const runtime::PipelineKvShare share = runtime::share_pipeline_kv(fits, lanes);
+                                const std::uint32_t logical = (context + 63U) / 64U;
+                                if (!tight && share.shared_pages != lanes * logical) {
+                                    std::printf("FAIL %s: shared real KV %u pages, not lanes x logical %u\n",
+                                                shape.c_str(), share.shared_pages, lanes * logical);
                                     ++totals.failed;
                                 }
-                                // one full-context request with its charge fits the stage's ledger
-                                if (pages < curve.minimum_main_page_groups) {
-                                    std::printf("FAIL %s stage %d: %u pages under the curve minimum %u\n", shape.c_str(),
-                                                s, pages, curve.minimum_main_page_groups);
-                                    ++totals.failed;
-                                }
-                                // every stage holds exactly the shared pool: no stage clamped it (review M8b minor 6)
-                                if (static_cast<std::uint64_t>(pages) * 64U != common) {
-                                    std::printf("FAIL %s stage %d: %u pages = %llu tokens, not the shared pool %u\n",
-                                                shape.c_str(), s, pages,
-                                                static_cast<unsigned long long>(pages) * 64ULL, common);
-                                    ++totals.failed;
-                                }
-                                // the upper bound: one page past this stage's curve maximum is refused, not clamped
-                                {
-                                    EngineOptions over = options;
-                                    over.kv_capacity = KvCapacityPolicy::explicit_capacity(
-                                        (curve.maximum_main_page_groups + 1U) * 64U);
-                                    bool refused = false;
-                                    try {
-                                        (void)Target::make_sequence_planner(device, over, profile, geometry);
-                                    } catch (const std::invalid_argument&) {
-                                        refused = true;
-                                    }
-                                    ++totals.plans;
-                                    if (!refused) {
-                                        std::printf("FAIL %s stage %d: a shared pool one page past the curve maximum "
-                                                    "%u was accepted\n",
-                                                    shape.c_str(), s, curve.maximum_main_page_groups);
+                                // the build: each stage with its own share, explicit + resolved-from-auto
+                                for (int s = 0; s < 2; ++s) {
+                                    const std::uint32_t want =
+                                        share.shared_pages + lanes * fits[static_cast<std::size_t>(s)].charge_pages;
+                                    if (share.stage_pages[static_cast<std::size_t>(s)] != want) {
+                                        std::printf("FAIL %s stage %d: share %u pages, not shared %u + %u x charge %u\n",
+                                                    shape.c_str(), s, share.stage_pages[static_cast<std::size_t>(s)],
+                                                    share.shared_pages, lanes, fits[static_cast<std::size_t>(s)].charge_pages);
                                         ++totals.failed;
                                     }
+                                    EngineOptions options = stage_options(s);
+                                    options.kv_capacity   = KvCapacityPolicy::explicit_capacity(
+                                        share.stage_pages[static_cast<std::size_t>(s)] * 64U);
+                                    options.kv_capacity_resolved_automatically = true;
+                                    auto planner = Target::make_sequence_planner(device, options, profile, geometry);
+                                    const auto curve = planner.capacity_curve();
+                                    const std::uint32_t pages =
+                                        runtime::resolve_kv_capacity(options.kv_capacity, curve, ~std::size_t{0})
+                                            .resolved_tokens / 64U;
+                                    const std::size_t expected = curve.reservation_bytes(pages);
+                                    auto plan = std::move(planner).finalize(pages);
+                                    ++totals.plans;
+                                    if (plan.device_reservation_bytes() != expected) {
+                                        std::printf("FAIL %s stage %d: reservation %zu != curve %zu\n", shape.c_str(),
+                                                    s, plan.device_reservation_bytes(), expected);
+                                        ++totals.failed;
+                                    }
+                                    // exactly its share: the planner did not clamp it either way
+                                    if (pages != share.stage_pages[static_cast<std::size_t>(s)]) {
+                                        std::printf("FAIL %s stage %d: plan holds %u pages, its share is %u\n",
+                                                    shape.c_str(), s, pages,
+                                                    share.stage_pages[static_cast<std::size_t>(s)]);
+                                        ++totals.failed;
+                                    }
+                                    // the upper bound: one page past the curve maximum is refused, not clamped
+                                    {
+                                        EngineOptions over = options;
+                                        over.kv_capacity   = KvCapacityPolicy::explicit_capacity(
+                                            (curve.maximum_main_page_groups + 1U) * 64U);
+                                        bool refused = false;
+                                        try {
+                                            (void)Target::make_sequence_planner(device, over, profile, geometry);
+                                        } catch (const std::invalid_argument&) {
+                                            refused = true;
+                                        }
+                                        ++totals.plans;
+                                        if (!refused) {
+                                            std::printf("FAIL %s stage %d: a pool one page past the curve maximum %u "
+                                                        "was accepted\n",
+                                                        shape.c_str(), s, curve.maximum_main_page_groups);
+                                            ++totals.failed;
+                                        }
+                                    }
+                                    if (lanes == 1 && !tight && (context == 262144U || context == 1048576U)) {
+                                        std::printf("ok   %s stage %d [%d, %d): shared real KV %u tokens, stage %u pages "
+                                                    "(charge %u, curve %u..%u)\n",
+                                                    shape.c_str(), s, bounds[static_cast<std::size_t>(s)],
+                                                    bounds[static_cast<std::size_t>(s) + 1], share.shared_pages * 64U,
+                                                    pages, fits[static_cast<std::size_t>(s)].charge_pages,
+                                                    curve.minimum_main_page_groups, curve.maximum_main_page_groups);
+                                    }
                                 }
-                                if (lanes == 1 && !tight) {
-                                    std::printf("ok   %s stage %d [%d, %d): shared pool %u tokens, stage pages %u "
-                                                "(curve %u..%u)\n",
-                                                shape.c_str(), s, bounds[static_cast<std::size_t>(s)],
-                                                bounds[static_cast<std::size_t>(s) + 1], common, pages,
-                                                curve.minimum_main_page_groups, curve.maximum_main_page_groups);
-                                }
+                            } catch (const std::exception& error) {
+                                std::printf("FAIL %s: %s\n", shape.c_str(), error.what());
+                                ++totals.failed;
                             }
-                        } catch (const std::exception& error) {
-                            std::printf("FAIL %s: %s\n", shape.c_str(), error.what());
-                            ++totals.failed;
                         }
                     }
                 }
