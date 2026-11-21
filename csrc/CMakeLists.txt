@@ -1723,8 +1723,8 @@ set_source_files_properties(
 target_link_libraries(sinfer_ops PUBLIC sinfer_core PRIVATE sinfer_nvfp4_tma sinfer_nvfp4_cutlass sinfer_fp8_block_sm90 sinfer_fp8_block_sm120 sinfer_gqa_sm90 sinfer_trtllm_moe CUDA::cublasLt)
 
 # ENGINE-INKLING lane c: the Inkling-2-Mini attention ops (api/ops/inkling_attention.h). An archive of its
-# own, deliberately NOT in SINFER_SHARED_ARCHIVES: nothing existing references it, so libsinfer and the
-# products (and the current model's numbers) stay exactly what they were; the inkling2 target links it.
+# own; only the inkling2 target calls it, so the other targets' code paths and numbers stay what they were.
+# In SINFER_SHARED_ARCHIVES (lane e1's wiring of the target, merge M3a+) so libsinfer carries it.
 # No fast math: the kernels reproduce the reference's rounding with explicit intrinsics.
 add_library(sinfer_inkling_attention STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/inkling_attention/inkling_prologue.cu
@@ -1892,7 +1892,8 @@ foreach(candidate IN ITEMS
     sinfer_engine sinfer_core sinfer_ops sinfer_artifact sinfer_text sinfer_encoder
     sinfer_nvfp4_tma sinfer_nvfp4_cutlass sinfer_fp8_block_sm90 sinfer_fp8_block_sm120 sinfer_gqa_sm90 sinfer_trtllm_moe sinfer_media_decode
     sinfer_serve sinfer_media_acquire sinfer_product_prompt_input
-    sinfer_product_load_progress sinfer_product_cuda_visibility)
+    sinfer_product_load_progress sinfer_product_cuda_visibility
+    sinfer_inkling_attention)
   if(TARGET ${candidate})
     list(APPEND SINFER_SHARED_ARCHIVES ${candidate})
   endif()
