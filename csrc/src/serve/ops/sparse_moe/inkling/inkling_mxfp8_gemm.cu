@@ -19,7 +19,6 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
-#include <cstdlib>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -45,7 +44,7 @@ struct Mxfp8Schedule {
     static_assert(kWarpM % 16 == 0 && kWarpN % 8 == 0);
 };
 
-inline constexpr int kMxfp8DefaultKWidth = 2;
+inline constexpr int kMxfp8KWidth = 2;
 
 using NarrowSchedule = Mxfp8Schedule<64, 8, 4, 1, 3>;
 using WideSchedule   = Mxfp8Schedule<64, 32, 2, 2, 2>;
@@ -261,17 +260,6 @@ __global__ __launch_bounds__(Schedule::kThreads) void mxfp8_expert_gemm_kernel(G
     }
 }
 
-/// The fragment K layout (see mxfp8_k_lo). Test knob SUROGATE_INKLING_MXFP8_KWIDTH (2, 4, 8, 16) while the
-/// layout of the reference's Triton build is being matched (M3); the default is the matched one.
-int mxfp8_kwidth() {
-    static const int value = [] {
-        const char* text = std::getenv("SUROGATE_INKLING_MXFP8_KWIDTH");
-        const int v      = text != nullptr ? std::atoi(text) : kMxfp8DefaultKWidth;
-        return (v == 2 || v == 4 || v == 8 || v == 16) ? v : kMxfp8DefaultKWidth;
-    }();
-    return value;
-}
-
 template <class Schedule, int K, bool GateUp, int KWidth>
 cudaError_t launch_kwidth(const dim3& grid, const GemmParams& params, cudaStream_t stream) {
     return pdl::launch_dependent({grid, dim3(Schedule::kThreads), 0, stream},
@@ -283,13 +271,10 @@ void launch_schedule(const GemmParams& params, std::int32_t slots, cudaStream_t 
     const int max_tiles = std::min(kExperts, slots) + slots / Schedule::kBlockN;
     if (max_tiles == 0) { return; }
     const dim3 grid(static_cast<unsigned>(max_tiles), kGateUpRows / Schedule::kBlockM);
-    cudaError_t status = cudaSuccess;
-    switch (mxfp8_kwidth()) {
-    case 4: status = launch_kwidth<Schedule, K, GateUp, 4>(grid, params, stream); break;
-    case 8: status = launch_kwidth<Schedule, K, GateUp, 8>(grid, params, stream); break;
-    case 16: status = launch_kwidth<Schedule, K, GateUp, 16>(grid, params, stream); break;
-    default: status = launch_kwidth<Schedule, K, GateUp, 2>(grid, params, stream); break;
-    }
+    // One fragment layout at every width (canonical, KWidth 2). M3 run 3 measured the alternatives against
+    // the vLLM capture (layer 20): KWidth 4 = the same 27 / 4.7 M gate_up elements off (same K set per MMA),
+    // 8 -> 25, 16 -> 44: none reproduces Triton's K grouping; the residual is recorded, not chased.
+    const cudaError_t status = launch_kwidth<Schedule, K, GateUp, kMxfp8KWidth>(grid, params, stream);
     if (status != cudaSuccess) {
         throw std::runtime_error(std::string("inkling_moe: mxfp8 expert gemm: ") + cudaGetErrorString(status));
     }
