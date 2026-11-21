@@ -601,6 +601,246 @@ int test_controller_tail(std::uint32_t seed, int streams, int dq, int n) {
                      2);
 }
 
+// ------------------------------------------------------------------------------- I8 lane mx: fast == reference
+//
+// The latency-cut decode / verify kernels (inkling_mix.cu, lane mx) against the reference kernels, bit for bit, over
+// every source count, addend, query count, stream count, width and conv row shape the engine uses (and the edges:
+// positions 0..2, rows with fewer valid columns, an empty row, in-place residual).
+
+/// `body` with the reference kernels, then with the fast ones (the switch is left on the fast kernels).
+template <class F>
+std::pair<std::vector<std::uint8_t>, std::vector<std::uint8_t>> ref_and_fast(F&& body) {
+    ops::inkling_mix_use_reference_kernels(true);
+    auto r = body();
+    ops::inkling_mix_use_reference_kernels(false);
+    auto f = body();
+    return {std::move(r), std::move(f)};
+}
+
+/// Bitwise, quiet on success: counts the cases and prints only failures.
+struct Tally {
+    const char* name;
+    int cases = 0, failures = 0;
+    void check(const std::string& label, const std::pair<std::vector<std::uint8_t>, std::vector<std::uint8_t>>& rf,
+               std::size_t esize) {
+        ++cases;
+        if (rf.first.size() != rf.second.size() || rf.first.empty()) {
+            ++failures;
+            std::cout << "FAIL " << name << " " << label << ": sizes " << rf.first.size() << " / " << rf.second.size() << "\n";
+            return;
+        }
+        std::size_t bad = 0, first = 0;
+        for (std::size_t i = 0; i < rf.first.size(); i += esize) {
+            if (std::memcmp(&rf.first[i], &rf.second[i], esize) != 0) {
+                if (bad == 0) { first = i / esize; }
+                ++bad;
+            }
+        }
+        if (bad) {
+            ++failures;
+            std::cout << "FAIL " << name << " " << label << ": " << bad << " of " << rf.first.size() / esize
+                      << " differ (first element " << first << ")\n";
+        }
+    }
+    int report() const {
+        std::cout << (failures ? "FAIL " : "ok   ") << name << ": fast == reference bit for bit in " << cases - failures
+                  << " / " << cases << " cases\n";
+        return failures;
+    }
+};
+
+int test_mx_attn_res(std::uint32_t seed) {
+    constexpr int kSlots = 7, kT = 37;
+    const auto residual = randn_bf16(static_cast<std::size_t>(kT) * kSlots * kD, seed, 0.8F);
+    const auto addend   = randn_bf16(static_cast<std::size_t>(kT) * kD, seed + 1, 0.3F);
+    const auto q        = randn_f32(static_cast<std::size_t>(4) * kD, seed + 2, 1.0F / 16.0F);
+    const auto w        = randn_bf16(static_cast<std::size_t>(4) * kD, seed + 3, 1.0F);
+    DeviceBuffer d_res = dev_bf16(residual), d_add = dev_bf16(addend), d_q = to_device(q), d_w = dev_bf16(w);
+    Tally tally{"I8 inkling_attn_res"};
+    for (int N = 1; N <= 6; ++N) {
+        for (const bool add : {false, true}) {
+            for (const int Q : {1, 2, 3, 4}) {
+                for (const bool norm : {true, false}) {
+                    for (const int T : {1, 2, 8, 37}) {
+                        Tensor q_t(d_q.p, DType::FP32, {kD, Q});
+                        Tensor w_t(d_w.p, DType::BF16, {kD, Q});
+                        const auto run = [&] {
+                            ops::InklingAttnResSources s;
+                            s.stack_count = N - 1;
+                            auto* base    = static_cast<std::uint16_t*>(d_res.p);
+                            for (int n = 0; n < N - 1; ++n) { s.stack[n] = ops::InklingPlane{base + n * kD, DType::BF16, kSlots * kD}; }
+                            s.last = ops::InklingPlane{base + 6 * kD, DType::BF16, kSlots * kD};
+                            if (add) { s.addend = ops::InklingPlane{d_add.p, DType::BF16, kD}; }
+                            DeviceBuffer d_out(static_cast<std::size_t>(T) * kD * Q * (norm ? 2 : 4));
+                            Tensor out(d_out.p, norm ? DType::BF16 : DType::FP32, {kD, T, Q});
+                            ops::inkling_attn_res(s, T, q_t, norm ? &w_t : nullptr, 1e-6F, out, nullptr);
+                            cuda_synchronize();
+                            return raw(d_out.p, d_out.bytes);
+                        };
+                        tally.check("N=" + std::to_string(N) + (add ? " +addend" : "") + " Q=" + std::to_string(Q) +
+                                        (norm ? " norm" : " fp32") + " T=" + std::to_string(T),
+                                    ref_and_fast(run), norm ? 2 : 4);
+                    }
+                }
+            }
+        }
+    }
+    return tally.report();
+}
+
+int test_mx_blend_inputs(std::uint32_t seed) {
+    constexpr int kSlots = 7, kT = 37;
+    const auto residual = randn_bf16(static_cast<std::size_t>(kT) * kSlots * kD, seed, 0.8F);
+    const auto add      = randn_bf16(static_cast<std::size_t>(kT) * kD, seed + 1, 0.3F);
+    const auto dqv      = randn_f32(static_cast<std::size_t>(3) * kD, seed + 2, 1.0F / 16.0F);
+    const auto mqv      = randn_f32(static_cast<std::size_t>(3) * kD, seed + 3, 1.0F / 16.0F);
+    DeviceBuffer d_res = dev_bf16(residual), d_add = dev_bf16(add), d_dq = to_device(dqv), d_mq = to_device(mqv);
+    Tally tally{"I8 inkling_blend_inputs"};
+    const int shapes[][2] = {{1, 1}, {1, 3}, {3, 3}}; // {DQ, S}
+    for (int N = 1; N <= 6; ++N) {
+        for (const bool addend : {false, true}) {
+            for (const auto& sh : shapes) {
+                const int dq = sh[0], S = sh[1];
+                for (const int T : {1, 2, 8, 37}) {
+                    Tensor dq_t(d_dq.p, DType::FP32, {kD, dq}), mq_t(d_mq.p, DType::FP32, {kD, S});
+                    DeviceBuffer dd(static_cast<std::size_t>(kD) * T * dq * 4), dm(static_cast<std::size_t>(kD) * T * S * 4),
+                        dp(static_cast<std::size_t>(2 * kD) * T * S * 2);
+                    const auto run = [&] {
+                        auto* base = static_cast<std::uint16_t*>(d_res.p);
+                        ops::InklingAttnResSources dst, bank;
+                        dst.stack_count = N - 1;
+                        for (int n = 0; n < N - 1; ++n) { dst.stack[n] = ops::InklingPlane{base + n * kD, DType::BF16, kSlots * kD}; }
+                        dst.last = ops::InklingPlane{base + 6 * kD, DType::BF16, kSlots * kD};
+                        if (addend) { dst.addend = ops::InklingPlane{d_add.p, DType::BF16, kD}; }
+                        bank.stack_count = 1;
+                        bank.stack[0]    = ops::InklingPlane{base + 5 * kD, DType::BF16, kSlots * kD};
+                        bank.last        = ops::InklingPlane{base + 2 * kD, DType::BF16, kSlots * kD};
+                        dd.fill(0);
+                        dm.fill(0);
+                        dp.fill(0);
+                        Tensor td(dd.p, DType::FP32, {kD, T, dq}), tm(dm.p, DType::FP32, {kD, T, S}),
+                            tp(dp.p, DType::BF16, {2 * kD, T, S});
+                        ops::inkling_blend_inputs(dst, dq_t, bank, mq_t, T, td, tm, tp, nullptr);
+                        cuda_synchronize();
+                        auto all = raw(dd.p, dd.bytes);
+                        const auto m = raw(dm.p, dm.bytes), p = raw(dp.p, dp.bytes);
+                        all.insert(all.end(), m.begin(), m.end());
+                        all.insert(all.end(), p.begin(), p.end()); // pair bf16 pairs compare as 4-byte units
+                        return all;
+                    };
+                    tally.check("N=" + std::to_string(N) + (addend ? " +addend" : "") + " DQ=" + std::to_string(dq) +
+                                    " S=" + std::to_string(S) + " T=" + std::to_string(T),
+                                ref_and_fast(run), 4);
+                }
+            }
+        }
+    }
+    return tally.report();
+}
+
+int test_mx_controller_tail(std::uint32_t seed) {
+    constexpr int kR = 64;
+    Tally tally{"I8 inkling_controller_tail"};
+    if (!ops::inkling_controller_tail_supported(1)) {
+        std::cout << "SKIP I8 inkling_controller_tail: no cluster launch on this device\n";
+        return 0;
+    }
+    const int shapes[][2] = {{1, 1}, {3, 1}, {3, 3}}; // {S, DQ}
+    for (const auto& sh : shapes) {
+        const int streams = sh[0], dq = sh[1];
+        for (const int n : {1, 2, 5, 8, 9, 16, 31, 32}) {
+            const auto down_bits = hash_bf16(static_cast<std::size_t>(streams) * kR * 2 * kD, seed + n, 0.03F);
+            const auto gf_bits   = hash_bf16(static_cast<std::size_t>(streams) * 2 * kD * kR, seed + n + 1, 0.2F);
+            const auto pair      = randn_bf16(static_cast<std::size_t>(2 * kD) * n * streams, seed + n + 2, 1.0F);
+            const auto dest      = randn_f32(static_cast<std::size_t>(kD) * n * dq, seed + n + 3, 0.7F);
+            const auto msg       = randn_f32(static_cast<std::size_t>(kD) * n * streams, seed + n + 4, 0.7F);
+            const auto w         = randn_bf16(static_cast<std::size_t>(kD) * streams, seed + n + 5, 1.0F);
+            DeviceBuffer d_down = to_device(down_bits), d_gf = to_device(gf_bits), d_pair = dev_bf16(pair),
+                         d_dest = to_device(dest), d_msg = to_device(msg), d_w = dev_bf16(w);
+            Tensor t_dest(d_dest.p, DType::FP32, {kD, n, dq}), t_msg(d_msg.p, DType::FP32, {kD, n, streams});
+            Tensor t_w(d_w.p, DType::BF16, {kD, streams});
+            const ops::InklingGemmBatch down_batch{streams, static_cast<std::int64_t>(kR) * 2 * kD,
+                                                   static_cast<std::int64_t>(n) * 2 * kD, static_cast<std::int64_t>(n) * kR};
+            const std::size_t ws = ops::inkling_gemm_inv_workspace_bytes(kR, 2 * kD, n, streams);
+            DeviceBuffer d_ws(ws), d_f(static_cast<std::size_t>(kD) * n * streams * 2);
+            const auto run = [&] {
+                d_f.fill(0);
+                ops::inkling_gemm_inv_partials(d_down.p, kR, 2 * kD, d_pair.p, n, down_batch, static_cast<float*>(d_ws.p),
+                                               ws, nullptr);
+                Tensor t_f(d_f.p, DType::BF16, {kD, n, streams});
+                ops::inkling_controller_tail(static_cast<const float*>(d_ws.p), d_gf.p, t_dest, t_msg, t_w, 1e-6F, t_f,
+                                             nullptr);
+                cuda_synchronize();
+                return raw(d_f.p, d_f.bytes);
+            };
+            tally.check("S=" + std::to_string(streams) + " DQ=" + std::to_string(dq) + " T=" + std::to_string(n),
+                        ref_and_fast(run), 2);
+        }
+    }
+    return tally.report();
+}
+
+int test_mx_short_conv(std::uint32_t seed) {
+    constexpr int kSlotsN = 8, kCols = 64;
+    const std::size_t slot_elems = static_cast<std::size_t>(G::kConvChannels) * 3;
+    const auto pool0 = randn_bf16(slot_elems * kSlotsN, seed, 1.0F);
+    const auto x     = randn_bf16(static_cast<std::size_t>(kCols) * kD, seed + 1, 1.0F);
+    const auto res   = randn_bf16(static_cast<std::size_t>(kCols) * kD, seed + 2, 1.0F);
+    const auto add   = randn_bf16(static_cast<std::size_t>(kCols) * kD, seed + 3, 1.0F);
+    DeviceBuffer d_x = dev_bf16(x), d_add = dev_bf16(add), d_pool(slot_elems * kSlotsN * 2), d_res(res.size() * 2),
+                 d_out(static_cast<std::size_t>(kCols) * kD * 2);
+    const auto pool_bits = bits(pool0);
+    Tally tally{"I8 inkling_short_conv"};
+    struct Stream {
+        int offset, channels;
+        std::uint32_t seed;
+    };
+    const Stream streams[] = {{G::kStreamAttn, kD, seed + 10}, {G::kStreamK, 1024, seed + 11}};
+    for (const auto& st : streams) {
+        const auto w = randn_bf16(static_cast<std::size_t>(st.channels) * 4, st.seed, 0.4F);
+        DeviceBuffer d_w = dev_bf16(w);
+        Tensor w_t(d_w.p, DType::BF16, {4, st.channels});
+        const ops::InklingConvStateView view{d_pool.p, static_cast<std::int64_t>(slot_elems), G::kConvChannels};
+        for (const int W : {1, 2, 3, 4, 7, 8}) {
+            for (const int B : {1, 3, 8}) {
+                if (W * B > kCols) { continue; }
+                for (int mode = 0; mode < 3; ++mode) { // 0 plain, 1 addend, 2 residual + addend in place
+                    // positions start at 0, 1, 2, 5, 1000 by row; rows with valid < W, and one empty row when B > 2
+                    std::vector<int> pos(static_cast<std::size_t>(W) * B), valid(B), slots(B);
+                    const int starts[] = {0, 1, 2, 5, 1000};
+                    for (int b = 0; b < B; ++b) {
+                        for (int j = 0; j < W; ++j) { pos[static_cast<std::size_t>(b) * W + j] = starts[b % 5] + j; }
+                        valid[b] = b == 2 ? 0 : (b % 2 == 1 ? std::max(1, W - 1) : W);
+                        slots[b] = (b * 3 + 1) % kSlotsN;
+                    }
+                    DeviceBuffer d_pos = to_device(pos), d_valid = to_device(valid), d_slots = to_device(slots);
+                    const ops::InklingConvRows rows{W, B, Tensor(d_pos.p, DType::I32, {W, B}),
+                                                    Tensor(d_valid.p, DType::I32, {B}), Tensor(d_slots.p, DType::I32, {B})};
+                    const auto run = [&] {
+                        CUDA_CHECK(cudaMemcpy(d_pool.p, pool_bits.data(), d_pool.bytes, cudaMemcpyHostToDevice));
+                        const auto rb16 = bits(res);
+                        CUDA_CHECK(cudaMemcpy(d_res.p, rb16.data(), d_res.bytes, cudaMemcpyHostToDevice));
+                        d_out.fill(0);
+                        const ops::InklingPlane xp{d_x.p, DType::BF16, kD}, ap{d_add.p, DType::BF16, kD},
+                            rp{d_res.p, DType::BF16, kD}, op{d_out.p, DType::BF16, kD};
+                        ops::inkling_short_conv(xp, st.channels, w_t, rows, view, st.offset, mode == 2 ? &rp : nullptr,
+                                                mode >= 1 ? &ap : nullptr, mode == 2 ? rp : op, nullptr);
+                        cuda_synchronize();
+                        auto all       = raw(mode == 2 ? d_res.p : d_out.p, d_out.bytes);
+                        const auto pst = raw(d_pool.p, d_pool.bytes);
+                        all.insert(all.end(), pst.begin(), pst.end());
+                        return all;
+                    };
+                    tally.check("C=" + std::to_string(st.channels) + " W=" + std::to_string(W) + " B=" + std::to_string(B) +
+                                    " mode=" + std::to_string(mode),
+                                ref_and_fast(run), 2);
+                }
+            }
+        }
+    }
+    return tally.report();
+}
+
 // ------------------------------------------------------------------------------------- I5 trainer log-prob
 
 /// inkling_head_logprob == the engine's own path (invariant FP32 head + softcap, then the scoring kernel through
@@ -878,6 +1118,10 @@ int main() {
         failures += test_controller_tail(3400 + n, 3, 3, n);
         failures += test_controller_tail(3500 + n, 1, 1, n);
     }
+    failures += test_mx_attn_res(3701);
+    failures += test_mx_blend_inputs(3711);
+    failures += test_mx_controller_tail(3721);
+    failures += test_mx_short_conv(3731);
     std::cout << (failures ? "FAIL" : "PASS") << " inkling_invariance (" << failures << " failures)\n";
     return failures ? 1 : 0;
 }

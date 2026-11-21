@@ -72,6 +72,15 @@ void inkling_attn_res(const InklingAttnResSources& sources, std::int32_t columns
                       cudaStream_t stream);
 
 /**
+ * Lane mx: at decode / verify widths inkling_attn_res, inkling_blend_inputs, inkling_controller_tail and
+ * inkling_short_conv run latency-cut kernels that compute the same bits as the reference kernels (invariance test
+ * I8). They read their WEIGHTS (queries, norm weights, conv taps, gain / forget) before the PDL wait, so those must
+ * not be written inside a step (they are written at load only). `on` = the reference kernels everywhere (tests and
+ * A/B; also SUROGATE_SERVE_INKLING_MIX_REFERENCE=1 at start). Takes effect at the next launch / graph capture.
+ */
+void inkling_mix_use_reference_kernels(bool on) noexcept;
+
+/**
  * Op inkling_embed (ref `inkling_embed`): out column t = bf16(rmsnorm_w(table row ids[t])), the
  * `_rms_norm_kernel` arithmetic: rstd = rsqrt(div_rn(sum x^2, 2304) + eps), y = (x * rstd) * w.
  * `ids` I32 [T] (each in [0, table_rows)), `table` BF16 rows of 2304, `norm_weight` BF16 [2304],
