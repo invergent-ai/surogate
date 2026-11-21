@@ -79,7 +79,6 @@ inline constexpr int kGemvRowsPerCta  = kGemvWarps * kGemvRowsPerWarp;
 template <int Steps, int Tokens>
 __global__ __launch_bounds__(kGemvWarps * 32) void gemv_kernel(const LinearParams p) {
     constexpr int K = Steps * 256;
-    pdl::wait_for_dependencies();
     const int block        = static_cast<int>(blockIdx.x);
     const LinearSegment& s = p.seg[segment_of(p, block)];
     const int warp         = static_cast<int>(threadIdx.x) >> 5;
@@ -94,6 +93,10 @@ __global__ __launch_bounds__(kGemvWarps * 32) void gemv_kernel(const LinearParam
 #pragma unroll
         for (int st = 0; st < Steps; ++st) { raw[r][st] = load_ldg<uint2>(row + st * 256); }
     }
+    // The weight codes never depend on the kernel before this one: they are in flight before the PDL wait,
+    // which guards only the activations (lane h 11-21: a 7 MB GEMV reaches 80 % of DRAM bandwidth in a graph
+    // without it, >= 98 % with it).
+    pdl::wait_for_dependencies();
 
     const bool per_row = s.k_per >= K;
     float acc[kGemvRowsPerWarp][Tokens];
@@ -168,7 +171,6 @@ __device__ __forceinline__ int swz64(int row, int chunk) { return row * kTk + ((
 template <int K, bool PerRow>
 __global__ __launch_bounds__(128) void gemm_kernel(const LinearParams p) {
     __shared__ __align__(16) GemmSmem sm;
-    pdl::wait_for_dependencies();
     const int block        = static_cast<int>(blockIdx.x);
     const LinearSegment& s = p.seg[segment_of(p, block)];
     const int tid          = static_cast<int>(threadIdx.x);
@@ -182,25 +184,25 @@ __global__ __launch_bounds__(128) void gemm_kernel(const LinearParams p) {
     const int col0         = static_cast<int>(blockIdx.y) * kTn;
     constexpr int Steps    = K / kTk;
 
-    const auto stage = [&](int step, int slot) {
+    // codes: 64 rows x 64 B = 256 chunks of 16 B; activations: 64 columns x 128 B = 512 chunks.
+    const auto stage_codes = [&](int step, int slot) {
         const int k0 = step * kTk;
-        // codes: 64 rows x 64 B = 256 chunks of 16 B; activations: 64 columns x 128 B = 512 chunks.
-        for (int c = tid; c < 256 + 512; c += 128) {
-            if (c < 256) {
-                const int row = c >> 2, part = c & 3;
-                const int local = local0 + row;
-                const bool ok   = local < s.rows;
-                const std::uint8_t* src =
-                    s.codes + static_cast<std::int64_t>(s.row_begin + (ok ? local : 0)) * K + k0 + part * 16;
-                cp_async_zfill<16>(&sm.codes[slot][row * kTk + part * 16], src, ok ? 16 : 0);
-            } else {
-                const int cc = c - 256;
-                const int col = cc >> 3, chunk = cc & 7;
-                const bool ok = col0 + col < p.columns;
-                const __nv_bfloat16* src =
-                    s.x + static_cast<std::int64_t>(ok ? col0 + col : 0) * K + k0 + chunk * 8;
-                cp_async_zfill<16>(&sm.x[slot][swz64(col, chunk)], src, ok ? 16 : 0);
-            }
+        for (int c = tid; c < 256; c += 128) {
+            const int row = c >> 2, part = c & 3;
+            const int local = local0 + row;
+            const bool ok   = local < s.rows;
+            const std::uint8_t* src =
+                s.codes + static_cast<std::int64_t>(s.row_begin + (ok ? local : 0)) * K + k0 + part * 16;
+            cp_async_zfill<16>(&sm.codes[slot][row * kTk + part * 16], src, ok ? 16 : 0);
+        }
+    };
+    const auto stage_x = [&](int step, int slot) {
+        const int k0 = step * kTk;
+        for (int c = tid; c < 512; c += 128) {
+            const int col = c >> 3, chunk = c & 7;
+            const bool ok = col0 + col < p.columns;
+            const __nv_bfloat16* src = s.x + static_cast<std::int64_t>(ok ? col0 + col : 0) * K + k0 + chunk * 8;
+            cp_async_zfill<16>(&sm.x[slot][swz64(col, chunk)], src, ok ? 16 : 0);
         }
     };
 
@@ -216,9 +218,14 @@ __global__ __launch_bounds__(128) void gemm_kernel(const LinearParams p) {
     // The four weight rows this thread's fragments touch (m tile mt, half h): local0 + 32 wm + 16 mt + gid + 8 h.
     const auto frag_row = [&](int mt, int h) { return local0 + 32 * wm + 16 * mt + gid + 8 * h; };
 
-    stage(0, 0);
+    // The first two steps' weight codes go out before the PDL wait (weights never depend on the previous
+    // kernel); the activations after it. Group 0 = codes 0 + codes 1 + x 0, group 1 = x 1.
+    stage_codes(0, 0);
+    if (Steps > 1) { stage_codes(1, 1); }
+    pdl::wait_for_dependencies();
+    stage_x(0, 0);
     cp_commit();
-    if (Steps > 1) { stage(1, 1); }
+    if (Steps > 1) { stage_x(1, 1); }
     cp_commit();
     const unsigned a_base = smem_addr(sm.a);
     for (int st = 0; st < Steps; ++st) {
@@ -258,7 +265,10 @@ __global__ __launch_bounds__(128) void gemm_kernel(const LinearParams p) {
             }
         }
         __syncthreads(); // the a tile and this stage's slots are free
-        if (st + 2 < Steps) { stage(st + 2, slot); }
+        if (st + 2 < Steps) {
+            stage_codes(st + 2, slot);
+            stage_x(st + 2, slot);
+        }
         cp_commit();
         // A cell ends every k_per columns (1x128: every two steps): scale its partial into the total.
         if (!PerRow && ((st + 1) * kTk) % s.k_per == 0) {
