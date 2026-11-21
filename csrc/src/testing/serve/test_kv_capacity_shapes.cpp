@@ -196,6 +196,32 @@ void check_stages(const char* name, const std::filesystem::path& artifact, Devic
                                                 s, pages, curve.minimum_main_page_groups);
                                     ++totals.failed;
                                 }
+                                // every stage holds exactly the shared pool: no stage clamped it (review M8b minor 6)
+                                if (static_cast<std::uint64_t>(pages) * 64U != common) {
+                                    std::printf("FAIL %s stage %d: %u pages = %llu tokens, not the shared pool %u\n",
+                                                shape.c_str(), s, pages,
+                                                static_cast<unsigned long long>(pages) * 64ULL, common);
+                                    ++totals.failed;
+                                }
+                                // the upper bound: one page past this stage's curve maximum is refused, not clamped
+                                {
+                                    EngineOptions over = options;
+                                    over.kv_capacity = KvCapacityPolicy::explicit_capacity(
+                                        (curve.maximum_main_page_groups + 1U) * 64U);
+                                    bool refused = false;
+                                    try {
+                                        (void)Target::make_sequence_planner(device, over, profile, geometry);
+                                    } catch (const std::invalid_argument&) {
+                                        refused = true;
+                                    }
+                                    ++totals.plans;
+                                    if (!refused) {
+                                        std::printf("FAIL %s stage %d: a shared pool one page past the curve maximum "
+                                                    "%u was accepted\n",
+                                                    shape.c_str(), s, curve.maximum_main_page_groups);
+                                        ++totals.failed;
+                                    }
+                                }
                                 if (lanes == 1 && !tight) {
                                     std::printf("ok   %s stage %d [%d, %d): shared pool %u tokens, stage pages %u "
                                                 "(curve %u..%u)\n",
