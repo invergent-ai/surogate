@@ -992,3 +992,14 @@ target_include_directories(sinfer_sampling_split_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR} ${SERVE_ROOT} ${CUDAToolkit_INCLUDE_DIRS})
 target_link_libraries(sinfer_sampling_split_test PRIVATE sinfer_core)
 target_compile_options(sinfer_sampling_split_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+
+# ENGINE-INKLING lane T (agent-EN-T): the engine-op trainer's fast-route shim (extern "C", ctypes from
+# surogate/train/inkling_fastpath/) over libsinfer.so -- the trainer drives the engine's own Inkling forward.
+# A shared library beside the op tests (inkbuild copies serve_tests/ back); nothing in the engine links it.
+add_library(sinfer_inkling_train SHARED EXCLUDE_FROM_ALL ${SERVE_ROOT}/inkling_fastpath/inkling_train_shim.cpp)
+target_include_directories(sinfer_inkling_train PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR} ${SERVE_ROOT} ${SINFER_JSON_INCLUDE} ${SUROGATE_VENDOR_DIR} ${CUDAToolkit_INCLUDE_DIRS})
+target_link_libraries(sinfer_inkling_train PRIVATE sinfer_shared CUDA::cudart)
+set_target_properties(sinfer_inkling_train PROPERTIES BUILD_RPATH "$ORIGIN:$ORIGIN/.." CXX_VISIBILITY_PRESET default)
+target_compile_options(sinfer_inkling_train PRIVATE
+  $<$<COMPILE_LANGUAGE:CXX>:-fno-fast-math> $<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>)
