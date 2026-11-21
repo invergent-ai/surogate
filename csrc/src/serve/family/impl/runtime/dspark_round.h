@@ -55,9 +55,13 @@ struct DSparkLaneStats {
     float stopped[kKinds]  = {};     ///< decayed rounds that ended on a rejected draft per kind
     std::uint8_t kind      = 0;      ///< the kind of the round in flight
     std::uint32_t extent   = 0;      ///< the drafts verified in the round in flight
+    bool noted             = false;  ///< a DSpark round of this lane was noted and not yet observed
     /// The round's outcome: `committed` tokens (accepted drafts + the correction / bonus). The kind's counts decay by
     /// `decay` every round of that kind, also at extent 0, so an estimate stuck low relaxes to the prior and re-probes.
+    /// Only a round noted at launch counts (nothing else ever changes the counts).
     void observe(std::uint32_t committed, float decay) {
+        if (!noted) { return; }
+        noted = false;
         const int k = kind < kKinds ? kind : 0;
         accepted[k] *= decay;
         stopped[k] *= decay;

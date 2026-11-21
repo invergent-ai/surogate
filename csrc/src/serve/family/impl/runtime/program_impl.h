@@ -138,6 +138,7 @@ void dspark_note_round_if(Sequence& sequence, std::uint32_t extent) {
     if constexpr (family::dspark_drafter<V>()) {
         sequence.dspark_stats.kind   = V::dspark_content_kind(std::span<const TokenId>(sequence.ledger.data(), sequence.ledger.size()));
         sequence.dspark_stats.extent = extent;
+        sequence.dspark_stats.noted  = true;
     } else {
         (void)sequence;
         (void)extent;
