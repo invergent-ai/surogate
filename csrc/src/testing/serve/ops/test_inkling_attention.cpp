@@ -2303,6 +2303,77 @@ void bench_attention_wo(const char* name, InklingLayerKind kind, int first) {
                 t_wo, t_att + t_wo);
 }
 
+// One decode attention call (attention + fold, 1 x 1, static metadata) over R rotated KV copies, for `bench cold`.
+struct BenchAttnCall {
+    InklingLayerKind kind;
+    Layer layer;
+    int keys, R;
+    std::vector<Rows> rot;
+    BenchPlane plane;
+    std::vector<float> q, r, qside;
+    DeviceBuffer dq, dr, dqs, dout;
+    ops::InklingAttentionInputs in;
+    std::vector<ops::InklingAttentionRows> views;
+    std::unique_ptr<WorkspaceArena> work;
+    Tensor out;
+    PagedKVBatchLayerView pv;
+
+    static int copies(InklingLayerKind k, int first) {
+        const double row_bytes = (k == InklingLayerKind::Global ? first + 1 : std::min(first + 1, 1088)) * 2048.0;
+        return std::max(1, static_cast<int>(std::ceil(256e6 / row_bytes)));
+    }
+    BenchAttnCall(InklingLayerKind k, int first, int seed)
+        : kind(k), layer(k, seed), keys(first + 1), R(copies(k, first)), plane(R, keys + 64) {
+        for (int i = 0; i < R; ++i) {
+            rot.push_back(make_rows(1, 1, {first}, {}));
+            rot.back().set_table_rows(i);
+        }
+        Rng rng(static_cast<std::uint32_t>(seed));
+        fill_qr(rng, rot[0], q, r);
+        qside.assign(6552, 0.25F);
+        dq = to_device_bf16(q);
+        dr = to_device_bf16(r);
+        dqs = to_device_bf16(qside);
+        dout = DeviceBuffer(3072 * 2);
+        in = ops::InklingAttentionInputs{Tensor(dq.p, DType::BF16, {128, 24, 1}), Tensor(dr.p, DType::BF16, {16, 24, 1}),
+                                         strided_bf16(dqs.p, G::kRowsGate, {3072}, 1, 6552),
+                                         strided_bf16(dqs.p, G::kRowsSink, {24}, 1, 6552),
+                                         Tensor(layer.dtable.p, DType::BF16, {16, G::kRelTableRows})};
+        for (const auto& rr : rot) {
+            views.push_back(rr.view(keys));
+            views.back().metadata_static = true;
+        }
+        work = std::make_unique<WorkspaceArena>(
+            ops::inkling_rel_attention_workspace_bytes(kind, 1, 1, views[0].envelope, views[0].key_groups) + 4096);
+        out = Tensor(dout.p, DType::BF16, {3072, 1});
+        pv  = plane.view(R);
+    }
+    void call(int i) { ops::inkling_rel_attention(in, kind, views[i % R], pv, *work, out, g_stream); }
+};
+
+// Is the slow local decode visit (h2's M9 trace: +3.4 us on the first local visit after a global one) a CODE switch or a
+// DATA effect? L = local decode at key 8,191; Gs = global decode at key 1,023 (the other kernel instantiation, the same
+// bytes as L: 1,024 keys); L' = local decode on its own plane (same code, other data). Per-pair excess = time of the
+// alternating graph minus the two kernels alone. Three interleaved rounds.
+void run_bench_cold() {
+    using K = InklingLayerKind;
+    cuda_check(cudaStreamCreateWithFlags(&g_stream, cudaStreamNonBlocking), "stream");
+    auto a  = std::make_unique<BenchAttnCall>(K::Local, 8191, 41);
+    auto a2 = std::make_unique<BenchAttnCall>(K::Local, 8191, 43);
+    auto g  = std::make_unique<BenchAttnCall>(K::Global, 1023, 47);
+    const int calls = 256; // a pair graph walks 128 KV copies (> 256 MB per kernel: reads from DRAM, not L2)
+    for (int round = 0; round < 3; ++round) {
+        const double t_l  = time_graph_us([&](int i) { a->call(i); }, calls);
+        const double t_l2 = time_graph_us([&](int i) { a2->call(i); }, calls);
+        const double t_g  = time_graph_us([&](int i) { g->call(i); }, calls);
+        // (time_graph_us is per call: a pair is two calls.)
+        const double t_ll = 2.0 * time_graph_us([&](int i) { if (i % 2 == 0) { a->call(i / 2); } else { a2->call(i / 2); } }, calls);
+        const double t_lg = 2.0 * time_graph_us([&](int i) { if (i % 2 == 0) { a->call(i / 2); } else { g->call(i / 2); } }, calls);
+        std::printf("bench cold round %d: L %.2f  L' %.2f  Gs %.2f us | pair L+L' %.2f (excess %+.2f) | pair L+Gs %.2f (excess %+.2f)\n",
+                    round, t_l, t_l2, t_g, t_ll, t_ll - t_l - t_l2, t_lg, t_lg - t_l - t_g);
+    }
+}
+
 // A/B of the decode kernel's latency knobs (L2 prefetch distance, PDL trigger at entry): same bits, different speed.
 void run_bench_ab() {
     using K = InklingLayerKind;
@@ -2641,6 +2712,10 @@ int main(int argc, char** argv) {
             }
             if (argc > 2 && std::string(argv[2]) == "prof") {
                 run_bench_prof();
+                return 0;
+            }
+            if (argc > 2 && std::string(argv[2]) == "cold") {
+                run_bench_cold();
                 return 0;
             }
             if (argc > 2 && std::string(argv[2]) == "fold") {
