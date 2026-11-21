@@ -87,6 +87,7 @@ void derive_rel_tables(const load::InklingWeights& weights, DerivedQueries& out)
     out.rel_storage              = DeviceBuffer(per * TextConfig::physical_layers);
     for (int layer = 0; layer < TextConfig::physical_layers; ++layer) {
         const load::InklingLayerWeights& L = weights.layers.at(static_cast<std::size_t>(layer));
+        if (L.rel_proj.data == nullptr) { continue; } // a layer bound ValidateOnly (another pipeline stage's)
         Tensor table(static_cast<std::byte*>(out.rel_storage.p) + per * layer, DType::BF16,
                      {kRel, static_cast<std::int32_t>(kRows)});
         ops::inkling_rel_proj_table(L.rel_proj, table, nullptr);

@@ -740,6 +740,12 @@ void Variant::run_visits(const ModelView& model, family::VisitRound& r) {
         rd.groups.push_back(g);
     }
     if (rd.groups.empty()) { throw std::logic_error("inkling2: a visit round with no columns"); }
+    if (!r.segments.empty() && r.max_visible_keys == 0) {
+        throw std::logic_error("inkling2: prompt segments without a visible-key promise (VisitRound.max_visible_keys)");
+    }
+    if (r.sequence_kv.valid() && r.block != nullptr && r.block->batch > 0) {
+        throw std::logic_error("inkling2: a single-sequence round cannot carry a decode / verify block");
+    }
     const auto& conv = r.state->conv;
     rd.pool = ops::InklingConvPool{conv[0].data,
                                    (static_cast<const std::byte*>(conv[1].data) - static_cast<const std::byte*>(conv[0].data)) / 2,
@@ -780,7 +786,7 @@ std::size_t Variant::visit_workspace_capacity_bytes(const family::TextGeometry&,
     const std::size_t T    = static_cast<std::size_t>(std::max<std::int32_t>(max_columns, std::max(batch_size, 1) * std::max(max_width, 1)));
     const std::size_t tile = std::min<std::size_t>(T, kTileColumns);
     std::size_t bytes = 0;
-    bytes += up(64 * 8);                                     // segment ints
+    bytes += up(64 * 8 * 4);                                 // segment ints (8 per segment, 64 segments)
     bytes += up(T * D * 3 * 2);                              // attn_in
     bytes += up(T * C::qkvr_rows * 2);                       // qkvr
     bytes += 2 * up(T * 32 * 2);                             // dynamic taps
