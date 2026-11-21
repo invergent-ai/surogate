@@ -159,6 +159,10 @@ struct InklingAttentionKnobs {
     int variant                     = 17;   // numerics variant bits (production 17)
     bool early_meta                 = true; // honour InklingAttentionRows::metadata_static
     std::size_t partial_cap_bytes   = std::size_t{1} << 30; // split-route partials above this -> one worker
+    // Prefill route (W > 16) only: split partials above this -> one worker (SUROGATE_INKLING_ATTN_PREFILL_PARTIAL_MB,
+    // default 64). Bounds the workspace an 8,192-column chunk reserves at long context (agent-EN 15:4x: the 1 GiB cap
+    // reserved 1,025 MiB at 262k); a wide chunk has CTAs from its columns, a narrow tail at long context runs unsplit.
+    std::size_t prefill_partial_cap_bytes = std::size_t{64} << 20;
     // Decode / verify split route: the last worker CTA of a (row, KV head) folds its 3 x W rows (no fold_kernel launch)
     // when W x slots <= this (SUROGATE_INKLING_ATTN_FUSED_FOLD; 0 = fold_kernel always). Same bits either way.
     int fused_fold_max = 1 << 30;
@@ -318,7 +322,10 @@ struct InklingAttentionInputs {
 ///             worker CTA folds; its 8 arrival counters per row live here)
 ///   workers = decode / verify (W <= 16): clamp(floor(2 * SMs / (8 B)), 1, global 64 | local slots);
 ///             prefill: 1 when tiles * 24 * B >= 2 * SMs (tiles = ceil(W / 64)), else clamp(ceil(2 SMs / CTAs), 1, min(32, slots));
-///             1 whenever bytes would exceed the partial cap (InklingAttentionKnobs::partial_cap_bytes, default 1 GiB).
+///             1 whenever bytes would exceed the partial cap: decode / verify InklingAttentionKnobs::partial_cap_bytes
+///             (default 1 GiB), prefill min(that, prefill_partial_cap_bytes (default 64 MiB)). So a prefill call's
+///             partials are <= 64 MiB (+ 512): inkling_attention_workspace_capacity_bytes(kind, 1, 1, 8192, 262k) =
+///             max(qr(8192) = 56.6 MB, max_w qr(w) + partials(w)) <= ~65 MiB.
 /// The plan (workers, cap) changes only the speed and this size, never the output bits. The call must use the same
 /// envelope and key_groups as this query. Throws outside the supported domain.
 [[nodiscard]] std::size_t inkling_rel_attention_workspace_bytes(InklingLayerKind kind,

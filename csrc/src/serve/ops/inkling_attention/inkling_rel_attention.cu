@@ -1325,6 +1325,8 @@ InklingAttentionKnobs& knobs() {
         x.variant           = env_int("SUROGATE_INKLING_ATTN_VARIANT", 17);
         x.early_meta        = env_int("SUROGATE_INKLING_ATTN_EARLY_META", 1) != 0;
         x.partial_cap_bytes = static_cast<std::size_t>(std::max(0, env_int("SUROGATE_INKLING_ATTN_PARTIAL_MB", 1024))) << 20;
+        x.prefill_partial_cap_bytes =
+            static_cast<std::size_t>(std::max(0, env_int("SUROGATE_INKLING_ATTN_PREFILL_PARTIAL_MB", 64))) << 20;
         x.fused_fold_max    = std::max(0, env_int("SUROGATE_INKLING_ATTN_FUSED_FOLD", x.fused_fold_max));
         x.linear_split      = env_int("SUROGATE_INKLING_LINEAR_SPLIT", 1) != 0;
         x.fused_prologue    = env_int("SUROGATE_INKLING_ATTN_FUSED_PROLOGUE", 1) != 0;
@@ -1410,7 +1412,8 @@ Plan make_plan(InklingLayerKind kind, const GroupSpec& gs, std::int32_t width, s
     }
     const int forced = knobs().splits;
     if (forced > 0) { plan.workers = std::min(forced, kMaxWorkers); }
-    const std::size_t cap = knobs().partial_cap_bytes;
+    const std::size_t cap = plan.decode ? knobs().partial_cap_bytes
+                                        : std::min(knobs().partial_cap_bytes, knobs().prefill_partial_cap_bytes);
     if (forced <= 0 && partial_bytes(plan, static_cast<std::int64_t>(width) * batch) > cap) { plan.workers = 1; }
     // The fused fold where its one CTA's chains are short (InklingAttentionKnobs::fused_fold_max; same bits either way).
     plan.fused    = plan.decode && plan.workers > 1 && static_cast<long>(width) * plan.max_slots <= knobs().fused_fold_max;

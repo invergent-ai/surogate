@@ -825,6 +825,13 @@ void run_invariance_case(const InvCase& c, const char* groups, std::uint32_t see
             compare("prefill W40 workers " + std::to_string(splits), run_inv_route(c.kind, ip, layer, c.L0 - s0, {{0, s0, c.L0 - s0}}));
         }
         ops::inkling_attention_knobs().splits = 0;
+        // The planned split (no force) under the prefill partial cap: generous (split) and 0 (one worker).
+        for (const std::size_t mb : {std::size_t{1024}, std::size_t{0}}) {
+            ops::inkling_attention_knobs().prefill_partial_cap_bytes = mb << 20;
+            compare("prefill W40 prefill cap " + std::to_string(mb) + " MiB",
+                    run_inv_route(c.kind, ip, layer, c.L0 - s0, {{0, s0, c.L0 - s0}}));
+        }
+        ops::inkling_attention_knobs().prefill_partial_cap_bytes = std::size_t{64} << 20;
     }
     const bool state_zero = persistent_state_zero();
     std::printf("%-44s routes %zu, target columns compared %zu, bit-different %zu, training entry != production on %zu "
@@ -2392,6 +2399,18 @@ int main(int argc, char** argv) {
     const std::string only = argc > 1 ? argv[1] : "";
     const auto want = [&](const std::string& name) { return only.empty() || name.find(only) != std::string::npos; };
     try {
+        if (want("small") || want("workspace")) {
+            // Workspace the engine reserves (agent-EN 15:4x: <= ~100 MiB at T = 8,192 x 262k).
+            for (const auto kind : {InklingLayerKind::Global, InklingLayerKind::Local}) {
+                ops::GqaExecutionEnvelope env{};
+                env.max_visible_keys = 262144;
+                const std::size_t pre = ops::inkling_attention_workspace_capacity_bytes(kind, 1, 1, 8192, env);
+                const std::size_t dec = ops::inkling_attention_workspace_capacity_bytes(kind, 8, 1, 8, env);
+                std::printf("workspace %-6s capacity at 262k: prefill B1 W 1..8192 %.1f MiB, decode / verify B8 W 1..8 %.1f MiB\n",
+                            kind == InklingLayerKind::Global ? "global" : "local", pre / 1048576.0, dec / 1048576.0);
+                check(pre <= std::size_t{100} << 20, "workspace prefill capacity <= 100 MiB");
+            }
+        }
         if (want("small")) {
             test_tau();
             test_rel_table_and_logits();
