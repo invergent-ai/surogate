@@ -132,7 +132,7 @@ def run_step(backend, rows: list[Row], version: int | None, cfg: StepConfig, log
             f"not sampled by policy version {version - cfg.max_policy_lag}..{version} alone")
     r3 = {"r3_rows": 0.0, "r3_replayed_tokens": 0.0, "r3_bad_rows": 0.0, "r3_shape_mismatches": 0.0,
           "r3_uncovered_interior": 0.0}
-    refused_long = refused_r3 = 0
+    refused_long = refused_r3 = refused_lag = 0
     if cfg.max_row_tokens:
         for r in rows:
             if r.loss_mask.any() and r.T > cfg.max_row_tokens:
@@ -147,11 +147,24 @@ def run_step(backend, rows: list[Row], version: int | None, cfg: StepConfig, log
             refused_r3 += 1
             live.remove(i)
             continue
+        # THE RULE for uncovered positions (NOTES "R3 COVERAGE RULE", agent-EN 18:2x): the trainer's own routing there equals
+        # the engine's only when the row was sampled by the adapter version the trainer's forward runs (the step's version;
+        # the engine never reuses a prefix across an adapter swap). A lagged row (an older version inside max_policy_lag)
+        # with uncovered interior positions would mix two versions' routing: refused and counted until the kit's join
+        # fills every position from the trial's own calls.
+        if c["r3_uncovered_interior"] and version is not None and rows[i].versions is not None:
+            vs = set(int(v) for v in rows[i].versions[rows[i].loss_mask])
+            if vs and vs != {int(version)}:
+                rows[i].loss_mask = np.zeros_like(rows[i].loss_mask)
+                refused_lag += 1
+                live.remove(i)
+                continue
         replays[i] = rp
         for k, v in c.items():
             r3[k] += v
     m["refused_long_rows"] = float(refused_long)
     m["r3_refused_rows"] = float(refused_r3)
+    m["r3_lagged_uncovered_refused_rows"] = float(refused_lag)
     # step-start score (pass 1) -> mismatch metric, TIS weights, pi_old
     kl, lr_, bw = [], [], []
     starts, wts = {}, {}

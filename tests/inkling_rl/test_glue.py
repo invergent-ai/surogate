@@ -255,6 +255,31 @@ def test_e2e_and_resume():
     shutil.rmtree(tmp)
 
 
+def test_lag_rule():
+    """R3 coverage rule: uncovered interior positions run the trainer's own routing, which equals the engine's only for
+    rows of the step's own version; a lagged row with uncovered positions is refused, an on-policy one is trained."""
+    from surogate.inkling_rl.step import run_step
+    eng = FakeInkling(seed=0, rank=4, alpha=8)
+    ids = np.array([1, 2, 3, 4, 5, 6, 7, 8], dtype=np.int64)
+    with torch.no_grad():
+        lp, cap = eng.forward(torch.as_tensor(ids))
+    routed = cap.numpy().astype(np.int16)
+    routed[:3] = -1                                  # a cached prefix the engine returned no rows for
+    routed[-1] = -1
+    mask = np.array([0, 0, 0, 0, 1, 1, 1, 1], bool)
+
+    def row(version):
+        return records.Row(ids=ids, loss_mask=mask.copy(), engine_lp=np.where(mask, lp.double().numpy(), 0.0),
+                           advantage=0.5, versions=np.where(mask, version, -1).astype(np.int32), teacher_lp=None,
+                           routed=routed.copy(), trial_idx=0, group_idx=0)
+
+    for version, refused in ((1, 0), (0, 1)):
+        res = run_step(FakeInkling(seed=0, rank=4, alpha=8), [row(version)], 1, StepConfig(), log=lambda *_: None)
+        assert res.metrics["r3_lagged_uncovered_refused_rows"] == refused, (version, res.metrics)
+        if not refused:
+            assert res.metrics["engine_mismatch_kl"] == 0.0     # own routing on the uncovered prefix == the engine's
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):
