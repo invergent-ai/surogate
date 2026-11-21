@@ -165,14 +165,21 @@ struct InklingAttentionKnobs {
     std::size_t prefill_partial_cap_bytes = std::size_t{64} << 20;
     // Decode / verify split route: the last worker CTA of a (row, KV head) folds its 3 x W rows (no fold_kernel launch)
     // when W x slots <= this (SUROGATE_INKLING_ATTN_FUSED_FOLD; 0 = fold_kernel always). Same bits either way.
-    int fused_fold_max = 1 << 30;
+    // Default 0: measured SLOWER than fold_kernel under graphs + PDL (perf18 16:0x: global 1x8k 18.2 -> 20.5 us, local
+    // 6.0 -> 6.7, verify W8 19.6 -> 29.6; lanes/c/NOTES.md PERF LOG).
+    int fused_fold_max = 0;
     // inkling_attn_linear, N <= 16: the cell-split narrow kernel (a row tile's cells over several warps, joined in cell
-    // order; SUROGATE_INKLING_LINEAR_SPLIT=0 = the one-warp-per-tile narrow kernel). Same bits either way.
-    bool linear_split = true;
+    // order) for 0 = no projection, 1 = wo_ud (K = 3,072) only, 2 = wo_ud and qkvr (SUROGATE_INKLING_LINEAR_SPLIT). Same
+    // bits either way. Default 1 (perf18: wo N=1 9.4 -> 6.6 us, N=8 9.7 -> 7.2; qkvr N=1 13.4 -> 14.3: slower).
+    int linear_split = 1;
     // inkling_attention (the fused call) on plain decode rows (W = 1, InPlace, no capture): the decode attention kernel
     // runs the prologue itself -- q / r per CTA, the K / V conv by the CTA owning the new key -- instead of a prologue
-    // launch (SUROGATE_INKLING_ATTN_FUSED_PROLOGUE=0 = the separate prologue). Same bits either way.
-    bool fused_prologue = true;
+    // launch (SUROGATE_INKLING_ATTN_FUSED_PROLOGUE=1). Same bits either way. Default off: perf18 measured it ~1 us
+    // SLOWER per call than the separate prologue (local 1x8k call 8.4 -> 9.4 us with the fused fold).
+    bool fused_prologue = false;
+    // fold_kernel: rows of <= 32 slots take the scan-free path (SUROGATE_INKLING_ATTN_FOLD_FAST=0 = always the scan).
+    // Same bits either way.
+    bool fold_fast = true;
 };
 [[nodiscard]] InklingAttentionKnobs& inkling_attention_knobs();
 

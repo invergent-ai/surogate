@@ -535,7 +535,9 @@ void inkling_attn_linear(std::span<const InklingProjection> projections, Workspa
     const std::int64_t n = projections[0].x->numel() / std::max<std::int64_t>(projections[0].x->ne[0], 1);
     const bool gemm      = n > 16;
     // Narrow route: the cell-split kernel (one 8-row tile a CTA) unless InklingAttentionKnobs::linear_split is off.
-    const bool split     = !gemm && inkling_attention_knobs().linear_split;
+    const int k_any      = projections[0].weight != nullptr ? projections[0].weight->k : 0;
+    const int lsplit     = inkling_attention_knobs().linear_split;
+    const bool split     = !gemm && (lsplit == 2 || (lsplit == 1 && k_any == 3072));
     const Prepared pr    = prepare(projections, gemm, op, split ? 8 : kNarrowRows);
     if (pr.params.columns <= 0) { return; }
     // One cell kind per launch: the accumulator chain is fixed at compile time.
