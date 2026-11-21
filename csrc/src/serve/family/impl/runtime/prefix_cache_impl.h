@@ -51,6 +51,24 @@ bool ProgramImplCore::window_reusable(const SequenceState& sequence, std::uint32
     return checkpoint.valid && base <= checkpoint.frontier && base + 1U >= checkpoint.frontier;
 }
 
+void ProgramImplCore::compact_window_kv() noexcept {
+    PagedKVPool& pool = decoder->text_kv.pool();
+    if (!pool.window_elastic()) { return; }
+    try {
+        // A host-tier copy reads a lane's window pages on the copy stream until its event: those
+        // lanes' pages stay where they are this time (fence_lane_copies would stall compute).
+        std::vector<const PagedKVAllocation*> pinned;
+        for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+            const bool copying = host_tier_state && lane < host_tier_state->lane_copy.size() &&
+                                 host_tier_state->lane_copy[lane] != nullptr;
+            if (copying && sequences[lane].kv) { pinned.push_back(&sequences[lane].kv->text); }
+        }
+        (void)pool.compact_window_class(pinned, device.stream);
+    } catch (...) {
+        // Opportunistic: a failed move leaves the page where it was (the pool undoes its take).
+    }
+}
+
 std::vector<Tensor> ProgramImplCore::prefix_state_tensors(const SequenceState& sequence,
                                                          bool checkpoint, bool draft,
                                                          bool with_hidden) const {

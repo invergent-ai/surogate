@@ -105,6 +105,14 @@ struct PagedKVPoolSpec {
     std::uint32_t window_lane_pages     = 0;
     std::uint32_t window_image_pages    = 0;
     std::uint32_t window_forward_tokens = 0;
+    // M3-C (lanes/f1/DESIGN-M3-kv-lever.md C; elastic pools only): the window planes are
+    // demand-mapped in their own region, whose guaranteed size is `window_floor_pages`; every
+    // reserved allocation is charged `window_lane_charge` window pages in THIS pool's page ledger
+    // (as main-page equivalents), shared-prefix window images their own pages when captured.
+    // The lane / image page counts above are then only the virtual span.
+    bool window_elastic                 = false;
+    std::uint32_t window_floor_pages    = 0;
+    std::uint32_t window_lane_charge    = 0;
 };
 
 struct PagedKVPlaneLayout {
@@ -125,6 +133,10 @@ struct PagedKVPoolLayout {
     std::uint32_t window_tokens        = 0;
     std::uint32_t window_page_count    = 0;
     TensorRegion window_block_tables;
+    // Elastic window class (M3-C): its planes' offsets are relative to a separate region of this
+    // many bytes, mapped in granules of this many window pages. Zero for a class in the arena.
+    std::size_t window_elastic_bytes     = 0;
+    std::uint32_t window_granule_pages   = 0;
 
     [[nodiscard]] std::size_t payload_bytes() const noexcept;
     [[nodiscard]] std::size_t metadata_bytes() const noexcept;
@@ -164,6 +176,7 @@ private:
     PagedKVWindowImage() = default;
     PagedKVPool* pool_ = nullptr;
     std::uint32_t tokens_ = 0;
+    std::uint32_t charge_ = 0; ///< elastic class: main-ledger pages this image is charged
     std::vector<KvWindowSlot> slots_; ///< logical page of the source, physical page of the image
 };
 
@@ -176,6 +189,13 @@ struct PagedKVWindowOccupancy {
     std::uint32_t lane_peak     = 0;
     std::uint32_t image_in_use  = 0;
     std::size_t page_bytes      = 0; ///< bytes one window page occupies across the class's planes
+    // Elastic class (M3-C); zero for a class in the arena.
+    bool elastic                  = false;
+    std::uint32_t granule_pages   = 0;
+    std::uint32_t mapped_pages    = 0; ///< window pages whose granule is mapped (in use + reserve + holes)
+    std::uint32_t floor_pages     = 0;
+    std::uint32_t charged_pages   = 0; ///< window pages charged to holders (allocations, images)
+    std::uint32_t moved_pages     = 0; ///< compaction moves so far
 };
 
 struct PagedKVHostImage {
@@ -235,12 +255,20 @@ public:
     [[nodiscard]] std::uint32_t entitled_pages() const noexcept;
     [[nodiscard]] std::uint32_t mapped_pages() const noexcept;
     [[nodiscard]] std::uint32_t free_pages() const noexcept;
+    /// With an elastic window class the allocation's window charge is part of the test.
     [[nodiscard]] bool can_reserve(std::uint32_t page_entitlement) const noexcept;
     /// May an allocation's entitlement go from `old_pages` to `new_pages`? Page arithmetic,
     /// and for an overcommitting elastic pool the device gate; admission asks this.
     [[nodiscard]] bool can_replace_entitlement(std::uint32_t old_pages,
                                                std::uint32_t new_pages) const noexcept;
+    /// As above with `extra` more ledger pages booked beside the entitlement (an elastic window
+    /// class's charge for an allocation not made yet; not part of the logical-capacity test).
+    [[nodiscard]] bool can_replace_entitlement(std::uint32_t old_pages, std::uint32_t new_pages,
+                                               std::uint32_t extra) const noexcept;
     [[nodiscard]] PagedKVAllocation reserve(std::uint32_t page_entitlement);
+    /// As reserve, charging `window_pages` window pages instead of the class's lane charge (graph
+    /// capture rows hold one). Same as reserve without an elastic window class.
+    [[nodiscard]] PagedKVAllocation reserve(std::uint32_t page_entitlement, std::uint32_t window_pages);
     // Full prefix pages remain owned by source. The incomplete boundary page is
     // private, copied device-to-device before any suffix writes can reach it.
     [[nodiscard]] PagedKVAllocation fork_prefix(std::shared_ptr<const PagedKVAllocation> source,
@@ -313,6 +341,22 @@ public:
     capture_window_image(const PagedKVAllocation& allocation, std::uint32_t tokens, cudaStream_t stream);
     [[nodiscard]] PagedKVWindowOccupancy window_occupancy() const noexcept;
 
+    // ---- Elastic window class (M3-C). All of these are zero / no-ops without one.
+    [[nodiscard]] bool window_elastic() const noexcept { return window_elastic_ != nullptr; }
+    [[nodiscard]] ElasticKvRegion* window_elastic_region() noexcept { return window_elastic_.get(); }
+    /// Main-ledger pages `window_pages` window pages stand for (0 without an elastic class).
+    [[nodiscard]] std::uint32_t window_charge_for(std::uint32_t window_pages) const noexcept;
+    /// The charge a reserve() books for a sequence's window pages.
+    [[nodiscard]] std::uint32_t window_lane_charge_pages() const noexcept {
+        return window_charge_for(window_lane_charge_);
+    }
+    /// At a round boundary: empties the highest granules of the class into holes below (bitwise
+    /// page copies on `stream`; the owners' slots and block-table entries follow), so physical
+    /// memory tracks the pages in use. Pages of `pinned` allocations stay where they are (a host
+    /// copy may still read them); images and the sentinel never move. Returns pages moved.
+    std::uint32_t compact_window_class(std::span<const PagedKVAllocation* const> pinned, cudaStream_t stream,
+                                       std::uint32_t max_moves = 64);
+
 private:
     friend class PagedKVAllocation;
     friend class PagedKVWindowImage;
@@ -323,6 +367,18 @@ private:
     void copy_window_pages(std::span<const std::int32_t> source, std::span<const std::int32_t> destination,
                            cudaStream_t stream) const;
     void zero_window_page(std::int32_t page, cudaStream_t stream) const;
+    [[nodiscard]] bool window_page_writable(std::int32_t page) const noexcept {
+        return page >= 0 && static_cast<std::uint32_t>(page) < window_page_count_ && page != window_sentinel_;
+    }
+    /// Pages of the image region, lowest first; elastic classes map them. Null when it is full.
+    [[nodiscard]] std::int32_t take_window_image_page();
+    void give_back_window_image_page(std::int32_t page) noexcept;
+    /// The ledger has room for `pages` more (capacity and, under overcommit, the device gate).
+    [[nodiscard]] bool ledger_fits(std::uint32_t pages) const noexcept;
+    /// Elastic class: book / return window pages in the window region's entitlement.
+    void charge_window_pages(std::int64_t delta) noexcept;
+    void register_window_holder(PagedKVAllocation* holder) { window_holders_.push_back(holder); }
+    void replace_window_holder(PagedKVAllocation* from, PagedKVAllocation* to) noexcept;
     void transfer_planes(const std::vector<std::size_t>& planes, std::uint32_t page_limit,
                          std::span<const std::int32_t> ids, std::span<std::byte* const> host,
                          std::uint32_t image_pages, bool to_device, cudaStream_t stream) const;
@@ -361,9 +417,19 @@ private:
     std::uint32_t window_image_pages_    = 0;
     std::int32_t window_sentinel_        = -1;
     Tensor window_block_tables_;
-    std::vector<std::int32_t> window_lane_free_;
-    std::vector<std::int32_t> window_image_free_;
+    std::vector<std::int32_t> window_lane_free_;  ///< sorted descending: the back is the lowest page
+    std::vector<std::int32_t> window_image_free_; ///< sorted descending
     std::uint32_t window_lane_peak_ = 0;
+    std::uint32_t window_page_count_ = 0;
+    // Elastic window class (M3-C).
+    std::unique_ptr<ElasticKvRegion> window_elastic_;
+    std::uint32_t window_lane_charge_   = 0; ///< window pages per reserved allocation
+    std::uint32_t window_floor_pages_   = 0;
+    std::uint32_t window_charged_pages_ = 0; ///< window pages charged to allocations and images
+    std::uint32_t window_moved_pages_   = 0;
+    std::size_t window_page_bytes_      = 0; ///< one window page across the class's planes
+    std::size_t main_page_bytes_        = 0; ///< one page across the full-context planes
+    std::vector<PagedKVAllocation*> window_holders_; ///< allocations with a window class (compaction)
 };
 
 class PagedKVAllocation {
@@ -414,6 +480,10 @@ public:
     void window_settle(std::uint32_t committed, std::span<const std::uint32_t> pins, cudaStream_t stream);
     [[nodiscard]] bool window_covers(std::uint32_t tokens) const noexcept { return window_.covers(tokens); }
     [[nodiscard]] std::span<const KvWindowSlot> window_slots() const noexcept { return window_.slots(); }
+    /// Elastic window class (M3-C): main-ledger pages booked for this allocation's window pages,
+    /// on top of `owned_entitlement()`; 0 otherwise. Admission arithmetic that releases or keeps
+    /// an allocation counts both.
+    [[nodiscard]] std::uint32_t window_charge() const noexcept { return window_charge_; }
     /// Fresh pages for `logical` (ascending, unmapped), returned in that order, for an upload.
     [[nodiscard]] std::vector<std::int32_t> window_map_restored(std::span<const std::uint32_t> logical,
                                                                 cudaStream_t stream);
@@ -440,6 +510,8 @@ private:
     std::uint32_t page_entitlement_ = 0;
     std::int32_t bound_row_         = -1;
     KvWindowPages window_; ///< inactive (window 0) unless the pool has a window class
+    std::uint32_t window_charge_       = 0; ///< main-ledger pages (elastic window class)
+    std::uint32_t window_charge_pages_ = 0; ///< the window pages they stand for
 };
 
 struct PagedKVReservation {

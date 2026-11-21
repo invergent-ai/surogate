@@ -238,6 +238,12 @@ struct KvWindowClassSize {
     std::uint32_t lane_pages  = 0;
     std::uint32_t image_pages = 0;
     std::uint32_t forward_tokens = 0;
+    // M3-C (set by the planner, not by plan_kv_window_class): demand-mapped class whose round
+    // transient (`transient_pages`, rounded to granules + one granule by the pool) is the floor,
+    // and whose holders are charged `lane_charge` window pages each in the main ledger.
+    bool elastic                  = false;
+    std::uint32_t lane_charge     = 0;
+    std::uint32_t transient_pages = 0;
 };
 
 [[nodiscard]] inline KvWindowClassSize plan_kv_window_class(std::uint32_t window_tokens, std::uint32_t rows,

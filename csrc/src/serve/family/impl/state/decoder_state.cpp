@@ -131,6 +131,10 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
         pool_spec.window_lane_pages     = window_class.lane_pages;
         pool_spec.window_image_pages    = window_class.image_pages;
         pool_spec.window_forward_tokens = window_class.forward_tokens;
+        // M3-C: the pool rounds the transient to its granules and adds one (plan_paged_kv_pool).
+        pool_spec.window_elastic        = window_class.elastic;
+        pool_spec.window_floor_pages    = window_class.transient_pages;
+        pool_spec.window_lane_charge    = window_class.lane_charge;
     }
     return PagedKVCacheLayout{
         .pool        = plan_paged_kv_pool(builder, pool_spec),

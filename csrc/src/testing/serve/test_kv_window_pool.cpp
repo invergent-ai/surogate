@@ -166,6 +166,114 @@ void check_without_windows(cudaStream_t stream) {
     expect(a.window_slots().empty() && a.window_covers(5), "window calls are no-ops");
 }
 
+/// M3-C: an elastic window class -- its own demand-mapped region, the sentinel first and zeroed,
+/// window charges booked in the main ledger (reserve, images, release), lowest-first pages,
+/// compaction moves pages down bitwise and rewrites the owners' rows.
+void check_elastic(const sinfer::DeviceContext& device) {
+    const std::string tag = "elastic";
+    cudaStream_t stream = device.stream;
+    constexpr std::int32_t kWindow = 128;
+    // 128 x 8 BF16 per token row: 128 KiB per page per plane -> 16 pages per 2 MiB granule.
+    sinfer::LayoutBuilder builder;
+    sinfer::PagedKVPoolSpec spec{.page_group_count      = 64,
+                                 .logical_page_capacity = 16,
+                                 .table_rows            = 3,
+                                 .plane_order           = sinfer::PagedKVPlaneOrder::PageMajor,
+                                 .elastic               = true,
+                                 .physical_page_cap     = 64,
+                                 .planes = {{sinfer::DType::BF16, 128, 8, 256, 0},
+                                            {sinfer::DType::BF16, 128, 8, 256, 0},
+                                            {sinfer::DType::BF16, 128, 8, 256, kWindow},
+                                            {sinfer::DType::BF16, 128, 8, 256, kWindow}},
+                                 .window_lane_pages     = 40,
+                                 .window_image_pages    = 8,
+                                 .window_forward_tokens = 1024,
+                                 .window_elastic        = true,
+                                 .window_floor_pages    = 10, // transient: rounded to 16, + 16 slack
+                                 .window_lane_charge    = 7};
+    const auto layout = sinfer::plan_paged_kv_pool(builder, spec);
+    expect(layout.window_elastic_bytes != 0 && layout.window_granule_pages == 16, tag + ": own region, 16-page granules");
+    expect(layout.spec.window_floor_pages == 32, tag + ": floor = transient in granules + one granule");
+    sinfer::DeviceArena arena(builder.finish(256));
+    const sinfer::PagedKVElasticOptions options{.device = device.device, .fence_stream = stream, .reserve_granules = 0};
+    sinfer::PagedKVPool pool({arena.base(), arena.capacity()}, layout, &options);
+    expect(pool.window_elastic() && pool.window_sentinel_page() == 0, tag + ": sentinel is page 0");
+    {
+        const auto sentinel = window_bytes(pool, {0}, stream);
+        bool zero = true;
+        for (const std::byte b : sentinel) { zero = zero && b == std::byte{0}; }
+        expect(zero, tag + ": sentinel page is zeroed");
+    }
+    // Equal page bytes in both classes: one window page = one main page, so a charge of 7 = 7 pages.
+    expect(pool.window_lane_charge_pages() == 7, tag + ": lane charge in main pages");
+    auto a = pool.reserve(4);
+    expect(pool.entitled_pages() == 11 && pool.window_occupancy().charged_pages == 7, tag + ": reserve charges");
+    auto capture = pool.reserve(1, 1);
+    expect(pool.entitled_pages() == 13, tag + ": a capture row is charged one window page");
+    capture.release();
+    expect(pool.entitled_pages() == 11, tag + ": release returns the charge");
+    auto b = pool.reserve(4);
+    auto c = pool.reserve(4);
+    a.bind_row(0, stream);
+    b.bind_row(1, stream);
+    c.bind_row(2, stream);
+    {
+        // 33 entitled; a 16-page reservation books 23 -> 56; then 1 more page books 8 (64 = the cap), 2 do not.
+        auto x = pool.reserve(16);
+        expect(pool.entitled_pages() == 56 && pool.can_reserve(1) && !pool.can_reserve(2),
+               tag + ": can_reserve books the window charge");
+    }
+    // a and b: long forwards map 16 pages each (lowest first: 1..16, 17..32); c then 2 (33, 34).
+    a.window_prepare(0, 1024, {}, stream);
+    b.window_prepare(0, 1024, {}, stream);
+    c.window_prepare(0, 128, {}, stream);
+    const auto pages_of = [](const sinfer::PagedKVAllocation& allocation) {
+        std::vector<std::int32_t> out;
+        for (const auto& slot : allocation.window_slots()) { out.push_back(slot.physical); }
+        return out;
+    };
+    const auto a_pages = pages_of(a), b_pages = pages_of(b), c_pages = pages_of(c);
+    expect(a_pages.size() == 16 && a_pages.front() == 1 && a_pages.back() == 16 && b_pages.front() == 17 &&
+               c_pages == std::vector<std::int32_t>({33, 34}), tag + ": lowest pages first");
+    fill_window_pages(pool, c_pages, 9, stream);
+    const auto c_bytes = window_bytes(pool, c_pages, stream);
+    // a and b settle at 1024: each keeps its window (logical 14, 15 = pages 15, 16 and 31, 32).
+    a.window_settle(1024, {}, stream);
+    b.window_settle(1024, {}, stream);
+    const auto b_kept = pages_of(b);
+    expect(b_kept == std::vector<std::int32_t>({31, 32}), tag + ": b keeps its window");
+    fill_window_pages(pool, b_kept, 11, stream);
+    const auto b_bytes = window_bytes(pool, b_kept, stream);
+    // 7 pages in use over 3 granules: compaction empties granules 2 and 1 into granule 0.
+    const std::uint32_t moved = pool.compact_window_class({}, stream);
+    cudaStreamSynchronize(stream);
+    const auto a_after = pages_of(a), b_after = pages_of(b), c_after = pages_of(c);
+    bool low = true;
+    for (const auto* pages : {&a_after, &b_after, &c_after}) {
+        for (const std::int32_t page : *pages) { low = low && page < 16; }
+    }
+    expect(moved == 5 && low, tag + ": compaction moved every page into granule 0 (" + std::to_string(moved) + " moves)");
+    expect(window_bytes(pool, c_after, stream) == c_bytes && window_bytes(pool, b_after, stream) == b_bytes,
+           tag + ": moved pages are bitwise the same");
+    auto row = device_row(c.window_block_table(), 16);
+    expect(row[0] == c_after[0] && row[1] == c_after[1] && row[2] == 0, tag + ": c's row follows the move");
+    row = device_row(b.window_block_table(), 16);
+    expect(row[13] == 0 && row[14] == b_after[0] && row[15] == b_after[1], tag + ": b's row follows the move");
+    expect(pool.compact_window_class({}, stream) == 0, tag + ": nothing left to compact");
+    // An image is charged while it lives.
+    const std::uint32_t before = pool.entitled_pages();
+    {
+        auto image = pool.capture_window_image(b, 1024, stream);
+        expect(image != nullptr && pool.entitled_pages() == before + 2, tag + ": image charged");
+    }
+    expect(pool.entitled_pages() == before, tag + ": image charge returned");
+    a.release();
+    b.release();
+    c.release();
+    expect(pool.entitled_pages() == 0 && pool.window_occupancy().charged_pages == 0 &&
+               pool.window_occupancy().lane_in_use == 0, tag + ": everything returned");
+}
+
 } // namespace
 
 int main() {
@@ -180,6 +288,7 @@ int main() {
         check(sinfer::PagedKVPlaneOrder::PageMajor, ctx.stream);
         check(sinfer::PagedKVPlaneOrder::HeadMajor, ctx.stream);
         check_without_windows(ctx.stream);
+        check_elastic(ctx);
     } catch (const std::exception& error) {
         std::cerr << "FAIL (exception): " << error.what() << '\n';
         return 1;

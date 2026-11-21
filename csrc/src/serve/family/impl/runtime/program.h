@@ -1084,6 +1084,9 @@ private:
     /// window behind its frontier and behind its rewrite checkpoint only.
     [[nodiscard]] bool window_reusable(const SequenceState& sequence, std::uint32_t base,
                                        bool archived) const noexcept;
+    /// M3-C: at a round boundary, compact an elastic window class (bitwise page moves); lanes
+    /// whose pages a host-tier copy may still read stay put. noexcept: a failure only skips it.
+    void compact_window_kv() noexcept;
     void release_sequence_growth_entitlement(SequenceState& sequence) noexcept;
     [[nodiscard]] family::PagedKVCache* backend_kv_cache() noexcept;
     [[nodiscard]] const family::PagedKVCache* backend_kv_cache() const noexcept;

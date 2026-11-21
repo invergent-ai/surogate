@@ -310,6 +310,14 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         window_class = plan_kv_window_class(window_tokens, plan.max_concurrency,
                                             static_cast<std::uint32_t>(effective_prefill_chunk),
                                             image_windows, rounds);
+        if (plan.kv_window_elastic && plan.elastic_kv) {
+            // M3-C (lanes/f1/DESIGN-M3-kv-lever.md C): the static bound above becomes the virtual
+            // span; the device holds the round transient (+ a granule) and what holders are charged.
+            window_class.elastic         = true;
+            window_class.lane_charge     = kv_window_lane_charge(window_tokens);
+            const std::uint32_t steady   = plan.max_concurrency * window_class.lane_charge;
+            window_class.transient_pages = window_class.lane_pages > steady ? window_class.lane_pages - steady : 1U;
+        }
     }
     LayoutBuilder builder;
     PersistentLayout out;
@@ -557,6 +565,16 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         const std::uint32_t granule = std::max(out.decoder.text_kv.pool.elastic_granule_pages, 1U);
         out.elastic_plane_bytes =
             per_page * (static_cast<std::size_t>(plan.main_page_groups) + granule - 1U);
+        // M3-C: an elastic window class's floor (whole granules) is held for the engine's life;
+        // its other pages come out of the main pages above through the ledger. A constant.
+        const auto& text_pool = out.decoder.text_kv.pool;
+        if (text_pool.spec.window_elastic && text_pool.window_elastic_bytes != 0) {
+            std::size_t window_page_bytes = 0;
+            for (const auto& plane : text_pool.planes) {
+                if (plane.spec.window > 0) { window_page_bytes += plane.storage.region.bytes / plane.storage.shape[3]; }
+            }
+            out.elastic_plane_bytes += window_page_bytes * text_pool.spec.window_floor_pages;
+        }
     }
     return out;
 }
@@ -1239,6 +1257,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->kv_skip_layers      = inputs.kv_skip_layers;
     impl->elastic_kv          = inputs.elastic_kv;
     impl->elastic_kv_overcommit = inputs.elastic_kv_overcommit;
+    impl->kv_window_elastic     = inputs.kv_window_elastic;
     impl->prefix_cache_host_bytes = inputs.prefix_cache_host_bytes;
     impl->weights_identity        = inputs.weights_identity;
     impl->persistent          = persistent_layout(*impl);
@@ -1394,6 +1413,12 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .kv_skip_layers = family::detail::kv_precision_layers(geometry, options.kv_cache_skip_layers),
         .elastic_kv                = options.elastic_kv,
         .elastic_kv_overcommit     = options.elastic_kv_overcommit,
+        .kv_window_elastic         = [&] {
+            // Lane f1 M3-C: the window class follows demand when the cache is sized to the device.
+            const char* raw = std::getenv("SUROGATE_SERVE_KV_WINDOW_ELASTIC");
+            if (raw != nullptr && *raw != '\0') { return options.elastic_kv && std::strcmp(raw, "0") != 0; }
+            return options.elastic_kv && options.kv_capacity.mode == KvCapacityMode::Automatic;
+        }(),
         .proposal_head             = options.speculative.proposal_head,
         .features                  = family::startup_features(options),
         .use_cuda_graph            = options.use_cuda_graph,

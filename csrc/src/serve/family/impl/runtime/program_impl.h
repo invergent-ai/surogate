@@ -629,12 +629,15 @@ bool ProgramImplCore::can_admit_lane(std::uint32_t lane, const RequestPlan& plan
     // The pool's own test: the page arithmetic, and for an overcommitting elastic pool the
     // device gate — a refusal there must keep the request pending, not fail its reservation.
     const auto can_replace = [](const PagedKVPool& pool, std::uint32_t old_pages,
-                                std::uint32_t new_pages) {
-        return pool.can_replace_entitlement(old_pages, new_pages);
+                                std::uint32_t new_pages, std::uint32_t extra = 0) {
+        return pool.can_replace_entitlement(old_pages, new_pages, extra);
     };
     const std::uint32_t old_text = sequence.kv ? sequence.kv->text.owned_entitlement() : 0;
-    if (!can_replace(decoder->text_kv.pool(), old_text, plan.summary().admission.main_kv_pages) ||
-        !leaves_kv_watermark(lane, old_text, 0, plan.summary().admission.main_kv_pages)) {
+    // Lane f1 M3-C: a lane without an allocation gets one, and an elastic window class books its
+    // window pages with it (0 for every model without one). A lane that has one keeps its charge.
+    const std::uint32_t window_charge = sequence.kv ? 0U : decoder->text_kv.pool().window_lane_charge_pages();
+    if (!can_replace(decoder->text_kv.pool(), old_text, plan.summary().admission.main_kv_pages, window_charge) ||
+        !leaves_kv_watermark(lane, old_text, 0, plan.summary().admission.main_kv_pages + window_charge)) {
         return false;
     }
     const family::PagedKVCache* backend = backend_kv_cache();
@@ -705,7 +708,10 @@ bool ProgramImplCore::can_admit_lane_after_retained_eviction(
             if (entry.second) { keep(entry.second->pages.get()); }
         }
         std::uint32_t pages = 0;
-        for (const PagedKVAllocation* allocation : kept) { pages += allocation->owned_entitlement(); }
+        // (+ the window pages an elastic window class booked for them, M3-C; 0 otherwise)
+        for (const PagedKVAllocation* allocation : kept) {
+            pages += allocation->owned_entitlement() + allocation->window_charge();
+        }
         return pages;
     };
     const auto reclaimable = [&](const PagedKVPool& pool, bool backend_pool) {
@@ -717,20 +723,23 @@ bool ProgramImplCore::can_admit_lane_after_retained_eviction(
     // The retained lanes' entitlements go back before the new one is taken: the pool's test
     // with them folded into the pages being replaced (device gate included).
     const auto can_replace = [](const PagedKVPool& pool, std::uint32_t old_pages,
-                                std::uint32_t reclaimable_pages, std::uint32_t new_pages) {
+                                std::uint32_t reclaimable_pages, std::uint32_t new_pages,
+                                std::uint32_t extra = 0) {
         if (old_pages > pool.entitled_pages() ||
             reclaimable_pages > pool.entitled_pages() - old_pages) {
             return false;
         }
-        return pool.can_replace_entitlement(old_pages + reclaimable_pages, new_pages);
+        return pool.can_replace_entitlement(old_pages + reclaimable_pages, new_pages, extra);
     };
 
     const SequenceState& sequence = sequences[lane];
     const std::uint32_t old_text  = sequence.kv ? sequence.kv->text.owned_entitlement() : 0;
+    // Lane f1 M3-C: as in can_admit_lane, a new allocation's window charge (0 without one).
+    const std::uint32_t window_charge = sequence.kv ? 0U : decoder->text_kv.pool().window_lane_charge_pages();
     if (!can_replace(decoder->text_kv.pool(), old_text, reclaimable_text,
-                     plan.summary().admission.main_kv_pages) ||
+                     plan.summary().admission.main_kv_pages, window_charge) ||
         !leaves_kv_watermark(lane, old_text, reclaimable_text,
-                             plan.summary().admission.main_kv_pages)) {
+                             plan.summary().admission.main_kv_pages + window_charge)) {
         return false;
     }
 
@@ -2051,7 +2060,8 @@ void ProgramImplCore::prepare_graphs() {
         }
         allocations.reserve(batch_capacity);
         for (std::uint32_t row = 0; row < batch_capacity; ++row) {
-            allocations.push_back(pool.reserve(1));
+            // One page, and one window page where the pool has a window class (window_capture_fill).
+            allocations.push_back(pool.reserve(1, pool.has_window_class() ? 1U : 0U));
             PagedKVAllocation& allocation = allocations.back();
             allocation.bind_row(static_cast<std::int32_t>(row), device.stream);
             allocation.materialize_pages(1, device.stream);
@@ -2086,6 +2096,7 @@ void ProgramImplCore::prepare_graphs() {
         const auto settle = [](family::PagedKVCache* cache) {
             if (cache == nullptr) { return; }
             if (ElasticKvRegion* region = cache->pool().elastic_region()) { region->wait_idle(); }
+            if (ElasticKvRegion* region = cache->pool().window_elastic_region()) { region->wait_idle(); }
         };
         settle(&decoder->text_kv);
         // The draft caches have a region only if they are ever built elastic.
@@ -5468,6 +5479,11 @@ bool ProgramImplCore::kv_service_pressure() noexcept {
     if (ElasticKvRegion* region = decoder->text_kv.pool().elastic_region()) {
         region->flush_reserve_release();
     }
+    // Lane f1 M3-C: an elastic window class flushes too, and compacts at this round boundary.
+    if (ElasticKvRegion* region = decoder->text_kv.pool().window_elastic_region()) {
+        region->flush_reserve_release();
+        compact_window_kv();
+    }
     return kv_under_pressure();
 }
 
@@ -5479,6 +5495,11 @@ bool ProgramImplCore::kv_under_pressure() const noexcept {
 void ProgramImplCore::kv_settle() noexcept {
     try { decoder->flush_checkpoint_releases(); } catch (...) {}
     if (ElasticKvRegion* region = decoder->text_kv.pool().elastic_region()) {
+        try {
+            region->wait_idle();
+        } catch (...) {}
+    }
+    if (ElasticKvRegion* region = decoder->text_kv.pool().window_elastic_region()) {
         try {
             region->wait_idle();
         } catch (...) {}
