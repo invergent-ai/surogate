@@ -287,6 +287,76 @@ __device__ __forceinline__ void fold_chains(const AttnParams& p, int b, int kvh,
     }
 }
 
+/// fold_set's fast path: one column (W = 1) of at most kFoldFastSlots slots. Thread d < 128 loads every slot's (m, l)
+/// of the three heads (warp-broadcast addresses) and its own acc values in ONE round of loads, then walks the slots in
+/// order: running maximum over the earlier slots with l > 0, fold_coeffs, the L / A chains -- fold_kernel's operands
+/// and order, so its bits -- and the same epilogue. No shared memory, no barrier.
+inline constexpr int kFoldFastSlots = 16;
+template <bool Local>
+__device__ __forceinline__ void fold_one_column(const AttnParams& p, int b, int kvh, int valid, int tid) {
+    if (tid >= Geo::kHeadDim) { return; }
+    const int d          = tid;
+    const std::int64_t n = static_cast<std::int64_t>(p.width) * b; // column 0
+    const bool ok        = valid > 0;
+    int count = 0;
+    bool poison = false;
+    if (ok) {
+        const int pos = p.positions[n];
+        const int ns  = group_of(p.groups, pos) - group_of(p.groups, Local ? max(0, pos - (p.window - 1)) : 0) + 1;
+        poison        = ns > p.max_slots;
+        count         = poison ? 0 : min(ns, kFoldFastSlots);
+    }
+    const std::int64_t stride = static_cast<std::int64_t>(p.width) * p.batch * Geo::kQHeads;
+    const bool gated = p.final_mode == kGated || p.final_mode == kTrain;
+    float2 ml[Geo::kGroup][kFoldFastSlots];
+    float x[Geo::kGroup][kFoldFastSlots];
+    float gate_v[Geo::kGroup], sink_v[Geo::kGroup];
+#pragma unroll
+    for (int hh = 0; hh < Geo::kGroup; ++hh) {
+        const int h      = kvh * Geo::kGroup + hh;
+        const std::int64_t row = n * Geo::kQHeads + h;
+        gate_v[hh] = (ok && gated) ? __bfloat162float(p.gate[n * p.gate_stride + h * Geo::kHeadDim + d]) : 0.0F;
+        sink_v[hh] = (ok && gated) ? __bfloat162float(p.sink[n * p.sink_stride + h]) : 0.0F;
+#pragma unroll
+        for (int s = 0; s < kFoldFastSlots; ++s) {
+            const bool in = s < count;
+            ml[hh][s] = in ? __ldcg(p.part_ml + s * stride + row) : make_float2(-CUDART_INF_F, 0.0F);
+            x[hh][s]  = in ? __ldcg(p.part_acc + (s * stride + row) * Geo::kHeadDim + d) : 0.0F;
+        }
+    }
+#pragma unroll
+    for (int hh = 0; hh < Geo::kGroup; ++hh) {
+        const int h = kvh * Geo::kGroup + hh;
+        float M = -CUDART_INF_F, L = 0.0F, A = 0.0F;
+#pragma unroll
+        for (int s = 0; s < kFoldFastSlots; ++s) {
+            if (ml[hh][s].y > 0.0F) { // only slots < count can have l > 0
+                float Mn, a, c;
+                fold_coeffs(M, ml[hh][s].x, Mn, a, c);
+                M = Mn;
+                L = fold_value(L, a, ml[hh][s].y, c);
+                A = fold_value(A, a, x[hh][s], c);
+            }
+        }
+        const bool has   = ok && L > 0.0F;
+        const float lse2 = has ? final_lse2(M, L, p.variant) : -CUDART_INF_F;
+        float o          = has ? final_o(A, L, p.variant) : 0.0F;
+        if (poison) { o = CUDART_NAN_F; }
+        if (gated) {
+            float y = 0.0F;
+            if (ok) { y = gated_value(o, gate_v[hh], gated_sink_factor(lse2, sink_v[hh])); }
+            p.out[n * Geo::kAttnWidth + h * Geo::kHeadDim + d] = __float2bfloat16_rn(y);
+        }
+        if (p.final_mode == kOutLse || p.final_mode == kTrain) {
+            p.out_f32[(n * Geo::kQHeads + h) * Geo::kHeadDim + d] = ok ? o : 0.0F;
+            if (d == 0) { p.lse[n * Geo::kQHeads + h] = ok ? __fmul_rn(lse2, kLn2) : 0.0F; }
+        }
+        if (p.final_mode == kDraft) {
+            p.out[(n * Geo::kQHeads + h) * Geo::kHeadDim + d] = __float2bfloat16_rn(ok ? o : 0.0F);
+        }
+    }
+}
+
 /// The fused fold of one decode / verify set (row b, KV head kvh: 3 heads x W columns), run by the set's last worker
 /// CTA after every worker's partials landed (or by worker 0 of a set without any group, which only writes zeros).
 /// The SAME arithmetic as fold_kernel, so the same bits: per row, each slot's coefficients are fold_coeffs(running
@@ -295,6 +365,10 @@ __device__ __forceinline__ void fold_chains(const AttnParams& p, int b, int kvh,
 /// (L2: written by other CTAs). `smem` = the attention kernel's shared memory (free after its main loop).
 template <bool Local>
 __device__ void fold_set(const AttnParams& p, int b, int kvh, int valid, unsigned char* smem, int smem_bytes) {
+    if (p.width == 1 && p.max_slots <= kFoldFastSlots) {
+        fold_one_column<Local>(p, b, kvh, valid, static_cast<int>(threadIdx.x));
+        return;
+    }
     const int tid    = static_cast<int>(threadIdx.x);
     const int lane   = tid & 31;
     const int warp   = tid >> 5;
@@ -1099,19 +1173,21 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
         // Arrival: every thread's partial stores are device-visible (fence) before thread 0 moves the counter; the
         // worker that brings it to `active` folds the set (no float atomics: fold_set folds in slot order).
         if (p.fold_counters != nullptr) {
+            // (CUTLASS's semaphore pattern: the barrier orders every thread's stores before thread 0's device-scope fence,
+            // which is cumulative; the reader side mirrors it.)
             __shared__ int last_flag;
-            __threadfence();
             __syncthreads();
             if (tid == 0) {
+                __threadfence();
                 std::int32_t* counter = p.fold_counters + b * Geo::kKvHeads + kvh;
                 last_flag             = atomicAdd(counter, 1) == active - 1 ? 1 : 0;
-                if (last_flag != 0) { *counter = 0; } // every worker arrived: back to zero (persistent state)
+                if (last_flag != 0) {
+                    *counter = 0; // every worker arrived: back to zero (persistent state)
+                    __threadfence();
+                }
             }
             __syncthreads();
-            if (last_flag != 0) {
-                __threadfence();
-                fold_set<Local>(p, b, kvh, valid, attn_smem_raw, static_cast<int>(sizeof(Smem)));
-            }
+            if (last_flag != 0) { fold_set<Local>(p, b, kvh, valid, attn_smem_raw, static_cast<int>(sizeof(Smem))); }
         }
     }
 }
