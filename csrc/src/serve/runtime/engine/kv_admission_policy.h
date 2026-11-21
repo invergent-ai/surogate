@@ -47,6 +47,15 @@ struct KvGrowthOutcome {
     std::vector<std::uint32_t> blocked;
 };
 
+/// The most one unit of work writes past a lane's frontier, in tokens: an ordinary burst of
+/// `burst` rounds, a verify round's anchor and drafts (`draft_window + 1`), or a DSpark draft
+/// block, whose K / V covers [frontier, frontier + draft_block) whatever k is (0 for any other
+/// model); plus one. A lane's entitlement covers this before each round.
+[[nodiscard]] constexpr std::uint32_t kv_round_reach(std::uint32_t burst, std::uint32_t draft_window,
+                                                     std::uint32_t draft_block) noexcept {
+    return std::max({burst, draft_window + 1U, draft_block}) + 1U;
+}
+
 /// Grows every lane that needs it, oldest first. When the pool refuses, idle KV goes first, then
 /// the request that arrived last is preempted -- which may be the lane that is growing -- and the
 /// lane tries again. An older request is never preempted for a newer one.

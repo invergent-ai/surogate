@@ -187,6 +187,24 @@ void test_requeue_and_forced() {
     check(sinfer::runtime::parse_kv_forced_preemption(nullptr).every == 0, "unset is off");
 }
 
+/// Lane f1 (review R6 finding 1): the growth reach covers every write of a round. Without a draft
+/// block it is the value every model had before; with DSpark's block of 8 and k <= 7 it covers
+/// [frontier, frontier + max(extent + 1, 8)) for every extent, as launch_dflash_round maps it.
+void test_round_reach() {
+    using sinfer::runtime::kv_round_reach;
+    for (std::uint32_t window = 0; window <= 16; ++window) {
+        check(kv_round_reach(8, window, 0) == std::max<std::uint32_t>(8, window + 1U) + 1U,
+              "without a draft block the reach is unchanged");
+    }
+    for (std::uint32_t window = 0; window <= 7; ++window) {
+        for (std::uint32_t extent = 0; extent <= window; ++extent) {
+            check(kv_round_reach(8, window, 8) >= std::max<std::uint32_t>(extent + 1U, 8U),
+                  "the reach covers a DSpark round's verify columns and draft block");
+        }
+    }
+    check(kv_round_reach(4, 3, 16) == 17, "a block wider than the burst and the window sets the reach");
+}
+
 /// A whole engine's scheduling in pages and tokens: first come, first served admission of prompt +
 /// headroom (with a watermark while others run), growth by rounds, preemption by recompute.
 struct SimRequest {
@@ -426,6 +444,7 @@ void test_pool_accounting() {
 int main() {
     test_growth_policy();
     test_requeue_and_forced();
+    test_round_reach();
     // 483k-token RTX 5090 replica, 16 lanes, BFCL-like short requests at the agentic default.
     test_simulation(1, 400, 16, 483328, {500, 4000, 20, 600});
     // Many 100k+ prompts, no max_tokens, on the same pool and on a small one.

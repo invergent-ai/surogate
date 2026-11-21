@@ -162,7 +162,8 @@ public:
         {
             const char* why = options.kv_admission.mode == KvAdmission::Reserve ? "" :
                               kPipelined ? " (a pipeline reserves)" :
-                              options.speculative.backend == SpeculativeBackend::DFlash ? " (DFlash reserves)" : "";
+                              !kv_on_demand_ && options.speculative.backend == SpeculativeBackend::DFlash
+                                  ? " (DFlash reserves)" : "";
             std::fprintf(stderr,
                          "kv-admission: %s%s (headroom %u tokens, watermark %.3f of %u pages)\n",
                          kv_on_demand_ ? "ondemand" : "reserve", why,
