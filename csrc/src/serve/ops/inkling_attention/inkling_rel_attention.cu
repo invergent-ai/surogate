@@ -47,6 +47,7 @@ inline constexpr int kRowBytes    = Geo::kHeadDim * 2;  // a bf16 tile row
 inline constexpr int kPrefillRows = 64;                 // query columns of one prefill CTA (4 row tiles)
 inline constexpr int kMaxWorkers  = 64;
 inline constexpr int kSmemLimit   = 101376;             // sm_120 opt-in shared memory per block
+inline constexpr int kFoldChunk   = 32;                 // partial slots per cp.async stage of fold_kernel
 
 // kTrain = the training entry: gated output AND pre-gate o + lse from the same final pass.
 enum Mode : int { kGated = 0, kOutLse = 1, kPartial = 2, kTrain = 3 };
@@ -832,7 +833,6 @@ __global__ __launch_bounds__(128) void fold_kernel(const AttnParams p) {
     float* sm_c = sm_a + p.max_slots;
     const std::int64_t stride = n_columns * Geo::kQHeads;
     const float2* ml          = p.part_ml + n * Geo::kQHeads + h;
-    const float* pa           = p.part_acc + (n * Geo::kQHeads + h) * Geo::kHeadDim + d;
     // Loads that do not depend on the scan go out first: the epilogue's gate / sink and the first 8 partials.
     float gate_v = 0.0F, sink_v = 0.0F;
     if constexpr (kWritesGated<Mode>) {
@@ -841,9 +841,24 @@ __global__ __launch_bounds__(128) void fold_kernel(const AttnParams p) {
             sink_v = __bfloat162float(p.sink[n * p.sink_stride + h]);
         }
     }
-    float first[8];
-#pragma unroll
-    for (int i = 0; i < 8; ++i) { first[i] = i < count ? pa[i * stride * Geo::kHeadDim] : 0.0F; }
+    // The partials' acc rows stream through a shared-memory double buffer of kFoldChunk slots (cp.async: all of a
+    // chunk's loads in flight at once), so the fma chains below never wait on a load.
+    float* ring = fold_smem + 4 * p.max_slots; // [2][kFoldChunk][128]
+    const auto stage_acc = [&](int chunk) {
+        const int s0c = chunk * kFoldChunk;
+        for (int i = d; i < kFoldChunk * 32; i += 128) {
+            const int sl = i >> 5, piece = i & 31;
+            if (s0c + sl < count) {
+                cp_async<16, Cache::cg>(ring + ((chunk & 1) * kFoldChunk + sl) * Geo::kHeadDim + piece * 4,
+                                        p.part_acc + ((static_cast<std::int64_t>(s0c + sl) * n_columns + n) * Geo::kQHeads + h) *
+                                                         Geo::kHeadDim + piece * 4);
+            }
+        }
+        cp_commit();
+    };
+    const int chunks = (count + kFoldChunk - 1) / kFoldChunk;
+    stage_acc(0);
+    stage_acc(1);
     for (int s = d; s < count; s += 128) {
         const float2 st = ml[s * stride];
         sm_m[s]         = st.x;
@@ -875,20 +890,26 @@ __global__ __launch_bounds__(128) void fold_kernel(const AttnParams p) {
     }
     __syncthreads();
     float L = 0.0F, A = 0.0F;
-    for (int s = 0; s < count; s += 8) {
-        float v[8];
-#pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            v[i] = s == 0 ? first[i] : (s + i < count ? pa[(s + i) * stride * Geo::kHeadDim] : 0.0F);
-        }
-#pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            if (s + i < count && sm_l[s + i] > 0.0F) {
-                L = fold_value(L, sm_a[s + i], sm_l[s + i], sm_c[s + i]);
-                A = fold_value(A, sm_a[s + i], v[i], sm_c[s + i]);
+    for (int k = 0; k < chunks; ++k) {
+        cp_wait<1>();
+        __syncthreads(); // chunk k landed (every thread's copies)
+        const float* acc_k = ring + (k & 1) * kFoldChunk * Geo::kHeadDim + d;
+        const int s0c      = k * kFoldChunk;
+        const int s1c      = min(s0c + kFoldChunk, count);
+        for (int s = s0c; s < s1c; ++s) {
+            if (sm_l[s] > 0.0F) {
+                L = fold_value(L, sm_a[s], sm_l[s], sm_c[s]);
+                A = fold_value(A, sm_a[s], acc_k[(s - s0c) * Geo::kHeadDim], sm_c[s]);
             }
         }
+        __syncthreads(); // every thread is done with the buffer before it is refilled
+        if (k + 2 < chunks) {
+            stage_acc(k + 2);
+        } else {
+            cp_commit(); // keep the group count uniform for cp_wait<1>
+        }
     }
+    cp_wait<0>();
     const bool has   = ok && L > 0.0F;
     const float lse2 = has ? final_lse2(M, L, p.variant) : -CUDART_INF_F;
     float o          = has ? final_o(A, L, p.variant) : 0.0F;
@@ -1072,14 +1093,19 @@ void dispatch(InklingLayerKind kind, int mode, const Plan& plan, const AttnParam
 
 template <int Mode>
 void launch_fold(InklingLayerKind kind, std::int64_t n, const AttnParams& p, cudaStream_t stream) {
-    const std::size_t smem = static_cast<std::size_t>(p.max_slots) * 16;
-    if (smem > 48 * 1024) { throw std::invalid_argument("inkling rel attention: too many partial slots for the fold"); }
-    const pdl::LaunchConfig launch{dim3(static_cast<unsigned>(n), Geo::kQHeads), dim3(Geo::kHeadDim), smem, stream};
-    if (kind == InklingLayerKind::Local) {
-        CUDA_CHECK(pdl::launch_dependent(launch, fold_kernel<true, Mode>, p));
-    } else {
-        CUDA_CHECK(pdl::launch_dependent(launch, fold_kernel<false, Mode>, p));
+    const std::size_t smem = static_cast<std::size_t>(p.max_slots) * 16 + 2 * kFoldChunk * Geo::kHeadDim * 4;
+    if (smem > static_cast<std::size_t>(kSmemLimit)) {
+        throw std::invalid_argument("inkling rel attention: too many partial slots for the fold");
     }
+    auto* kernel = kind == InklingLayerKind::Local ? fold_kernel<true, Mode> : fold_kernel<false, Mode>;
+    static const bool configured = [] {
+        CUDA_CHECK(cudaFuncSetAttribute(fold_kernel<true, Mode>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemLimit));
+        CUDA_CHECK(cudaFuncSetAttribute(fold_kernel<false, Mode>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemLimit));
+        return true;
+    }();
+    (void)configured;
+    const pdl::LaunchConfig launch{dim3(static_cast<unsigned>(n), Geo::kQHeads), dim3(Geo::kHeadDim), smem, stream};
+    CUDA_CHECK(pdl::launch_dependent(launch, kernel, p));
 }
 
 AttnParams make_params(const InklingAttentionInputs& in, const InklingAttentionRows& rows,
