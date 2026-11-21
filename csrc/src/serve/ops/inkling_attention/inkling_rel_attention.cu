@@ -110,7 +110,7 @@ struct AttnParams {
     // div.rn (else div.full), 16 lse with accurate log2f (else lg2.approx), 32 l = l * alpha + sum unfused.
     int variant;
     int l2_ahead;    // blocks asked of L2 ahead of their loads (SUROGATE_INKLING_ATTN_L2AHEAD, default 4; 0 = off)
-    int metadata_static; // InklingAttentionRows::metadata_static: rows / tables / old keys readable before the PDL wait
+    int reserved_metadata; // always 0 (was metadata_static; the slot keeps every kernel's parameter offsets)
     int window;          // Local: keys with pos - key < window (1,024; the DSpark draft's 1,032)
     int pdl_trigger; // trigger dependents at entry (SUROGATE_INKLING_ATTN_PDL_TRIGGER, default 1)
     // Decode split route with the fused fold: per (row b, KV head) arrival counters [B][8], zero when the kernel starts
@@ -506,16 +506,11 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
     constexpr int kSS      = Smem::kStripStride;
     extern __shared__ __align__(16) unsigned char attn_smem_raw[];
     Smem& sm = *reinterpret_cast<Smem*>(attn_smem_raw);
-    // With static metadata (the caller's promise, InklingAttentionRows::metadata_static) the rows, the block tables and
-    // the keys before the round's first position are read before the programmatic-dependency wait (they were written
-    // before the step's first kernel); q / r / gate / sink and the round's own keys only after it.
-    const bool early_meta = p.metadata_static != 0;
-    if (!early_meta) {
-        pdl::wait_for_dependencies();
-        // Dependents (the fold, or the next op: the wo projection streams its weights before its own wait) may launch
-        // now; they read nothing of ours before their wait, which waits for this grid to finish.
-        if (p.pdl_trigger != 0) { pdl::trigger_dependents(); }
-    }
+    // Every load of this kernel (rows, block tables, positions, keys, q / r / gate / sink) follows the dependency wait.
+    pdl::wait_for_dependencies();
+    // Dependents (the fold, or the next op: the wo projection streams its weights before its own wait) may launch
+    // now; they read nothing of ours before their wait, which waits for this grid to finish.
+    if (p.pdl_trigger != 0) { pdl::trigger_dependents(); }
 
     const int tid  = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
@@ -586,10 +581,6 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
         if (g_start >= g_stop) {
             if constexpr (kFusable) {
                 if (p.fold_counters != nullptr && active == 0 && worker == 0) {
-                    if (early_meta) {
-                        pdl::wait_for_dependencies();
-                        if (p.pdl_trigger != 0) { pdl::trigger_dependents(); }
-                    }
                     fold_set<Local>(p, b, kvh, valid, attn_smem_raw, static_cast<int>(sizeof(Smem)));
                 }
             }
@@ -657,36 +648,9 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
             cp_async_zfill<16>(dst, src, (kabs >= lo && kabs < hi) ? 16 : 0);
         }
     };
-    // (Raw ring) Load cursor; blocks staged before the PDL wait (decode / verify with static metadata, below).
+    // (Raw ring) Load cursor.
     Cursor ld;
     start(ld, g_start);
-    int pre_staged = 0;
-
-    if (early_meta) {
-        // Raw-ring decode / verify (Plan::raw): the worker's leading blocks whose keys all precede the round (written by
-        // earlier steps, InklingAttentionRows::metadata_static) land in the ring now, before the wait, one cp.async group
-        // each; the rest after it. Same codes, same widen: same bits.
-        if constexpr (Decode && Raw > 0) {
-            while (pre_staged < Raw && ld.g < g_stop && ld.kb * kBn + kBn - 1 < pmin) {
-                stage(ld.kb, pre_staged);
-                cp_commit();
-                advance(ld);
-                ++pre_staged;
-            }
-        }
-        // Ask L2 for the first two blocks of this worker whose keys all precede the round (written by earlier steps),
-        // so their loads after the wait hit L2: the position -> table -> page -> code chain overlaps the prologue.
-        // (Skipped only on the decode raw ring, whose leading old blocks are already in flight; review R4 minor 6.)
-        if (!(Decode && Raw > 0) && g_start < g_stop && (tid == 0 || tid == 32)) {
-            const int kb0 = max(group_begin(gs, g_start), lo) >> 6;
-            for (int kb = kb0; kb < kb0 + 2 && kb * kBn + kBn - 1 < pmin; ++kb) {
-                const std::int64_t off = kv_page_offset(table_row[(kb * kBn) >> kPageShift], kvh, 0);
-                prefetch_l2_bulk((tid == 0 ? p.k_pages : p.v_pages) + off, kBn * Geo::kHeadDim);
-            }
-        }
-        pdl::wait_for_dependencies();
-        if (p.pdl_trigger != 0) { pdl::trigger_dependents(); }
-    }
 
     // Q (eight k16 steps) and R fragments, in registers for the whole walk.
     unsigned af[QSmem ? 1 : 8][4];
@@ -1138,7 +1102,7 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
             }
         }
     } else {
-        for (int s = pre_staged; s < Raw; ++s) { // (slots [0, pre_staged) were staged before the PDL wait)
+        for (int s = 0; s < Raw; ++s) {
             if (ld.g < g_stop) {
                 stage(ld.kb, s);
                 advance(ld);
@@ -1264,13 +1228,8 @@ template <bool Local, int Mode>
 __global__ __launch_bounds__(128) void fold_kernel(const AttnParams p) {
     extern __shared__ float fold_smem[]; // [4][max_slots]: m, l, a, c
     __shared__ float seg_max[128];
-    // Static metadata (InklingAttentionRows::metadata_static: positions / valid columns complete before the step's first
-    // kernel): the row's slot count is read before the wait, so only the partials' loads follow it.
-    const bool early_meta = p.metadata_static != 0;
-    if (!early_meta) {
-        pdl::wait_for_dependencies();
-        if (p.pdl_trigger != 0) { pdl::trigger_dependents(); } // as in rel_attention_kernel
-    }
+    pdl::wait_for_dependencies();
+    if (p.pdl_trigger != 0) { pdl::trigger_dependents(); } // as in rel_attention_kernel
     const std::int64_t n         = blockIdx.x;
     const int h                  = static_cast<int>(blockIdx.y);
     const int d                  = static_cast<int>(threadIdx.x);
@@ -1290,10 +1249,6 @@ __global__ __launch_bounds__(128) void fold_kernel(const AttnParams p) {
         const int ns       = group_of(gs, pos) - g0 + 1;
         poison             = ns > p.max_slots;
         count              = poison ? 0 : ns;
-    }
-    if (early_meta) {
-        pdl::wait_for_dependencies();
-        if (p.pdl_trigger != 0) { pdl::trigger_dependents(); }
     }
     const std::int64_t stride = n_columns * Geo::kQHeads;
     const float2* ml          = p.part_ml + n * Geo::kQHeads + h;
@@ -1518,7 +1473,6 @@ InklingAttentionKnobs& knobs() {
         x.l2_ahead          = std::clamp(env_int("SUROGATE_INKLING_ATTN_L2AHEAD", -1), -1, 16);
         x.pdl_trigger       = env_int("SUROGATE_INKLING_ATTN_PDL_TRIGGER", 1) != 0;
         x.variant           = env_int("SUROGATE_INKLING_ATTN_VARIANT", 17);
-        x.early_meta        = env_int("SUROGATE_INKLING_ATTN_EARLY_META", 1) != 0;
         x.partial_cap_bytes = static_cast<std::size_t>(std::max(0, env_int("SUROGATE_INKLING_ATTN_PARTIAL_MB", 1024))) << 20;
         x.prefill_partial_cap_bytes =
             static_cast<std::size_t>(std::max(0, env_int("SUROGATE_INKLING_ATTN_PREFILL_PARTIAL_MB", 64))) << 20;
@@ -1527,13 +1481,13 @@ InklingAttentionKnobs& knobs() {
         x.fused_prologue    = env_int("SUROGATE_INKLING_ATTN_FUSED_PROLOGUE", x.fused_prologue ? 1 : 0) != 0;
         x.fold_fast         = env_int("SUROGATE_INKLING_ATTN_FOLD_FAST", 1) != 0;
         x.linear_gemm       = std::clamp(env_int("SUROGATE_INKLING_LINEAR_GEMM", x.linear_gemm), 0, 2);
-        // The raw ring stages old K / V blocks before the PDL wait, on a contract nothing enforces: a PDL predecessor may have
-        // written those keys. The environment never selects it, in any binary; the op test sets the knob field directly.
+        // The decode raw ring is test-only (measured slower on every decode row). The environment never selects it, in any
+        // binary; the op test sets the knob field directly.
         if (env_int("SUROGATE_INKLING_ATTN_DECODE_RAW", 0) != 0) {
             throw std::invalid_argument(
                 std::string("SUROGATE_INKLING_ATTN_DECODE_RAW=") + std::getenv("SUROGATE_INKLING_ATTN_DECODE_RAW") +
-                " is refused: the raw-ring decode path reads K / V keys before its PDL wait, and nothing guarantees that a "
-                "predecessor has finished writing them. Unset it, or use 0 (production).");
+                " is refused: the raw-ring decode path is test-only (measured slower on every decode row). Unset it, or use 0 "
+                "(production).");
         }
         x.fold_fence_light  = env_int("SUROGATE_INKLING_ATTN_FOLD_FENCE_LIGHT", x.fold_fence_light ? 1 : 0) != 0;
         // Mode 1 (ld.global.nc on x) is a known-broken negative control: FP8-route decode garbage (review R5 minor 10). The
@@ -1582,7 +1536,7 @@ struct Plan {
     bool pro       = false; // the in-kernel prologue (set by the fused call; W = 1 rows)
     int counters   = 0;     // fused: arrival counters (8 per row)
     int raw        = 0;     // decode / verify, one row tile (W <= 5): 2 = the cp.async raw ring (both blocks of a
-                            // 128-key group in flight at once; old blocks before the PDL wait), 0 = register staging
+                            // 128-key group in flight at once), 0 = register staging
     dim3 grid;
 };
 
@@ -1751,7 +1705,7 @@ AttnParams make_params(const InklingAttentionInputs& in, const InklingAttentionR
     p.variant         = k.variant & (1 | 8 | 16 | 32);
     p.l2_ahead        = std::clamp(k.l2_ahead, -1, 16); // -1: the route's default (run)
     p.pdl_trigger     = k.pdl_trigger ? 1 : 0;
-    p.metadata_static = (rows.metadata_static && k.early_meta) ? 1 : 0;
+    p.reserved_metadata = 0;
     p.fold_fast       = k.fold_fast ? 1 : 0;
     p.fold_fence_light = k.fold_fence_light ? 1 : 0;
     p.window          = Geo::kWindow;

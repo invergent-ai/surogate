@@ -122,10 +122,8 @@ struct InklingAttentionRows {
     Tensor valid_columns;
     Tensor kv_table_rows;
     GqaExecutionEnvelope envelope{};
-    /// Caller's promise (default false): positions, valid_columns, kv_table_rows and the plane's block tables were
-    /// complete before the step's FIRST kernel (host copies), and the plane's keys before each row's first position
-    /// were written by earlier steps. The attention then reads them before its programmatic-dependency wait and asks
-    /// L2 for its first old blocks, overlapping the prologue. Same bits either way.
+    /// NO EFFECT (2026-11-21): the attention kernels read rows, tables and keys only after their dependency wait, whatever
+    /// the caller sets here. The field stays until its callers are cleaned up.
     bool metadata_static = false;
     /// The key-group cut (see InklingKeyGroups); engine and trainer must pass the same value.
     InklingKeyGroups key_groups = InklingKeyGroups::Default;
@@ -144,7 +142,7 @@ struct InklingAttentionRows {
 
 /**
  * Process-wide tuning knobs of these ops: read ONCE from the environment when the process first uses them
- * (SUROGATE_INKLING_ATTN_GROUPS / _SPLITS / _CTAS / _PARTIAL_MB / _L2AHEAD / _PDL_TRIGGER / _VARIANT / _EARLY_META,
+ * (SUROGATE_INKLING_ATTN_GROUPS / _SPLITS / _CTAS / _PARTIAL_MB / _L2AHEAD / _PDL_TRIGGER / _VARIANT,
  * SUROGATE_INKLING_PREFILL_KS), never per call. Every knob changes the plan or the speed only, never the bits, except
  * `variant` (a numerics experiment; 17 = production) and `default_groups` (the cut for rows that pass Default).
  * Tests and benches may edit them between calls through inkling_attention_knobs(): not thread safe, never in serving.
@@ -157,7 +155,7 @@ struct InklingAttentionKnobs {
     int l2_ahead                    = -1;   // blocks asked of L2 ahead (-1: off; measured slower on every route)
     bool pdl_trigger                = true; // trigger dependents at kernel entry
     int variant                     = 17;   // numerics variant bits (production 17)
-    bool early_meta                 = true; // honour InklingAttentionRows::metadata_static
+    bool early_meta                 = true; // NO EFFECT (2026-11-21): the early metadata read is deleted; kept for the layout
     std::size_t partial_cap_bytes   = std::size_t{1} << 30; // split-route partials above this -> one worker
     // Prefill route (W > 16) only: split partials above this -> one worker (SUROGATE_INKLING_ATTN_PREFILL_PARTIAL_MB,
     // default 64). Bounds the workspace an 8,192-column chunk reserves at long context (agent-EN 15:4x: the 1 GiB cap
@@ -187,14 +185,13 @@ struct InklingAttentionKnobs {
     // 1496, 1x128 1874 / 1771 / 1658; qkvr N=4096 channel 863 / 809 / 754; wo N=8192 channel 618 / 592 / 549.
     int linear_gemm = 2;
     // Decode / verify with one row tile (W <= 5), not the in-kernel prologue (SUROGATE_INKLING_ATTN_DECODE_RAW): 0 =
-    // register-staged blocks (one block's codes in flight), 1 = the cp.async raw ring (two blocks in flight, a worker's
-    // old blocks staged before the PDL wait under metadata_static; ~72 KB smem: one CTA an SM) when workers x 8 x B <=
-    // SMs, 2 = the ring always. Same bits either way.
+    // register-staged blocks (one block's codes in flight), 1 = the cp.async raw ring (two blocks in flight; ~72 KB smem:
+    // one CTA an SM) when workers x 8 x B <= SMs, 2 = the ring always. Same bits either way.
     // Measured SLOWER (raw1, gpubox1 card 0, meta 1, us, raw 0 / 2): local 1x8k 6.4 / 7.4, global 1x8k 18.4 / 19.1, local
     // 8x8k 15.6 / 21.0, global 1x64k 94.5 / 106.0, verify W3 local 6.3 / 7.0 -> default 0 (kept, tested bitwise).
-    // The environment accepts 0 only: a nonzero value throws at the knobs' first read (engine load: workspace sizing),
-    // because the ring reads keys before its PDL wait on a contract nothing enforces. Only the op test selects 1 / 2, by
-    // setting this field.
+    // (Those timings predate 2026-11-21, when the ring still staged old blocks before the PDL wait.) The environment accepts
+    // 0 only: a nonzero value throws at the knobs' first read (engine load: workspace sizing). Only the op test selects
+    // 1 / 2, by setting this field.
     int decode_raw = 0;
     // Fused fold arrival (fused_fold_max > 0 only; SUROGATE_INKLING_ATTN_FOLD_FENCE_LIGHT): fence.acq_rel.gpu + a relaxed
     // atomic (Marlin's barrier pattern) instead of __threadfence (MEMBAR.SC.GPU + CCTL.IVALL) + atomicAdd. Same bits.
