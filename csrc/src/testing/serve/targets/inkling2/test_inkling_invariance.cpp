@@ -1085,6 +1085,68 @@ int test_pdl_chain(std::uint32_t seed) {
     return failures;
 }
 
+// ------------------------------------------------------------------------------------- I13 narrow wo kernel
+
+/// The narrow wo kernel == the generic kernel bit for bit (every written element, and the gaps of ldc > n stay untouched),
+/// alone and as a consumer in a back-to-back PDL chain that feeds each GEMM the previous one's output.
+int test_gemm_narrow(std::uint32_t seed) {
+    int failures = 0;
+    // {n, k, extra ldc}: unsplit shapes (32 x 3072 would split). The last five are the BF16 DSpark drafter's linears that
+    // qualify at N <= 8 with their real ldc: q 3072 x 2304 (5120), k / v 1024 x 2304 (5120), context k / v (2048), o, down.
+    const int shapes[][3] = {{16, 64, 16},      {32, 128, 16},       {32, 960, 16},       {kD, 64, 16},        {kD, 3072, 16},
+                             {3072, kD, 2048},  {1024, kD, 4096},    {1024, kD, 1024},    {kD, 3072, 0},       {kD, 9216, 0}};
+    for (const auto& sh : shapes) {
+        const int n = sh[0], k = sh[1];
+        DeviceBuffer d_w = to_device(hash_bf16(static_cast<std::size_t>(n) * k, seed++, 0.06F));
+        DeviceBuffer d_x = to_device(hash_bf16(static_cast<std::size_t>(8) * k, seed++, 1.0F));
+        for (const int T : {1, 2, 3, 5, 7, 8}) {
+            for (const int extra : {0, sh[2]}) {
+                const int ldc  = n + extra;
+                const auto run = [&](bool narrow) {
+                    ops::inkling_gemm_inv_use_narrow(narrow);
+                    DeviceBuffer d_out(static_cast<std::size_t>(T) * ldc * 2);
+                    cuda_check(cudaMemset(d_out.p, 0xAB, d_out.bytes), "fill");
+                    ops::inkling_gemm_inv(d_w.p, n, k, d_x.p, T, d_out.p, DType::BF16, ldc, {}, nullptr, 0, nullptr);
+                    cuda_synchronize();
+                    return raw(d_out.p, d_out.bytes);
+                };
+                const auto generic = run(false);
+                failures += same_bits("I13 narrow wo " + std::to_string(n) + " x " + std::to_string(k) + " T=" +
+                                          std::to_string(T) + " ldc=" + std::to_string(ldc) + " == generic",
+                                      run(true), generic, 2);
+            }
+        }
+    }
+    // PDL: 24 GEMMs of 128 x 128 back to back, each reading the previous output; narrow on the stream vs generic with a
+    // synchronize after every call.
+    constexpr int kChain = 24, kN = 128, kT = 8;
+    std::vector<DeviceBuffer> w;
+    for (int v = 0; v < kChain; ++v) { w.push_back(to_device(hash_bf16(static_cast<std::size_t>(kN) * kN, seed++, 0.09F))); }
+    const auto x0 = hash_bf16(static_cast<std::size_t>(kT) * kN, seed++, 1.0F);
+    DeviceBuffer d_a(x0.size() * 2), d_b(x0.size() * 2);
+    const auto reset = [&] { cuda_check(cudaMemcpy(d_a.p, x0.data(), x0.size() * 2, cudaMemcpyHostToDevice), "x0"); };
+    cudaStream_t stream = nullptr;
+    cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
+    const auto chain = [&](bool narrow, bool sync_each) {
+        ops::inkling_gemm_inv_use_narrow(narrow);
+        reset();
+        void* in = d_a.p;
+        void* out = d_b.p;
+        for (int v = 0; v < kChain; ++v) {
+            ops::inkling_gemm_inv(w[v].p, kN, kN, in, kT, out, DType::BF16, kN, {}, nullptr, 0, stream);
+            if (sync_each) { cuda_synchronize(stream); }
+            std::swap(in, out);
+        }
+        cuda_synchronize(stream);
+        return raw(in, x0.size() * 2);
+    };
+    const auto reference = chain(false, true);
+    failures += same_bits("I13 narrow wo in a PDL chain of 24 == generic, synchronized", chain(true, false), reference, 2);
+    cudaStreamDestroy(stream);
+    ops::inkling_gemm_inv_use_narrow(true); // back to the default: the rest of the suite runs the serving path
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -1103,6 +1165,7 @@ int main() {
     };
     std::uint32_t seed = 500;
     for (const auto& g : shapes) { failures += test_gemm(g, seed += 100); }
+    failures += test_gemm_narrow(3801);
     failures += test_gemm_group(2900);
     failures += test_attn_res(3001);
     failures += test_blend(3002);

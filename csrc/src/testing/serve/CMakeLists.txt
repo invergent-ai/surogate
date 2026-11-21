@@ -202,6 +202,8 @@ sinfer_add_op_test(sinfer_inkling_invariance_test SOURCES targets/inkling2/test_
 sinfer_add_test(sinfer_inkling_graph_launch_bench SOURCES targets/inkling2/bench_graph_launch.cu LIBRARIES CUDA::cudart)
 # Lane mx: critical-path cost of the mix ops in a decode-like PDL graph, reference vs latency-cut kernels (a bench).
 sinfer_add_op_test(sinfer_inkling_mix_bench SOURCES targets/inkling2/bench_inkling_mix.cu LIBRARIES sinfer_ops)
+# Lane e1: wo GEMM per call in a PDL graph, generic vs narrow kernel (the wo plan's op gate; a bench).
+sinfer_add_op_test(sinfer_inkling_wo_bench SOURCES targets/inkling2/bench_wo_narrow.cu LIBRARIES sinfer_ops)
 # Inkling-2-Mini DSpark drafter ops (ENGINE-INKLING lane e2) vs ref/dspark_ref.py's golden vectors (argument: the
 # vector dir with mtp.safetensors; lanes/e2/card_dspark_test.sh stages it).
 sinfer_add_op_test(sinfer_dspark_test SOURCES targets/inkling2/test_dspark.cpp
