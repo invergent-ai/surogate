@@ -174,6 +174,21 @@ public:
         slots_.clear();
     }
 
+    /// M3-C compaction: the live page `logical` now lives at `physical` (the caller copied its
+    /// bytes, bitwise, and owns the page it gave). Returns the page it lived at.
+    std::int32_t relocate(std::uint32_t logical, std::int32_t physical) {
+        const auto it = std::lower_bound(slots_.begin(), slots_.end(), logical,
+                                         [](const KvWindowSlot& slot, std::uint32_t value) {
+                                             return slot.logical < value;
+                                         });
+        if (it == slots_.end() || it->logical != logical) {
+            throw std::logic_error("window KV relocation of a page that is not live");
+        }
+        const std::int32_t old = it->physical;
+        it->physical           = physical;
+        return old;
+    }
+
 private:
     [[nodiscard]] std::vector<KvWindowSlot>::const_iterator find(std::uint32_t logical) const noexcept {
         return std::lower_bound(slots_.begin(), slots_.end(), logical,
@@ -246,6 +261,100 @@ struct KvWindowClassSize {
                       std::max(rounds_in_flight, 1U) * round_pages;
     out.image_pages = image_windows * window_pages;
     return out;
+}
+
+// ---- M3-C: the elastic window class (lanes/f1/DESIGN-M3-kv-lever.md section C) ---------------
+// The class's planes are demand-mapped in granules of `granule_pages` pages (2 MiB per plane:
+// Inkling's 80 window planes of 64 KiB per page give 32 pages, 160 MiB, per granule). The pool's
+// static bound above stays the VIRTUAL span; physical memory is (a) a floor the engine always
+// holds -- one round's prefill pages and a granule of compaction slack -- and (b) per holder
+// charges booked in the main pool's page ledger, so admission, the watermark and retained-lane
+// eviction see window pages as ordinary KV.
+
+/// Window pages one sequence may hold between forwards: its window, the rewrite checkpoint's
+/// pinned window, and the decode reach. The bound test_kv_window_pages checks for every lane.
+[[nodiscard]] inline std::uint32_t kv_window_lane_charge(std::uint32_t window_tokens) noexcept {
+    if (window_tokens == 0) { return 0; }
+    return 2U * (KvWindowPages::pages_for(window_tokens) + 1U) + 1U;
+}
+
+/// The guaranteed window pages of an elastic class: one round's prefill pages per round in
+/// flight, rounded to whole granules, and one granule of slack (compaction leaves at most one
+/// granule's worth of holes; the sentinel shares granule 0 with the lowest lane pages).
+[[nodiscard]] inline std::uint32_t kv_window_floor_pages(const KvWindowClassSize& size, std::uint32_t rows,
+                                                         std::uint32_t window_tokens,
+                                                         std::uint32_t granule_pages) noexcept {
+    if (window_tokens == 0 || rows == 0 || granule_pages == 0) { return 0; }
+    const std::uint32_t steady = rows * kv_window_lane_charge(window_tokens);
+    const std::uint32_t transient = size.lane_pages > steady ? size.lane_pages - steady : 0U;
+    const std::uint32_t rounded = (transient + granule_pages - 1U) / granule_pages * granule_pages;
+    return rounded + granule_pages;
+}
+
+/// Main-pool pages that stand for `window_pages` window pages in the shared ledger (bytes, rounded up).
+[[nodiscard]] inline std::uint32_t kv_window_main_equivalent(std::uint64_t window_pages, std::size_t window_page_bytes,
+                                                             std::size_t main_page_bytes) noexcept {
+    if (window_pages == 0 || main_page_bytes == 0) { return 0; }
+    const std::uint64_t bytes = window_pages * window_page_bytes;
+    return static_cast<std::uint32_t>((bytes + main_page_bytes - 1U) / main_page_bytes);
+}
+
+struct KvWindowMove {
+    std::int32_t from = -1;
+    std::int32_t to   = -1;
+};
+
+/// Compaction plan for a demand-mapped class: empty the highest granules that hold pages into
+/// free pages of LOWER granules that already hold pages (so no granule is mapped for it), as
+/// long as a whole granule empties and every page in it may move. `used` and `free_pages` are
+/// sorted ascending page ids inside the managed range; `movable(page)` says whether a used page
+/// may be copied now (an image, the sentinel, a page a host copy still reads may not). Pure:
+/// the pool copies the bytes and rewrites the owner's slot and block-table entry.
+template <class Movable>
+[[nodiscard]] std::vector<KvWindowMove> plan_kv_window_compaction(std::span<const std::int32_t> used,
+                                                                  std::span<const std::int32_t> free_pages,
+                                                                  std::uint32_t granule_pages,
+                                                                  std::uint32_t max_moves, Movable&& movable) {
+    std::vector<KvWindowMove> moves;
+    if (granule_pages == 0 || used.empty() || free_pages.empty() || max_moves == 0) { return moves; }
+    // Pages per granule in use.
+    std::vector<std::uint32_t> count;
+    for (const std::int32_t page : used) {
+        const auto g = static_cast<std::size_t>(page) / granule_pages;
+        if (g >= count.size()) { count.resize(g + 1, 0U); }
+        ++count[g];
+    }
+    // Holes: free pages in granules that hold pages, lowest first.
+    std::vector<std::int32_t> holes;
+    for (const std::int32_t page : free_pages) {
+        const auto g = static_cast<std::size_t>(page) / granule_pages;
+        if (g < count.size() && count[g] != 0) { holes.push_back(page); }
+    }
+    std::size_t next_hole = 0;
+    std::size_t top       = used.size(); // used[top - 1] is the highest page not yet moved
+    while (top > 0) {
+        const auto g = static_cast<std::size_t>(used[top - 1]) / granule_pages;
+        std::size_t first = top;
+        while (first > 0 && static_cast<std::size_t>(used[first - 1]) / granule_pages == g) { --first; }
+        const std::size_t pages = top - first;
+        // A granule that already received moved pages stays (holes are consumed lowest first).
+        if (next_hole > 0 && static_cast<std::size_t>(holes[next_hole - 1]) / granule_pages >= g) { break; }
+        // Holes strictly below this granule that are still free.
+        std::size_t available = 0;
+        for (std::size_t h = next_hole; h < holes.size() && static_cast<std::size_t>(holes[h]) / granule_pages < g; ++h) {
+            ++available;
+        }
+        if (pages > available || moves.size() + pages > max_moves) { break; }
+        bool all_movable = true;
+        for (std::size_t i = first; i < top && all_movable; ++i) { all_movable = movable(used[i]); }
+        if (!all_movable) { break; }
+        for (std::size_t i = first; i < top; ++i) {
+            moves.push_back(KvWindowMove{used[i], holes[next_hole++]});
+        }
+        count[g] = 0;
+        top      = first;
+    }
+    return moves;
 }
 
 } // namespace sinfer

@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <map>
 #include <random>
 #include <stdexcept>
@@ -59,9 +60,25 @@ struct Store final : sinfer::KvWindowPageSource {
     void give_back_window_page(std::int32_t page) noexcept override {
         if (owner[page] == -1) { ++g_failures; std::fprintf(stderr, "FAIL: page %d given back twice\n", page); }
         owner[page] = -1;
-        free.push_back(page);
+        if (sorted) {
+            // Elastic class (M3-C): the free list stays sorted descending, so takes are lowest-first.
+            free.insert(std::upper_bound(free.begin(), free.end(), page, std::greater<>()), page);
+        } else {
+            free.push_back(page);
+        }
     }
     std::uint32_t in_use() const { return capacity - static_cast<std::uint32_t>(free.size()); }
+    /// Granules holding at least one page (what a demand-mapped class keeps mapped, reserve aside).
+    std::uint32_t granules_in_use(std::uint32_t granule) const {
+        std::uint32_t count = 0;
+        for (std::uint32_t g = 0; g * granule < capacity; ++g) {
+            bool any = false;
+            for (std::uint32_t p = g * granule; p < std::min(capacity, (g + 1) * granule) && !any; ++p) { any = owner[p] != -1; }
+            count += any ? 1U : 0U;
+        }
+        return count;
+    }
+    bool sorted = false;
     std::vector<std::int32_t> free;
     std::vector<int> owner;
     std::vector<std::int64_t> cells;
@@ -265,14 +282,18 @@ void test_images(std::uint32_t window) {
 /// (mixed rounds), the others decode or verify; lanes finish, stay retained, and take new
 /// requests as appends at their frontier, checkpoint restores or full resets.
 void test_many_lanes(std::uint32_t window, std::uint32_t rows, std::uint32_t chunk, std::uint32_t seed,
-                     bool image_checkpoints = false) {
+                     bool image_checkpoints = false, std::uint32_t elastic_granule = 0) {
+    // elastic_granule != 0: M3-C -- the store hands out the lowest free page, and at every round boundary the
+    // compaction planner empties the highest granules into holes below; reads must stay exact across moves.
     // image_checkpoints: M3 lever A -- a checkpoint's window is an image copy made when the prefill passes it, the
     // lane pins nothing, and the class is sized without pins; the image region is small and may refuse a capture.
     const std::uint32_t image_windows = image_checkpoints ? rows / 2 + 2 : 0;
     const auto size = sinfer::plan_kv_window_class(window, rows, chunk, image_windows, 1, !image_checkpoints);
     Store store(size.lane_pages);
+    store.sorted = elastic_granule != 0;
     Store images(std::max(size.image_pages, 1U));
     std::uint32_t captured = 0, refused = 0, restored = 0;
+    std::uint32_t moved = 0, worst_waste = 0, over_bound_rounds = 0, boundaries = 0;
     std::mt19937 rng(seed);
     struct Lane {
         Seq seq;
@@ -351,18 +372,108 @@ void test_many_lanes(std::uint32_t window, std::uint32_t rows, std::uint32_t chu
                 lane.remaining -= accepted;
                 if (lane.remaining == 0) { lane.active = false; } // retained
             }
+            // Between forwards every lane holds at most its charge (window + pin + reach).
+            if (!image_checkpoints && seq.pages.page_count() > sinfer::kv_window_lane_charge(window)) {
+                expect(false, "a lane holds more than its window charge between forwards");
+            }
+        }
+        if (elastic_granule != 0) {
+            // Round boundary: compaction (bitwise page copies; the owner's slot follows).
+            std::vector<std::int32_t> used, free_sorted(store.free.rbegin(), store.free.rend());
+            for (std::uint32_t p = 0; p < store.capacity; ++p) { if (store.owner[p] != -1) { used.push_back(std::int32_t(p)); } }
+            const auto moves = sinfer::plan_kv_window_compaction(std::span<const std::int32_t>(used),
+                std::span<const std::int32_t>(free_sorted), elastic_granule, 64, [](std::int32_t) { return true; });
+            for (const auto& move : moves) {
+                bool found = false;
+                for (auto& lane : lanes) {
+                    for (const auto& slot : lane.seq.pages.slots()) {
+                        if (slot.physical != move.from) { continue; }
+                        // Take exactly `move.to` out of the free list, copy, relocate, give the old page back.
+                        const auto it = std::find(store.free.begin(), store.free.end(), move.to);
+                        if (it == store.free.end()) { expect(false, "compaction target is not free"); break; }
+                        store.free.erase(it);
+                        store.owner[move.to] = 1;
+                        std::copy_n(store.cells.begin() + std::ptrdiff_t(move.from) * kPage, kPage,
+                                    store.cells.begin() + std::ptrdiff_t(move.to) * kPage);
+                        const std::uint32_t logical = slot.logical;
+                        const std::int32_t old = lane.seq.pages.relocate(logical, move.to);
+                        expect(old == move.from, "relocate returns the old page");
+                        store.give_back_window_page(old);
+                        found = true;
+                        break;
+                    }
+                    if (found) { break; }
+                }
+                expect(found, "compaction moved a page no lane holds");
+                ++moved;
+            }
+            const std::uint32_t in_use = store.in_use();
+            const std::uint32_t granules = store.granules_in_use(elastic_granule);
+            const std::uint32_t waste = granules * elastic_granule - in_use;
+            worst_waste = std::max(worst_waste, waste);
+            ++boundaries;
+            if (granules > (in_use + elastic_granule - 1) / elastic_granule + 1) { ++over_bound_rounds; }
         }
     }
     for (auto& lane : lanes) { lane.seq.pages.release_all(store); drop_image(lane); }
     expect(store.in_use() == 0 && images.in_use() == 0, "many lanes give every page back");
-    std::printf("  window %u rows %u chunk %u%s: class %u lane pages, peak %u", window, rows, chunk,
-                image_checkpoints ? " (checkpoints as images)" : "", size.lane_pages, store.peak);
+    std::printf("  window %u rows %u chunk %u%s%s: class %u lane pages, peak %u", window, rows, chunk,
+                image_checkpoints ? " (checkpoints as images)" : "", elastic_granule ? " (elastic)" : "",
+                size.lane_pages, store.peak);
+    if (elastic_granule != 0) {
+        std::printf(", granule %u: %u pages moved, worst waste after compaction %u pages, %u of %u boundaries over "
+                    "ceil(in use / granule) + 1 granules", elastic_granule, moved, worst_waste, over_bound_rounds,
+                    boundaries);
+        // Compaction keeps the mapped granules within one of the minimum at nearly every boundary
+        // (a granule whose pages have no lower holes yet waits for the next round).
+        expect(over_bound_rounds * 20 <= boundaries, "elastic class: compaction keeps granules near the minimum");
+    }
     if (image_checkpoints) {
         std::printf(", images %u pages: %u captured, %u refused, %u restores", size.image_pages, captured, refused,
                     restored);
         expect(restored > 0, "checkpoint restores from images happened");
     }
     std::printf("\n");
+}
+
+/// M3-C: relocation keeps reads exact; the planner empties whole top granules into holes below,
+/// never into the granule it empties, never past its budget, never moving an immovable page.
+void test_compaction_planner() {
+    const std::uint32_t g = 4;
+    // Granule 0: pages 0, 2 used (holes 1, 3); granule 1: 5 used; granule 2: 8, 9 used.
+    const std::vector<std::int32_t> used{0, 2, 5, 8, 9};
+    const std::vector<std::int32_t> free{1, 3, 4, 6, 7, 10, 11, 12, 13, 14, 15};
+    auto moves = sinfer::plan_kv_window_compaction(std::span<const std::int32_t>(used), std::span<const std::int32_t>(free),
+                                                   g, 64, [](std::int32_t) { return true; });
+    // Granule 2 (2 pages) -> holes 1, 3; then granule 1 (page 5) has holes 4? no: 4, 6, 7 are in granule 1 itself,
+    // and granule 0 is full now -> stop.
+    expect(moves.size() == 2 && moves[0].from == 8 && moves[0].to == 1 && moves[1].from == 9 && moves[1].to == 3,
+           "planner empties the top granule into the lowest holes");
+    moves = sinfer::plan_kv_window_compaction(std::span<const std::int32_t>(used), std::span<const std::int32_t>(free),
+                                              g, 64, [](std::int32_t page) { return page != 9; });
+    expect(moves.empty(), "planner leaves a granule with an immovable page");
+    moves = sinfer::plan_kv_window_compaction(std::span<const std::int32_t>(used), std::span<const std::int32_t>(free),
+                                              g, 1, [](std::int32_t) { return true; });
+    expect(moves.empty(), "planner never splits a granule over its budget");
+    // Relocation: the slot follows, reads stay exact.
+    Store store(8);
+    Seq seq{KvWindowPages(256)};
+    forward(store, seq, 0, 200, 200, 1024, {});
+    seq.committed = 200;
+    const std::int32_t from = seq.pages.physical(1);
+    const std::int32_t to   = store.take_window_page();
+    std::copy_n(store.cells.begin() + std::ptrdiff_t(from) * kPage, kPage, store.cells.begin() + std::ptrdiff_t(to) * kPage);
+    expect(seq.pages.relocate(1, to) == from && seq.pages.physical(1) == to, "relocate moves the slot");
+    store.give_back_window_page(from);
+    forward(store, seq, 200, 10, 10, 1024, {});
+    bool threw = false;
+    try { (void)seq.pages.relocate(40, to); } catch (const std::logic_error&) { threw = true; }
+    expect(threw, "relocating a page that is not live throws");
+    // Sizing: Inkling (window 1,024, 32-page granules): charge 35 window pages per lane.
+    expect(sinfer::kv_window_lane_charge(1024) == 35, "lane charge = 2 x (window pages + 1) + 1");
+    const auto size = sinfer::plan_kv_window_class(1024, 8, 4096, 0);
+    expect(sinfer::kv_window_floor_pages(size, 8, 1024, 32) == 96 + 32, "floor = one round's pages in granules + 1");
+    expect(sinfer::kv_window_main_equivalent(35, 5u << 20, 1u << 20) == 175, "Inkling: a lane charge is 175 main pages");
 }
 
 } // namespace
@@ -382,6 +493,12 @@ int main() try {
     test_many_lanes(1024, 8, 2048, 5, true);
     test_many_lanes(1024, 16, 8192, 6, true);
     test_many_lanes(512, 4, 1024, 7, true);
+    // M3-C: the elastic class (Inkling's 32-page granules), lowest-first takes, compaction at round boundaries.
+    test_compaction_planner();
+    test_many_lanes(1024, 8, 4096, 8, false, 32);
+    test_many_lanes(1024, 8, 8192, 9, false, 32);
+    test_many_lanes(1024, 2, 4096, 10, false, 32);
+    test_many_lanes(512, 4, 1024, 11, false, 16);
     if (g_failures != 0) {
         std::fprintf(stderr, "test_kv_window_pages: %d failures\n", g_failures);
         return 1;
