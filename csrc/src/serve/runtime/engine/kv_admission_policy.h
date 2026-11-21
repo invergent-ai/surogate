@@ -47,6 +47,32 @@ struct KvGrowthOutcome {
     std::vector<std::uint32_t> blocked;
 };
 
+/// The most one unit of work writes past a lane's frontier, in tokens: an ordinary burst of
+/// `burst` rounds, a verify round's anchor and drafts (`draft_window + 1`), or a DSpark draft
+/// block, whose K / V covers [frontier, frontier + draft_block) whatever k is (0 for any other
+/// model); plus one. A lane's entitlement covers this before each round.
+[[nodiscard]] constexpr std::uint32_t kv_round_reach(std::uint32_t burst, std::uint32_t draft_window,
+                                                     std::uint32_t draft_block) noexcept {
+    return std::max({burst, draft_window + 1U, draft_block}) + 1U;
+}
+
+/// Whether an engine admits on demand. DFlash reserves; a DSpark drafter (draft KV in the text pool) may opt in, only with an
+/// explicit --kv-admission ondemand (lane f1). Without it this is the rule every engine had before the opt-in existed.
+[[nodiscard]] constexpr bool kv_engine_on_demand(bool on_demand_mode, bool pipeline_stage, bool dflash, bool dspark,
+                                                 bool explicit_on_demand) noexcept {
+    return on_demand_mode && !pipeline_stage && (!dflash || (dspark && explicit_on_demand));
+}
+
+/// Whether a DSpark row's committed tokens are independent of its drafts, so a recompute after a preemption goes on with
+/// the tokens it would have produced: a greedy row, or an untruncated sampled row under coupled verification with no
+/// min_p floor (whose coupled draw can differ from ordinary decoding by 1 ulp, review R5 minor 2). A row with top_p < 1 or
+/// top_k > 0 keeps the one-hot rejection rule: after a resume its continuation is drawn with other keys. Such rows keep
+/// their whole reservation unless SUROGATE_SERVE_KV_TRUNCATED_ONDEMAND=1 (lane f1, agent-EN's merge condition).
+[[nodiscard]] constexpr bool kv_dspark_row_recomputes_exactly(float temperature, std::int32_t top_k, float top_p,
+                                                              float min_p, bool coupled) noexcept {
+    return temperature <= 0.0F || (coupled && top_k <= 0 && top_p >= 1.0F && min_p <= 0.0F);
+}
+
 /// Grows every lane that needs it, oldest first. When the pool refuses, idle KV goes first, then
 /// the request that arrived last is preempted -- which may be the lane that is growing -- and the
 /// lane tries again. An older request is never preempted for a newer one.

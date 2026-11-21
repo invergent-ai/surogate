@@ -24,6 +24,7 @@
 #include "api/ops/inkling_mix.h"
 #include "family/impl/runtime/visit_round.h"
 #include "family/impl/runtime/dspark_round.h"
+#include "runtime/engine/kv_admission_policy.h"
 #include "ops/linear/ggml/ggml_dispatch.h"
 
 #include <cuda_runtime.h>
@@ -5836,8 +5837,11 @@ void ProgramImplCore::kv_settle() noexcept {
 
 void ProgramImplCore::configure_kv_admission(const runtime::KvAdmissionOptions& options) noexcept {
     kv_admission  = options;
-    kv_on_demand_ = options.mode == KvAdmission::OnDemand && !pipeline_stage() &&
-                    speculative_backend != SpeculativeBackend::DFlash;
+    // DFlash keeps the reservation. A DSpark drafter (lane f1, review R6 finding 1) keeps its draft KV in the text pool's own
+    // pages, so a lane's whole state can grow and be recomputed with its text allocation: opt-in, explicit flag only.
+    kv_on_demand_ = runtime::kv_engine_on_demand(options.mode == KvAdmission::OnDemand, pipeline_stage(),
+                                                 speculative_backend == SpeculativeBackend::DFlash,
+                                                 family::dspark_drafter<Variant>(), options.explicit_on_demand);
     const double fraction = std::clamp(static_cast<double>(options.watermark), 0.0, 0.5);
     kv_watermark_pages    = kv_on_demand_
                                 ? static_cast<std::uint32_t>(
@@ -5857,7 +5861,12 @@ bool ProgramImplCore::grow_lane_kv(std::uint32_t lane) {
     };
     // The most one unit writes past the frontier: an ordinary burst of kChainBurstLimit rounds,
     // or a verify round's anchor and drafts (whose head writes draft_window further).
-    const std::uint64_t reach = std::max<std::uint32_t>(kChainBurstLimit, draft_window + 1U) + 1U;
+    // A DSpark round also writes its draft block at [frontier, frontier + block) (dspark_round.h).
+    const std::uint32_t draft_block =
+        family::dspark_drafter<Variant>() && speculative_backend == SpeculativeBackend::DFlash
+            ? static_cast<std::uint32_t>(cfg.dflash.block_size)
+            : 0U;
+    const std::uint64_t reach = runtime::kv_round_reach(kChainBurstLimit, draft_window, draft_block);
     const std::uint64_t frontier = sequence.execution_frontier;
     PagedKVAllocation& text = sequence.kv->text;
     const std::uint32_t text_pages = std::max(

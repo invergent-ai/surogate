@@ -8,6 +8,7 @@
 #include "core/paged_kv_cache.h"
 #endif
 #include "runtime/engine/kv_admission_policy.h"
+#include "runtime/engine/pipeline_kv_share.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -20,6 +21,7 @@
 #include <optional>
 #include <random>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -185,6 +187,82 @@ void test_requeue_and_forced() {
     check(thrice.due(32, 1) && !thrice.due(31, 1) && thrice.due(48, 2) && !thrice.due(1000, 3),
           "forced preemption NxK fires every N tokens, K times");
     check(sinfer::runtime::parse_kv_forced_preemption(nullptr).every == 0, "unset is off");
+}
+
+/// Lane f1 (review R6 finding 1): the growth reach covers every write of a round. Without a draft
+/// block it is the value every model had before; with DSpark's block of 8 and k <= 7 it covers
+/// [frontier, frontier + max(extent + 1, 8)) for every extent, as launch_dflash_round maps it.
+void test_round_reach() {
+    using sinfer::runtime::kv_round_reach;
+    for (std::uint32_t window = 0; window <= 16; ++window) {
+        check(kv_round_reach(8, window, 0) == std::max<std::uint32_t>(8, window + 1U) + 1U,
+              "without a draft block the reach is unchanged");
+    }
+    for (std::uint32_t window = 0; window <= 7; ++window) {
+        for (std::uint32_t extent = 0; extent <= window; ++extent) {
+            check(kv_round_reach(8, window, 8) >= std::max<std::uint32_t>(extent + 1U, 8U),
+                  "the reach covers a DSpark round's verify columns and draft block");
+        }
+    }
+    check(kv_round_reach(4, 3, 16) == 17, "a block wider than the burst and the window sets the reach");
+
+    // Which DSpark rows may be recomputed: the ones whose committed tokens do not depend on the drafts.
+    using sinfer::runtime::kv_dspark_row_recomputes_exactly;
+    check(kv_dspark_row_recomputes_exactly(0.0F, 20, 0.95F, 0.0F, true), "a greedy row, whatever its filters");
+    check(kv_dspark_row_recomputes_exactly(0.0F, 0, 1.0F, 0.0F, false), "a greedy row without coupling");
+    check(kv_dspark_row_recomputes_exactly(1.0F, -1, 1.0F, 0.0F, true), "an untruncated coupled row");
+    check(!kv_dspark_row_recomputes_exactly(1.0F, 20, 0.95F, 0.0F, true), "the RL kit's pins keep the reservation");
+    check(!kv_dspark_row_recomputes_exactly(1.0F, 20, 1.0F, 0.0F, true), "top_k alone keeps the reservation");
+    check(!kv_dspark_row_recomputes_exactly(1.0F, -1, 0.95F, 0.0F, true), "top_p alone keeps the reservation");
+    check(!kv_dspark_row_recomputes_exactly(1.0F, -1, 1.0F, 0.05F, true), "a min_p floor keeps the reservation");
+    check(!kv_dspark_row_recomputes_exactly(1.0F, -1, 1.0F, 0.0F, false), "one-hot verification keeps the reservation");
+}
+
+/// Lane f1: without an explicit --kv-admission ondemand every engine takes the rule it had before the DSpark opt-in; with it, the
+/// only engine that changes is a one-card DSpark engine in on-demand mode.
+void test_engine_on_demand() {
+    using sinfer::runtime::kv_engine_on_demand;
+    int changed = 0;
+    for (int bits = 0; bits < 16; ++bits) {
+        const bool on_demand = bits & 1, pipeline = bits & 2, dflash = bits & 4, dspark = bits & 8;
+        const bool before = on_demand && !pipeline && !dflash;
+        check(kv_engine_on_demand(on_demand, pipeline, dflash, dspark, false) == before,
+              "without the explicit flag every engine keeps its old rule");
+        if (kv_engine_on_demand(on_demand, pipeline, dflash, dspark, true) != before) {
+            ++changed;
+            check(on_demand && !pipeline && dflash && dspark, "the explicit flag changes only a one-card DSpark engine");
+        }
+    }
+    check(changed == 1, "the explicit flag changes exactly one engine kind");
+}
+
+/// Lane f1 (review R5 minors 11 c, 12): what a pipeline stage counts against the run's need, and the page size the
+/// shared pool is converted with.
+void test_pipeline_held_tokens() {
+    using sinfer::runtime::pipeline_stage_held_tokens;
+    using sinfer::runtime::PipelineStageKvFit;
+    const PipelineStageKvFit fit{.resolved_pages = 1000, .minimum_pages = 200, .charge_pages = 175, .page_tokens = 64};
+    check(pipeline_stage_held_tokens(64000, fit, 4, false) == 64000 - 4 * 175 * 64, "auto counts real KV");
+    check(pipeline_stage_held_tokens(64000, fit, 4, true) == 64000, "an explicit capacity is compared as it stands");
+    check(pipeline_stage_held_tokens(1000, fit, 4, false) == 0, "a charge above the pool leaves no real KV");
+    const PipelineStageKvFit plain{.resolved_pages = 1000, .minimum_pages = 200, .charge_pages = 0, .page_tokens = 64};
+    check(pipeline_stage_held_tokens(64000, plain, 4, false) == 64000 &&
+              pipeline_stage_held_tokens(64000, plain, 4, true) == 64000,
+          "without a window class both are the capacity");
+    PipelineStageKvFit wide = fit;
+    wide.page_tokens        = 128;
+    check(pipeline_stage_held_tokens(100000, wide, 4, false) == 100000 - 4 * 175 * 128,
+          "the charge scales with the curve's page size");
+    const std::vector<PipelineStageKvFit> same{wide, wide};
+    check(sinfer::runtime::share_pipeline_kv(same, 1).page_tokens == 128, "the share carries the stages' page size");
+    const std::vector<PipelineStageKvFit> mixed{fit, wide};
+    bool refused = false;
+    try {
+        (void)sinfer::runtime::share_pipeline_kv(mixed, 1);
+    } catch (const std::invalid_argument&) {
+        refused = true;
+    }
+    check(refused, "stages with different page sizes are refused");
 }
 
 /// A whole engine's scheduling in pages and tokens: first come, first served admission of prompt +
@@ -426,6 +504,9 @@ void test_pool_accounting() {
 int main() {
     test_growth_policy();
     test_requeue_and_forced();
+    test_round_reach();
+    test_pipeline_held_tokens();
+    test_engine_on_demand();
     // 483k-token RTX 5090 replica, 16 lanes, BFCL-like short requests at the agentic default.
     test_simulation(1, 400, 16, 483328, {500, 4000, 20, 600});
     // Many 100k+ prompts, no max_tokens, on the same pool and on a small one.

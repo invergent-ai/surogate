@@ -132,24 +132,36 @@ void check_target(const char* name, const std::filesystem::path& artifact, Devic
 // lost to a larger charge on another stage). Also: one page past a stage's curve maximum is refused.
 // With and without DSpark (--spec dflash, K = 7: its drafter planes and a 1,032-token window class on the
 // last stage give that stage a different charge), 16k..1M x 1-8 lanes x chunk 2k / 8k, unlimited / tight.
+// A target without its own cut (Gemma 3's sliding windows; review R5 minor 11 a) takes three cuts, at a third, half
+// and two thirds of its layers, since construct_pipeline's balanced cut depends on the artifact's weights; 4k..32k.
 template <class Target>
 void check_stages(const char* name, const std::filesystem::path& artifact, DeviceContext& device, Totals& totals) {
-    if constexpr (requires { Target::pipeline_stage_bounds(2); }) {
-        artifact::Reader reader(artifact);
-        const family::TextGeometry geometry = Target::declared_geometry(reader);
-        const auto profile                  = Target::resolve_weights(reader.identity());
-        const std::vector<int> bounds       = Target::pipeline_stage_bounds(2);
-        const auto native                   = static_cast<std::uint32_t>(geometry.max_context);
+    artifact::Reader reader(artifact);
+    const family::TextGeometry geometry = Target::declared_geometry(reader);
+    const auto profile                  = Target::resolve_weights(reader.identity());
+    const auto native                   = static_cast<std::uint32_t>(geometry.max_context);
+    constexpr bool own_cut              = requires { Target::pipeline_stage_bounds(2); };
+    std::vector<std::vector<int>> cuts;
+    if constexpr (own_cut) {
+        cuts.push_back(Target::pipeline_stage_bounds(2));
+    } else {
+        const int layers = geometry.layers;
+        for (const int cut : {layers / 3, layers / 2, 2 * layers / 3}) { cuts.push_back({0, cut, layers}); }
+    }
+    const std::vector<std::uint32_t> contexts =
+        own_cut ? std::vector<std::uint32_t>{16384U, 131072U, 262144U, 1048576U}
+                : std::vector<std::uint32_t>{4096U, 8192U, 16384U, 32768U};
+    for (const std::vector<int>& bounds : cuts) {
         for (const bool dspark : {false, true}) {
             if (dspark && geometry.dflash.layers == 0) { continue; }
-            for (const std::uint32_t context : {16384U, 131072U, 262144U, 1048576U}) {
+            for (const std::uint32_t context : contexts) {
                 if (native != 0 && context > native) { continue; }
                 for (const std::uint32_t lanes : {1U, 2U, 4U, 8U}) {
                     for (const std::uint32_t chunk : {2048U, 8192U}) {
                         for (const bool tight : {false, true}) {
                             ++totals.shapes;
-                            const std::string shape = std::string(name) + (dspark ? " dspark" : "") + " 2 stages " +
-                                                      std::to_string(context) + " x " + std::to_string(lanes) +
+                            const std::string shape = std::string(name) + (dspark ? " dspark" : "") + " 2 stages cut " +
+                                                      std::to_string(bounds[1]) + " " + std::to_string(context) + " x " + std::to_string(lanes) +
                                                       " chunk " + std::to_string(chunk) +
                                                       (tight ? " tight" : " unlimited");
                             const auto stage_options = [&](int s) {
@@ -184,9 +196,10 @@ void check_stages(const char* name, const std::filesystem::path& artifact, Devic
                                     const auto resolved =
                                         runtime::resolve_kv_capacity(KvCapacityPolicy::automatic(0), curve, budget)
                                             .resolved_tokens;
-                                    fits.push_back({.resolved_pages = resolved / 64U,
+                                    fits.push_back({.resolved_pages = resolved / curve.main_page_tokens,
                                                     .minimum_pages  = curve.minimum_main_page_groups,
-                                                    .charge_pages   = curve.window_lane_charge_pages});
+                                                    .charge_pages   = curve.window_lane_charge_pages,
+                                                    .page_tokens    = curve.main_page_tokens});
                                 }
                                 const runtime::PipelineKvShare share = runtime::share_pipeline_kv(fits, lanes);
                                 const std::uint32_t logical = (context + 63U) / 64U;
@@ -248,7 +261,7 @@ void check_stages(const char* name, const std::filesystem::path& artifact, Devic
                                             ++totals.failed;
                                         }
                                     }
-                                    if (lanes == 1 && !tight && (context == 262144U || context == 1048576U)) {
+                                    if (lanes == 1 && !tight && (context == contexts.back() || context == 262144U)) {
                                         std::printf("ok   %s stage %d [%d, %d): shared real KV %u tokens, stage %u pages "
                                                     "(charge %u, curve %u..%u)\n",
                                                     shape.c_str(), s, bounds[static_cast<std::size_t>(s)],
@@ -266,8 +279,6 @@ void check_stages(const char* name, const std::filesystem::path& artifact, Devic
                 }
             }
         }
-    } else {
-        (void)name; (void)artifact; (void)device; (void)totals;
     }
 }
 
@@ -296,7 +307,10 @@ int main(int argc, char** argv) {
         check_target<targets::inkling2::Package>("inkling2", inkling, device, true, totals);
         check_stages<targets::inkling2::Package>("inkling2", inkling, device, totals);
     }
-    if (!gemma3.empty()) { check_target<targets::gemma3_270m::Package>("gemma3", gemma3, device, true, totals); }
+    if (!gemma3.empty()) {
+        check_target<targets::gemma3_270m::Package>("gemma3", gemma3, device, true, totals);
+        check_stages<targets::gemma3_270m::Package>("gemma3", gemma3, device, totals);
+    }
     std::printf("%s: %d shapes, %d plans, %d failures (%.1f s)\n", totals.failed == 0 ? "PASS" : "FAIL",
                 totals.shapes, totals.plans, totals.failed,
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());

@@ -97,6 +97,9 @@ enum class KvAdmission : std::uint8_t {
 
 struct KvAdmissionOptions {
     KvAdmission mode               = KvAdmission::OnDemand;
+    /// Set only by an explicit --kv-admission ondemand. A DSpark engine stays on Reserve without it
+    /// (lane f1): its recompute has not been shown on every route. No other engine reads it.
+    bool explicit_on_demand        = false;
     /// Decode tokens a request is entitled to beyond its prompt when it is admitted.
     std::uint32_t headroom_tokens  = 256;
     /// Fraction of the KV pool an admission leaves free while other requests run, so their
