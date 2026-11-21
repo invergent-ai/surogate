@@ -4,7 +4,8 @@
 Same requests for both engines over the OpenAI chat API, DISTINCT prompts per stream (each stream starts at its own
 offset of a cyclic text corpus, so no two streams share a prefix or a token sequence). Measures:
   decode   tok/s at S streams x context C (prompt of ~C tokens, G generated tokens, ignore_eos): per-stream and
-           aggregate decode rate (aggregate over the window where every stream is decoding), TTFT
+           aggregate decode rate (aggregate over the window where every stream is decoding), TTFT; the prompts are
+           pre-filled once (max_tokens 1) so the measured requests hit the prefix cache and decode together
   prefill  cold prompts of N tokens, 1 output token: prefill seconds and tok/s
   cached   TTFT of (prefix P + suffix of S tokens) after P was served once, vs a cold S-token prompt
   swap     POST /v1/load_lora_adapter latency while one stream decodes: the stream's largest inter-token gap
@@ -175,6 +176,8 @@ def main():
     ap.add_argument("--corpus", nargs="+", required=True)
     ap.add_argument("--decode", default="", help="comma list of SxC, e.g. 1x8k,8x64k")
     ap.add_argument("--gen", type=int, default=512, help="generated tokens per decode stream")
+    ap.add_argument("--no-prewarm", action="store_true",
+                    help="do not pre-fill each decode row's prompts (default: one max_tokens=1 pass first)")
     ap.add_argument("--prefill", default="", help="comma list of cold prompt sizes, e.g. 8k,97k")
     ap.add_argument("--cached", default="", help="comma list of P+S, e.g. 64k+256")
     ap.add_argument("--swap", nargs=2, metavar=("NAME", "PATH"), help="adapter to load while a stream decodes")
@@ -205,8 +208,11 @@ def main():
     for item in filter(None, a.decode.split(",")):
         s, ctx = item.lower().split("x")
         s, ctx = int(s), parse_tokens(ctx)
+        prompts = [corpus.prompt(i, s, ctx, salt) for i in range(s)]
+        if not a.no_prewarm:  # fill the prefix cache first, so the decode window holds no prefill of other streams
+            parallel(c, prompts, 1)
         log_before = len(read_request_log(a.request_log, 0))
-        outs = parallel(c, [corpus.prompt(i, s, ctx, salt) for i in range(s)], a.gen)
+        outs = parallel(c, prompts, a.gen)
         salt += 1
         row = dict(kind="decode", streams=s, ctx=ctx, gen=a.gen, **decode_summary(outs), **meta)
         b = bound_lookup(bounds, s, ctx)
