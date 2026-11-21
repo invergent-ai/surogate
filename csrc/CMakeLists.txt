@@ -1603,6 +1603,13 @@ set_source_files_properties(
   ${SERVE_ROOT}/ops/sparse_moe/marlin/marlin_moe_nvfp4_kernels_generated.cu
   PROPERTIES COMPILE_OPTIONS
   "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;-static-global-template-stub=false>")
+# Inkling-2-Mini hidden-stream ops (ENGINE-INKLING lane e1). -fmad=false: the reference fuses only
+# where it says fma, and so must these kernels (rl/engine-inkling-2026-11-21/lanes/e1/DESIGN-target.md 3).
+target_sources(sinfer_ops PRIVATE
+  ${SERVE_ROOT}/ops/inkling_mix/inkling_mix.cu
+  ${SERVE_ROOT}/ops/inkling_mix/inkling_gemm_f32.cpp)
+set_source_files_properties(${SERVE_ROOT}/ops/inkling_mix/inkling_mix.cu
+  PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:-fmad=false>")
 # Vendor-tuned CPU GEMM, optional and injected by path. Both live outside the
 # tree as reference checkouts rather than vendored dependencies, so a build with
 # neither must still work -- the encoder's own AVX-512 microkernel is always
