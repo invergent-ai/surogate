@@ -686,7 +686,12 @@ void Variant::run_visits(const ModelView& model, family::VisitRound& r) {
     CUDA_CHECK(cudaStreamIsCapturing(rd.s, &seg_capture));
     std::vector<std::int32_t> seg_ints;
     Tensor seg_dev;
-    if (!r.segments.empty()) { seg_dev = rd.work.alloc(DType::I32, {static_cast<std::int32_t>(2 * r.segments.size())}); }
+    // 8 ints per segment: the KV row at [8 i], the state slot at [8 i + 4] -- each 16-byte aligned (lane c's ops
+    // require aligned I32 metadata).
+    constexpr int kSegInts = 8;
+    if (!r.segments.empty()) {
+        seg_dev = rd.work.alloc(DType::I32, {static_cast<std::int32_t>(kSegInts * r.segments.size())});
+    }
     for (std::size_t i = 0; i < r.segments.size(); ++i) {
         const family::VisitSegment& seg = r.segments[i];
         Group g;
@@ -694,19 +699,20 @@ void Variant::run_visits(const ModelView& model, family::VisitRound& r) {
         g.width     = seg.count;
         g.batch     = 1;
         g.positions = Tensor(static_cast<std::int32_t*>(r.positions.data) + seg.column, DType::I32, {seg.count, 1});
-        auto* ints  = static_cast<std::int32_t*>(seg_dev.data) + 2 * i;
+        auto* ints  = static_cast<std::int32_t*>(seg_dev.data) + kSegInts * i;
+        std::int32_t row = 0; // unused when the segment's own table row tensor is taken
         if (seg.table_row.data != nullptr && !r.sequence_kv.valid()) {
             g.table_rows = seg.table_row.view({1});
-            seg_ints.push_back(0); // unused
         } else {
             if (!r.sequence_kv.valid() && seg.kv_table_row < 0) {
                 throw std::logic_error("inkling2: a segment without a KV row");
             }
-            seg_ints.push_back(r.sequence_kv.valid() ? 0 : seg.kv_table_row);
+            row          = r.sequence_kv.valid() ? 0 : seg.kv_table_row;
             g.table_rows = Tensor(ints, DType::I32, {1});
         }
-        seg_ints.push_back(seg.state_slot);
-        g.slots   = Tensor(ints + 1, DType::I32, {1});
+        const std::int32_t block[kSegInts] = {row, 0, 0, 0, seg.state_slot, 0, 0, 0};
+        seg_ints.insert(seg_ints.end(), block, block + kSegInts);
+        g.slots   = Tensor(ints + 4, DType::I32, {1});
         g.segment = &seg;
         rd.groups.push_back(g);
     }
