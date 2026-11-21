@@ -127,7 +127,7 @@ __global__ __launch_bounds__(Schedule::kThreads) void mxfp8_expert_gemm_kernel(G
     pdl::wait_for_dependencies();
     pdl::trigger_dependents();
     if (threadIdx.x == 0) { done_count = 0; }
-    find_expert_tile<Schedule::kBlockN>(p.offsets, static_cast<int>(blockIdx.x), tile_info);
+    find_expert_tile<Schedule::kBlockN>(p.offsets, static_cast<int>(p.n_fastest ? blockIdx.y : blockIdx.x), tile_info);
     const int expert = tile_info[0];
     if (expert < 0) { return; }
     const int row_begin = tile_info[1];
@@ -140,7 +140,7 @@ __global__ __launch_bounds__(Schedule::kThreads) void mxfp8_expert_gemm_kernel(G
     }
     __syncthreads();
 
-    const int n_begin = static_cast<int>(blockIdx.y) * Schedule::kBlockM;
+    const int n_begin = static_cast<int>(p.n_fastest ? blockIdx.x : blockIdx.y) * Schedule::kBlockM;
     const std::int64_t weight_row = static_cast<std::int64_t>(expert) * kGateUpRows + n_begin;
     const std::uint8_t* weight_codes  = p.weights.codes + weight_row * K;
     const std::uint8_t* weight_scales = p.weights.scales + weight_row * (K / 32);
@@ -286,7 +286,8 @@ template <class Schedule, int K, bool GateUp>
 void launch_schedule(const GemmParams& params, std::int32_t slots, cudaStream_t stream) {
     const int max_tiles = std::min(kExperts, slots) + slots / Schedule::kBlockN;
     if (max_tiles == 0) { return; }
-    const dim3 grid(static_cast<unsigned>(max_tiles), kGateUpRows / Schedule::kBlockM);
+    const dim3 grid = params.n_fastest ? dim3(kGateUpRows / Schedule::kBlockM, static_cast<unsigned>(max_tiles))
+                                       : dim3(static_cast<unsigned>(max_tiles), kGateUpRows / Schedule::kBlockM);
     // One fragment layout at every width (canonical, KWidth 2). M3 run 3 measured the alternatives against
     // the vLLM capture (layer 20): KWidth 4 = the same 27 / 4.7 M gate_up elements off (same K set per MMA),
     // 8 -> 25, 16 -> 44: none reproduces Triton's K grouping; the residual is recorded, not chased.
