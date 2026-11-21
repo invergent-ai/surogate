@@ -746,6 +746,10 @@ void run_invariance_case(const InvCase& c, const char* groups, std::uint32_t see
         compare("verify W8 B4 workers 1", run_inv_route(c.kind, ip, layer, 8, r4));
         unsetenv("SUROGATE_INKLING_ATTN_SPLITS");
     }
+    // The whole segment again with the 4-warp prefill kernel (KS = 1; the default is KS = 2).
+    setenv("SUROGATE_INKLING_PREFILL_KS", "1", 1);
+    compare("prefill KS1 one segment", run_inv_route(c.kind, ip, layer, c.L0 - c.P0, {{0, c.P0, c.L0 - c.P0}}));
+    unsetenv("SUROGATE_INKLING_PREFILL_KS");
     // A short prefill segment forced through the split route (partials + fold kernel) and through 1 worker.
     {
         const int s0 = std::max(c.P0, c.L0 - 40);
@@ -1813,6 +1817,13 @@ void run_bench() {
         bench_attention(name("attn verify W8 local 8x8k"), K::Local, 8, 8, 8184);
         bench_attention(name("attn prefill global W8192 past 256k"), K::Global, 8192, 1, 262144);
     }
+    // The 4-warp prefill kernel (KS = 1) for comparison, p1.
+    setenv("SUROGATE_INKLING_ATTN_GROUPS", "p1", 1);
+    setenv("SUROGATE_INKLING_PREFILL_KS", "1", 1);
+    bench_attention("attn prefill global W8192 from 0 [p1 KS1]", K::Global, 8192, 1, 0);
+    bench_attention("attn prefill global W8192 past 64k [p1 KS1]", K::Global, 8192, 1, 65536);
+    bench_attention("attn prefill local W8192 past 8k [p1 KS1]", K::Local, 8192, 1, 8192);
+    unsetenv("SUROGATE_INKLING_PREFILL_KS");
     unsetenv("SUROGATE_INKLING_ATTN_GROUPS");
     if (std::getenv("BENCH_ATTN_ONLY") != nullptr) { return; }
     bench_prologue("prologue local 1x1", K::Local, 1, 1, 8191);

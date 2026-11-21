@@ -912,7 +912,9 @@ Plan make_plan(InklingLayerKind kind, const GroupSpec& gs, std::int32_t width, s
     } else {
         plan.decode     = false;
         plan.mtiles     = 4;
-        plan.ks         = 1;
+        // KS = 2 (8 warps, two per SM sub-partition: one warp's softmax overlaps another's MMAs) or 1 (4 warps);
+        // SUROGATE_INKLING_PREFILL_KS picks (measurement); same bits either way.
+        plan.ks         = env_int("SUROGATE_INKLING_PREFILL_KS", 2) == 1 ? 1 : 2;
         const int tiles = (width + kPrefillRows - 1) / kPrefillRows;
         const long ctas = static_cast<long>(tiles) * Geo::kQHeads * batch;
         plan.workers    = ctas >= 2L * sms ? 1 : std::clamp(static_cast<int>((2L * sms + ctas - 1) / ctas), 1,
@@ -930,7 +932,7 @@ Plan make_plan(InklingLayerKind kind, const GroupSpec& gs, std::int32_t width, s
 
 template <bool Local, bool Decode, int MTiles, int KS, int Mode>
 void launch_kernel(const Plan& plan, const AttnParams& p, cudaStream_t stream) {
-    constexpr int Raw   = Decode ? 0 : pick_raw<MTiles, KS, Mode != kPartial>();
+    constexpr int Raw   = (Decode || KS > 1) ? 0 : pick_raw<MTiles, KS, Mode != kPartial>();
     constexpr int bytes = static_cast<int>(sizeof(AttnSmem<MTiles, KS, Raw, Mode != kPartial>));
     static_assert(bytes <= kSmemLimit, "inkling attention: shared memory over the sm_120 limit");
     auto* kernel = rel_attention_kernel<Local, Decode, MTiles, KS, Mode, Raw>;
@@ -945,7 +947,10 @@ void launch_kernel(const Plan& plan, const AttnParams& p, cudaStream_t stream) {
 
 template <bool Local, int Mode>
 void dispatch_mode(const Plan& plan, const AttnParams& p, cudaStream_t stream) {
-    if (!plan.decode) { return launch_kernel<Local, false, 4, 1, Mode>(plan, p, stream); }
+    if (!plan.decode) {
+        return plan.ks == 1 ? launch_kernel<Local, false, 4, 1, Mode>(plan, p, stream)
+                            : launch_kernel<Local, false, 4, 2, Mode>(plan, p, stream);
+    }
     switch (plan.mtiles) {
     case 1: return launch_kernel<Local, true, 1, 4, Mode>(plan, p, stream);
     case 2: return launch_kernel<Local, true, 2, 2, Mode>(plan, p, stream);
