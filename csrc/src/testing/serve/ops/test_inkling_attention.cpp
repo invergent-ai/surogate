@@ -2297,6 +2297,15 @@ void run_bench_ab() {
     bench_linear("attn_linear wo narrow N=8 1x128", 3072, 128, 8);
 }
 
+// The "GEMM 6 %" question (agent-EN): the qkvr GEMM rows, interleaved three times (pair with the BASE binary's bench).
+void run_bench_gemm() {
+    cuda_check(cudaStreamCreateWithFlags(&g_stream, cudaStreamNonBlocking), "stream");
+    for (int rep = 0; rep < 3; ++rep) {
+        bench_linear("attn_linear qkvr GEMM N=8192 1x128", 2304, 128, 8192);
+        bench_linear("attn_linear qkvr GEMM N=8192 channel", 2304, 2304, 8192);
+    }
+}
+
 // For nsys (per-kernel durations inside the graphs): a few decode probes and the wo projection, p1.
 void run_bench_prof() {
     using K = InklingLayerKind;
@@ -2384,6 +2393,10 @@ int main(int argc, char** argv) {
             }
             if (argc > 2 && std::string(argv[2]) == "fold") {
                 run_bench_fold();
+                return 0;
+            }
+            if (argc > 2 && std::string(argv[2]) == "gemm") {
+                run_bench_gemm();
                 return 0;
             }
             run_bench();
