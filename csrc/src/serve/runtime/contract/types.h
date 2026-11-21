@@ -168,6 +168,9 @@ struct SequenceCapacityCurve {
     std::uint32_t maximum_main_page_groups           = 0;
     std::size_t minimum_device_reservation_bytes     = 0;
     std::size_t bytes_per_additional_main_page_group = 0;
+    /// Lane f1: main pages every allocation is charged for an elastic window class, per lane (0 without
+    /// one). A pipeline shares real KV between stages whose charges differ (runtime/engine/pipeline_kv_share.h).
+    std::uint32_t window_lane_charge_pages           = 0;
 
     [[nodiscard]] std::size_t reservation_bytes(std::uint32_t main_page_groups) const;
     [[nodiscard]] std::uint32_t resolved_tokens(std::uint32_t main_page_groups) const;

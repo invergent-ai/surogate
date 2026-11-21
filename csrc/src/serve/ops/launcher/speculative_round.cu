@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 
 namespace sinfer::ops::detail {
 
@@ -67,7 +68,7 @@ void speculative_accept_greedy_drafts_launch_typed(
     const Tensor& current_extents, Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,
     Tensor& licensed_counts, Tensor& accepted, std::int32_t token_domain,
     const SamplingConfig* configs, DeviceSpan workspace, cudaStream_t stream,
-    std::int32_t draft_count) {
+    std::int32_t draft_count, bool split_routes) {
     const std::int32_t physical_rows     = logits.ne[0];
     const std::int32_t cols              = draft_count + 1;
     const std::int32_t batch             = drafts.ne[1];
@@ -76,9 +77,15 @@ void speculative_accept_greedy_drafts_launch_typed(
     const auto* sorted = sampling_sort_launch(logits, token_domain, configs,
         static_cast<const int32_t*>(drafts.data), static_cast<const int32_t*>(current_extents.data),
         cols, batch, scratch, layout.bytes, stream);
-    // Untruncated stochastic rows: the split route (speculative_exact_*_kernel) unless switched off; the wide
-    // kernel then skips them. Always the same launches for a shape, so a captured graph keeps one node set.
-    const bool exact_split = scratch.spec_exact_partials != nullptr && speculative_exact_split();
+    // Untruncated stochastic rows of a target that opts in (split_routes): the split routes (exact split / coupled)
+    // unless switched off; the wide kernel then skips them. Every other target launches exactly M7's kernels. Always
+    // the same launches for a shape, so a captured graph keeps one node set. The chunk partials sit after the batch's
+    // sampling layouts (speculative_split_partial_row_bytes per row).
+    const std::size_t partial_row_bytes = speculative_split_partial_row_bytes(token_domain, cols);
+    const bool exact_split = split_routes && partial_row_bytes != 0 && speculative_exact_split();
+    auto* const partials   = exact_split ? reinterpret_cast<unsigned long long*>(
+                                             static_cast<unsigned char*>(workspace.data) + layout.bytes * batch)
+                                         : nullptr;
     speculative_accept_wide_kernel<LogitT><<<batch, kSamplerBlock, 0, stream>>>(
         static_cast<const LogitT*>(logits.data), static_cast<const int32_t*>(drafts.data),
         static_cast<const int32_t*>(current_extents.data), static_cast<int32_t*>(lengths.data),
@@ -93,21 +100,36 @@ void speculative_accept_greedy_drafts_launch_typed(
             <<<sampling_resident_grid(speculative_exact_max_kernel<LogitT>, units), kSamplerBlock, 0, stream>>>(
                 static_cast<const LogitT*>(logits.data), static_cast<const std::int32_t*>(drafts.data),
                 static_cast<const std::int32_t*>(current_extents.data), configs, token_domain, physical_rows,
-                draft_count, batch, scratch.spec_exact_partials, layout.bytes, chunks);
+                draft_count, batch, partials, partial_row_bytes, chunks);
         CUDA_CHECK(cudaGetLastError());
         speculative_exact_partial_kernel<LogitT>
             <<<sampling_resident_grid(speculative_exact_partial_kernel<LogitT>, units), kSamplerBlock, 0, stream>>>(
                 static_cast<const LogitT*>(logits.data), static_cast<const std::int32_t*>(drafts.data),
                 static_cast<const std::int32_t*>(current_extents.data),
                 static_cast<const std::int32_t*>(lengths.data), configs, token_domain, physical_rows, draft_count,
-                batch, scratch.spec_exact_partials, layout.bytes, chunks);
+                batch, partials, partial_row_bytes, chunks);
+        CUDA_CHECK(cudaGetLastError());
+        // Coupled rows (cfg.speculative_coupled): the ordinary sampler's draw per column, greedy accept.
+        speculative_coupled_partial_kernel<LogitT>
+            <<<sampling_resident_grid(speculative_coupled_partial_kernel<LogitT>, units), kSamplerBlock, 0, stream>>>(
+                static_cast<const LogitT*>(logits.data), static_cast<const std::int32_t*>(drafts.data),
+                static_cast<const std::int32_t*>(current_extents.data),
+                static_cast<const std::int32_t*>(lengths.data), configs, token_domain, physical_rows, draft_count,
+                batch, partials, partial_row_bytes, chunks, -std::numeric_limits<float>::infinity());
+        CUDA_CHECK(cudaGetLastError());
+        speculative_coupled_finalize_kernel<LogitT><<<batch, kSamplerBlock, 0, stream>>>(
+            static_cast<const std::int32_t*>(drafts.data), static_cast<const std::int32_t*>(current_extents.data),
+            static_cast<std::int32_t*>(lengths.data), static_cast<std::int32_t*>(anchors.data),
+            static_cast<std::int32_t*>(licensed_tokens.data), static_cast<std::int32_t*>(licensed_counts.data),
+            static_cast<std::int32_t*>(accepted.data), configs, token_domain, draft_count,
+            partials, partial_row_bytes, chunks);
         CUDA_CHECK(cudaGetLastError());
         speculative_exact_finalize_kernel<LogitT><<<batch, kSamplerBlock, 0, stream>>>(
             static_cast<const LogitT*>(logits.data), static_cast<const std::int32_t*>(drafts.data),
             static_cast<const std::int32_t*>(current_extents.data), static_cast<std::int32_t*>(lengths.data),
             static_cast<std::int32_t*>(anchors.data), static_cast<std::int32_t*>(licensed_tokens.data),
             static_cast<std::int32_t*>(licensed_counts.data), static_cast<std::int32_t*>(accepted.data), configs,
-            token_domain, physical_rows, draft_count, scratch.spec_exact_partials, layout.bytes, chunks);
+            token_domain, physical_rows, draft_count, partials, partial_row_bytes, chunks);
         CUDA_CHECK(cudaGetLastError());
     }
     if (!layout.multiblock) {
@@ -158,15 +180,15 @@ void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const 
                                              Tensor& licensed_tokens, Tensor& licensed_counts,
                                              Tensor& accepted, std::int32_t token_domain,
                                              const SamplingConfig* configs, DeviceSpan workspace,
-                                             cudaStream_t stream, std::int32_t draft_count) {
+                                             cudaStream_t stream, std::int32_t draft_count, bool split_routes) {
     if (logits.dtype == DType::FP32) {
         speculative_accept_greedy_drafts_launch_typed<float>(
             target_tokens, logits, drafts, current_extents, lengths, anchors, licensed_tokens,
-            licensed_counts, accepted, token_domain, configs, workspace, stream, draft_count);
+            licensed_counts, accepted, token_domain, configs, workspace, stream, draft_count, split_routes);
     } else {
         speculative_accept_greedy_drafts_launch_typed<__nv_bfloat16>(
             target_tokens, logits, drafts, current_extents, lengths, anchors, licensed_tokens,
-            licensed_counts, accepted, token_domain, configs, workspace, stream, draft_count);
+            licensed_counts, accepted, token_domain, configs, workspace, stream, draft_count, split_routes);
     }
 }
 

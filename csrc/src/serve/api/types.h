@@ -704,6 +704,10 @@ struct PromptOptions {
 struct PromptInput {
     std::vector<ChatMessage> messages;
     PromptOptions options;
+    /// The images of `options.raw_chat_request` (Inkling-2, ENGINE-INKLING lane V-b): their bytes, acquired by the serving
+    /// layer from the body's image_url / input_image parts, in the body's order (message order, part order). Empty for
+    /// every other checkpoint, whose media travel inside `messages`.
+    std::vector<OwnedMedia> raw_chat_media;
 };
 
 struct PromptSummary {

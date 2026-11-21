@@ -12,6 +12,7 @@
 
 #include <map>
 #include <stdexcept>
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -141,10 +142,30 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
         // DSpark (lane e2): the fold and the drafter's derived weights; the runtime's DFlash guards need a payload.
         derive_dspark(weights, dspark, plan.plan.options.draft_linears_host, dspark_fp8_fold_requested());
         model.dspark = &dspark;
-        if (host_bank && dspark.fp8) {
-            // The host bank holds only the drafter's BF16 dense linears (~0.49 GiB pinned), read once above to quantise
-            // them; the FP8 drafter never reads them again (dspark.cpp dense()). Release it (M7 review): detach the
-            // objects from the artifact and null their views first, so nothing can dereference freed memory.
+        // The host bank holds the drafter's BF16 dense linears (~0.49 GiB pinned), read once above to quantise them;
+        // the FP8 drafter never reads them again (dspark.cpp dense()). Release it (M7 review) -- only if EVERY banked
+        // object is one of the 27 draft linears (mtp/layers/<l>/{attn/q,k,v,o,k_ctx,v_ctx; mlp/gate,up,down}; M8b
+        // review): a bank holding anything else (e.g. host experts, later) is kept. Detach the objects from the artifact
+        // and null their views first, so nothing can dereference freed memory.
+        const auto only_draft_linears = [&] {
+            static constexpr const char* kSuffix[9] = {"attn/q", "attn/k", "attn/v", "attn/o", "attn/k_ctx",
+                                                       "attn/v_ctx", "mlp/gate", "mlp/up", "mlp/down"};
+            if (plan.host_bank.objects.size() != weights.draft.layers.size() * 9) { return false; }
+            for (const auto& object : plan.host_bank.objects) {
+                bool known = false;
+                for (std::size_t l = 0; l < weights.draft.layers.size() && !known; ++l) {
+                    for (const char* suffix : kSuffix) {
+                        if (object.name == "mtp/layers/" + std::to_string(l) + "/" + suffix) {
+                            known = true;
+                            break;
+                        }
+                    }
+                }
+                if (!known) { return false; }
+            }
+            return true;
+        };
+        if (host_bank && dspark.fp8 && only_draft_linears()) {
             host_bank->detach(backing);
             for (auto& L : weights.draft.layers) {
                 for (Weight* wt : {&L.q, &L.k, &L.v, &L.o, &L.k_ctx, &L.v_ctx, &L.gate, &L.up, &L.down}) {
@@ -153,6 +174,11 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
                 }
             }
             host_bank.reset();
+            std::fprintf(stderr, "inkling2: DSpark FP8 drafter: released the host bank of %zu BF16 draft linears\n",
+                         plan.host_bank.objects.size());
+        } else if (host_bank && dspark.fp8) {
+            std::fprintf(stderr, "inkling2: DSpark FP8 drafter: host bank KEPT (it holds objects other than the 27 draft "
+                                 "linears)\n");
         }
     }
 

@@ -588,7 +588,13 @@ private:
             f.verifying = kind == FlightKind::Decode ? !stages_[0]->program->speculative_round_is_narrow(lanes.size())
                 : !stages_[0]->program->speculative_round_is_narrow(0);
             f.dflash_window = stages_[0]->program->select_dflash_draft_window(lanes);
-            prepare_drafts(lanes, budgets, f.dflash_window);
+            try {
+                prepare_drafts(lanes, budgets, f.dflash_window);
+            } catch (...) {
+                f.active  = false; // no flight without a handle (M8b review; the program cleared its lanes)
+                f.between = false;
+                throw;
+            }
         }
         f.result       = GroupResult{};
         // A decode round's residual is exactly `width` columns per lane (one, or the verify's

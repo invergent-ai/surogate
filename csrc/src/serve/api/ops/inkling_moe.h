@@ -235,4 +235,18 @@ void inkling_decode_expert_units(const InklingExpertBank& bank, InklingExpertFor
 /// spins `nanoseconds` of wall time, so the next kernel (the MoE's route) launches early as in serving.
 void inkling_bench_predecessor(std::int32_t nanoseconds, cudaStream_t stream);
 
+/// TEST ONLY (pdl-chain regression, PDL audit 2026-11-21): how the bf16 activation rows (x, y) are read by the row
+/// quantisers and the fused-y down: 0 = plain ld.global (the serving form), 1 = ld.global.nc (the form the audit
+/// removed: negative control, the regression must see stale rows), 2 = ld.global.cg (reported). Never set in serving.
+void inkling_test_read_only_loads(int mode);
+/// TEST ONLY: copy `bytes` (multiple of 16) with a PDL-launched kernel that waits for its predecessor and lets its
+/// dependents launch at once (the engine's kernel pattern): the pdl-chain regression's writer of the reused x buffer.
+/// `hostile`: after its trigger, every CTA (2 per SM) first reads all of the OLD destination through ld.global.nc
+/// (planting stale lines next to the dependent's CTAs), then writes; `sink`: 1 int (required when hostile).
+void inkling_test_copy_rows(const void* source, void* destination, std::int64_t bytes, cudaStream_t stream,
+                            bool hostile = false, int* sink = nullptr);
+/// TEST ONLY: a PDL-launched kernel whose CTAs (2 per SM) read all of `buffer` through ld.global.nc, planting its
+/// current lines in every SM's non-coherent cache (the pdl-chain negative control's hostile step). `sink`: 1 int.
+void inkling_test_plant_reads(const void* buffer, std::int64_t bytes, int* sink, cudaStream_t stream);
+
 } // namespace sinfer::ops

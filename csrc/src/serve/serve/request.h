@@ -253,6 +253,9 @@ struct GenerationRequest {
     /// The chat-completions body as the client sent it, for a model that renders its prompt from it
     /// (RequestLimits::raw_chat); `messages`, `tools` and the other conversation fields are then left empty.
     std::shared_ptr<const std::string> raw_chat_body;
+    /// With raw_chat_body: the body's image parts (image_url / input_image), in body order, whose bytes the serving
+    /// layer acquires for the renderer (PromptInput::raw_chat_media; Inkling-2 vision, ENGINE-INKLING lane V-b).
+    std::vector<ContentPart> raw_chat_images;
     std::vector<ChatTurn> messages;
     std::vector<ToolDefinition> tools;
     std::size_t tool_name_max_length = 64;
@@ -327,7 +330,7 @@ struct GenerationRequest {
     }
 
     [[nodiscard]] std::size_t media_item_count() const noexcept {
-        std::size_t count = 0;
+        std::size_t count = raw_chat_images.size();  // empty unless the model renders the raw body (Inkling-2)
         for (const ChatTurn& message : messages) {
             for (const ContentPart& part : message.content) {
                 if (part.kind == ContentKind::Image || part.kind == ContentKind::Video) { ++count; }
