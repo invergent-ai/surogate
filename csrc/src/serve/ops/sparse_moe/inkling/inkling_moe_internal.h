@@ -159,26 +159,17 @@ struct GemmParams {
     LoraRound lora;
     /// L2 prefetch-size hint for the weight-code loads (0 none, 128, 256): same bytes, a timing knob.
     std::int32_t l2_prefetch = 0;
-    /// Per-tile kernels: grid (N tiles, expert tiles) instead of (expert tiles, N tiles), so the CTAs
-    /// dispatched together stream one expert's contiguous rows. Same items, same bits; a timing knob.
-    std::int32_t n_fastest = 0;
 };
 
-/// TIMING KNOBS (removed once measured): SUROGATE_INKLING_L2_PREFETCH = 128 | 256 sets the weight loads'
-/// L2 prefetch hint (`GemmParams::l2_prefetch`); SUROGATE_INKLING_GRID_ORDER=n puts the N tiles fastest in
-/// the per-tile grids (`GemmParams::n_fastest`). Unset = as before. Every value computes the same bits.
+/// TIMING KNOB (removed once measured): SUROGATE_INKLING_L2_PREFETCH = 128 | 256 sets the weight loads'
+/// L2 prefetch hint (`GemmParams::l2_prefetch`); unset / other = none. Every value moves the same bytes.
 inline GemmParams with_l2_prefetch(GemmParams params) {
     static const int value = [] {
         const char* text = std::getenv("SUROGATE_INKLING_L2_PREFETCH");
         const int v      = text != nullptr ? std::atoi(text) : 0;
         return v == 128 || v == 256 ? v : 0;
     }();
-    static const int n_fastest = [] {
-        const char* text = std::getenv("SUROGATE_INKLING_GRID_ORDER");
-        return text != nullptr && text[0] == 'n' ? 1 : 0;
-    }();
     params.l2_prefetch = value;
-    params.n_fastest   = n_fastest;
     return params;
 }
 

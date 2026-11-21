@@ -207,7 +207,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     // Fused: the routing (offsets / sorted, written by the select kernel two or more launches back,
     // complete before the gate_up kernel's wait returned) is read through L2 BEFORE this kernel's
     // dependency wait, so the expert's w2 stages stream while the predecessor finishes.
-    find_expert_tile<Schedule::kBlockM, FusedYQuant>(p.offsets, static_cast<int>(p.n_fastest ? blockIdx.y : blockIdx.x), tile_info);
+    find_expert_tile<Schedule::kBlockM, FusedYQuant>(p.offsets, static_cast<int>(blockIdx.x), tile_info);
     const int expert = tile_info[0];
     if (expert < 0) {
         if constexpr (FusedYQuant) { pdl::wait_for_dependencies(); }
@@ -223,7 +223,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     }
     __syncthreads();
 
-    const int n_begin       = static_cast<int>(p.n_fastest ? blockIdx.x : blockIdx.y) * Schedule::kBlockN;
+    const int n_begin       = static_cast<int>(blockIdx.y) * Schedule::kBlockN;
     const int weight_begin  = expert * kGateUpRows + n_begin;
     constexpr int kKTiles   = K / Schedule::kBlockK;
     constexpr int kWaitGroups = kKTiles < Schedule::kStages ? kKTiles - 1 : Schedule::kStages - 1;
@@ -734,8 +734,7 @@ template <class Schedule, int K, bool GateUp, bool FusedYQuant = false>
 void launch_schedule(const GemmParams& params, std::int32_t slots, cudaStream_t stream) {
     const int max_tiles = std::min(kExperts, slots) + slots / Schedule::kBlockM;
     if (max_tiles == 0) { return; }
-    const dim3 grid = params.n_fastest ? dim3(kGateUpRows / Schedule::kBlockN, static_cast<unsigned>(max_tiles))
-                                       : dim3(static_cast<unsigned>(max_tiles), kGateUpRows / Schedule::kBlockN);
+    const dim3 grid(static_cast<unsigned>(max_tiles), kGateUpRows / Schedule::kBlockN);
     const cudaError_t status = pdl::launch_dependent({grid, dim3(Schedule::kThreads), 0, stream},
                                                      nvfp4_expert_gemm_kernel<Schedule, K, GateUp, FusedYQuant>, params);
     if (status != cudaSuccess) {
