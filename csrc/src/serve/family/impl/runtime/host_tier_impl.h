@@ -267,6 +267,10 @@ std::shared_ptr<family::detail::HostKvPool::Lease> ProgramImplCore::lease_host_s
 bool ProgramImplCore::snapshot_lane(std::uint32_t lane, int reason) {
     using namespace host_tier_detail;
     if (!host_tier_state || !host_tier_state->pool || lane >= max_concurrency) { return false; }
+    // Window-bounded KV (lane f1): the boundary objects do not carry window-class pages yet, so a
+    // model with windowed layers keeps no host-tier snapshot (DESIGN-window-kv.md 4.4); outputs are
+    // unaffected, its retained lanes and shared prefixes still serve reuse on the GPU.
+    if (window_paging()) { return false; }
     auto& tier = *host_tier_state;
     const SequenceState& sequence = sequences[lane];
     if (sequence.target_only || !sequence.retained || !sequence.cacheable || !sequence.kv || sequence.ledger.empty() ||
