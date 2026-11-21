@@ -127,6 +127,10 @@ void require_weights(const InklingMoeWeights& w) {
 
 } // namespace
 
+std::size_t inkling_moe_state_bytes() {
+    return aligned(static_cast<std::size_t>(kStateWords) * sizeof(std::int32_t));
+}
+
 std::size_t inkling_moe_workspace_bytes(InklingExpertFormat format, std::int32_t max_tokens, bool adapters) {
     if (max_tokens <= 0) { throw std::invalid_argument("inkling_moe_workspace_bytes: max_tokens must be positive"); }
     std::size_t total = kAlignment; // the arena's offset may be unaligned when the call starts
@@ -167,10 +171,12 @@ void inkling_moe(const Tensor& x, const InklingMoeWeights& weights, Tensor& out,
     // quantised once per token (the reference writes it once per routed row; the bits are equal).
     // Narrow rounds run both in one grid.
     const bool narrow = tokens <= kNarrowMaxTokens;
-    if (narrow) {
+    static_assert(kNarrowMaxTokens <= kNarrowStateMaxTokens);
+    const bool fused_select = narrow && options.state != nullptr;
+    if (narrow && !fused_select) {
         launch_route_quant_narrow(input, as_bf16(weights.router), b.logits, tokens, b.counters, kCounterWords, live,
                                   nvfp4, b.x_codes, b.x_scales, b.x_amax, b.x_bf16, stream);
-    } else {
+    } else if (!narrow) {
         launch_router_logits(input, as_bf16(weights.router), b.logits, tokens, b.counters, kCounterWords, stream);
         if (nvfp4) {
             launch_quant_nvfp4(input, tokens, kHidden, nullptr, live, b.x_codes, b.x_scales, b.x_amax, stream);
@@ -206,7 +212,15 @@ void inkling_moe(const Tensor& x, const InklingMoeWeights& weights, Tensor& out,
         route.capture_stride   = kTopK;
     }
     route.last_cta_places = narrow ? 1 : 0;
-    launch_router_select(b.logits, weights.router_bias, live, route, stream);
+    if (fused_select) {
+        route.counts = options.state + kStateCountsWord;
+        route.ticket = options.state + kStateTicketWord;
+        launch_route_select_narrow(input, as_bf16(weights.router), weights.router_bias, b.logits, live, nvfp4,
+                                   b.x_codes, b.x_scales, b.x_amax, b.x_bf16, route, options.state + kStateTileWord,
+                                   stream);
+    } else {
+        launch_router_select(b.logits, weights.router_bias, live, route, stream);
+    }
     if (!narrow) { launch_router_place(route, tokens, stream); }
 
     LoraRound lora;

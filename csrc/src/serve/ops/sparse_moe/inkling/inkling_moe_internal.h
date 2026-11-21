@@ -71,6 +71,22 @@ void launch_route_quant_narrow(const __nv_bfloat16* x, const __nv_bfloat16* rout
                                bool nvfp4, std::uint8_t* x_codes, std::uint8_t* x_scales, float* x_amax,
                                __nv_bfloat16* x_dequantised, cudaStream_t stream);
 
+/// Persistent state words (InklingMoeOptions::state): [0, 128) expert counts, [128] ticket, [129, 137) the
+/// arrival counter of each 8-token router tile. Zero between calls (each call returns them to zero).
+inline constexpr int kStateCountsWord   = 0;
+inline constexpr int kStateTicketWord   = kExperts;
+inline constexpr int kStateTileWord     = kExperts + 1;
+inline constexpr int kNarrowStateMaxTokens = 64;
+inline constexpr int kStateWords        = kStateTileWord + kNarrowStateMaxTokens / 8;
+
+/// Narrow rounds with the persistent state: router logits, x quantisation and the selection (+ offsets and
+/// placement by the last selector) in one grid; `out.counts` / `out.ticket` and `tile_arrivals` point into
+/// the state and are zero on entry and on exit.
+void launch_route_select_narrow(const __nv_bfloat16* x, const __nv_bfloat16* router, const float* bias,
+                                float* logits, LiveTokens live, bool nvfp4, std::uint8_t* x_codes,
+                                std::uint8_t* x_scales, float* x_amax, __nv_bfloat16* x_dequantised,
+                                const RouteOutputs& out, std::int32_t* tile_arrivals, cudaStream_t stream);
+
 /// sorted[offsets[ids[i]] + ranks[i]] = i for every routed slot i (after the select kernel).
 void launch_router_place(const RouteOutputs& out, std::int32_t tokens, cudaStream_t stream);
 

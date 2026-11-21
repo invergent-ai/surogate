@@ -534,8 +534,21 @@ struct DeviceRun {
     std::vector<int> capture;
 };
 
+/// The persistent zeroed state (InklingMoeOptions::state) every test call shares, as one engine stream
+/// would: allocated and zeroed ONCE; each call must leave it zero.
+DeviceBuffer& state_buffer() {
+    static DeviceBuffer* state =
+        new DeviceBuffer(to_device(std::vector<std::int32_t>(ops::inkling_moe_state_bytes() / 4, 0)));
+    return *state;
+}
+std::int32_t* persistent_state() { return static_cast<std::int32_t*>(state_buffer().p); }
+int state_nonzero_words() {
+    const auto words = from_device<std::int32_t>(state_buffer(), ops::inkling_moe_state_bytes() / 4);
+    return static_cast<int>(std::count_if(words.begin(), words.end(), [](std::int32_t w) { return w != 0; }));
+}
+
 DeviceRun run_moe(const Layer& l, const std::vector<float>& x, int tokens, const int* live = nullptr,
-                  const ops::InklingMoeAdapters* adapters = nullptr, bool capture = false) {
+                  const ops::InklingMoeAdapters* adapters = nullptr, bool capture = false, bool use_state = true) {
     DeviceBuffer dx = to_device(to_bf16_bits(std::vector<float>(x.begin(), x.begin() + static_cast<std::size_t>(tokens) * H)));
     DeviceBuffer dout(static_cast<std::size_t>(tokens) * H * 2);
     DeviceArena arena(ops::inkling_moe_workspace_bytes(l.format, tokens, adapters != nullptr));
@@ -557,6 +570,7 @@ DeviceRun run_moe(const Layer& l, const std::vector<float>& x, int tokens, const
         options.capture = &cap;
     }
     options.adapters = adapters;
+    options.state    = use_state ? persistent_state() : nullptr;
     ops::inkling_moe(tx, l.view, tout, arena, nullptr, options);
     cuda_synchronize();
     DeviceRun run;
@@ -883,6 +897,7 @@ int test_lora_store(const Layer& l, const std::vector<float>& x, const DeviceRun
         Tensor tx(dx.p, DType::BF16, {H, kT}), tout(dout.p, DType::BF16, {H, kT});
         ops::InklingMoeOptions options;
         options.adapters = &store_round;
+        options.state    = persistent_state();
         ops::inkling_moe(tx, l.view, tout, arena, stream, options); // warm (attributes) outside the capture
         arena.reset();
         cuda_synchronize(stream);
@@ -1010,6 +1025,83 @@ int test_lora_store(const Layer& l, const std::vector<float>& x, const DeviceRun
         failures += report("LoRA store: refusals (router, DoRA magnitude, wrong gate_up shape, rank > 64)", bad);
     }
     return failures;
+}
+
+/// The zeroed-counter contract of the fused narrow route (InklingMoeOptions::state): the state is zero after
+/// every call (self-cleaning); bits == the call without state at T = 1 / 8 / 24 / 64 (and == the wide path's
+/// rows); back-to-back calls; a captured graph that is discarded unrun ("aborted") and a graph replayed 3x;
+/// a call whose live count is 0; a call that throws on the host before launching.
+int test_state_contract(const Layer& l, const std::vector<float>& x, const DeviceRun& base, const DeviceRun& wide) {
+    int bad = 0, dirty = 0;
+    constexpr int kT = 24;
+    dirty += state_nonzero_words();
+    const DeviceRun no_state = run_moe(l, x, kT, nullptr, nullptr, false, false);
+    bad += no_state.out != base.out;
+    dirty += state_nonzero_words();
+    for (int t : {1, 8, 64}) {
+        const DeviceRun with  = run_moe(l, x, t);
+        dirty += state_nonzero_words();
+        const DeviceRun plain = run_moe(l, x, t, nullptr, nullptr, false, false);
+        bad += with.out != plain.out;
+        bad += !std::equal(with.out.begin(), with.out.end(), wide.out.begin());
+    }
+    const DeviceRun again = run_moe(l, x, kT);
+    bad += again.out != base.out;
+    dirty += state_nonzero_words();
+    {
+        cudaStream_t stream = nullptr;
+        cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
+        DeviceBuffer dx = to_device(to_bf16_bits(std::vector<float>(x.begin(), x.begin() + static_cast<std::size_t>(kT) * H)));
+        DeviceBuffer dout(static_cast<std::size_t>(kT) * H * 2);
+        DeviceArena arena(ops::inkling_moe_workspace_bytes(l.format, kT, false));
+        Tensor tx(dx.p, DType::BF16, {H, kT}), tout(dout.p, DType::BF16, {H, kT});
+        ops::InklingMoeOptions options;
+        options.state = persistent_state();
+        // "aborted": captured, never launched, discarded
+        cudaGraph_t discarded = nullptr;
+        cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "begin capture");
+        ops::inkling_moe(tx, l.view, tout, arena, stream, options);
+        arena.reset();
+        cuda_check(cudaStreamEndCapture(stream, &discarded), "end capture");
+        cudaGraphDestroy(discarded);
+        const DeviceRun after_discard = run_moe(l, x, kT);
+        bad += after_discard.out != base.out;
+        dirty += state_nonzero_words();
+        cudaGraph_t graph = nullptr;
+        cudaGraphExec_t exec = nullptr;
+        cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "begin capture");
+        ops::inkling_moe(tx, l.view, tout, arena, stream, options);
+        arena.reset();
+        cuda_check(cudaStreamEndCapture(stream, &graph), "end capture");
+        cuda_check(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
+        for (int replay = 0; replay < 3; ++replay) {
+            cuda_check(cudaMemsetAsync(dout.p, 0xFF, dout.bytes, stream), "poison");
+            cuda_check(cudaGraphLaunch(exec, stream), "launch");
+            cuda_synchronize(stream);
+            bad += from_device<std::uint16_t>(dout, static_cast<std::size_t>(kT) * H) != base.out;
+            dirty += state_nonzero_words();
+        }
+        cudaGraphExecDestroy(exec);
+        cudaGraphDestroy(graph);
+        cudaStreamDestroy(stream);
+    }
+    // every token padding: output rows zero, nothing routed
+    const int none = 0;
+    const DeviceRun empty = run_moe(l, x, kT, &none);
+    bad += std::any_of(empty.out.begin(), empty.out.end(), [](std::uint16_t v) { return v != 0; });
+    dirty += state_nonzero_words();
+    // a call that throws on the host (bad adapter rank) before any launch
+    try {
+        const ops::InklingMoeAdapters broken{reinterpret_cast<const ops::LoraBank*>(persistent_state()), nullptr, nullptr, 0};
+        (void)run_moe(l, x, kT, nullptr, &broken);
+        ++bad;
+    } catch (const std::exception&) {}
+    const DeviceRun last = run_moe(l, x, kT);
+    bad += last.out != base.out;
+    dirty += state_nonzero_words();
+    std::printf("  state contract: rows off %d, non-zero state words after calls %d\n", bad, dirty);
+    return report("fused narrow route: state self-cleaning, bits == no-state / wide, graphs, aborted capture",
+                  bad + dirty);
 }
 
 int test_moe(ops::InklingExpertFormat format) {
@@ -1143,6 +1235,7 @@ int test_moe(ops::InklingExpertFormat format) {
     // The delta is the difference of two bf16-rounded outputs: an indexing check (a wrong expert / slot / port gives
     // cos ~ 0), not a precision one.
     failures += report("LoRA: delta direction vs host (cos >= 0.99)", worst_delta_cos >= 0.99 ? 0 : 1);
+    failures += test_state_contract(l, x, base, wide);
     failures += test_lora_store(l, x, base, ids, gammas, w13, w2);
     failures += test_decode_units(l, nv ? "NVFP4 synthetic" : "MXFP8 synthetic");
     return failures;
@@ -1431,6 +1524,41 @@ int run_capture(const char* path, const char* dump_dir) {
         failures += report("capture: down GEMM rows bit-exact", bad_down);
         failures += report("capture: combined output bit-exact", bad_out);
     }
+    // 5. Narrow rounds on the real weights (fused route with the persistent state, and without): every row ==
+    //    our T = 256 row; NVFP4 also == vLLM's captured output rows.
+    {
+        DeviceBuffer full(static_cast<std::size_t>(tokens) * H * 2);
+        DeviceArena arena(ops::inkling_moe_workspace_bytes(format, tokens, false));
+        Tensor tfull(full.p, DType::BF16, {H, tokens});
+        ops::inkling_moe(tx, l.view, tfull, arena, nullptr);
+        cuda_synchronize();
+        const auto ours = from_device<std::uint16_t>(full, static_cast<std::size_t>(tokens) * H);
+        const auto ref  = st.vec<std::uint16_t>("out");
+        int off_ours = 0, off_ref = 0, dirty = 0;
+        for (const auto& [first, count] : std::vector<std::pair<int, int>>{{0, 1}, {100, 1}, {tokens - 1, 1}, {8, 8}, {64, 64}, {190, 24}}) {
+            for (const bool state : {true, false}) {
+                DeviceBuffer out(static_cast<std::size_t>(count) * H * 2);
+                DeviceArena small(ops::inkling_moe_workspace_bytes(format, count, false));
+                Tensor tin(static_cast<std::uint16_t*>(dx.p) + static_cast<std::size_t>(first) * H, DType::BF16, {H, count});
+                Tensor tout(out.p, DType::BF16, {H, count});
+                ops::InklingMoeOptions options;
+                options.state = state ? persistent_state() : nullptr;
+                ops::inkling_moe(tin, l.view, tout, small, nullptr, options);
+                cuda_synchronize();
+                const auto rows = from_device<std::uint16_t>(out, static_cast<std::size_t>(count) * H);
+                for (std::size_t i = 0; i < rows.size(); ++i) {
+                    off_ours += rows[i] != ours[static_cast<std::size_t>(first) * H + i];
+                    off_ref += rows[i] != ref[static_cast<std::size_t>(first) * H + i];
+                }
+                dirty += state_nonzero_words();
+            }
+        }
+        std::printf("  narrow rows (T = 1 / 8 / 24 / 64, fused route and not) vs our T = 256: off %d; vs vLLM: off %d; "
+                    "state words left %d\n", off_ours, off_ref, dirty);
+        failures += report("capture: narrow rows (fused route + plain) == T=256 rows (bit-exact), state clean",
+                           off_ours + dirty);
+        if (nv) { failures += report("capture: narrow rows == vLLM output rows (bit-exact)", off_ref); }
+    }
     // The trainer's dX operand decoded from the REAL bank (checkpoint scales / amax) vs the host decode.
     failures += test_decode_units(l, nv ? "NVFP4 real layer" : "MXFP8 real layer");
     return failures;
@@ -1504,15 +1632,17 @@ int run_bench(const char* path) {
         std::vector<bool> used(E, false);
         for (int id : ids) { used[id] = true; }
         const int distinct = static_cast<int>(std::count(used.begin(), used.end(), true));
-        // graph of one call
-        ops::inkling_moe(tx, l.view, tout, arena, stream);
+        // graph of one call (with the persistent state unless INKLING_BENCH_NOSTATE=1: the A/B of the fused route)
+        ops::InklingMoeOptions bench_options;
+        bench_options.state = std::getenv("INKLING_BENCH_NOSTATE") != nullptr ? nullptr : persistent_state();
+        ops::inkling_moe(tx, l.view, tout, arena, stream, bench_options);
         arena.reset();
         cuda_synchronize(stream);
         std::vector<cudaGraph_t> graphs(views.size(), nullptr);
         std::vector<cudaGraphExec_t> execs(views.size(), nullptr);
         for (std::size_t c = 0; c < views.size(); ++c) {
             cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "begin capture");
-            ops::inkling_moe(tx, views[c], tout, arena, stream);
+            ops::inkling_moe(tx, views[c], tout, arena, stream, bench_options);
             arena.reset();
             cuda_check(cudaStreamEndCapture(stream, &graphs[c]), "end capture");
             cuda_check(cudaGraphInstantiate(&execs[c], graphs[c], 0), "instantiate");

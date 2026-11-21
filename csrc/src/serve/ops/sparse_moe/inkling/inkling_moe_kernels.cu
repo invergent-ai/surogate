@@ -260,15 +260,13 @@ __global__ __launch_bounds__(256) void router_logits_tiled_kernel(const __nv_bfl
 // ---------------------------------------------------------------------------------------------
 // Selection: a warp per token, 4 tokens per block; the last block lays out the expert rows.
 // ---------------------------------------------------------------------------------------------
-__global__ __launch_bounds__(128) void router_select_kernel(const float* __restrict__ logits,
-                                                            const float* __restrict__ bias,
-                                                            LiveTokens live, RouteOutputs out) {
-    pdl::wait_for_dependencies();
-    pdl::trigger_dependents();
-    const int thread = static_cast<int>(threadIdx.x);
-    const int warp   = thread >> 5;
-    const int lane   = thread & 31;
-    const int token  = static_cast<int>(blockIdx.x) * 4 + warp;
+/// One warp selects token `token` (< live.tokens): zeroes its fused-combine counters (and its output row
+/// when it is padding), picks the top 8, writes ids / gammas / capture and, with `out.counts`, takes a
+/// rank inside each expert. `L2Logits`: the logits were written by other CTAs of the same grid (read
+/// through L2). Identical arithmetic either way.
+template <bool L2Logits>
+__device__ __forceinline__ void select_token(const float* __restrict__ logits, const float* __restrict__ bias,
+                                             LiveTokens live, const RouteOutputs& out, int token, int lane) {
     const int tokens = live.tokens;
     const int alive  = live_count(live);
     if (token < tokens && out.arrivals != nullptr) {
@@ -282,12 +280,13 @@ __global__ __launch_bounds__(128) void router_select_kernel(const float* __restr
     }
     if (token < tokens) {
         const float* row = logits + static_cast<std::int64_t>(token) * kExperts;
+        const auto logit = [&](int expert) { return L2Logits ? __ldcg(row + expert) : row[expert]; };
         if (token < alive) {
             std::uint64_t keys[4];
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
                 const int expert = lane + 32 * i;
-                keys[i]          = router_key(row[expert], bias[expert], expert);
+                keys[i]          = router_key(logit(expert), bias[expert], expert);
             }
             int my_expert = -1;
 #pragma unroll
@@ -302,7 +301,7 @@ __global__ __launch_bounds__(128) void router_select_kernel(const float* __restr
                 }
                 if (lane == slot) { my_expert = router_key_expert(best); }
             }
-            const float my_log_prob = lane < kTopK ? router_log_sigmoid(row[my_expert]) : 0.0F;
+            const float my_log_prob = lane < kTopK ? router_log_sigmoid(logit(my_expert)) : 0.0F;
             float log_probs[kTopK];
 #pragma unroll
             for (int slot = 0; slot < kTopK; ++slot) {
@@ -334,43 +333,65 @@ __global__ __launch_bounds__(128) void router_select_kernel(const float* __restr
             if (out.counts != nullptr) { out.ranks[index] = -1; }
         }
     }
-    if (out.counts == nullptr) { return; }
+}
 
-    // The last block to finish lays out the rows: offsets by expert, then each routed slot at
-    // offsets[expert] + rank.
-    __shared__ int is_last;
+/// The CTA that holds the last ticket lays out the rows: offsets by expert (an integer prefix of the
+/// counts), then, with `out.last_cta_places`, each routed slot at offsets[expert] + rank. Threads
+/// [0, 128) scan (one expert each); all `Threads` place. Called by every thread of the CTA.
+template <int Threads>
+__device__ __forceinline__ void place_rows(const RouteOutputs& out, int tokens, int thread) {
+    static_assert(Threads >= kExperts && Threads % 32 == 0);
     __shared__ int offsets[kExperts + 1];
-    __shared__ int warp_totals[4];
+    __shared__ int warp_totals[kExperts / 32];
+    const int warp = thread >> 5, lane = thread & 31;
+    int count = 0, inclusive = 0;
+    if (thread < kExperts) {
+        count     = __ldcg(out.counts + thread);
+        inclusive = count;
+#pragma unroll
+        for (int offset = 1; offset < 32; offset <<= 1) {
+            const int other = __shfl_up_sync(0xFFFFFFFFU, inclusive, offset);
+            if (lane >= offset) { inclusive += other; }
+        }
+        if (lane == 31) { warp_totals[warp] = inclusive; }
+    }
+    __syncthreads();
+    if (thread < kExperts) {
+        int before = 0;
+        for (int w = 0; w < warp; ++w) { before += warp_totals[w]; }
+        const int exclusive = before + inclusive - count;
+        offsets[thread]     = exclusive;
+        out.offsets[thread] = exclusive;
+        if (thread == kExperts - 1) {
+            offsets[kExperts]     = exclusive + count;
+            out.offsets[kExperts] = exclusive + count;
+        }
+    }
+    if (!out.last_cta_places) { return; }
+    __syncthreads();
+    for (int index = thread; index < tokens * kTopK; index += Threads) {
+        const int expert = __ldcg(out.ids + index);
+        if (expert >= 0) { out.sorted[offsets[expert] + __ldcg(out.ranks + index)] = index; }
+    }
+}
+
+__global__ __launch_bounds__(128) void router_select_kernel(const float* __restrict__ logits,
+                                                            const float* __restrict__ bias,
+                                                            LiveTokens live, RouteOutputs out) {
+    pdl::wait_for_dependencies();
+    pdl::trigger_dependents();
+    const int thread = static_cast<int>(threadIdx.x);
+    select_token<false>(logits, bias, live, out, static_cast<int>(blockIdx.x) * 4 + (thread >> 5), thread & 31);
+    if (out.counts == nullptr) { return; }
+    // The last block to finish lays out the rows.
+    __shared__ int is_last;
     __threadfence();
     __syncthreads();
     if (thread == 0) { is_last = atomicAdd(out.ticket, 1) == static_cast<int>(gridDim.x) - 1; }
     __syncthreads();
     if (!is_last) { return; }
     __threadfence();
-    const int count = __ldcg(out.counts + thread);
-    int inclusive   = count;
-#pragma unroll
-    for (int offset = 1; offset < 32; offset <<= 1) {
-        const int other = __shfl_up_sync(0xFFFFFFFFU, inclusive, offset);
-        if (lane >= offset) { inclusive += other; }
-    }
-    if (lane == 31) { warp_totals[warp] = inclusive; }
-    __syncthreads();
-    int before = 0;
-    for (int w = 0; w < warp; ++w) { before += warp_totals[w]; }
-    const int exclusive = before + inclusive - count;
-    offsets[thread]     = exclusive;
-    out.offsets[thread] = exclusive;
-    if (thread == kExperts - 1) {
-        offsets[kExperts]     = exclusive + count;
-        out.offsets[kExperts] = exclusive + count;
-    }
-    if (!out.last_cta_places) { return; }
-    __syncthreads();
-    for (int index = thread; index < tokens * kTopK; index += 128) {
-        const int expert = __ldcg(out.ids + index);
-        if (expert >= 0) { out.sorted[offsets[expert] + __ldcg(out.ranks + index)] = index; }
-    }
+    place_rows<128>(out, live.tokens, thread);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -520,6 +541,8 @@ inline constexpr int kStagedRowBytes   = kHidden * 2 + 16; ///< 4624: 8 rows x 4
 inline constexpr int kStagedTileTokens = 8;
 inline constexpr int kStagedSharedBytes = 2 * 8 * kStagedRowBytes;
 
+/// `Threads` >= 96: warps 0-2 run the K groups' MMA chains; all threads stage.
+template <int Threads>
 __device__ __forceinline__ void router_logits_staged_tile(const __nv_bfloat16* __restrict__ x,
                                                           const __nv_bfloat16* __restrict__ router,
                                                           float* __restrict__ logits, std::int32_t tokens,
@@ -527,14 +550,14 @@ __device__ __forceinline__ void router_logits_staged_tile(const __nv_bfloat16* _
                                                           int e_tile, int m_tile, unsigned char* staged) {
     const int thread = static_cast<int>(threadIdx.x);
     if (zero != nullptr && e_tile == 0 && m_tile == 0) {
-        for (int i = thread; i < zero_words; i += 96) { zero[i] = 0; }
+        for (int i = thread; i < zero_words; i += Threads) { zero[i] = 0; }
     }
     const int e0 = e_tile * 8;
     const int m0 = m_tile * kStagedTileTokens;
     unsigned char* w_rows = staged;
     unsigned char* x_rows = staged + 8 * kStagedRowBytes;
     constexpr int kChunks = kHidden / 8; // 16-byte chunks per row
-    for (int i = thread; i < 8 * kChunks; i += 96) {
+    for (int i = thread; i < 8 * kChunks; i += Threads) {
         const int row   = i / kChunks;
         const int chunk = i - row * kChunks;
         cp_async<16, Cache::cg>(w_rows + row * kStagedRowBytes + chunk * 16,
@@ -556,16 +579,18 @@ __device__ __forceinline__ void router_logits_staged_tile(const __nv_bfloat16* _
     const int k_end    = min(k_begin + kRouterGroup, kHidden);
     const auto* x0 = reinterpret_cast<const std::uint32_t*>(x_rows + group_id * kStagedRowBytes);
     const auto* w  = reinterpret_cast<const std::uint32_t*>(w_rows + group_id * kStagedRowBytes);
-    float c0 = 0.0F, c1 = 0.0F, c2 = 0.0F, c3 = 0.0F;
-#pragma unroll 8
-    for (int k = k_begin; k < k_end; k += 16) {
-        const int lo = (k + 2 * quad) >> 1;
-        const int hi = (k + 8 + 2 * quad) >> 1;
-        mma_bf16(c0, c1, c2, c3, x0[lo], 0U, x0[hi], 0U, w[lo], w[hi]);
-    }
     __shared__ float partial[3][kStagedTileTokens][8];
-    partial[warp][group_id][2 * quad]     = c0;
-    partial[warp][group_id][2 * quad + 1] = c1;
+    if (Threads == 96 || warp < 3) {
+        float c0 = 0.0F, c1 = 0.0F, c2 = 0.0F, c3 = 0.0F;
+#pragma unroll 8
+        for (int k = k_begin; k < k_end; k += 16) {
+            const int lo = (k + 2 * quad) >> 1;
+            const int hi = (k + 8 + 2 * quad) >> 1;
+            mma_bf16(c0, c1, c2, c3, x0[lo], 0U, x0[hi], 0U, w[lo], w[hi]);
+        }
+        partial[warp][group_id][2 * quad]     = c0;
+        partial[warp][group_id][2 * quad + 1] = c1;
+    }
     __syncthreads();
     if (thread < kStagedTileTokens * 8) {
         const int row   = thread >> 3;
@@ -604,7 +629,7 @@ __global__ __launch_bounds__(96) void route_quant_narrow_kernel(const __nv_bfloa
     const int block        = static_cast<int>(blockIdx.x);
     const int router_tiles = (kExperts / 8) * ((tokens + kStagedTileTokens - 1) / kStagedTileTokens);
     if (block < router_tiles) {
-        router_logits_staged_tile(x, router, logits, tokens, zero, zero_words, block % (kExperts / 8),
+        router_logits_staged_tile<96>(x, router, logits, tokens, zero, zero_words, block % (kExperts / 8),
                                   block / (kExperts / 8), staged);
         return;
     }
@@ -614,6 +639,63 @@ __global__ __launch_bounds__(96) void route_quant_narrow_kernel(const __nv_bfloa
     } else {
         quant_mxfp8_row(x, tokens, kHidden, nullptr, live, nullptr, nullptr, q.dequantised, row);
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Narrow rounds with the persistent zeroed state (InklingMoeOptions::state): router tiles, x
+// quantisation AND the selection in one grid. The 16 router CTAs of token tile m arrive on
+// tile_arrivals[m]; the last to arrive selects the tile's 8 tokens (a warp each, select_token) and
+// takes a ticket; the CTA with the last ticket lays out the rows (place_rows) and returns every
+// counter of the call to zero (self-cleaning: the next call starts from zeros without a memset).
+// The counters decide only WHICH CTA selects / places, never the order of any floating-point sum:
+// logits, selection and weights are the standalone kernels' code on the same inputs.
+// ---------------------------------------------------------------------------------------------
+inline constexpr int kFusedRouteThreads = 256;
+
+template <bool Nvfp4>
+__global__ __launch_bounds__(kFusedRouteThreads) void route_select_narrow_kernel(
+    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ router, const float* __restrict__ bias,
+    float* __restrict__ logits, LiveTokens live, XQuantOutputs q, RouteOutputs out, std::int32_t* tile_arrivals) {
+    extern __shared__ __align__(16) unsigned char staged[];
+    pdl::wait_for_dependencies();
+    pdl::trigger_dependents();
+    const int tokens       = live.tokens;
+    const int block        = static_cast<int>(blockIdx.x);
+    const int thread       = static_cast<int>(threadIdx.x);
+    const int token_tiles  = (tokens + kStagedTileTokens - 1) / kStagedTileTokens;
+    const int router_tiles = (kExperts / 8) * token_tiles;
+    if (block >= router_tiles) {
+        const int row = (block - router_tiles) * (kFusedRouteThreads / 32) + (thread >> 5);
+        if constexpr (Nvfp4) {
+            quant_nvfp4_row(x, tokens, kHidden, nullptr, live, q.codes, q.scales, q.amax, row);
+        } else {
+            quant_mxfp8_row(x, tokens, kHidden, nullptr, live, nullptr, nullptr, q.dequantised, row);
+        }
+        return;
+    }
+    const int m_tile = block / (kExperts / 8);
+    router_logits_staged_tile<kFusedRouteThreads>(x, router, logits, tokens, nullptr, 0, block % (kExperts / 8),
+                                                  m_tile, staged);
+    __shared__ int role;
+    __threadfence();
+    __syncthreads();
+    if (thread == 0) { role = atomicAdd(tile_arrivals + m_tile, 1) == kExperts / 8 - 1; }
+    __syncthreads();
+    if (role == 0) { return; }
+    __threadfence();
+    if (thread == 0) { tile_arrivals[m_tile] = 0; } // no other CTA touches it again in this call
+    static_assert(kFusedRouteThreads / 32 == kStagedTileTokens);
+    select_token<true>(logits, bias, live, out, m_tile * kStagedTileTokens + (thread >> 5), thread & 31);
+    __threadfence();
+    __syncthreads();
+    if (thread == 0) { role = atomicAdd(out.ticket, 1) == token_tiles - 1; }
+    __syncthreads();
+    if (role == 0) { return; }
+    __threadfence();
+    place_rows<kFusedRouteThreads>(out, tokens, thread);
+    __syncthreads();
+    if (thread < kExperts) { out.counts[thread] = 0; }
+    if (thread == 0) { *out.ticket = 0; }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -882,6 +964,35 @@ void launch_route_quant_narrow(const __nv_bfloat16* x, const __nv_bfloat16* rout
     }
     if (status != cudaSuccess) {
         throw std::runtime_error(std::string("inkling_moe: route + x quant (narrow): ") + cudaGetErrorString(status));
+    }
+}
+
+void launch_route_select_narrow(const __nv_bfloat16* x, const __nv_bfloat16* router, const float* bias,
+                                float* logits, LiveTokens live, bool nvfp4, std::uint8_t* x_codes,
+                                std::uint8_t* x_scales, float* x_amax, __nv_bfloat16* x_dequantised,
+                                const RouteOutputs& out, std::int32_t* tile_arrivals, cudaStream_t stream) {
+    if (live.tokens > kNarrowStateMaxTokens || out.counts == nullptr || out.ticket == nullptr ||
+        !out.last_cta_places) {
+        throw std::invalid_argument("inkling_moe: the fused narrow route needs T <= 64, counters and last-CTA placement");
+    }
+    XQuantOutputs q;
+    q.codes       = x_codes;
+    q.scales      = x_scales;
+    q.amax        = x_amax;
+    q.dequantised = x_dequantised;
+    const int token_tiles = (live.tokens + kStagedTileTokens - 1) / kStagedTileTokens;
+    const int blocks      = (kExperts / 8) * token_tiles + (live.tokens + kFusedRouteThreads / 32 - 1) / (kFusedRouteThreads / 32);
+    auto* kernel = nvfp4 ? route_select_narrow_kernel<true> : route_select_narrow_kernel<false>;
+    cudaError_t status = ::sinfer::ops::set_func_attribute_per_device(
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kStagedSharedBytes);
+    if (status == cudaSuccess) {
+        status = pdl::launch_dependent({dim3(static_cast<unsigned>(blocks)), dim3(kFusedRouteThreads),
+                                        static_cast<std::size_t>(kStagedSharedBytes), stream},
+                                       kernel, x, router, bias, logits, live, q, out, tile_arrivals);
+    }
+    if (status != cudaSuccess) {
+        throw std::runtime_error(std::string("inkling_moe: route + select + x quant (narrow): ") +
+                                 cudaGetErrorString(status));
     }
 }
 

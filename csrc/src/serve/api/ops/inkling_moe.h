@@ -145,7 +145,19 @@ struct InklingMoeOptions {
     const InklingMoeCapture* capture = nullptr;
     /// Test / debug only (see InklingMoeTaps).
     const InklingMoeTaps* taps = nullptr;
+    /// Optional persistent state: device memory of `inkling_moe_state_bytes()` bytes, ZEROED ONCE by the
+    /// caller when it is allocated, written by nothing else, and never shared by two calls in flight (one per
+    /// stream; calls on one stream are ordered). Not the transient workspace: other ops reuse that between
+    /// calls. With it, narrow rounds (T <= 64) fold the selection into the router grid -- the last router CTA
+    /// of a token tile selects its tokens, the last selector lays out the rows -- and that CTA returns every
+    /// counter to zero before the grid ends (no per-call memset; a captured graph replays from zeros). The
+    /// counters choose only WHICH CTA selects / places, never the order of any sum: the bits are those of
+    /// the call without state. Null = the separate select kernel.
+    std::int32_t* state = nullptr;
 };
+
+/// Bytes of `InklingMoeOptions::state`.
+[[nodiscard]] std::size_t inkling_moe_state_bytes();
 
 /// Transient workspace one `inkling_moe` call of up to `max_tokens` tokens needs (graph-stable,
 /// caller-owned, no state across calls). `adapters` adds the LoRA low-rank buffers.
