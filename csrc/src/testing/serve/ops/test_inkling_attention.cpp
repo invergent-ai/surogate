@@ -2345,6 +2345,108 @@ void run_bench_ab() {
     bench_linear("attn_linear wo narrow N=8 1x128", 3072, 128, 8);
 }
 
+// PDL-chain regression (agent-EN 17:4x: the FP8 route decoded garbage in the engine, prefill fine). The engine's decode
+// sequence per visit -- attention (gated) -> wo_ud (narrow attn_linear) -> qkvr (narrow attn_linear) -- with ONE gated
+// buffer and ONE wo buffer reused by every visit (as the visit arena does), launched back to back with PDL, eager and as
+// a CUDA graph; each visit's qkvr output (distinct buffers) vs a reference that gives every visit fresh buffers and
+// synchronises between ops. A stale read of the reused buffers shows up as bit differences.
+void test_pdl_chain() {
+    using K = InklingLayerKind;
+    if (g_stream == nullptr) { cuda_check(cudaStreamCreateWithFlags(&g_stream, cudaStreamNonBlocking), "stream"); }
+    const K kind = K::Local;
+    const int W = 1, B = 8, N = W * B, first = 8191, keys = first + W, R = 4, visits = 24;
+    const Layer layer(kind, 11);
+    const Rows rows = make_rows(W, B, std::vector<int>(B, first), {});
+    BenchPlane plane(B, keys + 64);
+    const auto pv = plane.view(B);
+    std::vector<DeviceBuffer> dq, dr, dqs;
+    for (int r = 0; r < R; ++r) {
+        Rng rng(700 + r);
+        std::vector<float> q, rr;
+        fill_qr(rng, rows, q, rr);
+        std::vector<float> qside(static_cast<std::size_t>(N) * 6552);
+        for (auto& v : qside) { v = rng.uni(-3.0F, 3.0F); }
+        dq.push_back(to_device_bf16(q));
+        dr.push_back(to_device_bf16(rr));
+        dqs.push_back(to_device_bf16(qside));
+    }
+    const auto inputs = [&](int r) {
+        return ops::InklingAttentionInputs{Tensor(dq[r].p, DType::BF16, {128, 24, N}), Tensor(dr[r].p, DType::BF16, {16, 24, N}),
+                                           strided_bf16(dqs[r].p, G::kRowsGate, {3072}, N, 6552),
+                                           strided_bf16(dqs[r].p, G::kRowsSink, {24}, N, 6552),
+                                           Tensor(layer.dtable.p, DType::BF16, {16, G::kRelTableRows})};
+    };
+    ops::InklingAttentionRows view = rows.view(keys);
+    view.metadata_static           = true;
+    WorkspaceArena work(ops::inkling_rel_attention_workspace_bytes(kind, W, B, view.envelope, view.key_groups) + 4096);
+    const Fp8Weight wo(2304, 3072, 3072, 1, 41, false), qkvr(8600, 2304, 2304, 1, 42, false);
+    DeviceBuffer gated(static_cast<std::size_t>(N) * 3072 * 2), wout(static_cast<std::size_t>(N) * 2304 * 2);
+    std::vector<DeviceBuffer> outs, ref_gated, ref_wo, refs;
+    for (int i = 0; i < visits; ++i) {
+        outs.emplace_back(static_cast<std::size_t>(N) * 8600 * 2);
+        ref_gated.emplace_back(static_cast<std::size_t>(N) * 3072 * 2);
+        ref_wo.emplace_back(static_cast<std::size_t>(N) * 2304 * 2);
+        refs.emplace_back(static_cast<std::size_t>(N) * 8600 * 2);
+    }
+    const auto visit = [&](int i, void* g, void* w, void* o, bool sync) {
+        const auto in = inputs(i % R);
+        Tensor gt(g, DType::BF16, {3072, N}), wt(w, DType::BF16, {2304, N}), ot(o, DType::BF16, {8600, N});
+        ops::inkling_rel_attention(in, kind, view, pv, work, gt, g_stream);
+        if (sync) { cuda_check(cudaStreamSynchronize(g_stream), "sync"); }
+        const ops::InklingProjection p1{&gt, &wo.w, 0, &wt};
+        ops::inkling_attn_linear(std::span<const ops::InklingProjection>(&p1, 1), nullptr, g_stream);
+        if (sync) { cuda_check(cudaStreamSynchronize(g_stream), "sync"); }
+        const ops::InklingProjection p2{&wt, &qkvr.w, 0, &ot};
+        ops::inkling_attn_linear(std::span<const ops::InklingProjection>(&p2, 1), nullptr, g_stream);
+        if (sync) { cuda_check(cudaStreamSynchronize(g_stream), "sync"); }
+    };
+    for (int i = 0; i < visits; ++i) { visit(i, ref_gated[i].p, ref_wo[i].p, refs[i].p, true); }
+    bool control = false; // linear_x_nc on: the old ld.global.nc x loads (negative control, reported, not checked)
+    const auto compare_all = [&](const char* route_in) {
+        const std::string route = std::string(route_in) + (control ? " [x ld.nc control]" : "");
+        cuda_check(cudaStreamSynchronize(g_stream), "sync");
+        std::size_t bad = 0, total = 0;
+        int first_bad = -1;
+        for (int i = 0; i < visits; ++i) {
+            const auto a = from_device<std::uint16_t>(outs[i], static_cast<std::size_t>(N) * 8600);
+            const auto b = from_device<std::uint16_t>(refs[i], static_cast<std::size_t>(N) * 8600);
+            for (std::size_t e = 0; e < a.size(); ++e) {
+                if (a[e] != b[e]) {
+                    ++bad;
+                    if (first_bad < 0) { first_bad = i; }
+                }
+            }
+            total += a.size();
+            cuda_check(cudaMemset(outs[i].p, 0xff, outs[i].bytes), "poison");
+        }
+        std::printf("pdl chain %-36s attention -> wo -> qkvr x %d visits, reused buffers: %zu / %zu outputs bit-different%s\n",
+                    route.c_str(), visits, bad, total,
+                    first_bad >= 0 ? (" (first visit " + std::to_string(first_bad) + ")").c_str() : "");
+        if (!control) { check(bad == 0, "pdl chain " + route); }
+    };
+    for (const bool ctl : {false, true}) {
+        control                                     = ctl;
+        ops::inkling_attention_knobs().linear_x_nc = ctl;
+        for (int rep = 0; rep < 3; ++rep) {
+            for (int i = 0; i < visits; ++i) { visit(i, gated.p, wout.p, outs[i].p, false); }
+            compare_all("eager");
+        }
+        cudaGraph_t graph;
+        cudaGraphExec_t exec;
+        cuda_check(cudaStreamBeginCapture(g_stream, cudaStreamCaptureModeThreadLocal), "capture");
+        for (int i = 0; i < visits; ++i) { visit(i, gated.p, wout.p, outs[i].p, false); }
+        cuda_check(cudaStreamEndCapture(g_stream, &graph), "end capture");
+        cuda_check(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
+        for (int rep = 0; rep < 3; ++rep) {
+            cuda_check(cudaGraphLaunch(exec, g_stream), "graph launch");
+            compare_all("graph");
+        }
+        cudaGraphExecDestroy(exec);
+        cudaGraphDestroy(graph);
+    }
+    ops::inkling_attention_knobs().linear_x_nc = false;
+}
+
 // Decode staging A/B (agent-EN-c4): register staging (decode_raw 0) vs the cp.async raw ring (2) vs the auto rule (1),
 // static metadata off / on; then the engine's fused call (separate prologue + fold kernel) on the decode rows.
 void run_bench_raw() {
@@ -2585,6 +2687,7 @@ int main(int argc, char** argv) {
         }
         test_invariance(want);
         test_draft(want);
+        if (want("pdl chain")) { test_pdl_chain(); }
     } catch (const std::exception& e) {
         std::cerr << "EXCEPTION " << e.what() << '\n';
         return 1;

@@ -99,6 +99,19 @@ __device__ __forceinline__ void cell_end(float (&acc)[4], float (&part)[4], floa
     part[0] = part[1] = part[2] = part[3] = 0.0F;
 }
 
+/// The activations x of the narrow kernels: written by the previous kernel of the PDL chain, so read through L2 (ld.cg,
+/// coherent) -- never ld.global.nc, whose read-only contract the producer breaks while this grid is resident (the
+/// engine's decode reuses the visit arena's x buffer every visit: the FP8 route decoded garbage, agent-EN 17:4x).
+/// XNc = the old non-coherent load (test-only, InklingAttentionKnobs::linear_x_nc: the regression's negative control).
+template <bool XNc>
+__device__ __forceinline__ uint4 load_x(const __nv_bfloat16* ptr) {
+    if constexpr (XNc) {
+        return load_ldg<uint4>(ptr);
+    } else {
+        return __ldcg(reinterpret_cast<const uint4*>(ptr));
+    }
+}
+
 __device__ __forceinline__ float cell_scale(const LinearSegment& s, int local, int cell) {
     const int row = s.row_begin + min(local, s.rows - 1);
     return s.scales[static_cast<std::int64_t>(row / s.rows_per) * s.kcells + cell];
@@ -117,7 +130,7 @@ inline constexpr int kNarrowRows   = kNarrowWarps * 8;
 inline constexpr int kNarrowStages = 8; // qkvr (K = 2304, 1,075 warps); wo (K = 3072, 288 warps) uses 16: fewer warps,
                                          // so more of each warp's slab in flight (copies grouped in pairs then)
 
-template <int K, bool PerRow>
+template <int K, bool PerRow, bool XNc = false>
 __global__ __launch_bounds__(kNarrowWarps * 32) void narrow_kernel(const LinearParams p) {
     constexpr int Cells = K / 128;
     static_assert(Cells % 2 == 0, "cells run in pairs");
@@ -179,8 +192,8 @@ __global__ __launch_bounds__(kNarrowWarps * 32) void narrow_kernel(const LinearP
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             const int ch0 = 4 * c + j, ch1 = 4 * c + 4 + j;
-            chunk_steps(part0, mask(load_ldg<uint4>(x0 + 32 * ch0), t0), mask(load_ldg<uint4>(x1 + 32 * ch0), t1), codes(c, j));
-            chunk_steps(part1, mask(load_ldg<uint4>(x0 + 32 * ch1), t0), mask(load_ldg<uint4>(x1 + 32 * ch1), t1), codes(c + 1, j));
+            chunk_steps(part0, mask(load_x<XNc>(x0 + 32 * ch0), t0), mask(load_x<XNc>(x1 + 32 * ch0), t1), codes(c, j));
+            chunk_steps(part1, mask(load_x<XNc>(x0 + 32 * ch1), t0), mask(load_x<XNc>(x1 + 32 * ch1), t1), codes(c + 1, j));
         }
         float s00 = 1.0F, s01 = 1.0F, s10 = 1.0F, s11 = 1.0F;
         if constexpr (!PerRow) {
@@ -224,7 +237,7 @@ __global__ __launch_bounds__(kNarrowWarps * 32) void narrow_kernel(const LinearP
 // gemm_kernel's (a cell's part is the same chain from zero; acc = fmaf(scale, part, acc) in cell order): same bits.
 inline constexpr int kSplitCpw = 6; // cells a warp
 
-template <int K, bool PerRow>
+template <int K, bool PerRow, bool XNc = false>
 __global__ __launch_bounds__((K / 128 / kSplitCpw) * 32) void narrow_split_kernel(const LinearParams p) {
     constexpr int Cells = K / 128;
     constexpr int CW    = Cells / kSplitCpw; // warps
@@ -290,8 +303,8 @@ __global__ __launch_bounds__((K / 128 / kSplitCpw) * 32) void narrow_split_kerne
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             const int ch0 = 4 * (cell0 + i) + j, ch1 = ch0 + 4;
-            chunk_steps(part0, mask(load_ldg<uint4>(x0 + 32 * ch0), t0), mask(load_ldg<uint4>(x1 + 32 * ch0), t1), codes(i, j));
-            chunk_steps(part1, mask(load_ldg<uint4>(x0 + 32 * ch1), t0), mask(load_ldg<uint4>(x1 + 32 * ch1), t1), codes(i + 1, j));
+            chunk_steps(part0, mask(load_x<XNc>(x0 + 32 * ch0), t0), mask(load_x<XNc>(x1 + 32 * ch0), t1), codes(i, j));
+            chunk_steps(part1, mask(load_x<XNc>(x0 + 32 * ch1), t0), mask(load_x<XNc>(x1 + 32 * ch1), t1), codes(i + 1, j));
         }
         parts[cell0 + i][lane]     = make_float4(part0[0], part0[1], part0[2], part0[3]);
         parts[cell0 + i + 1][lane] = make_float4(part1[0], part1[1], part1[2], part1[3]);
@@ -765,10 +778,19 @@ void inkling_attn_linear(std::span<const InklingProjection> projections, Workspa
     for (int i = 1; i < pr.params.segments; ++i) {
         if ((pr.params.seg[i].k_per == pr.k) != per_row) { fail(op, "projections of one call share their scale cell kind"); }
     }
+    const bool xnc = inkling_attention_knobs().linear_x_nc; // test-only negative control (old ld.global.nc x loads)
     if (split) {
         const unsigned threads = static_cast<unsigned>(pr.k / 128 / kSplitCpw * 32);
         const pdl::LaunchConfig launch{dim3(static_cast<unsigned>(pr.blocks)), dim3(threads), 0, stream};
-        if (pr.k == 2304) {
+        if (xnc) {
+            if (pr.k == 2304) {
+                CUDA_CHECK(per_row ? pdl::launch_dependent(launch, narrow_split_kernel<2304, true, true>, pr.params)
+                                   : pdl::launch_dependent(launch, narrow_split_kernel<2304, false, true>, pr.params));
+            } else {
+                CUDA_CHECK(per_row ? pdl::launch_dependent(launch, narrow_split_kernel<3072, true, true>, pr.params)
+                                   : pdl::launch_dependent(launch, narrow_split_kernel<3072, false, true>, pr.params));
+            }
+        } else if (pr.k == 2304) {
             CUDA_CHECK(per_row ? pdl::launch_dependent(launch, narrow_split_kernel<2304, true>, pr.params)
                                : pdl::launch_dependent(launch, narrow_split_kernel<2304, false>, pr.params));
         } else {
@@ -779,7 +801,15 @@ void inkling_attn_linear(std::span<const InklingProjection> projections, Workspa
     }
     if (!gemm) {
         const pdl::LaunchConfig launch{dim3(static_cast<unsigned>(pr.blocks)), dim3(kNarrowWarps * 32), 0, stream};
-        if (pr.k == 2304) {
+        if (xnc) {
+            if (pr.k == 2304) {
+                CUDA_CHECK(per_row ? pdl::launch_dependent(launch, narrow_kernel<2304, true, true>, pr.params)
+                                   : pdl::launch_dependent(launch, narrow_kernel<2304, false, true>, pr.params));
+            } else {
+                CUDA_CHECK(per_row ? pdl::launch_dependent(launch, narrow_kernel<3072, true, true>, pr.params)
+                                   : pdl::launch_dependent(launch, narrow_kernel<3072, false, true>, pr.params));
+            }
+        } else if (pr.k == 2304) {
             CUDA_CHECK(per_row ? pdl::launch_dependent(launch, narrow_kernel<2304, true>, pr.params)
                                : pdl::launch_dependent(launch, narrow_kernel<2304, false>, pr.params));
         } else {
