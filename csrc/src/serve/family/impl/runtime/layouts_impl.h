@@ -428,7 +428,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                                          .batch_capacity = decode_batch_capacity(plan.max_concurrency, plan.speculative_backend),
                                          .draft_window   = plan.draft_window,
                                          .enable_mtp     = plan.features.mtp(),
-                                         .enable_dflash  = plan.features.dflash()});
+                                         .enable_dflash  = plan.features.dflash(),
+                                         .logits_dtype   = family::logits_dtype<Variant>()});
     out.prefill_hidden = add_tensor(
         builder, DType::BF16, {round_hidden, effective_prefill_chunk}, "step prefill hidden");
     family::complete_round_state_layout(builder, out.round);

@@ -24,6 +24,9 @@ struct RoundStateSpec {
     std::uint32_t draft_window   = 0;
     bool enable_mtp              = false;
     bool enable_dflash           = false;
+    /// The target's logits planes (ordinary, verify, finalize, step): BF16, or FP32 for a target that keeps
+    /// them FP32 after its softcap (family/impl/runtime/visit_round.h logits_dtype). Draft-head logits stay BF16.
+    DType logits_dtype           = DType::BF16;
 };
 
 // Stable pinned/device transfer format for ordinary decode. The full fixed-size object is copied

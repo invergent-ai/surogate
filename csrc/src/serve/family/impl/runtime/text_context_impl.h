@@ -875,6 +875,21 @@ void apply_logit_softcap(const ModelConfig& cfg, Tensor& logits, cudaStream_t st
     if (cfg.logit_softcap > 0.0F) { ops::logit_softcap(logits, cfg.logit_softcap, stream); }
 }
 
+/// The target LM head into `logits`: the family's linear + softcap, or an FP32-logits target's own head
+/// (family/impl/runtime/visit_round.h). `logits` then has that target's logits dtype.
+template <class V, class Model>
+void head_logits(const Model& weights, const Tensor& hidden, const Weight& lm_head, const ModelConfig& cfg,
+                 Tensor& logits, cudaStream_t stream) {
+    if constexpr (family::logits_fp32<V>()) {
+        (void)lm_head;
+        (void)cfg;
+        family::lm_head_if<V>(weights, hidden, logits, stream);
+    } else {
+        ops::linear(hidden, lm_head, logits, stream);
+        apply_logit_softcap(cfg, logits, stream);
+    }
+}
+
 template <class V>
 void TextContext::proposal_argmax(const Tensor& wide, Tensor& logits, Tensor& proposal_tokens) {
     const int T = wide.ne[1];
@@ -899,8 +914,7 @@ void TextContext::proposal_argmax(const Tensor& wide, Tensor& logits, Tensor& pr
                                       ctx_.stream);
     } else {
         Tensor output_logits = matrix_window(logits, T);
-        ops::linear(hidden, *lm_head_, output_logits, ctx_.stream);
-        apply_logit_softcap(cfg_, output_logits, ctx_.stream);
+        head_logits<Variant>(weights_, hidden, *lm_head_, cfg_, output_logits, ctx_.stream);
         ops::argmax(output_logits, proposal_tokens, cfg_.token_domain, ctx_.stream);
     }
 }
@@ -1073,10 +1087,9 @@ Tensor TextContext::lm_head_view(const Tensor& stored, cudaStream_t stream) {
 void TextContext::logits_from_hidden(const Tensor& hidden, Tensor& logits) {
     if (hidden.ne[1] <= 0) throw std::invalid_argument("cached hidden batch is empty");
     require_tensor_shape(hidden, DType::BF16, {round_hidden_width(), hidden.ne[1]}, "cached hidden");
-    require_tensor_shape(logits, DType::BF16, {cfg_.vocab, hidden.ne[1]}, "cached hidden logits");
+    require_tensor_shape(logits, family::logits_dtype<Variant>(), {cfg_.vocab, hidden.ne[1]}, "cached hidden logits");
     auto scope = work_.scope();
-    ops::linear(lm_head_view(hidden, ctx_.stream), *lm_head_, logits, ctx_.stream);
-    apply_logit_softcap(cfg_, logits, ctx_.stream);
+    head_logits<Variant>(weights_, lm_head_view(hidden, ctx_.stream), *lm_head_, cfg_, logits, ctx_.stream);
 }
 
 bool TextContext::candidate_rows_exact() const {
@@ -1127,8 +1140,7 @@ void finish_round_hidden(const Model& weights, const Tensor& x, float eps, Tenso
         }
     }
     Hooks::finish(weights, x, eps, hidden, work, stream);
-    ops::linear(hidden, lm_head, logits, stream);
-    apply_logit_softcap(cfg, logits, stream);
+    head_logits<Variant>(weights, hidden, lm_head, cfg, logits, stream);
 }
 
 void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_positions,
@@ -1148,7 +1160,7 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
                          "ordinary decode Linear Attention slots");
     require_tensor_shape(hidden, DType::BF16, {round_hidden_width(), batch},
                          "ordinary decode hidden");
-    require_tensor_shape(logits, DType::BF16, {cfg_.vocab, batch}, "ordinary decode logits");
+    require_tensor_shape(logits, family::logits_dtype<Variant>(), {cfg_.vocab, batch}, "ordinary decode logits");
 
     cudaStream_t stream = ctx_.stream;
     work_.reset();
@@ -1206,7 +1218,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
                          "target verify batch Linear Attention slots");
     require_tensor_shape(hidden, DType::BF16, {round_hidden_width(), width, batch},
                          "target verify batch hidden");
-    require_tensor_shape(logits, DType::BF16, {cfg_.vocab, width, batch},
+    require_tensor_shape(logits, family::logits_dtype<Variant>(), {cfg_.vocab, width, batch},
                          "target verify batch logits");
     require_tensor_shape(target_tokens, DType::I32, {width, batch}, "target verify batch tokens");
 
@@ -3123,8 +3135,7 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                                    cudaMemcpyDeviceToDevice, s));
         Tensor logits_decode = decode.logits;
         ops::ScopedLoraColumns decode_lora(roots.lora_slots.slice(0, prefill_cols, decode_columns));
-        ops::linear(xl_decode, *lm_head_, logits_decode, s);
-        apply_logit_softcap(cfg_, logits_decode, s);
+        head_logits<Variant>(weights_, xl_decode, *lm_head_, cfg_, logits_decode, s);
     }
 
     // The draft head over each segment's columns, so a round under the head keeps the head's
@@ -3248,8 +3259,7 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
             }
         }
         ops::ScopedLoraColumns final_lora(roots.lora_slots.slice(0, 0, finalizers));
-        ops::linear(lm_head_view(gathered, s), *lm_head_, logits, s);
-        apply_logit_softcap(cfg_, logits, s);
+        head_logits<Variant>(weights_, lm_head_view(gathered, s), *lm_head_, cfg_, logits, s);
         Tensor sampled   = finalize.tokens.slice(0, 0, finalizers);
         Tensor positions_out = finalize.positions.slice(0, 0, finalizers);
         ops::sample(logits, sampled, cfg_.token_domain, finalize.sampling, positions_out,
@@ -3710,8 +3720,7 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
                                cudaMemcpyDeviceToDevice, s));
     Tensor logits_decode = decode.logits;
     ops::ScopedLoraColumns decode_lora(roots.lora_slots.slice(0, prefill_cols, batch));
-    ops::linear(xl_decode, *lm_head_, logits_decode, s);
-    apply_logit_softcap(cfg_, logits_decode, s);
+    head_logits<Variant>(weights_, xl_decode, *lm_head_, cfg_, logits_decode, s);
 }
 
 // Stages one mixed round into the family, captures the (chunk bucket, batch
@@ -3791,16 +3800,17 @@ void TextContext::observe_prompt_logits(const Tensor& hidden, int base, cudaStre
     const std::size_t spare = work_.capacity() - work_.used();
     // Leave room for the head's normalization and projection scratch. Fall back
     // to the persistent one-column logits when a small model has no spare arena.
-    const std::size_t bytes_per_column = std::size_t(cfg_.vocab) * 2 + std::size_t(cfg_.hidden) * 16;
+    const std::size_t bytes_per_column =
+        std::size_t(cfg_.vocab) * dtype_size(family::logits_dtype<Variant>()) + std::size_t(cfg_.hidden) * 16;
     const int fits = spare > 16384 ? int((spare - 16384) / bytes_per_column) : 0;
     const int stripe = std::max(1, std::min({32, fits, end - first}));
-    Tensor storage = stripe > 1 ? work_.alloc(DType::BF16, {cfg_.vocab, stripe}) : matrix_window(io_.logits, 1);
+    Tensor storage = stripe > 1 ? work_.alloc(family::logits_dtype<Variant>(), {cfg_.vocab, stripe})
+                                : matrix_window(io_.logits, 1);
     for (int col = first; col < end; col += stripe) {
         auto scratch = work_.scope();
         const int count = std::min(stripe, end - col);
         Tensor logits = storage.slice(1, 0, count);
-        ops::linear(lm_head_view(hidden.slice(1, col, count), stream), *lm_head_, logits, stream);
-        apply_logit_softcap(cfg_, logits, stream);
+        head_logits<Variant>(weights_, lm_head_view(hidden.slice(1, col, count), stream), *lm_head_, cfg_, logits, stream);
         logprob_observer(logits, base + col + 1, false);
     }
 }
@@ -3846,8 +3856,7 @@ bool TextContext::try_prefill_graph_chunk(std::span<const int> ids, int t0, int 
         Tensor xf      = matrix_window(prefill_hidden_, len);
         Tensor last_xf = xf.slice(1, len - 1, 1);
         Tensor logits  = matrix_window(io_.logits, 1);
-        ops::linear(lm_head_view(last_xf, s), *lm_head_, logits, s);
-        apply_logit_softcap(cfg_, logits, s);
+        head_logits<Variant>(weights_, lm_head_view(last_xf, s), *lm_head_, cfg_, logits, s);
         ops::set_i32_scalar(io_.pos, base_i + T, s);
         ops::set_i32_scalar(io_.rope_pos, base_i + T + rope_delta_, s);
         work_.reset();
@@ -4120,8 +4129,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             if (is_last && stage_finishes()) {
                 Tensor last_xf = xf.slice(1, len - 1, 1);
                 Tensor logits  = matrix_window(io_.logits, 1);
-                ops::linear(lm_head_view(last_xf, s), *lm_head_, logits, s);
-        apply_logit_softcap(cfg_, logits, s);
+                head_logits<Variant>(weights_, lm_head_view(last_xf, s), *lm_head_, cfg_, logits, s);
                 // Set io_.pos to the bonus token's absolute position (base + T) before picking so
                 // the sampler RNG is keyed by it (prefill purpose keeps it distinct from the first
                 // decode step, which reuses the same io_.pos).

@@ -41,6 +41,22 @@ template <class Variant>
     }
 }
 
+/// Whether the target keeps its logits FP32 after the softcap (`logits_fp32`), as its reference does.
+template <class Variant>
+[[nodiscard]] constexpr bool logits_fp32() {
+    if constexpr (requires { Variant::logits_fp32; }) {
+        return Variant::logits_fp32;
+    } else {
+        return false;
+    }
+}
+
+/// The dtype of every target-logits plane the runtime allocates and the sampler reads.
+template <class Variant>
+[[nodiscard]] constexpr DType logits_dtype() {
+    return logits_fp32<Variant>() ? DType::FP32 : DType::BF16;
+}
+
 /// How a round's conv / recurrent state is kept: updated in place (prefill, decode, a narrow speculative
 /// round), or, for a speculative verify, updated in place after a backup with every column's inputs
 /// recorded, so the resolve can commit the accepted prefix (`fold`).
@@ -136,6 +152,16 @@ void run_visits_if(const Model& model, VisitRound& round) {
     } else {
         (void)model;
         (void)round;
+    }
+}
+
+/// An FP32-logits target's own LM head (projection + softcap into FP32 logits).
+template <class V, class Model>
+void lm_head_if(const Model& model, const Tensor& hidden, Tensor& logits, cudaStream_t stream) {
+    if constexpr (logits_fp32<V>()) {
+        V::lm_head(model, hidden, logits, stream);
+    } else {
+        (void)model; (void)hidden; (void)logits; (void)stream;
     }
 }
 
