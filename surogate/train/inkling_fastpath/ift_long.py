@@ -42,13 +42,21 @@ class TokenChunked(torch.autograd.Function):
     parameter gradients are summed over chunks."""
 
     @staticmethod
-    def forward(ctx, fn, tdims_in, tdims_out, n_tok, chunk, store_bf16, *inputs):
+    def forward(ctx, fn, tdims_in, tdims_out, n_tok, chunk, store_bf16, vals, *inputs):
         T = inputs[0].shape[tdims_in[0]]
         parts = None
+        dev = inputs[0].device
+        vals = vals or (None,) * n_tok
+
+        def src(i, c0, n):  # a chunk of token input i: from its host value when given, else from the input
+            if vals[i] is not None:
+                return vals[i].narrow(tdims_in[i], c0, n).to(dev, non_blocking=True).float()
+            return inputs[i].narrow(tdims_in[i], c0, n)
+
         with torch.no_grad():
             for c0 in range(0, T, chunk):
                 n = min(chunk, T - c0)
-                args = [x.narrow(tdims_in[i], c0, n) for i, x in enumerate(inputs[:n_tok])] + list(inputs[n_tok:])
+                args = [src(i, c0, n) for i in range(n_tok)] + list(inputs[n_tok:])
                 o = fn(*args)
                 o = o if isinstance(o, tuple) else (o,)
                 if parts is None:
@@ -58,42 +66,58 @@ class TokenChunked(torch.autograd.Function):
         outs = tuple(torch.cat(p, tdims_out[j]) if len(p) > 1 else p[0] for j, p in enumerate(parts))
         ctx.fn, ctx.tdi, ctx.tdo, ctx.n_tok, ctx.chunk = fn, tdims_in, tdims_out, n_tok, chunk
         ctx.in_dtypes = [x.dtype for x in inputs]
-        keep = [x.detach().to(BF16) if (i < n_tok and store_bf16[i]) else x for i, x in enumerate(inputs)]
+        ctx.vals = vals
+        keep = [x if i >= n_tok else (None if vals[i] is not None else (x.detach().to(BF16) if store_bf16[i] else x))
+                for i, x in enumerate(inputs)]
         ctx.offload = T >= OFFLOAD_MIN
+        ctx.dev = dev
+        ctx.host = [None] * n_tok
         if ctx.offload:  # token inputs to pinned host (non-blocking), params stay
-            ctx.host = []
             for i, x in enumerate(keep[:n_tok]):
+                if x is None:
+                    continue
                 h = torch.empty(x.shape, dtype=x.dtype, device="cpu", pin_memory=True)
                 h.copy_(x, non_blocking=True)  # stream-ordered: x's memory is reused only after the copy
-                ctx.host.append(h)
-            ctx.dev = inputs[0].device
-            ctx.save_for_backward(*keep[n_tok:])
-        else:
-            ctx.save_for_backward(*keep)
+                ctx.host[i] = h
+                keep[i] = None
+        ctx.n_dev = [i for i in range(n_tok) if keep[i] is not None]
+        ctx.save_for_backward(*[keep[i] for i in ctx.n_dev], *keep[n_tok:])
         return outs if len(outs) > 1 else outs[0]
 
     @staticmethod
     def backward(ctx, *gouts):
-        if ctx.offload:
-            saved = tuple(h.to(ctx.dev, non_blocking=True) for h in ctx.host[:ctx.n_tok]) + tuple(ctx.saved_tensors)
-            ctx.host = None
-        else:
-            saved = ctx.saved_tensors
         n_tok, chunk, tdi, tdo = ctx.n_tok, ctx.chunk, ctx.tdi, ctx.tdo
-        need = ctx.needs_input_grad[6:]
-        dev = gouts[0].device if gouts[0] is not None else saved[0].device
-        T = saved[0].shape[tdi[0]]
-        toks = [(x.float() if (x.dtype == BF16 and ctx.in_dtypes[i] == F32) else x) for i, x in enumerate(saved[:n_tok])]
+        st = ctx.saved_tensors
+        dev_saved = dict(zip(ctx.n_dev, st[:len(ctx.n_dev)]))
+        params_saved = st[len(ctx.n_dev):]
+        dev = ctx.dev
+        toks = []
+        for i in range(n_tok):  # value sources: device copy, pinned host copy, or the caller's host values
+            if i in dev_saved:
+                x = dev_saved[i]
+            elif ctx.host[i] is not None:
+                x = ctx.host[i]
+            else:
+                x = ctx.vals[i]
+            toks.append(x)
+        ctx.host = None
+        need = ctx.needs_input_grad[7:]
+        T = toks[0].shape[tdi[0]]
+
+        def chunk_of(i, c0, n):
+            x = toks[i].narrow(tdi[i], c0, n)
+            if x.device != dev:
+                x = x.to(dev, non_blocking=True)
+            return x.float() if (x.dtype == BF16 and ctx.in_dtypes[i] == F32) else x
         params = [p.detach().requires_grad_(bool(need[n_tok + i]) and p.is_floating_point())
-                  for i, p in enumerate(saved[n_tok:])]
-        gin = [torch.zeros(x.shape, dtype=F32, device=x.device) if (need[i] and x.is_floating_point()) else None
-               for i, x in enumerate(toks)]
+                  for i, p in enumerate(params_saved)]
+        gin = [torch.zeros(toks[i].shape, dtype=F32, device=dev)
+               if (need[i] and (toks[i].is_floating_point())) else None for i in range(n_tok)]
         pgr = [None] * len(params)
         for c0 in range(0, T, chunk):
             n = min(chunk, T - c0)
             with torch.enable_grad(), torch.device(dev):
-                ins = [x.narrow(tdi[i], c0, n).detach().requires_grad_(gin[i] is not None)
-                       for i, x in enumerate(toks)]
+                ins = [chunk_of(i, c0, n).detach().requires_grad_(gin[i] is not None) for i in range(n_tok)]
                 o = ctx.fn(*ins, *params)
                 o = o if isinstance(o, tuple) else (o,)
                 outs, grads_o = [], []
@@ -118,13 +142,15 @@ class TokenChunked(torch.autograd.Function):
                         pgr[i] = g if pgr[i] is None else pgr[i] + g
         res = [None if g is None else g.to(ctx.in_dtypes[i]) for i, g in enumerate(gin)]
         res += [None if g is None else g.to(ctx.in_dtypes[n_tok + i]) for i, g in enumerate(pgr)]
-        return (None, None, None, None, None, None, *res)
+        return (None, None, None, None, None, None, None, *res)
 
 
-def tc(fn, tok, tdims_in, tdims_out, params=(), store_bf16=None, chunk=None):
+def tc(fn, tok, tdims_in, tdims_out, params=(), store_bf16=None, chunk=None, vals=None):
+    """vals: per token input, None or a (host) tensor holding its VALUES; the input itself is then only a graph node
+    (a zero placeholder leaf) that receives the gradient."""
     store = store_bf16 if store_bf16 is not None else [False] * len(tok)
     return TokenChunked.apply(fn, tuple(tdims_in), tuple(tdims_out), len(tok), chunk or CHUNK, tuple(store),
-                              *tok, *params)
+                              tuple(vals) if vals is not None else None, *tok, *params)
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -159,13 +185,14 @@ class RelAttentionR(torch.autograd.Function):
             o = torch.einsum("hgbk,hkd->hgbd", p, vv[:, k0:b1]) / l
             out[b0:b1] = o.permute(2, 0, 1, 3).reshape(b1 - b0, hq, dh)
             lse[b0:b1] = (m + RA.t_log(l))[..., 0].permute(2, 0, 1).reshape(b1 - b0, hq)
-        ctx.save_for_backward(q, k, v, r_out, rel_proj, out, lse)
+        ctx.save_for_backward(q.to(BF16), k.to(BF16), v.to(BF16), r_out.to(BF16), rel_proj, out, lse)
         ctx.window, ctx.q_block, ctx.scale = window, q_block, scale
         return out, lse
 
     @staticmethod
     def backward(ctx, dout, dlse):
         q, k, v, r_out, rel_proj, out, lse = ctx.saved_tensors
+        q, k, v, r_out = q.float(), k.float(), v.float(), r_out.float()
         window, qb, scale = ctx.window, ctx.q_block, ctx.scale
         T, hq, dh = q.shape
         hk = k.shape[1]
@@ -219,8 +246,9 @@ class _Shift:
 # ---------------------------------------------------------------------------------------------------------------
 # a visit's recompute, staged
 # ---------------------------------------------------------------------------------------------------------------
-def visit_torch_long(W: B.EngineWeights, vi, stack, partial, bank, ids, lora, chunk=None):
-    """Same function as B.visit_torch (new partial [T, D] fp32), built from token-chunked stages."""
+def visit_torch_long(W: B.EngineWeights, vi, stack, partial, bank, ids, lora, chunk=None, act_vals=None):
+    """Same function as B.visit_torch (new partial [T, D] fp32), built from token-chunked stages. act_vals: host
+    values of (stack..., partial, bank...) when the passed tensors are zero placeholders (graph nodes only)."""
     L = W.layers[vi.layer]
     T = partial.shape[0]
     n = len(stack)
@@ -255,7 +283,7 @@ def visit_torch_long(W: B.EngineWeights, vi, stack, partial, bank, ids, lora, ch
         return ain.permute(1, 0, 2)
 
     with B._tick("fwd.attn_in"):
-        attn_in = tc(f_ain, act, [0] * len(act), [0], store_bf16=[True] * len(act), chunk=chunk)
+        attn_in = tc(f_ain, act, [0] * len(act), [0], store_bf16=[True] * len(act), chunk=chunk, vals=act_vals)
     # 2. projections + q / r clips (per token)
     QS = 3 if attn_in.shape[1] == 3 else 1
 
@@ -341,12 +369,18 @@ def visit_torch_long(W: B.EngineWeights, vi, stack, partial, bank, ids, lora, ch
 
     with B._tick("fwd.moe"):
         tok = list(stack) + [partial, attn_out] + (list(bank) if has_bank else []) + [ids]
+        mvals = None
+        if act_vals is not None:
+            mvals = list(act_vals[:n + 1]) + [None] + list(act_vals[n + 1:]) + [None]
         moe_out = tc(f_moe, tok, [0] * len(tok), [0], params=lt,
-                     store_bf16=[True] * (n + 1) + [True] + ([True, True] if has_bank else []) + [False], chunk=chunk)
+                     store_bf16=[True] * (n + 1) + [True] + ([True, True] if has_bank else []) + [False], chunk=chunk,
+                     vals=mvals)
     # 8. MLP-output conv (full T)
     with B._tick("fwd.out_conv"):
-        new_partial, _ = RA.inkling_short_conv(moe_out, L.mlp_sconv, None, addend=attn_out,
-                                               residual=None if first else partial.float())
+        res_ = None
+        if not first:  # the partial's value (+ its graph node: a zero placeholder when the value is on the host)
+            res_ = partial.float() if act_vals is None else partial + act_vals[n].to(partial.device).float()
+        new_partial, _ = RA.inkling_short_conv(moe_out, L.mlp_sconv, None, addend=attn_out, residual=res_)
     return new_partial
 
 
@@ -390,7 +424,8 @@ def forward_host(eng: InklingEngine, ids: torch.Tensor, adapters_per_layer=None)
     eng.final_hidden(x, T, hidden, ws)
     lp = F.logprobs(eng, hidden, ids)
     torch.cuda.current_stream(eng.device).synchronize()
-    del x, seg
+    del x, seg, ws
+    eng._ws = None  # T x ~90 KB of engine workspace: not needed by the backward
     return {"x0": host["x0"], "outs": outs, "routing": routing, "hidden": hidden, "lp": lp}
 
 
@@ -413,13 +448,15 @@ class EngineVisitH(torch.autograd.Function):
         need = ctx.needs_input_grad[8:]
         n_act = len(ctx.host_ins)
         with torch.enable_grad(), torch.device(dev):
-            ins = [h.to(dev, non_blocking=True).float().requires_grad_(bool(need[i])) for i, h in enumerate(ctx.host_ins)]
+            T = ctx.host_ins[0].shape[0]
+            ins = [torch.zeros(1, dtype=F32, device=dev).expand(T, D).requires_grad_(bool(need[i]))
+                   for i in range(n_act)]
             lt = [t.detach().requires_grad_(bool(need[n_act + i])) for i, t in enumerate(ctx.saved_tensors)]
             n = ctx.n_stack
             stack, partial = ins[:n], ins[n]
             bank = (ins[n + 1], ins[n + 2]) if ctx.has_bank else None
             lora = dict(zip(B.LORA_KEYS, lt)) | {"scale": ctx.lora_scale} if ctx.lora_scale is not None else None
-            out = visit_torch_long(ctx.W, ctx.vi, stack, partial, bank, ctx.ids, lora)
+            out = visit_torch_long(ctx.W, ctx.vi, stack, partial, bank, ctx.ids, lora, act_vals=ctx.host_ins)
             want = [t for t in ins + lt if t.requires_grad]
             with B._tick("bwd.autograd"):
                 grads = torch.autograd.grad(out, want, g.contiguous(), allow_unused=True)
@@ -445,8 +482,9 @@ class FinalMixH(torch.autograd.Function):
                                        W.final_norm.reshape(1, D), EPS)[0]
 
         with torch.enable_grad(), torch.device(dev):
-            ins = [h.to(dev, non_blocking=True).float().requires_grad_(bool(need[i])) for i, h in enumerate(ctx.host_ins)]
-            hid = tc(f_mix, ins, [0] * 5, [0], store_bf16=[True] * 5)
+            T = ctx.host_ins[0].shape[0]
+            ins = [torch.zeros(1, dtype=F32, device=dev).expand(T, D).requires_grad_(bool(need[i])) for i in range(5)]
+            hid = tc(f_mix, ins, [0] * 5, [0], store_bf16=[True] * 5, vals=ctx.host_ins)
             want = [t for t in ins if t.requires_grad]
             grads = torch.autograd.grad(hid, want, g.contiguous(), allow_unused=True)
         it = iter(grads)
