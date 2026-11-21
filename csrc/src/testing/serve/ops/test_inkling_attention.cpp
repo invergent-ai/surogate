@@ -26,6 +26,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <memory>
 #include <numeric>
 #include <sstream>
 #include <random>
@@ -274,6 +275,11 @@ struct Rows {
         if (masked) { dvalid = to_device_i32(valid); }
         std::vector<int> rows(B);
         std::iota(rows.begin(), rows.end(), 0);
+        dtables = to_device_i32(rows);
+    }
+    void set_table_rows(int offset) {
+        std::vector<int> rows(B);
+        std::iota(rows.begin(), rows.end(), offset);
         dtables = to_device_i32(rows);
     }
     ops::InklingAttentionRows view(int max_keys) const {
@@ -890,7 +896,7 @@ struct Fp8Weight {
     DeviceBuffer dcodes, dscales;
     Weight w{};
 
-    Fp8Weight(int n_in, int k_in, int k_per_in, int rows_per_in, std::uint32_t seed)
+    Fp8Weight(int n_in, int k_in, int k_per_in, int rows_per_in, std::uint32_t seed, bool with_dequant = true)
         : n(n_in), k(k_in), k_per(k_per_in), rows_per(rows_per_in) {
         Rng rng(seed);
         codes.resize(static_cast<std::size_t>(n) * k);
@@ -903,8 +909,8 @@ struct Fp8Weight {
         for (auto& x : scales) { x = rng.uni(1e-4F, 4e-3F); }
         dcodes  = to_device(codes);
         dscales = to_device(scales);
-        dequant.resize(codes.size());
-        for (int r = 0; r < n; ++r) {
+        if (with_dequant) { dequant.resize(codes.size()); }
+        for (int r = 0; with_dequant && r < n; ++r) {
             for (int c = 0; c < k; ++c) {
                 dequant[static_cast<std::size_t>(r) * k + c] =
                     static_cast<double>(e4m3_decode(codes[static_cast<std::size_t>(r) * k + c])) *
@@ -1304,9 +1310,17 @@ constexpr double kBf16TF = 253.0;  // lane h, measured BF16 MMA peak
 
 void bench_attention(const char* name, InklingLayerKind kind, int W, int B, int first) {
     const Layer layer(kind, 11);
-    const Rows rows = make_rows(W, B, std::vector<int>(B, first), {});
     const int N = W * B, keys = first + W;
-    BenchPlane plane(B, keys + 64);
+    // R copies of every row's KV (> 256 MB in all), one per timed call in turn: the reads come from DRAM, not L2.
+    const double row_bytes = (kind == InklingLayerKind::Global ? keys : std::min(keys, 1088)) * 2048.0;
+    const int R = W <= G::kMaxSmallColumns ? std::max(1, static_cast<int>(std::ceil(256e6 / (row_bytes * B)))) : 1;
+    std::vector<Rows> rot;
+    for (int r = 0; r < R; ++r) {
+        rot.push_back(make_rows(W, B, std::vector<int>(B, first), {}));
+        rot.back().set_table_rows(r * B);
+    }
+    const Rows& rows = rot[0];
+    BenchPlane plane(B * R, keys + 64);
     Rng rng(3);
     std::vector<float> q, r;
     fill_qr(rng, rows, q, r);
@@ -1316,12 +1330,17 @@ void bench_attention(const char* name, InklingLayerKind kind, int W, int B, int 
                                    strided_bf16(dqs.p, G::kRowsGate, {3072}, N, 6552),
                                    strided_bf16(dqs.p, G::kRowsSink, {24}, N, 6552),
                                    Tensor(layer.dtable.p, DType::BF16, {16, G::kRelTableRows})};
-    const auto view = rows.view(keys);
-    WorkspaceArena work(ops::inkling_rel_attention_workspace_bytes(kind, W, B, view.envelope) + 4096);
+    std::vector<ops::InklingAttentionRows> views;
+    for (const auto& rr : rot) { views.push_back(rr.view(keys)); }
+    WorkspaceArena work(ops::inkling_rel_attention_workspace_bytes(kind, W, B, views[0].envelope) + 4096);
     DeviceBuffer dout(static_cast<std::size_t>(N) * 3072 * 2);
     Tensor out(dout.p, DType::BF16, {3072, N});
-    const auto pv  = plane.view(B);
-    const double us = time_us([&] { ops::inkling_rel_attention(in, kind, view, pv, work, out, nullptr); });
+    const auto pv  = plane.view(B * R);
+    int turn = 0;
+    const double us = time_us([&] {
+        ops::inkling_rel_attention(in, kind, views[turn % R], pv, work, out, nullptr);
+        ++turn;
+    }, std::max(20, 2 * R));
     const bool glob = kind == InklingLayerKind::Global;
     // Bytes: every visible key's K and V once per row (decode / verify); FLOPs: 512 per (query, key, head).
     double keys_read = 0.0, flops = 0.0;
@@ -1375,13 +1394,20 @@ void bench_prologue(const char* name, InklingLayerKind kind, int W, int B, int f
 
 void bench_linear(const char* name, int k, int k_per, int columns) {
     const int n = k == 2304 ? 8600 : 2304;
-    const Fp8Weight fw(n, k, k_per, 1, 21);
+    // R weight copies (> 256 MB), one per timed call in turn: the codes come from DRAM, not L2.
+    const int R = columns <= 8 ? static_cast<int>(std::ceil(256e6 / (static_cast<double>(n) * k))) : 1;
+    std::vector<std::unique_ptr<Fp8Weight>> ws;
+    for (int r = 0; r < R; ++r) { ws.push_back(std::make_unique<Fp8Weight>(n, k, k_per, 1, 21 + r, false)); }
     std::vector<float> x(static_cast<std::size_t>(k) * columns, 0.5F);
     DeviceBuffer dx = to_device_bf16(x), dout(static_cast<std::size_t>(n) * columns * 2);
     Tensor xt(dx.p, DType::BF16, {k, columns});
     Tensor ot(dout.p, DType::BF16, {n, columns});
-    const ops::InklingProjection pj{&xt, &fw.w, 0, &ot};
-    const double us = time_us([&] { ops::inkling_attn_linear(std::span<const ops::InklingProjection>(&pj, 1), nullptr, nullptr); });
+    int turn = 0;
+    const double us = time_us([&] {
+        const ops::InklingProjection pj{&xt, &ws[turn % R]->w, 0, &ot};
+        ops::inkling_attn_linear(std::span<const ops::InklingProjection>(&pj, 1), nullptr, nullptr);
+        ++turn;
+    }, std::max(20, 2 * R));
     const double gb = static_cast<double>(n) * k / 1e9, tf = 2.0 * n * k * columns / 1e12;
     if (columns <= 8) {
         std::printf("bench %-40s %9.1f us  %7.1f GB/s  %5.1f %% of %.0f GB/s\n", name, us, gb / (us * 1e-6),
