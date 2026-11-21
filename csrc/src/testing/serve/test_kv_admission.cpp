@@ -8,6 +8,7 @@
 #include "core/paged_kv_cache.h"
 #endif
 #include "runtime/engine/kv_admission_policy.h"
+#include "runtime/engine/pipeline_kv_share.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -20,6 +21,7 @@
 #include <optional>
 #include <random>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -203,6 +205,35 @@ void test_round_reach() {
         }
     }
     check(kv_round_reach(4, 3, 16) == 17, "a block wider than the burst and the window sets the reach");
+}
+
+/// Lane f1 (review R5 minors 11 c, 12): what a pipeline stage counts against the run's need, and the page size the
+/// shared pool is converted with.
+void test_pipeline_held_tokens() {
+    using sinfer::runtime::pipeline_stage_held_tokens;
+    using sinfer::runtime::PipelineStageKvFit;
+    const PipelineStageKvFit fit{.resolved_pages = 1000, .minimum_pages = 200, .charge_pages = 175, .page_tokens = 64};
+    check(pipeline_stage_held_tokens(64000, fit, 4, false) == 64000 - 4 * 175 * 64, "auto counts real KV");
+    check(pipeline_stage_held_tokens(64000, fit, 4, true) == 64000, "an explicit capacity is compared as it stands");
+    check(pipeline_stage_held_tokens(1000, fit, 4, false) == 0, "a charge above the pool leaves no real KV");
+    const PipelineStageKvFit plain{.resolved_pages = 1000, .minimum_pages = 200, .charge_pages = 0, .page_tokens = 64};
+    check(pipeline_stage_held_tokens(64000, plain, 4, false) == 64000 &&
+              pipeline_stage_held_tokens(64000, plain, 4, true) == 64000,
+          "without a window class both are the capacity");
+    PipelineStageKvFit wide = fit;
+    wide.page_tokens        = 128;
+    check(pipeline_stage_held_tokens(100000, wide, 4, false) == 100000 - 4 * 175 * 128,
+          "the charge scales with the curve's page size");
+    const std::vector<PipelineStageKvFit> same{wide, wide};
+    check(sinfer::runtime::share_pipeline_kv(same, 1).page_tokens == 128, "the share carries the stages' page size");
+    const std::vector<PipelineStageKvFit> mixed{fit, wide};
+    bool refused = false;
+    try {
+        (void)sinfer::runtime::share_pipeline_kv(mixed, 1);
+    } catch (const std::invalid_argument&) {
+        refused = true;
+    }
+    check(refused, "stages with different page sizes are refused");
 }
 
 /// A whole engine's scheduling in pages and tokens: first come, first served admission of prompt +
@@ -445,6 +476,7 @@ int main() {
     test_growth_policy();
     test_requeue_and_forced();
     test_round_reach();
+    test_pipeline_held_tokens();
     // 483k-token RTX 5090 replica, 16 lanes, BFCL-like short requests at the agentic default.
     test_simulation(1, 400, 16, 483328, {500, 4000, 20, 600});
     // Many 100k+ prompts, no max_tokens, on the same pool and on a small one.

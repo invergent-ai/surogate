@@ -733,10 +733,10 @@ struct StageFit {
     std::uint32_t kv_tokens  = 0;
     /// Lane f1: the curve the stage resolved (pages, its minimum) and its per-lane window charge.
     runtime::PipelineStageKvFit pages{};
-    /// The tokens left for KV when every lane holds its window charge (= kv_tokens without a class).
-    [[nodiscard]] std::uint64_t real_tokens(std::uint32_t lanes) const noexcept {
-        const std::uint64_t charged = static_cast<std::uint64_t>(lanes) * pages.charge_pages * 64U;
-        return kv_tokens > charged ? kv_tokens - charged : 0;
+    /// What this stage counts against the run's need (runtime::pipeline_stage_held_tokens): the tokens left for KV when
+    /// every lane holds its window charge, or the capacity itself when it is explicit.
+    [[nodiscard]] std::uint64_t held_tokens(std::uint32_t lanes, bool explicit_capacity) const noexcept {
+        return runtime::pipeline_stage_held_tokens(kv_tokens, pages, lanes, explicit_capacity);
     }
 };
 
@@ -780,6 +780,7 @@ StageFit stage_fit(artifact::Reader& reader, const EngineOptions& stage,
         .resolved_pages = fit.kv_tokens / curve.main_page_tokens,
         .minimum_pages  = curve.minimum_main_page_groups,
         .charge_pages   = curve.window_lane_charge_pages,
+        .page_tokens    = curve.main_page_tokens,
     };
     return fit;
 }
@@ -864,8 +865,11 @@ preflight_pipeline(const EngineOptions& options, artifact::Reader& reader,
         if (automatic) {
             const auto layers = static_cast<std::uint32_t>(stage.pipeline_stage_last -
                                                            stage.pipeline_stage_first);
-            // Real KV (lane f1): a window class's per-lane charge holds no tokens of the context.
-            while (fit.real_tokens(options.max_concurrency) < wanted && stage.host_moe_layers < layers) {
+            // Real KV (lane f1): a window class's per-lane charge holds no tokens of the context. An
+            // explicit capacity is compared as it stands (pipeline_stage_held_tokens).
+            const bool explicit_capacity = options.kv_capacity.mode == KvCapacityMode::Explicit;
+            while (fit.held_tokens(options.max_concurrency, explicit_capacity) < wanted &&
+                   stage.host_moe_layers < layers) {
                 ++stage.host_moe_layers;
                 fit = fit_or_zero(stage);
             }
@@ -888,9 +892,9 @@ preflight_pipeline(const EngineOptions& options, artifact::Reader& reader,
     }
     // Lane f1: the stages share real KV, and each holds that plus its own lanes' window charge.
     const runtime::PipelineKvShare share = runtime::share_pipeline_kv(fits, options.max_concurrency);
-    out.kv_tokens = share.shared_pages * static_cast<std::uint32_t>(kPagedKVPageSize);
+    out.kv_tokens = share.shared_pages * share.page_tokens;
     for (const std::uint32_t pages : share.stage_pages) {
-        out.stage_kv_tokens.push_back(pages * static_cast<std::uint32_t>(kPagedKVPageSize));
+        out.stage_kv_tokens.push_back(pages * share.page_tokens);
     }
     return out;
 }

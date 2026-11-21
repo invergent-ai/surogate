@@ -30,19 +30,36 @@ struct PipelineStageKvFit {
     std::uint32_t resolved_pages = 0; ///< the stage's own resolution of its curve
     std::uint32_t minimum_pages  = 0; ///< the curve's minimum (one full-context request + its charge)
     std::uint32_t charge_pages   = 0; ///< per-lane window charge in this stage's main pages (0 without a class)
+    std::uint32_t page_tokens    = 0; ///< tokens per main page of this stage's curve (review R5 minor 12)
 };
 
 struct PipelineKvShare {
     std::uint32_t shared_pages = 0;        ///< real KV pages every stage holds with every lane charged
+    std::uint32_t page_tokens  = 0;        ///< tokens per page, the same on every stage
     std::vector<std::uint32_t> stage_pages; ///< each stage's page count: shared + lanes x its charge
 };
+
+/// The KV tokens a stage counts against what a run needs when `--host-moe-layers auto` decides whether to offload.
+/// Under auto, real KV: a window class's per-lane charge holds no tokens of the context. Under an explicit capacity, the
+/// capacity itself: it never grows with memory, so measuring it net of the charge would stay short forever and offload
+/// every mixture layer of the stage (review R5 minor 11 c).
+[[nodiscard]] inline std::uint64_t pipeline_stage_held_tokens(std::uint32_t kv_tokens, const PipelineStageKvFit& fit,
+                                                              std::uint32_t lanes, bool explicit_capacity) noexcept {
+    if (explicit_capacity) { return kv_tokens; }
+    const std::uint64_t charged = static_cast<std::uint64_t>(lanes) * fit.charge_pages * fit.page_tokens;
+    return kv_tokens > charged ? kv_tokens - charged : 0;
+}
 
 [[nodiscard]] inline PipelineKvShare share_pipeline_kv(std::span<const PipelineStageKvFit> stages,
                                                        std::uint32_t lanes) {
     if (stages.empty() || lanes == 0) { throw std::invalid_argument("pipeline KV share needs stages and lanes"); }
     PipelineKvShare out;
+    out.page_tokens = stages.front().page_tokens;
     bool first = true;
     for (const PipelineStageKvFit& stage : stages) {
+        if (stage.page_tokens == 0 || stage.page_tokens != out.page_tokens) {
+            throw std::invalid_argument("pipeline stages disagree on the KV page size");
+        }
         const std::uint64_t charged = static_cast<std::uint64_t>(lanes) * stage.charge_pages;
         const std::uint64_t real    = stage.resolved_pages > charged ? stage.resolved_pages - charged : 0;
         out.shared_pages = first ? static_cast<std::uint32_t>(real)
