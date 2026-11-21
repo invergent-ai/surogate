@@ -596,7 +596,7 @@ using namespace sinfer::targets::inkling2::fastpath;
 extern "C" {
 
 /// Version of this C ABI (bump on any signature change; the Python binding checks it).
-int ift_abi_version() { return 1; }
+int ift_abi_version() { return 2; }
 
 const char* ift_last_error() { return t_error.c_str(); }
 
@@ -658,16 +658,21 @@ int ift_visit_info(int v, std::int32_t* out16) {
 }
 
 /// Workspace bytes of one trainer forward of T columns (Variant::visit_workspace_capacity_bytes for a prompt round
-/// of T columns, every key visible; with expert adapters when `adapters` != 0), plus the head's.
+/// of T columns, every key visible; with expert adapters when `adapters` != 0). The head's: ift_head_workspace_bytes.
 std::size_t ift_workspace_bytes(std::int32_t T, int adapters) {
     std::size_t bytes = 0;
     (void)guarded([&] {
         family::TextGeometry geometry{};
         bytes = Variant::visit_workspace_capacity_bytes(geometry, family::TextPhase::Prefill, 0, 0, T,
                                                         static_cast<std::uint32_t>(T), adapters != 0);
-        bytes = std::max(bytes, ops::inkling_head_logprob_workspace_bytes(C::output_rows, T) + 4096);
     });
     return bytes;
+}
+
+/// Workspace of one ift_head_logprob call of T columns (its fp32 logits: ~0.8 MB per column; the caller chunks the
+/// columns -- every column's value is fixed by that column alone).
+std::size_t ift_head_workspace_bytes(std::int32_t T) {
+    return ops::inkling_head_logprob_workspace_bytes(C::output_rows, T) + 4096;
 }
 
 /// Bytes of the persistent per-stream state (lane d's MoE counters + lane c's fold counters); zero it ONCE.

@@ -74,6 +74,4 @@ def forward(eng: InklingEngine, ids: torch.Tensor, save: bool = True, tap_names=
 @torch.no_grad()
 def logprobs(eng: InklingEngine, hidden: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
     """log p(ids[t + 1] | prefix up to t) for t = 0..T-2, fp32 [T - 1], bit for bit the engine's prompt log-probs."""
-    T = ids.numel()
-    ws = eng.workspace(T)
-    return eng.head_logprob(hidden[:-1].contiguous(), ids[1:].contiguous(), ws)
+    return eng.head_logprob(hidden[:-1].contiguous(), ids[1:].contiguous())

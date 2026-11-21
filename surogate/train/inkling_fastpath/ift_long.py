@@ -27,6 +27,8 @@ import ift_forward as F
 D = B.D
 BF16, F32 = torch.bfloat16, torch.float32
 CHUNK = int(os.environ.get("IFT_CHUNK", "1024"))
+# TokenChunked token inputs of rows at least this long are saved in pinned host memory (bf16) instead of on the card
+OFFLOAD_MIN = int(os.environ.get("IFT_OFFLOAD_MIN", "8192"))
 EPS = B.EPS
 
 
@@ -56,13 +58,27 @@ class TokenChunked(torch.autograd.Function):
         outs = tuple(torch.cat(p, tdims_out[j]) if len(p) > 1 else p[0] for j, p in enumerate(parts))
         ctx.fn, ctx.tdi, ctx.tdo, ctx.n_tok, ctx.chunk = fn, tdims_in, tdims_out, n_tok, chunk
         ctx.in_dtypes = [x.dtype for x in inputs]
-        ctx.save_for_backward(*[x.detach().to(BF16) if (i < n_tok and store_bf16[i]) else x
-                                for i, x in enumerate(inputs)])
+        keep = [x.detach().to(BF16) if (i < n_tok and store_bf16[i]) else x for i, x in enumerate(inputs)]
+        ctx.offload = T >= OFFLOAD_MIN
+        if ctx.offload:  # token inputs to pinned host (non-blocking), params stay
+            ctx.host = []
+            for i, x in enumerate(keep[:n_tok]):
+                h = torch.empty(x.shape, dtype=x.dtype, pin_memory=True)
+                h.copy_(x, non_blocking=True)  # stream-ordered: x's memory is reused only after the copy
+                ctx.host.append(h)
+            ctx.dev = inputs[0].device
+            ctx.save_for_backward(*keep[n_tok:])
+        else:
+            ctx.save_for_backward(*keep)
         return outs if len(outs) > 1 else outs[0]
 
     @staticmethod
     def backward(ctx, *gouts):
-        saved = ctx.saved_tensors
+        if ctx.offload:
+            saved = tuple(h.to(ctx.dev, non_blocking=True) for h in ctx.host[:ctx.n_tok]) + tuple(ctx.saved_tensors)
+            ctx.host = None
+        else:
+            saved = ctx.saved_tensors
         n_tok, chunk, tdi, tdo = ctx.n_tok, ctx.chunk, ctx.tdi, ctx.tdo
         need = ctx.needs_input_grad[6:]
         dev = gouts[0].device if gouts[0] is not None else saved[0].device
@@ -269,6 +285,7 @@ def visit_torch_long(W: B.EngineWeights, vi, stack, partial, bank, ids, lora, ch
         tok = [attn_in] + ([tau] if tau is not None else [])
         pr = tc(f_proj, tok, [0] * len(tok), [0] * (8 if not L.is_local else 6), store_bf16=[True, False][:len(tok)],
                 chunk=chunk)
+    del attn_in
     q_out, r_out, gate, sink, k_raw, v_raw = pr[:6]
     # 3. K / V causal convs + clip / norm (full T)
     with B._tick("fwd.kv"):
@@ -282,9 +299,11 @@ def visit_torch_long(W: B.EngineWeights, vi, stack, partial, bank, ids, lora, ch
         vh = vc.reshape(T, -1, 128)
         K = RA.kv_store(RA.l2_clip(kh, None, 22.627416997969522, EPS), True)
         V = RA.kv_store(vh * RA.t_rsqrt(RA.rsum(vh * vh, -1, keepdim=True) / 128 + EPS), True)
+        del kc, vc, kh, vh, k_raw, v_raw, pr
     # 4. attention (flash, bias from r per block)
     with B._tick("fwd.attention"):
         out, lse = RelAttentionR.apply(q_out, K.float(), V.float(), r_out, L.rel_proj, 1024 if L.is_local else 0)
+        del K, V, q_out, r_out
     # 5. gate / sink + wo_ud (per token)
 
     def f_gw(o, l, gt, sk):
@@ -294,8 +313,10 @@ def visit_torch_long(W: B.EngineWeights, vi, stack, partial, bank, ids, lora, ch
         attn_partial = tc(f_gw, [out, lse, gate, sink], [0, 0, 0, 0], [0], store_bf16=[False, False, True, True],
                           chunk=chunk)
     # 6. attention-output conv (full T)
+    del out, lse, gate, sink
     with B._tick("fwd.wo_conv"):
         attn_out, _ = RA.inkling_short_conv(attn_partial, L.attn_sconv, None)
+    del attn_partial
     # 7. MLP input + MoE (per token)
 
     def f_moe(*a):

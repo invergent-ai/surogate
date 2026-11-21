@@ -19,7 +19,7 @@ from dataclasses import dataclass
 
 import torch
 
-ABI_VERSION = 1
+ABI_VERSION = 2
 NAMES = ("hidden", "residual", "layers", "physical_layers", "output_rows", "token_domain", "qkvr_rows",
          "attn_width", "conv_channels", "experts", "top_k", "intermediate", "fp8_attention")
 
@@ -103,6 +103,8 @@ def load_lib(bin_dir: str) -> Lib:
     s.ift_visit_info.argtypes = [ctypes.c_int, _I32P]
     s.ift_workspace_bytes.restype = _SZ
     s.ift_workspace_bytes.argtypes = [_I32, ctypes.c_int]
+    s.ift_head_workspace_bytes.restype = _SZ
+    s.ift_head_workspace_bytes.argtypes = [_I32]
     s.ift_state_bytes.restype = _SZ
     s.ift_embed.argtypes = [_VP, _VP, _I32, _VP, _VP, _SZ, _VP]
     s.ift_run_visit.argtypes = [_VP, ctypes.c_int, _VP, _I32, _VP, _VP, _VP, _VP, _VP, _I32, _VP, _VP, _VP, _VP, _VP,
@@ -214,12 +216,25 @@ class InklingEngine:
         self._check(self.lib.shim.ift_final_hidden(self.h, x.data_ptr(), T, hidden.data_ptr(), ws.data_ptr(),
                                                    ws.numel(), self.stream()), "ift_final_hidden")
 
-    def head_logprob(self, hidden: torch.Tensor, ids: torch.Tensor, ws: torch.Tensor) -> torch.Tensor:
-        """hidden [N, 2304] bf16 contiguous, ids [N] int32 contiguous -> fp32 [N] (the engine's returned values)."""
+    HEAD_CHUNK = 1024
+
+    def head_logprob(self, hidden: torch.Tensor, ids: torch.Tensor, ws: torch.Tensor | None = None) -> torch.Tensor:
+        """hidden [N, 2304] bf16 contiguous, ids [N] int32 contiguous -> fp32 [N] (the engine's returned values), in
+        column chunks of HEAD_CHUNK (each column's value depends on that column alone; the fp32 logits of a chunk
+        are the call's workspace: ~0.8 MB per column)."""
         N = ids.numel()
         out = torch.empty(N, dtype=torch.float32, device=self.dev)
-        self._check(self.lib.shim.ift_head_logprob(self.h, hidden.data_ptr(), N, ids.data_ptr(), out.data_ptr(),
-                                                   ws.data_ptr(), ws.numel(), self.stream()), "ift_head_logprob")
+        c = min(N, self.HEAD_CHUNK)
+        need = int(self.lib.shim.ift_head_workspace_bytes(c))
+        if ws is None or ws.numel() < need:
+            ws = torch.empty(need, dtype=torch.uint8, device=self.dev)
+        for a in range(0, N, c):
+            n = min(c, N - a)
+            h = hidden[a:a + n].contiguous()
+            t = ids[a:a + n].contiguous()
+            o = out[a:a + n]
+            self._check(self.lib.shim.ift_head_logprob(self.h, h.data_ptr(), n, t.data_ptr(), o.data_ptr(),
+                                                       ws.data_ptr(), ws.numel(), self.stream()), "ift_head_logprob")
         return out
 
     def decode_experts(self, layer: int, which: str, first: int, count: int, out: torch.Tensor | None = None):
