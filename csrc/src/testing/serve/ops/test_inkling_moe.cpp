@@ -108,8 +108,9 @@ Nvfp4Row quant_nvfp4(const float* x, int k) {
         for (int j = 0; j < 16; ++j) {
             code6[j] = e2m1(xb[j] * inv6, v6[j]);
             code4[j] = e2m1(xb[j] * inv4, v4[j]);
-            err6[j]  = std::fabs((v6[j] * s6) * outer - xb[j]);
-            err4[j]  = std::fabs((v4[j] * s4) * outer - xb[j]);
+            // fused, as the vLLM image's compiled kernel (measured on lane a's capture)
+            err6[j]  = std::fabs(std::fma(v6[j] * s6, outer, -xb[j]));
+            err4[j]  = std::fabs(std::fma(v4[j] * s4, outer, -xb[j]));
         }
         for (int w = 16; w > 1; w /= 2) {
             for (int j = 0; j < w / 2; ++j) {

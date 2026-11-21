@@ -144,9 +144,11 @@ __device__ __forceinline__ std::uint64_t nvfp4_candidate(const float (&x)[16], f
         const std::uint32_t byte =
             e2m1_pair(__fmul_rn(x[2 * k], inverse), __fmul_rn(x[2 * k + 1], inverse), low, high);
         packed |= static_cast<std::uint64_t>(byte & 0xFFU) << (8 * k);
-        const float error_low  = fabsf(__fsub_rn(__fmul_rn(__fmul_rn(low, scale), outer), x[2 * k]));
-        const float error_high =
-            fabsf(__fsub_rn(__fmul_rn(__fmul_rn(high, scale), outer), x[2 * k + 1]));
+        // MEASURED (lanes/d/NOTES.md, vLLM eager capture p000, layer 0): the image's compiled kernel forms
+        // this error as fma(rec, outer, -x) -- the Python source's `enable_fp_fusion=False` notwithstanding.
+        // The unfused form picks the other candidate in 3 of 36,864 blocks; the fused one reproduces all.
+        const float error_low  = fabsf(__fmaf_rn(__fmul_rn(low, scale), outer, -x[2 * k]));
+        const float error_high = fabsf(__fmaf_rn(__fmul_rn(high, scale), outer, -x[2 * k + 1]));
         pair_error[k] = __fadd_rn(error_low, error_high);
     }
     const float quad0  = __fadd_rn(pair_error[0], pair_error[1]);
