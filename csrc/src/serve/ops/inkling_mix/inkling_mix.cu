@@ -390,6 +390,10 @@ struct ConvArgs {
     std::int64_t addend_stride = 0;
     bf16* out                = nullptr;
     std::int64_t out_stride  = 0;
+    /// 1 when one CTA covers each row's columns (W <= kConvColumnTile) and nothing is captured: the conv kernel
+    /// writes the new window itself (read, then write; no other thread owns the row's channel) -- the decode /
+    /// verify form, one launch instead of two.
+    int fuse_window          = 0;
 };
 
 /// The value at sequence index i of row b: S = [state tap 0, 1, 2, x column 0, 1, ...].
@@ -435,6 +439,13 @@ __global__ void __launch_bounds__(kConvChannelTile)
             y = __float2bfloat16_rn(base + __bfloat162float(y));
         }
         a.out[n * a.out_stride + c] = y;
+    }
+    if (a.fuse_window && valid > 0) { // conv_window_kernel's update, by the only thread that owns (c, b)
+        float upd[3];
+#pragma unroll
+        for (int i = 0; i < 3; ++i) { upd[i] = conv_seq(a, b, slot, valid + i, c); }
+#pragma unroll
+        for (int i = 0; i < 3; ++i) { a.state[slot * a.slot_stride + i * a.tap_stride + c] = __float2bfloat16_rn(upd[i]); }
     }
 }
 
@@ -812,11 +823,14 @@ void inkling_short_conv(const InklingPlane& x, std::int32_t channels, const Tens
             op, "a capture needs one row and a column in [0, W]");
     const dim3 grid(grid_count(channels, kConvChannelTile), grid_count(rows.width, kConvColumnTile),
                     static_cast<unsigned>(rows.batch));
+    a.fuse_window = capture_slot < 0 && rows.width <= kConvColumnTile ? 1 : 0;
     short_conv_kernel<<<grid, kConvChannelTile, 0, stream>>>(a);
     CUDA_CHECK(cudaGetLastError());
-    conv_window_kernel<<<dim3(grid_count(channels, kConvChannelTile), static_cast<unsigned>(rows.batch)),
-                         kConvChannelTile, 0, stream>>>(a, capture_column, capture_slot, 1);
-    CUDA_CHECK(cudaGetLastError());
+    if (!a.fuse_window) {
+        conv_window_kernel<<<dim3(grid_count(channels, kConvChannelTile), static_cast<unsigned>(rows.batch)),
+                             kConvChannelTile, 0, stream>>>(a, capture_column, capture_slot, 1);
+        CUDA_CHECK(cudaGetLastError());
+    }
 }
 
 void inkling_conv_capture_window(const InklingPlane& x, std::int32_t channels,
