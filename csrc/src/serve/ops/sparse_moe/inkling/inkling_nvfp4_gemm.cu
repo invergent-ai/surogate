@@ -747,13 +747,14 @@ void launch_persistent(const GemmParams& params, std::int32_t slots, cudaStream_
 }
 
 /// Prefill kernel choice. TIMING KNOB (removed once measured): SUROGATE_INKLING_NVFP4_PREFILL=old
-/// (the v1 per-tile kernel) | alt (persistent, 128 x 128 tiles) | tall (persistent, 256 x 128);
-/// default persistent 128 x 256.
+/// (the v1 per-tile kernel) | new (persistent 128 x 256 for both) | alt (persistent, 128 x 128 tiles) |
+/// tall (persistent, 256 x 128); default: gate_up persistent 128 x 256, down per-tile.
 /// Every choice computes the same bits.
 int prefill_variant() {
     static const int variant = [] {
         const char* value = std::getenv("SUROGATE_INKLING_NVFP4_PREFILL");
         if (value == nullptr) { return 0; }
+        if (std::strcmp(value, "new") == 0) { return 4; }
         if (std::strcmp(value, "old") == 0) { return 1; }
         if (std::strcmp(value, "alt") == 0) { return 2; }
         if (std::strcmp(value, "tall") == 0) { return 3; }
@@ -768,7 +769,16 @@ void launch_prefill(const GemmParams& params, std::int32_t slots, cudaStream_t s
     case 1: launch_schedule<WideSchedule, K, GateUp>(params, slots, stream); return;
     case 2: launch_persistent<PersistentAlt, K, GateUp>(params, slots, stream); return;
     case 3: launch_persistent<PersistentTall, K, GateUp>(params, slots, stream); return;
-    default: launch_persistent<PersistentWide, K, GateUp>(params, slots, stream); return;
+    case 4: launch_persistent<PersistentWide, K, GateUp>(params, slots, stream); return;
+    default:
+        // Measured 12:03 (T = 4,096, cold): gate_up persistent 514 us vs per-tile 549; down per-tile 332 vs
+        // persistent 367 (the fused combine overlaps better with two CTAs per SM).
+        if constexpr (GateUp) {
+            launch_persistent<PersistentWide, K, GateUp>(params, slots, stream);
+        } else {
+            launch_schedule<WideSchedule, K, GateUp>(params, slots, stream);
+        }
+        return;
     }
 }
 

@@ -509,6 +509,77 @@ __global__ __launch_bounds__(256) void quant_mxfp8_kernel(const __nv_bfloat16* _
 }
 
 // ---------------------------------------------------------------------------------------------
+// Router logits, narrow rounds, staged: a block = 8 experts x 8 tokens, 3 warps (the K groups).
+// The block's 8 router rows and 8 token rows are copied into shared memory with cp.async in one
+// round trip, then each warp runs its chain from shared memory: the old tile kernel paid one
+// dependent global round trip per k step (64 per group: ~25 us at T = 1 with cold weights).
+// Same MMA, same fragments (a0 / a2 = token row g, a1 / a3 = 0: rows 8-15 are padding, whose
+// outputs are discarded and never touch rows 0-7), same chains, same `(p0 + p1) + p2`.
+// ---------------------------------------------------------------------------------------------
+inline constexpr int kStagedRowBytes   = kHidden * 2 + 16; ///< 4624: 8 rows x 4 quads hit 32 banks
+inline constexpr int kStagedTileTokens = 8;
+inline constexpr int kStagedSharedBytes = 2 * 8 * kStagedRowBytes;
+
+__device__ __forceinline__ void router_logits_staged_tile(const __nv_bfloat16* __restrict__ x,
+                                                          const __nv_bfloat16* __restrict__ router,
+                                                          float* __restrict__ logits, std::int32_t tokens,
+                                                          std::int32_t* __restrict__ zero, std::int32_t zero_words,
+                                                          int e_tile, int m_tile, unsigned char* staged) {
+    const int thread = static_cast<int>(threadIdx.x);
+    if (zero != nullptr && e_tile == 0 && m_tile == 0) {
+        for (int i = thread; i < zero_words; i += 96) { zero[i] = 0; }
+    }
+    const int e0 = e_tile * 8;
+    const int m0 = m_tile * kStagedTileTokens;
+    unsigned char* w_rows = staged;
+    unsigned char* x_rows = staged + 8 * kStagedRowBytes;
+    constexpr int kChunks = kHidden / 8; // 16-byte chunks per row
+    for (int i = thread; i < 8 * kChunks; i += 96) {
+        const int row   = i / kChunks;
+        const int chunk = i - row * kChunks;
+        cp_async<16, Cache::cg>(w_rows + row * kStagedRowBytes + chunk * 16,
+                                router + static_cast<std::int64_t>(e0 + row) * kHidden + chunk * 8);
+        const int token  = m0 + row;
+        const bool valid = token < tokens;
+        cp_async_zfill<16, Cache::cg>(x_rows + row * kStagedRowBytes + chunk * 16,
+                                      x + static_cast<std::int64_t>(valid ? token : 0) * kHidden + chunk * 8,
+                                      valid ? 16 : 0);
+    }
+    cp_commit();
+    cp_wait<0>();
+    __syncthreads();
+    const int warp     = thread >> 5;
+    const int lane     = thread & 31;
+    const int group_id = lane >> 2;
+    const int quad     = lane & 3;
+    const int k_begin  = warp * kRouterGroup;
+    const int k_end    = min(k_begin + kRouterGroup, kHidden);
+    const auto* x0 = reinterpret_cast<const std::uint32_t*>(x_rows + group_id * kStagedRowBytes);
+    const auto* w  = reinterpret_cast<const std::uint32_t*>(w_rows + group_id * kStagedRowBytes);
+    float c0 = 0.0F, c1 = 0.0F, c2 = 0.0F, c3 = 0.0F;
+#pragma unroll 8
+    for (int k = k_begin; k < k_end; k += 16) {
+        const int lo = (k + 2 * quad) >> 1;
+        const int hi = (k + 8 + 2 * quad) >> 1;
+        mma_bf16(c0, c1, c2, c3, x0[lo], 0U, x0[hi], 0U, w[lo], w[hi]);
+    }
+    __shared__ float partial[3][kStagedTileTokens][8];
+    partial[warp][group_id][2 * quad]     = c0;
+    partial[warp][group_id][2 * quad + 1] = c1;
+    __syncthreads();
+    if (thread < kStagedTileTokens * 8) {
+        const int row   = thread >> 3;
+        const int col   = thread & 7;
+        const int token = m0 + row;
+        if (token < tokens) {
+            // `_group_sum`: total = p0; total += p1; total += p2.
+            logits[static_cast<std::int64_t>(token) * kExperts + e0 + col] =
+                __fadd_rn(__fadd_rn(partial[0][row][col], partial[1][row][col]), partial[2][row][col]);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Narrow rounds (decode / verify): router logits tiles and the x quantisation in ONE grid
 // (DESIGN-moe 2.1; one launch fewer). Blocks [0, 16 * ceil(T / 16)) are router tiles, the rest
 // quantise x rows, a warp per row. Each part runs the same code as its standalone kernel.
@@ -527,13 +598,14 @@ __global__ __launch_bounds__(96) void route_quant_narrow_kernel(const __nv_bfloa
                                                                 std::int32_t* __restrict__ zero,
                                                                 std::int32_t zero_words, LiveTokens live,
                                                                 XQuantOutputs q) {
+    extern __shared__ __align__(16) unsigned char staged[];
     pdl::wait_for_dependencies();
     pdl::trigger_dependents();
     const int block        = static_cast<int>(blockIdx.x);
-    const int router_tiles = (kExperts / 8) * ((tokens + 15) / 16);
+    const int router_tiles = (kExperts / 8) * ((tokens + kStagedTileTokens - 1) / kStagedTileTokens);
     if (block < router_tiles) {
-        router_logits_tile(x, router, logits, tokens, zero, zero_words, block % (kExperts / 8),
-                           block / (kExperts / 8));
+        router_logits_staged_tile(x, router, logits, tokens, zero, zero_words, block % (kExperts / 8),
+                                  block / (kExperts / 8), staged);
         return;
     }
     const int row = (block - router_tiles) * 3 + (static_cast<int>(threadIdx.x) >> 5);
@@ -713,13 +785,17 @@ void launch_route_quant_narrow(const __nv_bfloat16* x, const __nv_bfloat16* rout
     q.scales      = x_scales;
     q.amax        = x_amax;
     q.dequantised = x_dequantised;
-    const int blocks = (kExperts / 8) * ((tokens + 15) / 16) + (tokens + 2) / 3;
-    if (nvfp4) {
-        launch("route + x quant (narrow)", dim3(static_cast<unsigned>(blocks)), dim3(96), stream,
-               route_quant_narrow_kernel<true>, x, router, logits, tokens, zero, zero_words, live, q);
-    } else {
-        launch("route + x quant (narrow)", dim3(static_cast<unsigned>(blocks)), dim3(96), stream,
-               route_quant_narrow_kernel<false>, x, router, logits, tokens, zero, zero_words, live, q);
+    const int blocks = (kExperts / 8) * ((tokens + kStagedTileTokens - 1) / kStagedTileTokens) + (tokens + 2) / 3;
+    auto* kernel = nvfp4 ? route_quant_narrow_kernel<true> : route_quant_narrow_kernel<false>;
+    cudaError_t status = ::sinfer::ops::set_func_attribute_per_device(
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kStagedSharedBytes);
+    if (status == cudaSuccess) {
+        status = pdl::launch_dependent({dim3(static_cast<unsigned>(blocks)), dim3(96),
+                                        static_cast<std::size_t>(kStagedSharedBytes), stream},
+                                       kernel, x, router, logits, tokens, zero, zero_words, live, q);
+    }
+    if (status != cudaSuccess) {
+        throw std::runtime_error(std::string("inkling_moe: route + x quant (narrow): ") + cudaGetErrorString(status));
     }
 }
 
