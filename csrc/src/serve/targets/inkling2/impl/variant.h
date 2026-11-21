@@ -93,9 +93,10 @@ struct Variant {
     /// The content kind a lane is writing, from the last content marker of the current model message: 0 tool-call
     /// JSON, 1 message structure, 2 thinking (also: no marker within 4,096 tokens), 3 answer text.
     [[nodiscard]] static std::uint8_t dspark_content_kind(std::span<const TokenId> ledger);
-    /// The draft cap of a lane under --spec-adaptive. stats == nullptr: static per content kind (lanes/e2/k_policy.py)
-    /// -- tool-call JSON 7, structure 7, thinking 3, text 2. Otherwise per lane: the window of {0, 1, 2, 3, 7} with the
-    /// most tokens per unit of round time at this request's own acceptance on the kind (family::DSparkLaneStats).
+    /// The draft cap of a lane under --spec-adaptive. stats == nullptr (the default policy "static"): per content kind
+    /// (lanes/e2/k_policy.py) -- tool-call JSON 7, structure 7, thinking 3, text 2. Otherwise (opt-in policy "lane"):
+    /// the window of {0, 1, 2, 3, 7} with the most tokens per unit of 1-stream round time at this request's own
+    /// acceptance on the kind (family::DSparkLaneStats).
     [[nodiscard]] static std::uint32_t dspark_draft_cap(std::span<const TokenId> ledger,
                                                         const family::DSparkLaneStats* stats = nullptr);
     [[nodiscard]] static std::size_t dspark_propose_workspace_bytes(std::int32_t batch, std::uint32_t max_visible_keys);

@@ -44,7 +44,8 @@ template <class Variant>
     }
 }
 
-/// A lane's draft acceptance by content kind, for the DSpark k policy under --spec-adaptive (agent-EN-e2c): decayed
+/// A lane's draft acceptance by content kind, for the opt-in DSpark k policy "lane" (SUROGATE_SERVE_DSPARK_K_POLICY=lane;
+/// the default is "static"; not carried across a KV preemption yet -- KvResumeState) (agent-EN-e2c): decayed
 /// counts of accepted drafts and of rounds stopped by a rejection, per kind, from this request's own rounds only (reset
 /// at every request start), so a lane's k depends on nothing but its own tokens -- batch- and timing-independent, and a
 /// sampled rollout stays reproducible under its per-(request, position) seeds. Read by the Variant's

@@ -9,7 +9,8 @@
 //      Chi-square per column against p_j (alpha 1e-3) on peaked, medium, flat rows, a low-probability draft, T = 0.7,
 //      min_p; a POWER control re-tests every column against p_j with 1 % of the mass moved between two bins (must
 //      fail where the samples allow, to show the test resolves an error of that size).
-//   3. OLD vs NEW (informational, not required at T1): rows whose result differs from the one-CTA wide kernel.
+//   3. OLD vs NEW: every row's result must equal the one-CTA wide kernel's (any difference FAILS; agent-EN 17:5x), at
+//      Inkling's shape, W4g's real vocabulary (248,320, BF16) and the older Qwen3 shape (151,669 / 151,936).
 // `bench`: the op's time per call, old vs split, B = 1 / 8, K = 7, every draft accepted (8 columns drawn).
 
 #include "api/ops/speculative_round.h"
@@ -388,7 +389,9 @@ int test_invariance_and_identity(const Shape& s) {
         }
         std::printf("| %s | %s | %ld | %ld | %ld | %ld / %ld | %ld |\n", s.name, names[kind], rows, rep, alone, k3, k3n, old_same);
         std::fflush(stdout);
-        if (rep != rows || alone != rows || k3 != k3n) { ++failures; }
+        // agent-EN 17:5x: any difference from the old one-CTA route fails (same draws by construction; the normalizer is
+        // the same double sum in another order)
+        if (rep != rows || alone != rows || k3 != k3n || old_same != rows) { ++failures; }
     }
     ops::detail::speculative_exact_split() = true;
     return failures;
@@ -631,7 +634,10 @@ int main(int argc, char** argv) {
         std::printf("no CUDA device: skipped\n");
         return 77;
     }
-    const Shape shapes[2] = {{"Inkling fp32 201024", true, 201024, 201024}, {"W4g bf16 151669/151936", false, 151669, 151936}};
+    // W4g's real vocabulary is 248,320 (agent-EN 17:5x); 151,669 / 151,936 is the older Qwen3 shape S1 tested.
+    const Shape shapes[3] = {{"Inkling fp32 201024", true, 201024, 201024},
+                             {"W4g bf16 248320", false, 248320, 248320},
+                             {"Qwen3 bf16 151669/151936", false, 151669, 151936}};
     const std::string mode = argc > 1 ? argv[1] : "all";
     if (mode == "bench") {
         for (const Shape& s : shapes) { run_bench(s); }

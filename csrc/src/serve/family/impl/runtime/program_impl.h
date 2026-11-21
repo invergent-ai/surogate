@@ -96,19 +96,21 @@ void round_trace_state(const Pool& pool, cudaStream_t stream, const char* when) 
 namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS {
 namespace {
 
-/// DSpark under --spec-adaptive: the k policy (SUROGATE_SERVE_DSPARK_K_POLICY). 2 (default, "lane"): each lane's cap
-/// from its content kind AND its own request's acceptance on that kind (family::DSparkLaneStats, the Variant's
-/// dspark_draft_cap); 1 ("static"): the cap per content kind only (tool JSON / structure 7, thinking 3, text 2;
-/// lanes/e2/k_policy.py); 0 ("measured"): the measured AdaptiveDFlash choice per batch size and context band, no caps.
-/// Under 1 / 2 a lane's extent is its own cap whatever the batch (the window is the smallest captured one holding every
-/// cap), so its drafts, and its sampled tokens, do not depend on the other lanes or on timing.
+/// DSpark under --spec-adaptive: the k policy (SUROGATE_SERVE_DSPARK_K_POLICY). 1 (DEFAULT, "static"): each lane's
+/// cap per content kind (tool JSON / structure 7, thinking 3, text 2; lanes/e2/k_policy.py); 2 ("lane", opt-in): the cap
+/// from the content kind AND this request's own acceptance on it (family::DSparkLaneStats, the Variant's
+/// dspark_draft_cap; priced with 1-stream round times, so slower at 8 streams -- rows2: -4 % T0, -8 % T1 -- and its
+/// statistics are not yet carried across a KV preemption, so a sampled rollout that is preempted may not reproduce);
+/// 0 ("measured"): the measured AdaptiveDFlash choice per batch size and context band, no caps. Under 1 / 2 a lane's
+/// extent is its own cap whatever the batch (the window is the smallest captured one holding every cap), so its
+/// drafts, and its sampled tokens, do not depend on the other lanes or on timing.
 [[nodiscard]] int dspark_k_policy() {
     if constexpr (family::dspark_drafter<Variant>()) {
         static const int mode = [] {
             const char* raw = std::getenv("SUROGATE_SERVE_DSPARK_K_POLICY");
             if (raw != nullptr && std::string_view(raw) == "measured") { return 0; }
-            if (raw != nullptr && std::string_view(raw) == "static") { return 1; }
-            return 2;
+            if (raw != nullptr && std::string_view(raw) == "lane") { return 2; }
+            return 1;
         }();
         return mode;
     } else {
