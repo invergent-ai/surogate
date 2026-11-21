@@ -763,7 +763,9 @@ int test_lora_delta(std::uint32_t seed) {
 /// inkling_conv_attn_res (decode rows, W = 1) == inkling_short_conv + inkling_attn_res, bitwise: the conv output
 /// plane, the conv windows and the mix output; rows with positions 0 / 1 / 2, idle rows (valid 0), conv output as
 /// `last` (stack + partial) and as `addend`.
-int test_conv_attn_res(std::uint32_t seed, int B, bool as_last) {
+/// form 0: the attention-output conv (no residual / addend); 1: the MLP conv in place (residual = the output plane,
+/// + addend); 2: the MLP conv of a block's first visit (addend only).
+int test_conv_attn_res(std::uint32_t seed, int B, bool as_last, int form = 0) {
     constexpr int kSlotsN = 40;
     const int stack = as_last ? 3 : 2; // + the partial and conv_out (last) / + partial last with conv_out addend
     const std::size_t slot_elems = static_cast<std::size_t>(G::kConvChannels) * 3;
@@ -773,6 +775,9 @@ int test_conv_attn_res(std::uint32_t seed, int B, bool as_last) {
     const auto planes = randn_bf16(static_cast<std::size_t>(stack + 1) * B * kD, seed + 3, 1.0F);
     const auto qv     = randn_f32(kD, seed + 4, 0.05F);
     const auto nw     = randn_bf16(kD, seed + 5, 1.0F);
+    const auto prev   = randn_bf16(static_cast<std::size_t>(B) * kD, seed + 6, 1.0F); // the partial (residual)
+    const auto addv   = randn_bf16(static_cast<std::size_t>(B) * kD, seed + 7, 1.0F); // attn_out (addend)
+    DeviceBuffer d_add = dev_bf16(addv);
     std::vector<int> pos(B), valid(B), slots(B);
     for (int b = 0; b < B; ++b) {
         pos[b]   = b < 3 ? b : 100 + 7 * b;
@@ -791,9 +796,8 @@ int test_conv_attn_res(std::uint32_t seed, int B, bool as_last) {
         std::vector<std::uint8_t> conv, state, out;
     };
     const auto run = [&](bool fused) {
-        DeviceBuffer d_pool = dev_bf16(init), d_conv(static_cast<std::size_t>(B) * kD * 2),
-                     d_out(static_cast<std::size_t>(B) * kD * 2);
-        d_conv.fill(0);
+        DeviceBuffer d_pool = dev_bf16(init), d_conv = dev_bf16(prev), d_out(static_cast<std::size_t>(B) * kD * 2);
+        if (form == 0) { d_conv.fill(0); }
         const ops::InklingConvStateView view{d_pool.p, static_cast<std::int64_t>(slot_elems), G::kConvChannels};
         const ops::InklingPlane conv_out{d_conv.p, DType::BF16, kD};
         ops::InklingAttnResSources src;
@@ -808,18 +812,23 @@ int test_conv_attn_res(std::uint32_t seed, int B, bool as_last) {
         }
         Tensor out(d_out.p, DType::BF16, {kD, B, 1});
         const ops::InklingPlane xin{d_x.p, DType::BF16, kD};
+        const ops::InklingPlane addend{d_add.p, DType::BF16, kD};
+        const ops::InklingPlane* res_p = form == 1 ? &conv_out : nullptr; // in place, as the engine's MLP conv
+        const ops::InklingPlane* add_p = form == 0 ? nullptr : &addend;
+        const int offset               = form == 0 ? G::kStreamAttn : G::kStreamMlp;
         if (fused) {
-            ops::inkling_conv_attn_res(xin, w_t, rows, view, G::kStreamAttn, conv_out, src, q_t, &nw_t, 1e-6F, out,
-                                       nullptr);
+            ops::inkling_conv_attn_res(xin, w_t, rows, view, offset, conv_out, src, q_t, &nw_t, 1e-6F, out, nullptr,
+                                       res_p, add_p);
         } else {
-            ops::inkling_short_conv(xin, kD, w_t, rows, view, G::kStreamAttn, nullptr, nullptr, conv_out, nullptr);
+            ops::inkling_short_conv(xin, kD, w_t, rows, view, offset, res_p, add_p, conv_out, nullptr);
             ops::inkling_attn_res(src, B, q_t, &nw_t, 1e-6F, out, nullptr);
         }
         cuda_synchronize();
         return Run{raw(d_conv.p, d_conv.bytes), raw(d_pool.p, d_pool.bytes), raw(d_out.p, d_out.bytes)};
     };
     const Run u = run(false), f = run(true);
-    const std::string tag = "I8 conv + attn_res fused, B=" + std::to_string(B) + (as_last ? " (last)" : " (addend)");
+    const std::string tag = "I8 conv + attn_res fused, B=" + std::to_string(B) + (as_last ? " (last)" : " (addend)") +
+                            (form == 1 ? " MLP in place" : form == 2 ? " MLP first" : "");
     int failures = 0;
     failures += same_bits(tag + ": conv output", f.conv, u.conv, 2);
     failures += same_bits(tag + ": conv windows", f.state, u.state, 2);
@@ -934,6 +943,8 @@ int main() {
         failures += test_conv_attn_res(3800 + B, B, false);
         failures += test_conv_blend(3900 + B, B, true);
         failures += test_conv_blend(4000 + B, B, false);
+        failures += test_conv_attn_res(4100 + B, B, true, 1);
+        failures += test_conv_attn_res(4200 + B, B, true, 2);
     }
     for (const int n : {1, 5, 8, 13, 32}) {
         failures += test_controller_tail(3300 + n, 3, 1, n);

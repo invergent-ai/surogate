@@ -623,7 +623,7 @@ __global__ void __launch_bounds__(kConvChannelTile)
 /// (d) fusion, decode form: short_conv_kernel for every row of W = 1 (no residual / addend, window in place) and then
 /// the attn_res column that reads the conv's output, one CTA per row. The conv writes its output plane and the window
 /// exactly as short_conv_kernel; after the barrier the mix reads that plane as attn_res_kernel does: same bits.
-/// short_conv_kernel's arithmetic for row b of a W = 1 call (no residual / addend; the window in place).
+/// short_conv_kernel's arithmetic for row b of a W = 1 call (residual / addend as there; the window in place).
 __device__ __forceinline__ void conv_row_w1(const ConvArgs& a, int b) {
     const int valid   = a.valid != nullptr ? a.valid[b] : 1;
     if (valid > 0) {
@@ -642,7 +642,15 @@ __device__ __forceinline__ void conv_row_w1(const ConvArgs& a, int b) {
                 acc           = fmaf(v, w[k], acc);
             }
             const float cur = __bfloat162float(a.x[static_cast<std::int64_t>(b) * a.x_stride + c]);
-            a.out[static_cast<std::int64_t>(b) * a.out_stride + c] = __float2bfloat16_rn((acc + cur) * scale);
+            bf16 y          = __float2bfloat16_rn((acc + cur) * scale);
+            if (a.addend != nullptr) {
+                float base = __bfloat162float(a.addend[static_cast<std::int64_t>(b) * a.addend_stride + c]);
+                if (a.residual != nullptr) {
+                    base = __bfloat162float(a.residual[static_cast<std::int64_t>(b) * a.residual_stride + c]) + base;
+                }
+                y = __float2bfloat16_rn(base + __bfloat162float(y));
+            }
+            a.out[static_cast<std::int64_t>(b) * a.out_stride + c] = y;
             float upd[3];
 #pragma unroll
             for (int i = 0; i < 3; ++i) { upd[i] = conv_seq(a, b, slot, 1 + i, c); }
@@ -1106,10 +1114,30 @@ void inkling_blend_rms_norm(const Tensor& dest, const Tensor& message, const Ten
     CUDA_CHECK(cudaGetLastError());
 }
 
+namespace {
+
+/// The conv's optional residual / addend (inkling_short_conv's rules).
+void conv_extras(ConvArgs& a, const InklingPlane* residual, const InklingPlane* addend, const char* op) {
+    if (addend != nullptr) {
+        require(addend->data != nullptr && addend->dtype == DType::BF16, op, "addend must be BF16");
+        a.addend        = static_cast<const bf16*>(addend->data);
+        a.addend_stride = addend->column_stride;
+    }
+    if (residual != nullptr) {
+        require(addend != nullptr, op, "a residual needs an addend (the reference's form)");
+        require(residual->data != nullptr && residual->dtype == DType::BF16, op, "residual must be BF16");
+        a.residual        = static_cast<const bf16*>(residual->data);
+        a.residual_stride = residual->column_stride;
+    }
+}
+
+} // namespace
+
 void inkling_conv_attn_res(const InklingPlane& x, const Tensor& conv_weight, const InklingConvRows& rows,
                            const InklingConvStateView& state, std::int32_t channel_offset, const InklingPlane& conv_out,
                            const InklingAttnResSources& sources, const Tensor& queries, const Tensor* norm_weight,
-                           float norm_eps, Tensor& out, cudaStream_t stream) {
+                           float norm_eps, Tensor& out, cudaStream_t stream, const InklingPlane* conv_residual,
+                           const InklingPlane* conv_addend) {
     constexpr const char* op = "inkling_conv_attn_res";
     require(rows.width == 1, op, "the fused decode form takes rows of one column (W = 1)");
     ConvAttnResArgs f;
@@ -1120,6 +1148,7 @@ void inkling_conv_attn_res(const InklingPlane& x, const Tensor& conv_weight, con
             "the mix must read the conv output (as last or addend)");
     f.conv.out        = static_cast<bf16*>(conv_out.data);
     f.conv.out_stride = conv_out.column_stride;
+    conv_extras(f.conv, conv_residual, conv_addend, op);
     f.mix             = attn_res_args(sources, rows.batch, queries, norm_weight, norm_eps, out, op);
     const dim3 grid(static_cast<unsigned>(rows.batch));
     switch (sources.stack_count + 1) {
@@ -1139,7 +1168,8 @@ void inkling_conv_blend_inputs(const InklingPlane& x, const Tensor& conv_weight,
                                const InklingPlane& conv_out, const InklingAttnResSources& dest_sources,
                                const Tensor& dest_queries, const InklingAttnResSources& bank,
                                const Tensor& message_queries, Tensor& dest, Tensor& message, Tensor& pair,
-                               cudaStream_t stream) {
+                               cudaStream_t stream, const InklingPlane* conv_residual,
+                               const InklingPlane* conv_addend) {
     constexpr const char* op = "inkling_conv_blend_inputs";
     require(rows.width == 1, op, "the fused decode form takes rows of one column (W = 1)");
     ConvBlendArgs f;
@@ -1150,6 +1180,7 @@ void inkling_conv_blend_inputs(const InklingPlane& x, const Tensor& conv_weight,
             "the dest mix must read the conv output (as last or addend)");
     f.conv.out        = static_cast<bf16*>(conv_out.data);
     f.conv.out_stride = conv_out.column_stride;
+    conv_extras(f.conv, conv_residual, conv_addend, op);
     f.blend = blend_inputs_args(dest_sources, dest_queries, bank, message_queries, rows.batch, dest, message, pair, op);
     const dim3 grid(static_cast<unsigned>(rows.batch));
     switch (dest_sources.stack_count + 1) {

@@ -128,6 +128,10 @@ struct Round {
     ops::InklingConvPool pool{};
     /// The segments' ints went in one host copy this round: everything the step wrote before is complete.
     bool seg_barrier = false;
+    /// (d) fusion 2: a decode round's next-visit attention inputs, computed by the previous visit's MLP-conv launch
+    /// ([D, T, 3] BF16, round scope); `carry_visit` is the visit they belong to (-1: none).
+    Tensor carry;
+    int carry_visit = -1;
 };
 
 /// S10 attention LoRA: the round's adapter selection on the bank table registered under `key` (a layer's qkvr or
@@ -183,6 +187,8 @@ struct FusedConv {
     ops::InklingConvStateView state;
     std::int32_t channel_offset = 0;
     ops::InklingPlane out;
+    const ops::InklingPlane* residual = nullptr; ///< the MLP conv's (residual + addend) + conv form
+    const ops::InklingPlane* addend   = nullptr;
 };
 
 /// The fp32 AttnRes mix + message blend of a looped visit, column-tiled (DESIGN-target.md 3.4).
@@ -222,7 +228,8 @@ void blended_inputs(Round& rd, const VisitInfo& vi, const load::InklingLayerWeig
         // attention-output conv in front of it on a decode round (I9).
         if (conv != nullptr) {
             ops::inkling_conv_blend_inputs(conv->x, *conv->weight, conv->rows, conv->state, conv->channel_offset,
-                                           conv->out, src, dest_queries, bank, msg_queries, dest, msg, pair, rd.s);
+                                           conv->out, src, dest_queries, bank, msg_queries, dest, msg, pair, rd.s,
+                                           conv->residual, conv->addend);
         } else {
             ops::inkling_blend_inputs(src, dest_queries, bank, msg_queries, n, dest, msg, pair, rd.s);
         }
@@ -520,10 +527,16 @@ void run_visit(Round& rd, int v) {
     if (vi.feature >= 0 && rd.r.features.active()) {
         rd.r.features.capture(rd.r.features.context, vi.feature, slot_tensor(rd.r.x, vi.partial, T), s);
     }
-    // 1. attention inputs
-    const int Q    = (vi.global || vi.looped) ? 3 : 1;
-    Tensor attn_in = rd.work.alloc(DType::BF16, {D, T, Q});
-    attention_inputs(rd, v, vi, L, attn_in);
+    // 1. attention inputs (already computed by the previous visit's MLP-conv launch under (d) fusion 2)
+    const int Q = (vi.global || vi.looped) ? 3 : 1;
+    Tensor attn_in;
+    if (rd.carry_visit == v) {
+        attn_in        = Tensor(rd.carry.data, DType::BF16, {D, T, Q});
+        rd.carry_visit = -1;
+    } else {
+        attn_in = rd.work.alloc(DType::BF16, {D, T, Q});
+        attention_inputs(rd, v, vi, L, attn_in);
+    }
     dump("attn_in", v, attn_in.data, DType::BF16, D, D, T, Q, s);
     // 2. projections: one GEMM over the fused rows, or three over their row ranges (q-side / K / V)
     Tensor qkvr = rd.work.alloc(DType::BF16, {C::qkvr_rows, T});
@@ -820,8 +833,41 @@ void run_visit(Round& rd, int v) {
         ops::inkling_moe(x, moe_weights(L), moe_out, rd.work, s, options);
     }
     dump("moe_out", v, moe_out.data, DType::BF16, D, D, T, 1, s);
-    // 8. MLP-output conv: (residual + attn_out) + conv(moe_out) into the next partial (in place when not first)
+    // 8. MLP-output conv: (residual + attn_out) + conv(moe_out) into the next partial (in place when not first).
+    //    (d) fusion 2 on a decode round: the same launch also computes the NEXT visit's attention inputs (the mix /
+    //    blend that reads this partial as its `last`), kept in rd.carry for run_visit(v + 1).
+    const bool fuse_next = rd.carry.data != nullptr && fuse_conv_mix && v + 1 < rd.r.last_visit &&
+                           [&] {
+                               const VisitInfo& vn = kVisits[static_cast<std::size_t>(v + 1)];
+                               return !(vn.stack_count == 0 && vn.partial == 0) && vn.partial == vi.next_partial;
+                           }();
+    if (fuse_next) {
+        const Group& g                       = rd.groups[0];
+        const VisitInfo& vn                  = kVisits[static_cast<std::size_t>(v + 1)];
+        const load::InklingLayerWeights& Ln  = *rd.model.full_layers.at(static_cast<std::size_t>(v + 1)).projection.layer;
+        const int Qn                         = (vn.global || vn.looped) ? 3 : 1;
+        ops::InklingAttnResSources src;
+        src.stack_count = vn.stack_count;
+        for (int i = 0; i < vn.stack_count; ++i) { src.stack[i] = slot_plane(rd.r.x, vn.stack[i]); }
+        src.last                             = slot_plane(rd.r.x, vn.partial);
+        const Tensor& queries                = rd.q.attn.at(static_cast<std::size_t>(vn.layer));
+        Tensor next_in(rd.carry.data, DType::BF16, {D, T, Qn});
+        const ops::InklingPlane residual     = slot_plane(rd.r.x, vi.partial);
+        const ops::InklingPlane addend       = packed(attn_out, 0);
+        const ops::InklingPlane* residual_p  = vi.first ? nullptr : &residual;
+        if (!vn.looped) {
+            ops::inkling_conv_attn_res(packed(moe_out, 0), L.mlp_out_conv, g.rows(), state, G::kStreamMlp,
+                                       slot_plane(rd.r.x, vi.next_partial), src, queries, &Ln.attn_input_norm,
+                                       C::rms_epsilon, next_in, s, residual_p, &addend);
+        } else {
+            const FusedConv fc{packed(moe_out, 0), &L.mlp_out_conv, g.rows(), state, G::kStreamMlp,
+                               slot_plane(rd.r.x, vi.next_partial), residual_p, &addend};
+            blended_inputs(rd, vn, Ln, src, queries, 0, 3, Ln.attn_input_norm, next_in, &fc);
+        }
+        rd.carry_visit = v + 1;
+    }
     for (const Group& g : rd.groups) {
+        if (fuse_next) { break; }
         const family::VisitSegment* seg = g.segment;
         if (g.record) {
             ops::inkling_conv_record(packed(moe_out, g.column), D, g.width, g.batch, v, G::kStreamMlp, rd.records, s);
@@ -955,6 +1001,11 @@ void Variant::run_visits(const ModelView& model, family::VisitRound& r) {
     }();
     d.active = d.dir != nullptr && !dumped && capturing == cudaStreamCaptureStatusNone && !r.segments.empty() &&
                rd.T >= min_columns;
+    // (d) fusion 2's carried attention inputs: a decode round of one W = 1 group (<= 256 rows).
+    if (!fusions_off() && rd.groups.size() == 1 && rd.groups[0].segment == nullptr && !rd.groups[0].record &&
+        rd.groups[0].width == 1 && rd.T <= 256) {
+        rd.carry = rd.work.alloc(DType::BF16, {D, rd.T, 3});
+    }
     for (int v = r.first_visit; v < r.last_visit; ++v) { run_visit(rd, v); }
     if (d.active) {
         dumped   = true;
@@ -1003,6 +1054,8 @@ std::size_t Variant::visit_workspace_capacity_bytes(const family::TextGeometry&,
                                                                        static_cast<std::int32_t>(T), lora_enabled),
                                       naive::moe_workspace_bytes(static_cast<std::int32_t>(T))});
     bytes += up(attention) + up(moe);
+    // (d) fusion 2: the carried next-visit attention inputs of a decode round (<= 256 rows, 3 streams)
+    bytes += up(static_cast<std::size_t>(256) * D * 3 * 2);
     // S10 attention LoRA: the fp32 low-rank buffers of the qkvr (6 slices) and wo_ud calls, at the kernels' rank bound 64
     if (lora_enabled) {
         bytes += up(ops::inkling_lora_delta_workspace_bytes(6, 64, static_cast<std::int32_t>(T))) +
