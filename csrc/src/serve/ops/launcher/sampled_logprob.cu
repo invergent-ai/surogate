@@ -16,6 +16,10 @@ constexpr int kThreads = 512;
 constexpr int kVector  = 8; // BF16 logits per 16-byte load
 constexpr int kUnroll  = 4; // loads each thread keeps in flight
 
+/// One logit as a float: BF16 rows on every target but those that keep FP32 logits.
+__device__ __forceinline__ float logit_value(__nv_bfloat16 x) { return __bfloat162float(x); }
+__device__ __forceinline__ float logit_value(float x) { return x; }
+
 /// Calls `visit(x)` for every logit of the row, scaled by `inverse`. An aligned row
 /// is read 16 bytes at a time, kUnroll loads issued before any is used: one block
 /// per column reads a whole 151,936-token row twice, and with one 2-byte load per
@@ -50,7 +54,8 @@ __device__ __forceinline__ void for_each_scaled(const float* __restrict__ row, i
                                                 float inverse, Visit&& visit) {
     constexpr int kFloatVector = 4; // FP32 logits per 16-byte load
     const int tid        = static_cast<int>(threadIdx.x);
-    const int vector_end = (reinterpret_cast<std::uintptr_t>(row) & 15u) == 0 ? domain / kFloatVector * kFloatVector : 0;
+    const int vector_end =
+        (reinterpret_cast<std::uintptr_t>(row) & 15u) == 0 ? domain / kFloatVector * kFloatVector : 0;
     for (int base = tid * kFloatVector; base < vector_end; base += kThreads * kFloatVector * kUnroll) {
         float4 packed[kUnroll];
 #pragma unroll
@@ -69,9 +74,6 @@ __device__ __forceinline__ void for_each_scaled(const float* __restrict__ row, i
     }
     for (int v = vector_end + tid; v < domain; v += kThreads) { visit(row[v] * inverse); }
 }
-
-__device__ __forceinline__ float logit_value(__nv_bfloat16 x) { return __bfloat162float(x); }
-__device__ __forceinline__ float logit_value(float x) { return x; }
 
 /// One block per column: a max pass and a sum pass over the vocabulary, each
 /// reduced within warps and then across them through shared memory. The scale is
@@ -232,8 +234,9 @@ void score_logprobs_device(const Tensor& logits, const Tensor& tokens, int domai
         score_kernel<float><<<columns, 512, 0, stream>>>(static_cast<const float*>(logits.data),
             static_cast<const int*>(tokens.data), output, logits.ne[0], domain, configs, -1, width, counts);
     } else {
-        score_kernel<__nv_bfloat16><<<columns, 512, 0, stream>>>(static_cast<const __nv_bfloat16*>(logits.data),
-            static_cast<const int*>(tokens.data), output, logits.ne[0], domain, configs, -1, width, counts);
+        score_kernel<__nv_bfloat16><<<columns, 512, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(logits.data), static_cast<const int*>(tokens.data), output,
+            logits.ne[0], domain, configs, -1, width, counts);
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -258,8 +261,9 @@ std::vector<TokenScore> score_logprobs_batch(const Tensor& logits, std::span<con
             score_kernel<float><<<columns, 512, 0, stream>>>(static_cast<const float*>(logits.data),
                 device_tokens, device_out, logits.ne[0], domain, nullptr, top_k, 1, nullptr);
         } else {
-            score_kernel<__nv_bfloat16><<<columns, 512, 0, stream>>>(static_cast<const __nv_bfloat16*>(logits.data),
-                device_tokens, device_out, logits.ne[0], domain, nullptr, top_k, 1, nullptr);
+            score_kernel<__nv_bfloat16><<<columns, 512, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(logits.data), device_tokens, device_out, logits.ne[0], domain,
+                nullptr, top_k, 1, nullptr);
         }
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaMemcpyAsync(host.data(), device_out, columns * sizeof(RawTokenScores),

@@ -10,12 +10,14 @@
 #include <cuda_runtime.h>
 
 namespace sinfer::ops {
+/// Reads the named logits of one column as floats. `logits` is BF16 or FP32.
 std::vector<float> gather_candidate_logits(const Tensor& logits, std::span<const TokenId> tokens,
                                             int domain, cudaStream_t stream, DeviceSpan scratch,
                                             std::span<float> host);
 /// Asynchronous batched scoring into caller-owned device output. Columns are
 /// lane-major, with `width` verification positions per lane; counts can mask
 /// unlicensed speculative positions. All pointers remain valid through stream completion.
+/// `logits` is BF16 or FP32; the same holds for score_logprobs_batch and score_logprobs.
 void score_logprobs_device(const Tensor& logits, const Tensor& tokens, int domain,
                           const SamplingConfig* configs, RawTokenScores* output,
                           cudaStream_t stream, int width = 1, const int* counts = nullptr);
@@ -32,7 +34,7 @@ TokenScore score_logprobs(const Tensor& logits, TokenId token, int domain, int t
  *
  *   out[c] = logits[tokens[c],c]/T_c - log(sum_v exp(logits[v,c]/T_c))
  *
- * evaluated in FP32 from the represented BF16 logits with a max-subtracted sum,
+ * evaluated in FP32 from the represented BF16 or FP32 logits with a max-subtracted sum,
  * where T_c is `configs[c].temperature` and a non-positive temperature -- a
  * greedy row -- reads as 1.
  *
@@ -47,7 +49,7 @@ TokenScore score_logprobs(const Tensor& logits, TokenId token, int domain, int t
  * past the vocabulary carries untrained rows that must not enter the sum. A
  * token outside the vocabulary yields NaN for its column rather than throwing.
  *
- * `logits` is BF16 [vocab, n], `tokens` is I32 [n], `out` is FP32 [n], and
+ * `logits` is BF16 or FP32 [vocab, n], `tokens` is I32 [n], `out` is FP32 [n], and
  * `configs` is a device-resident SamplingConfig[n]. The Op writes all of out and
  * uses no workspace or persistent state.
  */

@@ -140,4 +140,58 @@ static_assert(visit_of(11, 1) == 23 && visit_of(17, 2) == 41 && visit_of(23, 0) 
 // Global visits 5, 11, 17, 23, 29, 35, 41, 47 (OPS.md 1).
 static_assert(kVisits[11].global && kVisits[17].global && kVisits[29].global && kVisits[35].global && !kVisits[10].global);
 
+// The whole table against a replay of the reference's own stack (`loop.py` Inkling2LoopModel.forward): every
+// stack entry is named by what it holds -- 1 = the embedding, 2 = the prelude block, 10 + 2p / 11 + 2p = pass
+// p's blocks of layers 6-11 / 12-17, 20 = the coda's -- and for every visit the sources, the partial, the
+// slot the MLP writes and the message bank must name the same entries in the reference and in the slots.
+namespace visits_detail {
+
+constexpr int entry_of(int layer, int pass) {
+    if (layer < TextConfig::core_start) { return 2; }
+    if (layer >= TextConfig::core_end) { return 20; }
+    return (layer < 12 ? 10 : 11) + 2 * pass;
+}
+
+constexpr bool replay_matches() {
+    int ref[8]{1, 0, 0, 0, 0, 0, 0, 0}; // the reference's stack (entries)
+    int nb = 0, prelude_blocks = -1;
+    int bank0 = 0, bank1 = 0;
+    int slot[TextConfig::stack_slots]{1, 0, 0, 0, 0, 0, 0}; // ours
+    for (int v = 0; v < TextConfig::layers; ++v) {
+        const VisitInfo& vi = kVisits[v];
+        const int i = vi.layer, p = vi.pass;
+        if (i == TextConfig::core_start && p == 0) {
+            prelude_blocks = nb;
+        } else if (i == TextConfig::core_start) {
+            bank0 = ref[prelude_blocks + 1];
+            bank1 = ref[prelude_blocks + 2];
+            nb    = prelude_blocks;
+            ref[nb] = 2; // stack[nb].copy_(prelude_partial)
+        }
+        // sources, partial, bank
+        if (vi.stack_count != nb) { return false; }
+        for (int k = 0; k < nb; ++k) {
+            if (slot[vi.stack[k]] != ref[k]) { return false; }
+        }
+        if (slot[vi.partial] != ref[nb]) { return false; }
+        if (vi.looped && (slot[vi.bank[0]] != bank0 || slot[vi.bank[1]] != bank1)) { return false; }
+        if (vi.first != (i % TextConfig::block_layers == 0)) { return false; }
+        // the MLP conv: a first layer closes a block (nb + 1) and starts the next partial
+        if (vi.first) { ++nb; }
+        ref[nb]               = entry_of(i, p);
+        slot[vi.next_partial] = entry_of(i, p);
+        if (!vi.first && vi.next_partial != vi.partial) { return false; }
+    }
+    // the final output mix reads the reference's stack[:nb] + stack[nb]
+    if (nb != static_cast<int>(kFinalStack.size())) { return false; }
+    for (int k = 0; k < nb; ++k) {
+        if (slot[kFinalStack[k]] != ref[k]) { return false; }
+    }
+    return slot[kFinalPartial] == ref[nb];
+}
+
+} // namespace visits_detail
+
+static_assert(visits_detail::replay_matches(), "the visit table disagrees with the reference's AttnRes stack");
+
 } // namespace sinfer::targets::inkling2::detail
