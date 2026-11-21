@@ -1097,14 +1097,16 @@ void dispatch(InklingLayerKind kind, int mode, const Plan& plan, const AttnParam
 
 template <int Mode>
 void launch_fold(InklingLayerKind kind, std::int64_t n, const AttnParams& p, cudaStream_t stream) {
+    // fold_kernel also holds 512 B of static shared memory (seg_max): its dynamic part stays 1 KiB under the opt-in limit.
+    constexpr int kFoldDynMax = kSmemLimit - 1024;
     const std::size_t smem = static_cast<std::size_t>(p.max_slots) * 16 + 2 * kFoldChunk * Geo::kHeadDim * 4;
-    if (smem > static_cast<std::size_t>(kSmemLimit)) {
+    if (smem > static_cast<std::size_t>(kFoldDynMax)) {
         throw std::invalid_argument("inkling rel attention: too many partial slots for the fold");
     }
     auto* kernel = kind == InklingLayerKind::Local ? fold_kernel<true, Mode> : fold_kernel<false, Mode>;
     static const bool configured = [] {
-        CUDA_CHECK(cudaFuncSetAttribute(fold_kernel<true, Mode>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemLimit));
-        CUDA_CHECK(cudaFuncSetAttribute(fold_kernel<false, Mode>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemLimit));
+        CUDA_CHECK(cudaFuncSetAttribute(fold_kernel<true, Mode>, cudaFuncAttributeMaxDynamicSharedMemorySize, kFoldDynMax));
+        CUDA_CHECK(cudaFuncSetAttribute(fold_kernel<false, Mode>, cudaFuncAttributeMaxDynamicSharedMemorySize, kFoldDynMax));
         return true;
     }();
     (void)configured;
