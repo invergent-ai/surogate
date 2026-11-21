@@ -15,6 +15,11 @@ void speculative_prepare_verify_ids_launch(const Tensor& anchors, const Tensor& 
                                            const Tensor& current_extents, Tensor& verify_ids,
                                            cudaStream_t stream);
 
+/// Untruncated stochastic rows of a verify round: the split route (speculative_exact_*_kernel, true, the default) or
+/// the one-CTA wide kernel. Same draws (the normalizer's double sum in another order). Read once from
+/// SUROGATE_SPEC_EXACT_SPLIT; tests may edit it.
+[[nodiscard]] bool& speculative_exact_split();
+
 void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const Tensor& logits,
                                              const Tensor& drafts, const Tensor& current_extents,
                                              Tensor& lengths, Tensor& anchors,

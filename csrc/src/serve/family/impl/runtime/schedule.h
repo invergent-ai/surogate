@@ -252,5 +252,10 @@ void capture_dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_s
 void dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                          DFlashEnvelopes envelopes, ops::GqaExecutionEnvelope target_envelope,
                          DecodeGraphExecutable* executable);
+/// DSpark on a pipeline (dspark_round.h; ENGINE-INKLING lane e1): on the drafter stage, the round's context append and
+/// proposal ahead of the first stage's launch; with k > 0 the verify ids [width * batch] and, at
+/// kDSparkDraftImportStride, their positions land in the pinned `draft_export` (complete after a stream synchronize).
+void dflash_pipeline_propose(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
+                             DFlashEnvelopes envelopes, void* draft_export);
 
 } // namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS::schedule

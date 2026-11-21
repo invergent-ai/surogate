@@ -54,6 +54,9 @@ public:
     /// pointer is an object's pointer -- which is what makes host residency a placement rather
     /// than a second way to build every weight in the engine.
     void attach_host_object(ObjectHandle handle, const void* device_pointer);
+    /// Undo attach_host_object before the bank's memory is released (a target that read a banked object once at
+    /// load): the object names no materialized bytes again, so a later read throws instead of touching freed memory.
+    void detach_host_object(ObjectHandle handle);
     /// The typed row runs of a ggml-blocks tensor whose rows are not all one format, pointing
     /// into its device bytes; empty for a homogeneous object.
     std::span<const WeightSegment> segments(ObjectHandle handle) const;

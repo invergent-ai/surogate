@@ -893,7 +893,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     options.api_key = resolve_api_key(api_key, api_key_file);
     if (!max_context_explicit) { options.max_context = 0; } // auto by default
     if (!options.devices.empty()) {
-        for (std::size_t i = 0; i < options.devices.size(); ++i) {
+        // SUROGATE_SERVE_TEST_SHARED_DEVICES=1 (tests only): pipeline stages may share a GPU (cli/options.cpp too).
+        const char* shared_raw = std::getenv("SUROGATE_SERVE_TEST_SHARED_DEVICES");
+        const bool shared      = shared_raw != nullptr && std::string_view(shared_raw) == "1";
+        for (std::size_t i = 0; i < options.devices.size() && !shared; ++i) {
             for (std::size_t j = 0; j < i; ++j) {
                 if (options.devices[i] == options.devices[j]) {
                     throw std::invalid_argument("--devices must contain distinct GPUs");

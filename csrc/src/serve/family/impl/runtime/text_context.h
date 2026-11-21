@@ -411,8 +411,15 @@ struct StageSpan {
     std::size_t column_bytes = 0;
     std::size_t residual_bytes = 0;
     Tensor* features = nullptr; // compact DFlash feature columns carried beside the residual
-
+    // DSpark on a pipeline (dspark_round.h; ENGINE-INKLING lane e1): on a stage that does not hold the drafter and has
+    // no import (the first), the drafter stage's verify ids [width * batch] I32 then, at kDSparkDraftImportStride, their
+    // cache positions -- the two fields the boundary packet carries to the later stages. Null for every other target.
+    const void* draft_import_pinned = nullptr;
 };
+
+/// Offset (I32 elements) of the positions in a DSpark draft import / export buffer (StageSpan::draft_import_pinned).
+inline constexpr std::size_t kDSparkDraftImportStride =
+    static_cast<std::size_t>(kMaximumBatchColumns) * kDFlashDecodeMaximumWidth;
 
 struct DFlashFeatureSink {
     static constexpr bool enabled = true;

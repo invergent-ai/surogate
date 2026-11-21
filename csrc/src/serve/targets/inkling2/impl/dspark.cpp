@@ -2,6 +2,7 @@
 
 #include "targets/inkling2/impl/dspark.h"
 #include "targets/inkling2/impl/variant.h"
+#include "targets/inkling2/impl/visits.h"
 
 #include "api/ops/inkling_mix.h"
 #include "api/ops/inkling_attention.h"
@@ -13,6 +14,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <stdexcept>
 #include <vector>
 
@@ -91,7 +93,12 @@ family::DFlashGeometry dspark_dflash_geometry(const load::ArtifactConfig& config
     g.rms_epsilon     = G::kEps;
     g.rope_theta      = G::kRopeTheta;
     g.attention_scale = G::kScale;
-    for (int f = 0; f < G::kFeatures; ++f) { g.target_feature_layers[static_cast<std::size_t>(f)] = f; }
+    // Features named by the visit that produces them (visits.h kFeatureLabels): on one card a label only names its row;
+    // on the 2-card split the family's feature sink uses it to tell which stage captures a feature and which imports it.
+    static_assert(G::kFeatures == static_cast<int>(kFeatureLabels.size()));
+    for (int f = 0; f < G::kFeatures; ++f) {
+        g.target_feature_layers[static_cast<std::size_t>(f)] = kFeatureLabels[static_cast<std::size_t>(f)];
+    }
     return g;
 }
 
@@ -133,6 +140,44 @@ bool dspark_fp8_fold_requested() {
         return raw != nullptr && raw[0] == '1';
     }();
     return !bf16;
+}
+
+namespace {
+// The derived storage block of derive_dspark: alpha, mix norms, rnn_proj split, (BF16 fold), fold bias, inv_freq.
+std::size_t dspark_storage_bytes(bool fp8_fold) {
+    constexpr std::int64_t D = G::kHidden, V = G::kVocabPadded, R = G::kRank;
+    const std::size_t o_norms = align256(16 * sizeof(float));
+    const std::size_t o_sp    = align256(o_norms + D * 4 * 2);
+    const std::size_t o_hf    = align256(o_sp + G::kRnnRows * G::kRnnStateCols * 2);
+    const std::size_t o_fw    = align256(o_hf + G::kRnnRows * G::kRnnContextCols * 2);
+    const std::size_t o_fb    = align256(o_fw + (fp8_fold ? 0 : V * R * 2));
+    const std::size_t o_freq  = align256(o_fb + V * 2);
+    return align256(o_freq + 64 * sizeof(float));
+}
+std::size_t dspark_fold_storage_bytes() {
+    return align256(static_cast<std::size_t>(G::kVocabPadded) * G::kRank) +
+           align256(static_cast<std::size_t>(G::kVocabPadded) * 4);
+}
+// The FP8 linears of one drafter layer, (rows n, columns k): q k v o k_ctx v_ctx gate up down.
+constexpr std::int64_t kDraftLinearShapes[9][2] = {
+    {G::kQRows, G::kHidden}, {G::kKvRows, G::kHidden}, {G::kKvRows, G::kHidden}, {G::kHidden, G::kQRows},
+    {G::kKvRows, G::kHidden}, {G::kKvRows, G::kHidden}, {G::kIntermediate, G::kHidden},
+    {G::kIntermediate, G::kHidden}, {G::kHidden, G::kIntermediate}};
+} // namespace
+
+std::size_t dspark_derived_device_bytes(bool fp8_weights, bool fp8_fold) {
+    std::size_t total = dspark_storage_bytes(fp8_fold) + (fp8_fold ? dspark_fold_storage_bytes() : 0);
+    if (fp8_weights) {
+        std::size_t w8 = 0;
+        for (int l = 0; l < G::kLayers; ++l) {
+            for (const auto& nk : kDraftLinearShapes) {
+                w8 = align256(w8 + static_cast<std::size_t>(nk[0]) * static_cast<std::size_t>(nk[1]));
+                w8 = align256(w8 + static_cast<std::size_t>(nk[0]) * sizeof(float));
+            }
+        }
+        total += w8;
+    }
+    return total;
 }
 
 void derive_dspark(const load::InklingWeights& w, DSparkDerived& out, bool fp8_weights, bool fp8_fold) {
@@ -252,6 +297,12 @@ void derive_dspark(const load::InklingWeights& w, DSparkDerived& out, bool fp8_w
         }
         CUDA_CHECK(cudaDeviceSynchronize());
         out.fp8 = true;
+    }
+    // The registry booked dspark_derived_device_bytes before the KV was sized: the allocations must be exactly that.
+    const std::size_t allocated = out.storage.bytes + out.fold_storage.bytes + out.w8_storage.bytes;
+    if (allocated != dspark_derived_device_bytes(fp8_weights, fp8_fold)) {
+        throw std::logic_error("inkling2 DSpark: derived bytes " + std::to_string(allocated) + " != booked " +
+                               std::to_string(dspark_derived_device_bytes(fp8_weights, fp8_fold)));
     }
     out.ready     = true;
 }
@@ -482,7 +533,9 @@ const InklingModel& dspark_model(const RuntimeModelView& model) {
 }
 
 DSparkKv dspark_kv(const family::DSparkRuntime& rt) {
-    if (rt.text_kv == nullptr || rt.text_kv->layers() < Variant::dspark_first_plane + G::kLayers) {
+    // On the 2-card split the last stage's pool holds the planes of visits 30..47 then 48..50 (layers() counts the
+    // stage's planes, not the global index): batch_layer_view checks the global plane against the stage's range.
+    if (rt.text_kv == nullptr || rt.text_kv->layers() < static_cast<std::uint32_t>(G::kLayers)) {
         throw std::logic_error("inkling2 DSpark: the text pool carries no draft planes (48..50)");
     }
     DSparkKv kv;
@@ -548,7 +601,7 @@ void Variant::dspark_propose(const ModelView& model, const family::DSparkRuntime
     }
 }
 
-std::uint32_t Variant::dspark_draft_cap(std::span<const TokenId> ledger) {
+std::uint8_t Variant::dspark_content_kind(std::span<const TokenId> ledger) {
     // Inkling-2's content markers (model/tokenizer.json): <|content_thinking|> 200008, <|content_invoke_tool_json|>
     // 200049, <|content_text|> 200004; <|message_model|> 200001 opens a model message (structure until a marker).
     constexpr TokenId kThinking = 200008, kToolJson = 200049, kText = 200004, kMessageModel = 200001;
@@ -556,12 +609,51 @@ std::uint32_t Variant::dspark_draft_cap(std::span<const TokenId> ledger) {
     const std::size_t n = ledger.size();
     for (std::size_t i = 0; i < std::min(n, kScan); ++i) {
         const TokenId t = ledger[n - 1 - i];
-        if (t == kToolJson) { return 7; }
-        if (t == kThinking) { return 3; }
-        if (t == kText) { return 2; }
-        if (t == kMessageModel) { return 7; }
+        if (t == kToolJson) { return 0; }
+        if (t == kMessageModel) { return 1; }
+        if (t == kThinking) { return 2; }
+        if (t == kText) { return 3; }
     }
-    return 3; // no marker within reach: a long block of unknown kind -- thinking's cap
+    return 2; // no marker within reach: a long block of unknown kind -- thinking
+}
+
+std::uint32_t Variant::dspark_draft_cap(std::span<const TokenId> ledger, const family::DSparkLaneStats* stats) {
+    const std::uint8_t kind = dspark_content_kind(ledger);
+    if (stats == nullptr) {
+        // static per content kind (lanes/e2/k_policy.py): tool-call JSON 7, structure 7, thinking 3, text 2
+        constexpr std::uint32_t kStatic[4] = {7, 7, 3, 2};
+        return kStatic[kind];
+    }
+    // Per lane (agent-EN-e2c): the k of {0, 1, 2, 3, 7} with the most committed tokens per unit of round time,
+    //   E_k = 1 + a + ... + a^k (per-position acceptance a, geometric), cost_k = the 1-stream round time of window k,
+    // with a = this request's own acceptance on this content kind (accepted drafts / (accepted drafts + rejecting
+    // rounds), decayed), shrunk to the kind's prior by kPriorTrials pseudo-trials. Priors: the engine's real rounds
+    // (lane h M6 / e2c, temperature 0) and lanes/e2/k_policy.json (CPU, round dynamics): tool JSON ~0.92, structure
+    // ~0.85, thinking ~0.70, answer text ~0.52. Costs (ms, lane h M6 1 x 3k, graphs, T0; regression of decode seconds
+    // on rounds per window): k2 9.68, k3 10.44, k7 13.69; plain decode 6.1 (+0.5 for the context append at k 0); k1
+    // interpolated. Break-even vs k 0 near a = 0.42; k 7 overtakes k 3 near a = 0.76.
+    constexpr float kPrior[4]    = {0.92f, 0.85f, 0.70f, 0.52f};
+    constexpr float kPriorTrials = 8.0f;
+    constexpr std::uint32_t kWindows[5] = {0, 1, 2, 3, 7};
+    constexpr float kCost[5]            = {6.6f, 8.9f, 9.68f, 10.44f, 13.69f};
+    const float a = std::clamp((stats->accepted[kind] + kPriorTrials * kPrior[kind]) /
+                                   (stats->accepted[kind] + stats->stopped[kind] + kPriorTrials),
+                               0.0f, 0.999f);
+    std::uint32_t best = kWindows[0];
+    float best_rate    = 1.0f / kCost[0];
+    for (int w = 1; w < 5; ++w) {
+        float e = 1.0f, p = 1.0f;
+        for (std::uint32_t i = 0; i < kWindows[w]; ++i) {
+            p *= a;
+            e += p;
+        }
+        const float rate = e / kCost[w];
+        if (rate > best_rate) {
+            best      = kWindows[w];
+            best_rate = rate;
+        }
+    }
+    return best;
 }
 
 std::size_t Variant::dspark_append_workspace_bytes(std::int32_t columns) {

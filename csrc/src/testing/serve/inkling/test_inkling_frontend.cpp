@@ -77,6 +77,19 @@ std::string first_diff(const std::vector<int>& a, const std::vector<int>& b) {
     return o.str();
 }
 
+// The renderer vectors to check against: renderer-099 (owner rule 2026-11-21 17:40: a request that sets no reasoning
+// effort renders at 0.99; those vectors expect vLLM's ids for the same body with chat_template_kwargs.reasoning_effort
+// = 0.99, every other vector is vLLM's own as in renderer/). renderer/ (vLLM's default 0.9) only where 099 is missing.
+fs::path renderer_set(const fs::path& vectors) {
+    const fs::path set = fs::is_directory(vectors / "renderer-099") ? vectors / "renderer-099" : vectors / "renderer";
+    static bool said = false;
+    if (!said) {
+        said = true;
+        std::cout << "renderer vectors: " << set.filename().string() << "\n";
+    }
+    return set;
+}
+
 std::vector<fs::path> vector_files(const fs::path& dir) {
     std::vector<fs::path> files;
     if (!fs::is_directory(dir)) { return files; }
@@ -148,15 +161,28 @@ int main() {
 
     // 2. renderer: request body -> prompt ids
     {
-        int n = 0, bad = 0, errors = 0;
-        for (const fs::path& f : vector_files(vectors / "renderer")) {
+        int n = 0, bad = 0, errors = 0, effort_default = 0, effort_default_bad = 0, effort_explicit = 0;
+        for (const fs::path& f : vector_files(renderer_set(vectors))) {
             const ink::PyValue vec = ink::py_json_loads(read_file(f));
             const std::string name = vec.find("case")->text;
             const std::string body = ink::py_json_dumps(*vec.find("body"), ink::PyDumpStyle{.ensure_ascii = false});
             const ink::PyValue& expected = *vec.find("expected");
             const bool want_error = expected.find("error") != nullptr;
+            const ink::PyValue* meta = vec.find("meta");
+            const bool by_default = meta != nullptr && meta->is_object() && meta->find("effort_default") != nullptr;
             ++n;
             errors += want_error;
+            effort_default += by_default;
+            if (!want_error && !by_default) {
+                // a request that names its effort (top-level or chat_template_kwargs, not null / "auto"): kept as sent
+                const ink::PyValue* b = vec.find("body");
+                const ink::PyValue* top = b->find("reasoning_effort");
+                const ink::PyValue* ctk = b->find("chat_template_kwargs");
+                const ink::PyValue* kw = ctk != nullptr && ctk->is_object() ? ctk->find("reasoning_effort") : nullptr;
+                effort_explicit += (top != nullptr && !top->is_null()) ||
+                                   (kw != nullptr && !kw->is_null() && !(kw->is_string() && kw->text == "auto"));
+            }
+            const int bad_before = bad;
             std::vector<int> got;
             std::string got_error;
             try {
@@ -175,6 +201,7 @@ int main() {
             if (!got_error.empty()) {
                 ++bad;
                 report("render " + name + ": error '" + got_error + "', vLLM renders");
+                effort_default_bad += by_default;
                 continue;
             }
             const std::vector<int> want = ints(expected.find("prompt_token_ids"));
@@ -182,8 +209,11 @@ int main() {
                 ++bad;
                 report("render " + name + " " + first_diff(got, want));
             }
+            if (by_default && bad != bad_before) { ++effort_default_bad; }
         }
         std::cout << "renderer: " << n << " vectors (" << errors << " request errors), " << bad << " mismatches\n";
+        std::cout << "  effort: " << effort_default << " set none (rendered at the default 0.99), " << effort_default_bad
+                  << " mismatches; " << effort_explicit << " set one (kept)\n";
         failures += bad;
         if (n == 0) { ++failures; }
     }

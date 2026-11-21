@@ -74,10 +74,12 @@ __global__ void speculative_accept_wide_kernel(
     const LogitT* logits, const int32_t* drafts, const int32_t* extents,
     int32_t* lengths, int32_t* anchors, int32_t* tokens, int32_t* counts, int32_t* accepted,
     const SamplingConfig* configs, int domain, int physical_rows, int k,
-    const unsigned long long* sorted, size_t sorted_row_stride) {
+    const unsigned long long* sorted, size_t sorted_row_stride, int skip_untruncated = 0) {
     const int row = blockIdx.x, width = k + 1;
     const SamplingConfig cfg = configs[row];
     if (!sampling_wide(cfg)) { return; }
+    // Untruncated rows go to the split route below (speculative_exact_*_kernel) when the launcher runs it.
+    if (skip_untruncated && sampling_untruncated(cfg)) { return; }
     const int extent = min(k, max(0, extents[row]));
     const int length = lengths[row];
     const auto* row_drafts = drafts + row * k;
@@ -116,6 +118,177 @@ __global__ void speculative_accept_wide_kernel(
         accepted[row] = produced - 1;
         anchors[row] = tokens[row * width + produced - 1];
         lengths[row] = length + produced;
+        for (int i = produced; i < width; ++i) { tokens[row * width + i] = 0; }
+        if (cfg.token_counts) {
+            for (int i = 0; i < produced; ++i) {
+                const int token = tokens[row * width + i];
+                if (token >= 0 && token < domain) { atomicAdd(cfg.token_counts + token, 1); }
+            }
+        }
+    }
+}
+
+// ---- Split route for untruncated stochastic rows (agent-EN-e2c, 2026-11-21) -------------------------------------
+// speculative_accept_wide_kernel draws an untruncated row's verify columns with ONE CTA, column after column
+// (sampling_untruncated_exact: two passes over the vocabulary, the second with a double-precision exp per token).
+// Measured on Inkling (201k vocabulary, lane h M6 rows): ~1.1 ms per verified column, ~8 ms of a k = 7 round at
+// temperature 1, while MTP-off decoding pays nothing for temperature 1 (its draw is split over chunks since S1).
+// These three kernels compute the same draws with sampling_untruncated_exact's per-token expressions unchanged, cut
+// into kSamplerFullVocabChunkItems-token chunks, every verified column in parallel:
+//   1. speculative_exact_max_kernel: per (row, column, chunk) the maximum adjusted logit;
+//   2. speculative_exact_partial_kernel: the column maximum from the chunk maxima (exact), then per chunk the double
+//      sum of exp((x - max) / T) over the tokens at or above the min_p floor and the best Gumbel key (the draft
+//      excluded on a draft column; correction / bonus purposes and positions as before);
+//   3. speculative_exact_finalize_kernel: per row, each column's normalizer = its chunk sums in a fixed order, the
+//      draft's probability, the sequential accept / correction / bonus walk and the commit of the wide kernel.
+// The maximum and the Gumbel winner do not depend on the partition (exact max; strict total order on the keys), so
+// the corrections and bonuses drawn are the old route's; the normalizer is the same double sum in another order
+// (relative difference ~1e-16), so the accept test u < p(draft) can differ from the old route only when u lies within
+// that rounding of p. Deterministic: fixed reduction orders, no atomics, RNG keyed by (seed, position, purpose).
+// Partials: [3][width][chunks] u64 per row (max bits, sum bits, key) in the row's workspace (spec_exact_partials).
+__device__ inline unsigned long long* speculative_exact_slot(unsigned long long* partials, std::size_t row_stride,
+                                                             int row, int slot, int width, int col, int chunks) {
+    auto* base = reinterpret_cast<unsigned long long*>(reinterpret_cast<unsigned char*>(partials) +
+                                                       static_cast<std::size_t>(row) * row_stride);
+    return base + (static_cast<std::int64_t>(slot) * width + col) * chunks;
+}
+
+// The column maximum from its chunk maxima (every thread of the block returns it).
+__device__ inline float speculative_exact_column_max(const unsigned long long* maxima, int chunks,
+                                                     ExactSamplingScratch& scratch) {
+    float m = -CUDART_INF_F;
+    for (int c = threadIdx.x; c < chunks; c += blockDim.x) {
+        m = fmaxf(m, __uint_as_float(static_cast<unsigned int>(maxima[c])));
+    }
+    return exact_max(m, scratch);
+}
+
+template <typename LogitT>
+__launch_bounds__(kSamplerBlock) __global__ void speculative_exact_max_kernel(
+    const LogitT* logits, const std::int32_t* drafts, const std::int32_t* extents,
+    const SamplingConfig* configs, int domain, int physical_rows, int k, int batch,
+    unsigned long long* partials, std::size_t row_stride, int chunks) {
+    __shared__ SamplingRowAdmission rows;
+    __shared__ ExactSamplingScratch scratch;
+    const int width = k + 1;
+    const auto take = [&](int row) { return sampling_untruncated(configs[row]); };
+    sampling_for_each_unit(rows, batch, width, chunks, extents, take, [&](int row, int col, int chunk) {
+        const SamplingConfig cfg    = configs[row];
+        const std::int32_t* overlay = drafts + row * k;
+        const LogitT* column = logits + (static_cast<std::int64_t>(row) * width + col) * physical_rows;
+        const int begin      = chunk * kSamplerFullVocabChunkItems;
+        const int end        = min(domain, begin + kSamplerFullVocabChunkItems);
+        float m              = -CUDART_INF_F;
+        for (int v = begin + static_cast<int>(threadIdx.x); v < end; v += blockDim.x) {
+            m = fmaxf(m, sampling_adjusted_logit(logit_value(column[v]), v, cfg, overlay, col));
+        }
+        m = exact_max(m, scratch);
+        if (threadIdx.x == 0) {
+            speculative_exact_slot(partials, row_stride, row, 0, width, col, chunks)[chunk] = __float_as_uint(m);
+        }
+    });
+}
+
+template <typename LogitT>
+__launch_bounds__(kSamplerBlock) __global__ void speculative_exact_partial_kernel(
+    const LogitT* logits, const std::int32_t* drafts, const std::int32_t* extents,
+    const std::int32_t* lengths, const SamplingConfig* configs, int domain, int physical_rows, int k,
+    int batch, unsigned long long* partials, std::size_t row_stride, int chunks) {
+    __shared__ SamplingRowAdmission rows;
+    __shared__ ExactSamplingScratch scratch;
+    const int width = k + 1;
+    const auto take = [&](int row) { return sampling_untruncated(configs[row]); };
+    sampling_for_each_unit(rows, batch, width, chunks, extents, take, [&](int row, int col, int chunk) {
+        const SamplingConfig cfg    = configs[row];
+        const int extent            = min(k, max(0, extents[row]));
+        const std::int32_t* overlay = drafts + row * k;
+        const LogitT* column = logits + (static_cast<std::int64_t>(row) * width + col) * physical_rows;
+        const float top =
+            speculative_exact_column_max(speculative_exact_slot(partials, row_stride, row, 0, width, col, chunks),
+                                         chunks, scratch);
+        const float floor  = cfg.min_p > 0 ? top + cfg.temperature * logf(cfg.min_p) : -CUDART_INF_F;
+        const int excluded = col < extent ? overlay[col] : -1;
+        const int purpose  = col < extent ? kSamplePurposeSpeculativeCorrection : kSamplePurposeSpeculativeBonus;
+        const int position = lengths[row] + col + 1;
+        const int begin    = chunk * kSamplerFullVocabChunkItems;
+        const int end      = min(domain, begin + kSamplerFullVocabChunkItems);
+        double total            = 0;
+        unsigned long long best = 0;
+        for (int v = begin + static_cast<int>(threadIdx.x); v < end; v += blockDim.x) {
+            const float x = sampling_adjusted_logit(logit_value(column[v]), v, cfg, overlay, col);
+            if (!isfinite(x) || x < floor) { continue; }
+            total += exp((double(x) - top) / cfg.temperature);
+            if (v != excluded) {
+                const auto key = sampling_sort_key(
+                    (x - top) / cfg.temperature + sampling_gumbel(cfg.seed, position, purpose, v), v);
+                if (key > best) { best = key; }
+            }
+        }
+        total = exact_sum(total, scratch);
+        best  = sampling_block_max_key(best, scratch.keys);
+        if (threadIdx.x == 0) {
+            speculative_exact_slot(partials, row_stride, row, 1, width, col, chunks)[chunk] =
+                static_cast<unsigned long long>(__double_as_longlong(total));
+            speculative_exact_slot(partials, row_stride, row, 2, width, col, chunks)[chunk] = best;
+        }
+        __syncthreads(); // scratch.keys is reused by the next unit
+    });
+}
+
+template <typename LogitT>
+__launch_bounds__(kSamplerBlock) __global__ void speculative_exact_finalize_kernel(
+    const LogitT* logits, const std::int32_t* drafts, const std::int32_t* extents, std::int32_t* lengths,
+    std::int32_t* anchors, std::int32_t* tokens, std::int32_t* counts, std::int32_t* accepted,
+    const SamplingConfig* configs, int domain, int physical_rows, int k, unsigned long long* partials,
+    std::size_t row_stride, int chunks) {
+    const int row = static_cast<int>(blockIdx.x), width = k + 1;
+    const SamplingConfig cfg = configs[row];
+    if (!sampling_untruncated(cfg)) { return; }
+    const int extent                = min(k, max(0, extents[row]));
+    const int length                = lengths[row];
+    const std::int32_t* row_drafts  = drafts + row * k;
+    __shared__ ExactSamplingScratch scratch;
+    __shared__ int stop;
+    __shared__ int produced;
+    for (int col = 0; col <= extent; ++col) {
+        const unsigned long long* sums = speculative_exact_slot(partials, row_stride, row, 1, width, col, chunks);
+        const unsigned long long* keys = speculative_exact_slot(partials, row_stride, row, 2, width, col, chunks);
+        const float top =
+            speculative_exact_column_max(speculative_exact_slot(partials, row_stride, row, 0, width, col, chunks),
+                                         chunks, scratch);
+        double s               = 0;
+        unsigned long long b   = 0;
+        for (int c = threadIdx.x; c < chunks; c += blockDim.x) {
+            s += __longlong_as_double(static_cast<long long>(sums[c]));
+            if (keys[c] > b) { b = keys[c]; }
+        }
+        const double total            = exact_sum(s, scratch);
+        const unsigned long long best = sampling_block_max_key(b, scratch.keys);
+        if (threadIdx.x == 0) {
+            const int draft   = col < extent ? row_drafts[col] : -1;
+            float probability = 0;
+            if (draft >= 0 && draft < domain) {
+                const LogitT* column = logits + (static_cast<std::int64_t>(row) * width + col) * physical_rows;
+                const float floor    = cfg.min_p > 0 ? top + cfg.temperature * logf(cfg.min_p) : -CUDART_INF_F;
+                const float x = sampling_adjusted_logit(logit_value(column[draft]), draft, cfg, row_drafts, col);
+                if (isfinite(x) && x >= floor && total > 0) {
+                    probability = static_cast<float>(exp((double(x) - top) / cfg.temperature) / total);
+                }
+            }
+            const bool keep = col < extent && sampling_uniform(cfg.seed, length + col + 1,
+                                                               kSamplePurposeSpeculativeAccept, 0) < probability;
+            tokens[row * width + col] = keep ? draft : sampling_key_index(best);
+            stop     = !keep;
+            produced = col + 1;
+        }
+        __syncthreads();
+        if (stop) { break; }
+    }
+    if (threadIdx.x == 0) {
+        counts[row]   = produced;
+        accepted[row] = produced - 1;
+        anchors[row]  = tokens[row * width + produced - 1];
+        lengths[row]  = length + produced;
         for (int i = produced; i < width; ++i) { tokens[row * width + i] = 0; }
         if (cfg.token_counts) {
             for (int i = 0; i < produced; ++i) {

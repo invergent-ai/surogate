@@ -122,6 +122,8 @@ public:
     /// objects to a mapped host pointer and every `materialized_weight`/`materialized_tensor`
     /// in the engine reads them without knowing where they live.
     void attach(artifact::MaterializedArtifact& backing) const;
+    /// Undo attach: before the last reference to a bank whose objects were read only at load is dropped.
+    void detach(artifact::MaterializedArtifact& backing) const;
 
 private:
     std::vector<std::pair<std::size_t, HostObject>> objects_;

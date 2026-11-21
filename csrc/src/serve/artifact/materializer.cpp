@@ -122,6 +122,14 @@ void MaterializedArtifact::attach_host_object(ObjectHandle handle, const void* d
     }
 }
 
+void MaterializedArtifact::detach_host_object(ObjectHandle handle) {
+    if (handle.index >= objects_.size()) {
+        throw ArtifactError("host bank detachment names an object outside the artifact");
+    }
+    objects_[handle.index].device = nullptr;
+    for (auto& segment : objects_[handle.index].segments) { segment.qdata = nullptr; }
+}
+
 std::span<const WeightSegment> MaterializedArtifact::segments(ObjectHandle handle) const {
     if (handle.index >= objects_.size() || objects_[handle.index].device == nullptr) {
         throw ArtifactError("object handle does not name a materialized tensor");
