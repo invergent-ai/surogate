@@ -653,8 +653,11 @@ AttnParams make_params(const InklingAttentionInputs& in, const InklingAttentionR
     // Triton computes `softmax_scale * LOG2E` in fp32 inside the kernel; one IEEE product here.
     const float scale = static_cast<float>(0.08838834764831845);
     p.qk_scale_log2   = scale * kLog2e;
-    const char* variant = std::getenv("SUROGATE_INKLING_ATTN_VARIANT"); // experiment only; default 0
-    p.variant         = variant == nullptr ? 0 : std::atoi(variant);
+    // Default 17 = bias added unfused (s + bf16(b) * log2e) and lse with the accurate log2f: decided against lane
+    // a's capture of vLLM's own sm_120 prefill kernel (M3 run 2, visits 0 and 5: fp32 out bit-equal 47.5 -> 52.1 %,
+    // lse 82.8 -> 89.1 % vs variant 0). The env override remains for the bit-identity experiment.
+    const char* variant = std::getenv("SUROGATE_INKLING_ATTN_VARIANT");
+    p.variant         = variant == nullptr ? 17 : std::atoi(variant);
     return p;
 }
 
