@@ -80,6 +80,28 @@ enum class InklingLayerKind : std::uint8_t {
 };
 
 /**
+ * Key groups of the invariant attention: the keys of every row are cut into groups whose boundaries depend only on the
+ * absolute key position; a group is walked in 64-key blocks with one running softmax state, groups are folded in order
+ * (inkling_rel_attention.cu header). The cut is part of the arithmetic: the engine and the trainer must use the SAME
+ * value (it is a field of InklingAttentionRows, which both entry points take). Global / local group sizes:
+ * P1 512 / 128; P2 2,048 (8,192 from key 65,536) / 256; P3 512 below key 65,536, 2,048 to 131,072, 8,192 beyond / 128;
+ * P4 (measurement) P3 / 64; P5 (measurement) 256 below 65,536 then P3 / 128. Default = the process default: the
+ * compiled kInklingDefaultKeyGroups = P3, FROZEN by lane h's price session (2026-11-21 14:1x: P3 mean -0.93 % vs the
+ * non-invariant BASE, worst +1.1 % at 1x262k; P1 +5.4 %, P2 +10.8 % on their worst probes). P1 / P2 / P4 / P5 are
+ * test / measurement options only. SUROGATE_INKLING_ATTN_GROUPS (p1 .. p5), if set when the process first uses these
+ * ops, overrides the default (read once; a test override).
+ */
+enum class InklingKeyGroups : std::uint8_t {
+    Default,
+    P1,
+    P2,
+    P3,
+    P4,
+    P5,
+};
+inline constexpr InklingKeyGroups kInklingDefaultKeyGroups = InklingKeyGroups::P3;
+
+/**
  * The rows of one attention call (shared by the prologue and the attention of the same visit).
  *
  * `positions` is contiguous I32 [W, B]: the absolute position of column j of row b. A row's valid
@@ -100,7 +122,34 @@ struct InklingAttentionRows {
     Tensor valid_columns;
     Tensor kv_table_rows;
     GqaExecutionEnvelope envelope{};
+    /// Caller's promise (default false): positions, valid_columns, kv_table_rows and the plane's block tables were
+    /// complete before the step's FIRST kernel (host copies), and the plane's keys before each row's first position
+    /// were written by earlier steps. The attention then reads them before its programmatic-dependency wait and asks
+    /// L2 for its first old blocks, overlapping the prologue. Same bits either way.
+    bool metadata_static = false;
+    /// The key-group cut (see InklingKeyGroups); engine and trainer must pass the same value.
+    InklingKeyGroups key_groups = InklingKeyGroups::Default;
 };
+
+/**
+ * Process-wide tuning knobs of these ops: read ONCE from the environment when the process first uses them
+ * (SUROGATE_INKLING_ATTN_GROUPS / _SPLITS / _CTAS / _PARTIAL_MB / _L2AHEAD / _PDL_TRIGGER / _VARIANT / _EARLY_META,
+ * SUROGATE_INKLING_PREFILL_KS), never per call. Every knob changes the plan or the speed only, never the bits, except
+ * `variant` (a numerics experiment; 17 = production) and `default_groups` (the cut for rows that pass Default).
+ * Tests and benches may edit them between calls through inkling_attention_knobs(): not thread safe, never in serving.
+ */
+struct InklingAttentionKnobs {
+    InklingKeyGroups default_groups = kInklingDefaultKeyGroups;
+    int splits                      = 0;    // > 0: force this many workers (split route)
+    int cta_target                  = 0;    // decode CTA target (0: 2 x SMs)
+    int prefill_ks                  = 2;    // 2: 8-warp prefill kernel, 1: 4-warp
+    int l2_ahead                    = -1;   // blocks asked of L2 ahead (-1: off; measured slower on every route)
+    bool pdl_trigger                = true; // trigger dependents at kernel entry
+    int variant                     = 17;   // numerics variant bits (production 17)
+    bool early_meta                 = true; // honour InklingAttentionRows::metadata_static
+    std::size_t partial_cap_bytes   = std::size_t{1} << 30; // split-route partials above this -> one worker
+};
+[[nodiscard]] InklingAttentionKnobs& inkling_attention_knobs();
 
 /// InPlace (prefill, decode, the narrow MTP round): each row's slot is read, then replaced by the
 /// window after its last valid column. Record (speculative verify): the slot is only read; every valid
@@ -192,7 +241,8 @@ void inkling_attention(const InklingProjections& projections, const InklingAtten
                                                                      std::int32_t batch,
                                                                      std::int32_t min_width,
                                                                      std::int32_t max_width,
-                                                                     GqaExecutionEnvelope envelope);
+                                                                     GqaExecutionEnvelope envelope,
+                                                                     InklingKeyGroups key_groups = InklingKeyGroups::Default);
 
 // ---- The component ops (op tests against lane a's vectors; also callable on their own). ------------
 
@@ -237,12 +287,22 @@ struct InklingAttentionInputs {
     Tensor rel_table;
 };
 
-/// Workspace for inkling_rel_attention / _out_lse at B rows of W columns (split partials); zero when
-/// the call plans a single split. Throws outside the supported domain.
+/// Workspace for inkling_rel_attention / _out_lse / _train at B rows of W columns: the split route's partials, zero when
+/// the call plans one worker. Exactly (N = W * B):
+///   slots   = local: (1023 >> log2(local group)) + 2 (9 at 128-key groups);  global: group_of(max_visible_keys - 1) + 1
+///             (P3: max_visible_keys <= 65,536 -> ceil(keys / 512); then + ceil((keys - 65,536) / 2,048) up to 131,072,
+///             then + ceil((keys - 131,072) / 8,192); 176 at 262,144)
+///   bytes   = workers > 1 ? slots * N * 24 * (128 * 4 + 8) + 512 : 0
+///   workers = decode / verify (W <= 16): clamp(floor(2 * SMs / (8 B)), 1, global 64 | local slots);
+///             prefill: 1 when tiles * 24 * B >= 2 * SMs (tiles = ceil(W / 64)), else clamp(ceil(2 SMs / CTAs), 1, min(32, slots));
+///             1 whenever bytes would exceed the partial cap (InklingAttentionKnobs::partial_cap_bytes, default 1 GiB).
+/// The plan (workers, cap) changes only the speed and this size, never the output bits. The call must use the same
+/// envelope and key_groups as this query. Throws outside the supported domain.
 [[nodiscard]] std::size_t inkling_rel_attention_workspace_bytes(InklingLayerKind kind,
                                                                 std::int32_t width,
                                                                 std::int32_t batch,
-                                                                GqaExecutionEnvelope envelope);
+                                                                GqaExecutionEnvelope envelope,
+                                                                InklingKeyGroups key_groups = InklingKeyGroups::Default);
 
 /**
  * Op inkling_rel_attention, production route (ref `inkling_rel_attention` + `inkling_gate_sink`; D1
@@ -301,6 +361,22 @@ void inkling_attention_train(const InklingProjections& projections, const Inklin
                              const InklingConvStateArgs& conv, const PagedKVBatchLayerView& cache,
                              WorkspaceArena& workspace, Tensor& out, InklingAttentionTrainOutputs& train,
                              cudaStream_t stream);
+
+/**
+ * DSpark draft block attention (agent-EN-e2b, 13:35; ref/dspark_ref.py DSparkRef.attention): q BF16 [128, 24, N]
+ * contiguous (N = W * B; W = the 8 block columns of a lane), keys from the draft plane (paged unit-scale FP8 e4m3, the
+ * block's own K / V already written there at [P_b, P_b + 8)). Every column of a lane passes the block's last position
+ * P_b + 7 in rows.positions, so all its rows see one key set. window = 0: global; else keys with pos - key < window
+ * (1,032 on draft layers 0 / 2 = keys >= P_b - 1,024). Scale 128^-0.5; no relative bias, gate, sink or tau. out = BF16
+ * [128, 24, N] contiguous, o rounded once; invalid columns and idle rows zero. The same per-row arithmetic, key groups
+ * (rows.key_groups) and fold as inkling_rel_attention: batch / width / split invariant.
+ */
+void inkling_draft_attention(const Tensor& q, std::int32_t window, const InklingAttentionRows& rows,
+                             const PagedKVBatchLayerView& draft_plane, WorkspaceArena& workspace, Tensor& out,
+                             cudaStream_t stream);
+[[nodiscard]] std::size_t inkling_draft_attention_workspace_bytes(std::int32_t window, std::int32_t width,
+                                                                  std::int32_t batch, GqaExecutionEnvelope envelope,
+                                                                  InklingKeyGroups key_groups = InklingKeyGroups::Default);
 
 /**
  * Op inkling_gate_sink (ref `inkling_gate_sink`, vLLM `_gate_sink_kernel`, D1 A7): result =

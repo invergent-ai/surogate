@@ -10,6 +10,7 @@
 #include "artifact/reader.h"
 #include "family/impl/lora_bind.h"
 #include "family/impl/lora_bind_inkling.h"
+#include "targets/inkling2/impl/lora_attention.h"
 #include "targets/inkling2/impl/model.h"
 #include "targets/inkling2/impl/variant.h"
 
@@ -18,6 +19,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace sinfer::targets::inkling2::detail {
 
@@ -72,6 +74,27 @@ void bind_lora(const detail::LoadedModelData& data, const EngineOptions& options
         ops::InklingMoeWeights key;
         key.router = L.router.qdata;
         family::bind_lora_inkling_moe(store, static_cast<int>(index), key);
+        // Attention (vLLM parity): the six qkvr slices under their checkpoint names, the fused `attn.qkvr` twin, wo_ud.
+        using Binding = ops::LoraStore::ModuleBinding;
+        using C       = detail::TextConfig;
+        if (L.qkvr.qdata == nullptr || L.output.qdata == nullptr) {
+            throw std::logic_error("inkling2: attention LoRA needs the layer's qkvr / wo_ud weights bound");
+        }
+        std::vector<Binding> slices;
+        for (int s = 0; s < 6; ++s) {
+            const detail::AttnLoraSlice& sl = detail::kQkvrLoraSlices[s];
+            const Binding b{L.qkvr.qdata, detail::kQkvrLoraPort + s, C::hidden, sl.rows};
+            store.register_module(static_cast<int>(index), sl.name, b);
+            Binding fused    = b;
+            fused.source_out = C::qkvr_rows;
+            fused.row_offset = sl.begin;
+            store.register_module(static_cast<int>(index), detail::kQkvrLoraFusedName, fused);
+            slices.push_back(b);
+        }
+        store.register_bank_table(L.qkvr.qdata, slices);
+        const Binding wo{L.output.qdata, detail::kWoLoraPort, C::attn_width, C::hidden};
+        store.register_module(static_cast<int>(index), detail::kWoLoraName, wo);
+        store.register_bank_table(L.output.qdata, {wo});
     }
     family::finish_lora_bind(store, options);
 }
@@ -146,9 +169,6 @@ family::TextGeometry Package::declared_geometry(const artifact::Reader& reader) 
 std::unique_ptr<Package::Program> Package::create_program(const LoadedModel& model, SequencePlan&& plan,
                                                           DeviceContext& device) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
-    // Lane c's key-group size: P3 by default (agent-EN 12:5x, until lane h's price session decides); the
-    // environment still overrides (p1 / p2 / p3).
-    ::setenv("SUROGATE_INKLING_ATTN_GROUPS", "p3", 0);
     detail::Variant::prepare_lm_head(16);
     return family::create_program<detail::Variant>(model.impl_->data.runtime, model.impl_->weights_profile,
                                                    std::move(plan), device);

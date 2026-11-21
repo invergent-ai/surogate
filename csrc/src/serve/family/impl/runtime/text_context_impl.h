@@ -2119,6 +2119,9 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap, const Tensor* deepst
             // A row of several columns is a speculative verify: the conv state is recorded for the fold.
             block.mode     = block.width > 1 ? family::VisitStateMode::Record : family::VisitStateMode::InPlace;
             block.envelope = *active_gqa_envelope_;
+            // The ordinary decode step's metadata is the ingress H2D copy, the step body's first node; a program with a
+            // speculative backend (visit records planned) writes positions / valid columns with kernels, so not there.
+            block.metadata_static = block.width == 1 && io_.visit_records_old == nullptr;
             run_visit_round(x, tap, {}, &block, false, active_cache_positions_->view({block.width * block.batch}));
         }
         return;

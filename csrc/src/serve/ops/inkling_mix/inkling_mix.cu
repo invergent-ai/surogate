@@ -164,6 +164,7 @@ __device__ __forceinline__ void mix_query(const float (&x)[N][kPer], const float
 template <int N>
 __global__ void __launch_bounds__(kThreads) attn_res_kernel(const __grid_constant__ AttnResArgs a) {
     pdl::wait_for_dependencies(); // PDL: every read / write after the producer grid completes
+    pdl::trigger_dependents(); // PDL: the next kernel may launch now (it waits for this grid before any read)
     __shared__ float scratch[(kThreads / 32) * (N > 2 ? N : 2)];
     const std::int64_t t = blockIdx.x;
     float x[N][kPer];
@@ -217,6 +218,7 @@ struct BlendInputsArgs {
 template <int N>
 __global__ void __launch_bounds__(kThreads) blend_inputs_kernel(const __grid_constant__ BlendInputsArgs a) {
     pdl::wait_for_dependencies(); // PDL: every read / write after the producer grid completes
+    pdl::trigger_dependents(); // PDL: the next kernel may launch now (it waits for this grid before any read)
     __shared__ float scratch[(kThreads / 32) * (N > 2 ? N : 2)];
     const std::int64_t t = blockIdx.x;
     float x[N][kPer];
@@ -289,6 +291,7 @@ __global__ void __launch_bounds__(kThreads)
     rms_norm_kernel(PlaneDev x_plane, const bf16* w, int num_weights, float eps, bf16* out,
                     std::int64_t columns) {
     pdl::wait_for_dependencies();
+    pdl::trigger_dependents(); // PDL: the next kernel may launch now (it waits for this grid before any read)
     __shared__ float scratch[kThreads / 32];
     const std::int64_t t = blockIdx.x;
     float x[kPer];
@@ -316,6 +319,7 @@ __global__ void __launch_bounds__(kThreads)
     pair_rms_norm_kernel(const float* dest, std::int64_t dest_stream_stride, const float* msg,
                          bf16* out, std::int64_t columns) {
     pdl::wait_for_dependencies();
+    pdl::trigger_dependents(); // PDL: the next kernel may launch now (it waits for this grid before any read)
     __shared__ float scratch[(kThreads / 32) * 2];
     const std::int64_t t = blockIdx.x;
     const std::int64_t s = blockIdx.y;
@@ -348,6 +352,7 @@ __global__ void __launch_bounds__(kThreads)
                           const float* gain_forget, const bf16* w, int w_stream_stride, float eps,
                           bf16* out, std::int64_t columns) {
     pdl::wait_for_dependencies();
+    pdl::trigger_dependents(); // PDL: the next kernel may launch now (it waits for this grid before any read)
     __shared__ float scratch[kThreads / 32];
     const std::int64_t t   = blockIdx.x;
     const std::int64_t s   = blockIdx.y;
@@ -414,6 +419,7 @@ struct TailArgs {
 __global__ void __cluster_dims__(kTailCtas, 1, 1) __launch_bounds__(kThreads)
     controller_tail_kernel(const __grid_constant__ TailArgs a) {
     pdl::wait_for_dependencies();
+    pdl::trigger_dependents(); // PDL: the next kernel may launch now (it waits for this grid before any read)
     extern __shared__ __align__(16) unsigned char tail_smem[];
     auto* As = reinterpret_cast<bf16*>(tail_smem);                      // [576][64] swizzled (then G: fp32 [576][8])
     auto* Bs = As + kTailRows * kRank;                                 // [8][64] swizzled
@@ -559,6 +565,7 @@ __device__ __forceinline__ float conv_seq(const ConvArgs& a, int b, std::int64_t
 __global__ void __launch_bounds__(kConvChannelTile)
     short_conv_kernel(const __grid_constant__ ConvArgs a) {
     pdl::wait_for_dependencies(); // PDL: every read / write after the producer grid completes
+    pdl::trigger_dependents(); // PDL: the next kernel may launch now (it waits for this grid before any read)
     const int c = blockIdx.x * kConvChannelTile + threadIdx.x;
     const int b = blockIdx.z;
     if (c >= a.channels) { return; }
@@ -610,6 +617,7 @@ __global__ void __launch_bounds__(kConvChannelTile)
     conv_window_kernel(const __grid_constant__ ConvArgs a, int capture_column, int capture_slot,
                        int update_slots) {
     pdl::wait_for_dependencies();
+    pdl::trigger_dependents(); // PDL: the next kernel may launch now (it waits for this grid before any read)
     const int c = blockIdx.x * kConvChannelTile + threadIdx.x;
     const int b = blockIdx.y;
     if (c >= a.channels) { return; }
@@ -704,6 +712,7 @@ __global__ void conv_fold_kernel(const __grid_constant__ FoldArgs f, bf16* pool,
 
 __global__ void softcap_f32_kernel(float* logits, int rows, int tokens, std::int64_t ldc, float cap) {
     pdl::wait_for_dependencies();
+    pdl::trigger_dependents(); // PDL: the next kernel may launch now (it waits for this grid before any read)
     const std::int64_t i     = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::int64_t total = static_cast<std::int64_t>(rows) * tokens;
     if (i >= total) { return; }

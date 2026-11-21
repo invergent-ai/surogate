@@ -313,6 +313,38 @@ void inkling_head_logprob(const void* head_weight, std::int32_t vocab_rows, std:
                           const std::int32_t* token_ids, float* out, void* workspace, std::size_t workspace_bytes,
                           cudaStream_t stream);
 
+/// One output slice of a LoRA-adapted projection (inkling_lora_delta): bank `bank` of the device bank table, its BF16
+/// input plane `x` [k, T] (column stride `x_stride` elements) and its BF16 output plane `out` [rows, T] (column stride
+/// `out_stride`); `rows` / k must be the bank's n / k (the binding guarantees it).
+struct InklingLoraSlice {
+    std::int32_t bank      = 0;
+    std::int32_t rows      = 0;
+    const void* x          = nullptr;
+    std::int64_t x_stride  = 0;
+    void* out              = nullptr;
+    std::int64_t out_stride = 0;
+};
+inline constexpr int kInklingLoraMaxSlices = 6;
+
+/// Bytes of the fp32 low-rank buffer of one inkling_lora_delta call: [tokens][slices][max_rank].
+[[nodiscard]] std::size_t inkling_lora_delta_workspace_bytes(std::int32_t slices, std::int32_t max_rank,
+                                                             std::int32_t tokens) noexcept;
+
+/**
+ * Attention LoRA (S10; lanes/e1/NOTES.md), ONE arithmetic at every width / batch: for every token t whose slot
+ * s = token_slot[t] (or *uniform_slot) is >= 0 and every slice:
+ *   low[r] = fma chain over k = 0..K-1 of A_s[r, k] * x[k, t] (fp32, from 0; 32 lane chains with a fixed xor-tree),
+ *   delta[j] = fma chain over r = 0..R-1 of B_s[j, r] * low[r] (fp32, from 0),
+ *   out[j, t] = bf16_rn(float(out[j, t]) + delta[j]) where delta[j] != 0 (else out stays: a zero adapter is bitwise
+ *   the base). A negative slot leaves the token's rows untouched. `table` is the LoRA store's device bank table
+ * (alpha / r folded into A by the store; R = the store's max_rank, shorter adapters zero-padded); per-token work only,
+ * so the bits do not depend on T, the batch or the other tokens.
+ */
+void inkling_lora_delta(const void* table, const InklingLoraSlice* slices, std::int32_t slice_count,
+                        std::int32_t max_rank, std::int32_t tokens, const std::int32_t* token_slot,
+                        const std::int32_t* uniform_slot, void* workspace, std::size_t workspace_bytes,
+                        cudaStream_t stream);
+
 /// In place: x = (tanh(x / cap)) * cap in fp32 (vLLM LogitsProcessor soft_cap), FP32 [rows, T] with
 /// `ldc` elements per column, first `rows` rows of each column.
 void inkling_softcap_f32(float* logits, std::int32_t rows, std::int32_t tokens, std::int32_t ldc,
