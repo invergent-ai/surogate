@@ -653,7 +653,8 @@ void PagedKVPool::download_window_pages_to(std::span<const std::int32_t> physica
     if (destinations.size() != window_planes_.size()) {
         throw std::invalid_argument("window image does not name every window plane");
     }
-    transfer_planes(window_planes_, static_cast<std::uint32_t>(window_sentinel_), physical, destinations,
+    // The sentinel may be read (a test checks it is zero); only uploads must never reach it.
+    transfer_planes(window_planes_, static_cast<std::uint32_t>(window_sentinel_) + 1U, physical, destinations,
                     static_cast<std::uint32_t>(physical.size()), false, stream);
 }
 
