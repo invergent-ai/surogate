@@ -896,10 +896,23 @@ __global__ __launch_bounds__(128) void fold_kernel(const AttnParams p) {
         const float* acc_k = ring + (k & 1) * kFoldChunk * Geo::kHeadDim + d;
         const int s0c      = k * kFoldChunk;
         const int s1c      = min(s0c + kFoldChunk, count);
-        for (int s = s0c; s < s1c; ++s) {
-            if (sm_l[s] > 0.0F) {
-                L = fold_value(L, sm_a[s], sm_l[s], sm_c[s]);
-                A = fold_value(A, sm_a[s], acc_k[(s - s0c) * Geo::kHeadDim], sm_c[s]);
+        // Unrolled by 8 with every operand read first: only the two fma chains stay serial.
+        for (int s = s0c; s < s1c; s += 8) {
+            float la[8], ll[8], lc[8], lx[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const bool in = s + i < s1c;
+                ll[i]         = in ? sm_l[s + i] : 0.0F;
+                la[i]         = in ? sm_a[s + i] : 0.0F;
+                lc[i]         = in ? sm_c[s + i] : 0.0F;
+                lx[i]         = in ? acc_k[(s + i - s0c) * Geo::kHeadDim] : 0.0F;
+            }
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                if (ll[i] > 0.0F) {
+                    L = fold_value(L, la[i], ll[i], lc[i]);
+                    A = fold_value(A, la[i], lx[i], lc[i]);
+                }
             }
         }
         __syncthreads(); // every thread is done with the buffer before it is refilled
