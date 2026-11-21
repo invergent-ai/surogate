@@ -2,7 +2,9 @@
 // Numerics: inkling_numerics.cuh; design: rl/engine-inkling-2026-11-21/lanes/d/DESIGN-moe.md.
 
 #include "core/pdl.cuh"
+#include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
+#include "ops/kernel/func_attribute.cuh"
 #include "ops/sparse_moe/inkling/inkling_gemm_common.cuh"
 #include "ops/sparse_moe/inkling/inkling_moe_internal.h"
 #include "ops/sparse_moe/inkling/inkling_numerics.cuh"
@@ -111,6 +113,137 @@ __global__ __launch_bounds__(96) void router_logits_kernel(const __nv_bfloat16* 
             // `_group_sum`: total = p0; total += p1; total += p2.
             logits[static_cast<std::int64_t>(token) * kExperts + e0 + col] =
                 __fadd_rn(__fadd_rn(partial[0][row][col], partial[1][row][col]), partial[2][row][col]);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Router logits, wide rounds: a CTA = 32 tokens x `Experts` experts, 8 warps (2 x 16-token rows
+// x 4 expert groups), x and W streamed through shared memory in 64-wide K chunks (cp.async,
+// 4 stages, 128-byte rows swizzled by row). Each output is the SAME arithmetic as the kernel
+// above: per 1024-wide K group one chain of bf16 m16n8k16 MMAs from zero, k ascending, the
+// canonical fragments (ldmatrix gives the registers the direct loads give), then
+// `(p0 + p1) + p2`.
+// ---------------------------------------------------------------------------------------------
+inline constexpr int kRouterTileTokens = 32;
+inline constexpr int kRouterKChunk     = 64;
+inline constexpr int kRouterStages     = 4;
+
+template <int Experts>
+struct RouterTiledShared {
+    alignas(128) __nv_bfloat16 x[kRouterStages][kRouterTileTokens * kRouterKChunk];
+    alignas(128) __nv_bfloat16 w[kRouterStages][Experts * kRouterKChunk];
+};
+
+/// Element offset of (row, k) in a 64-wide bf16 chunk row: 16-byte segment k / 8 at (k / 8) ^ (row & 7).
+__device__ __forceinline__ int router_swizzled(int row, int k) {
+    return row * kRouterKChunk + ((((k >> 3) ^ (row & 7))) << 3) + (k & 7);
+}
+
+template <int Experts>
+__global__ __launch_bounds__(256) void router_logits_tiled_kernel(const __nv_bfloat16* __restrict__ x,
+                                                                  const __nv_bfloat16* __restrict__ router,
+                                                                  float* __restrict__ logits,
+                                                                  std::int32_t tokens,
+                                                                  std::int32_t* __restrict__ zero,
+                                                                  std::int32_t zero_words) {
+    constexpr int kWarpExperts = Experts / 4;
+    constexpr int kMmaN        = kWarpExperts / 8;
+    constexpr int kChunks      = kHidden / kRouterKChunk;       // 36
+    constexpr int kGroupChunks = kRouterGroup / kRouterKChunk;  // 16
+    static_assert(kMmaN >= 1 && kWarpExperts % 8 == 0);
+    extern __shared__ __align__(128) unsigned char shared_bytes[];
+    auto& shared = *reinterpret_cast<RouterTiledShared<Experts>*>(shared_bytes);
+
+    pdl::wait_for_dependencies();
+    pdl::trigger_dependents();
+    const int thread = static_cast<int>(threadIdx.x);
+    if (zero != nullptr && blockIdx.x == 0 && blockIdx.y == 0) {
+        for (int i = thread; i < zero_words; i += 256) { zero[i] = 0; }
+    }
+    const int m0 = static_cast<int>(blockIdx.x) * kRouterTileTokens;
+    const int e0 = static_cast<int>(blockIdx.y) * Experts;
+    const auto load_stage = [&](int stage, int chunk) {
+        {
+            const int row   = thread >> 3;
+            const int seg   = thread & 7;
+            const int token = m0 + row;
+            const bool valid = token < tokens;
+            cp_async_zfill<16, Cache::cg>(shared.x[stage] + router_swizzled(row, seg * 8),
+                                          x + static_cast<std::int64_t>(valid ? token : 0) * kHidden +
+                                              chunk * kRouterKChunk + seg * 8,
+                                          valid ? 16 : 0);
+        }
+#pragma unroll
+        for (int task = thread; task < Experts * 8; task += 256) {
+            const int row = task >> 3;
+            const int seg = task & 7;
+            cp_async<16, Cache::cg>(shared.w[stage] + router_swizzled(row, seg * 8),
+                                    router + static_cast<std::int64_t>(e0 + row) * kHidden +
+                                        chunk * kRouterKChunk + seg * 8);
+        }
+    };
+#pragma unroll
+    for (int stage = 0; stage < kRouterStages - 1; ++stage) {
+        load_stage(stage, stage);
+        cp_commit();
+    }
+
+    const int lane   = thread & 31;
+    const int warp   = thread >> 5;
+    const int warp_m = warp & 1;
+    const int warp_n = warp >> 1;
+    float total[kMmaN][4] = {};
+    float acc[kMmaN][4]   = {};
+    for (int chunk = 0; chunk < kChunks; ++chunk) {
+        cp_wait<kRouterStages - 2>();
+        __syncthreads();
+        if (chunk + kRouterStages - 1 < kChunks) {
+            load_stage((chunk + kRouterStages - 1) % kRouterStages, chunk + kRouterStages - 1);
+        }
+        cp_commit();
+        const int stage = chunk % kRouterStages;
+#pragma unroll
+        for (int kk = 0; kk < kRouterKChunk / 16; ++kk) {
+            unsigned a0, a1, a2, a3;
+            {
+                const int row = warp_m * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
+                const int k   = kk * 16 + (lane >> 4) * 8;
+                ldmatrix_x4(a0, a1, a2, a3, smem_addr(shared.x[stage] + router_swizzled(row, k)));
+            }
+#pragma unroll
+            for (int j = 0; j < kMmaN; ++j) {
+                const int row = warp_n * kWarpExperts + j * 8 + (lane & 7);
+                const int k   = kk * 16 + ((lane >> 3) & 1) * 8;
+                unsigned b0, b1;
+                ldmatrix_x2(b0, b1, smem_addr(shared.w[stage] + router_swizzled(row, k)));
+                mma_bf16(acc[j][0], acc[j][1], acc[j][2], acc[j][3], a0, a1, a2, a3, b0, b1);
+            }
+        }
+        if ((chunk + 1) % kGroupChunks == 0 || chunk + 1 == kChunks) {
+            // `_group_sum`: total = p0; total += p1; total += p2.
+            const bool first = chunk < kGroupChunks;
+#pragma unroll
+            for (int j = 0; j < kMmaN; ++j) {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    total[j][i] = first ? acc[j][i] : __fadd_rn(total[j][i], acc[j][i]);
+                    acc[j][i]   = 0.0F;
+                }
+            }
+        }
+    }
+    const int row0 = m0 + warp_m * 16 + (lane >> 2);
+#pragma unroll
+    for (int j = 0; j < kMmaN; ++j) {
+        const int column = e0 + warp_n * kWarpExperts + j * 8 + 2 * (lane & 3);
+        if (row0 < tokens) {
+            *reinterpret_cast<float2*>(logits + static_cast<std::int64_t>(row0) * kExperts + column) =
+                make_float2(total[j][0], total[j][1]);
+        }
+        if (row0 + 8 < tokens) {
+            *reinterpret_cast<float2*>(logits + static_cast<std::int64_t>(row0 + 8) * kExperts + column) =
+                make_float2(total[j][2], total[j][3]);
         }
     }
 }
@@ -465,9 +598,39 @@ void launch(const char* what, dim3 grid, dim3 block, cudaStream_t stream,
 
 } // namespace
 
+template <int Experts>
+void launch_router_tiled(const __nv_bfloat16* x, const __nv_bfloat16* router, float* logits,
+                         std::int32_t tokens, std::int32_t* zero, std::int32_t zero_words,
+                         cudaStream_t stream) {
+    constexpr std::size_t kShared = sizeof(RouterTiledShared<Experts>);
+    auto* kernel = router_logits_tiled_kernel<Experts>;
+    cudaError_t status = ::sinfer::ops::set_func_attribute_per_device(
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kShared));
+    if (status == cudaSuccess) {
+        const dim3 grid(static_cast<unsigned>((tokens + kRouterTileTokens - 1) / kRouterTileTokens),
+                        kExperts / Experts);
+        status = pdl::launch_dependent({grid, dim3(256), kShared, stream}, kernel, x, router, logits, tokens,
+                                       zero, zero_words);
+    }
+    if (status != cudaSuccess) {
+        throw std::runtime_error(std::string("inkling_moe: router logits (tiled): ") + cudaGetErrorString(status));
+    }
+}
+
+/// Rounds above this width take the tiled router kernel (same bits; a speed choice).
+inline constexpr std::int32_t kRouterTiledMinTokens = 65;
+
 void launch_router_logits(const __nv_bfloat16* x, const __nv_bfloat16* router, float* logits,
                           std::int32_t tokens, std::int32_t* zero, std::int32_t zero_words,
                           cudaStream_t stream) {
+    if (tokens >= 2048) {
+        launch_router_tiled<128>(x, router, logits, tokens, zero, zero_words, stream);
+        return;
+    }
+    if (tokens >= kRouterTiledMinTokens) {
+        launch_router_tiled<32>(x, router, logits, tokens, zero, zero_words, stream);
+        return;
+    }
     launch("router logits", dim3(kExperts / 8, static_cast<unsigned>((tokens + 15) / 16)), dim3(96),
            stream, router_logits_kernel, x, router, logits, tokens, zero, zero_words);
 }
