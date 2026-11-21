@@ -433,7 +433,7 @@ class MoEGM(torch.autograd.Function):
 #   TF32: the remaining fp32 GEMMs (attention, LoRA, controllers) on TF32 tensor cores.
 # ---------------------------------------------------------------------------------------------------------------
 FAST_GEMM = os.environ.get("IFT_FAST_GEMM", "1") == "1"
-TF32 = os.environ.get("IFT_TF32", "1") == "1"
+TF32 = os.environ.get("IFT_TF32", "0") == "1"  # lev2-1: TF32 drifts the gradient (cos 0.99978, rel err 2 %)
 _RA_MM = RA.mm
 _RA_BMM = RA.bmm
 
