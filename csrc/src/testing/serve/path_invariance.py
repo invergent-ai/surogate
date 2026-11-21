@@ -10,7 +10,9 @@ Paths
   prefill   prompt S on a fresh engine (one prefill when |S| fits the engine's prefill chunk): the REFERENCE
   decode    prompt P, max_tokens |X| + K: X and Z come from decode rounds (X is P's greedy continuation, so S = P + X)
   verify    as decode, on an engine started with --verify-args (MTP / DFlash): X and Z from verify rounds
-  cut@b     prompt S[:b] (max_tokens 1), then S: the suffix prefills from b (a GPU prefix hit = a chunk cut at b)
+  cut@b     prompt S[:b] (max_tokens 1), then S: the suffix prefills from b (a GPU prefix hit = a chunk cut at b);
+            b = |S| - 1 ("last", in the default cuts) is the case where the whole prompt but its last token is cached
+            and that last token runs as a one-token step (a decode-shaped round inside a prefill)
   host@b    as cut@b on an engine with a host tier and a KV capacity of --host-capacity tokens, with one long
             unrelated prompt in between that needs the retained lane's pages: the prefix spills to the host tier and
             S restores it from there (checked: GET /kv_stats host "restores" grows across S's request)
@@ -157,7 +159,8 @@ def main():
     ap.add_argument("--prompt-chars", type=int, default=6000, help="length of P in characters")
     ap.add_argument("--x-tokens", type=int, default=48, help="|X|: tokens decoded after P that become part of S")
     ap.add_argument("--k-tokens", type=int, default=16, help="|Z|: tokens whose log-probs are compared")
-    ap.add_argument("--cuts", default="512,1061", help="prefix-hit cut points b (tokens)")
+    ap.add_argument("--cuts", default="512,1061,last",
+                    help="prefix-hit cut points b (tokens); 'last' = |S| - 1 (only the last prompt token is computed)")
     ap.add_argument("--host-capacity", type=int, default=4096,
                     help="max-model-len = kv-capacity of the host-path engine (small, so the evicting prompt spills)")
     ap.add_argument("--workdir", default=".")
@@ -182,8 +185,14 @@ def main():
             print(report["error"])
             return 2
         cuts = []
-        for b in (int(c) for c in args.cuts.split(",") if c):
-            cuts.append(prefix_text(eng, s_text, s_ids, min(b, len(s_ids) - 1)))
+        for c in (c.strip() for c in args.cuts.split(",") if c.strip()):
+            if c == "last":
+                # S without its last token: P + X[:-1] re-tokenizes to s_ids[:-1] unless the boundary merges.
+                text = p_text + "".join(x_texts[:-1])
+                ids, _ = eng.tokenize(text)
+                cuts.append((len(ids), text) if ids == s_ids[:-1] else prefix_text(eng, s_text, s_ids, len(s_ids) - 1))
+            else:
+                cuts.append(prefix_text(eng, s_text, s_ids, min(int(c), len(s_ids) - 1)))
     finally:
         eng.close()
     report["s_tokens"] = len(s_ids)
