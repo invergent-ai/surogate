@@ -282,10 +282,8 @@ def visit_torch_long(W: B.EngineWeights, vi, stack, partial, bank, ids, lora, ch
             ain = RA.inkling_loop_blend(dests, msgs[:3], L.ctrl_down[0:3], L.ctrl_gf[0:3], norm_w, EPS)
         return ain.permute(1, 0, 2)
 
-    with B._tick("fwd.attn_in"):
-        attn_in = tc(f_ain, act, [0] * len(act), [0], store_bf16=[True] * len(act), chunk=chunk, vals=act_vals)
-    # 2. projections + q / r clips (per token)
-    QS = 3 if attn_in.shape[1] == 3 else 1
+    # 1 + 2 fused in ONE token-chunked stage: the [T, Q, D] attention inputs (and their gradient) never exist at full T
+    QS = 3 if (vi.looped or not L.is_local) else 1
 
     def f_proj(ain, *tau_):
         xq = ain[:, 0]
@@ -309,11 +307,15 @@ def visit_torch_long(W: B.EngineWeights, vi, stack, partial, bank, ids, lora, ch
             outs += [RA.rb(RA.mm(xk, L.k_wproj)), RA.rb(RA.mm(xv, L.v_wproj))]
         return tuple(outs)
 
-    with B._tick("fwd.proj"):
-        tok = [attn_in] + ([tau] if tau is not None else [])
-        pr = tc(f_proj, tok, [0] * len(tok), [0] * (8 if not L.is_local else 6), store_bf16=[True, False][:len(tok)],
-                chunk=chunk)
-    del attn_in
+    def f_ain_proj(*a):
+        ain = f_ain(*a[:len(act)])
+        return f_proj(ain, *a[len(act):])
+
+    with B._tick("fwd.ain_proj"):
+        tok = act + ([tau] if tau is not None else [])
+        tvals = (list(act_vals) + [None] * (len(tok) - len(act))) if act_vals is not None else None
+        pr = tc(f_ain_proj, tok, [0] * len(tok), [0] * (8 if not L.is_local else 6),
+                store_bf16=[True] * len(act) + [False] * (len(tok) - len(act)), chunk=chunk, vals=tvals)
     q_out, r_out, gate, sink, k_raw, v_raw = pr[:6]
     # 3. K / V causal convs + clip / norm (full T)
     with B._tick("fwd.kv"):
