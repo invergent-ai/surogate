@@ -87,8 +87,32 @@ struct Nvfp4Geometry {
     static constexpr int kScaleTilesPerRow = K / 64;
 };
 
-// BlockK 128: 1152 is not a multiple of 256. Static shared memory stays under 48 KB.
+/// Nvfp4W4a4MmaSchedule's members without its 4-stage cap (the narrow kernel keeps its storage in dynamic
+/// shared memory): `ResidentDown` holds a CTA's whole w2 slice (9 k-tiles) so every weight byte of the
+/// small-T down is requested BEFORE the dependency wait, while gate_up still runs.
+template <int BlockM, int BlockN, int BlockK, int WarpsM, int WarpsN, int Stages, int MinBlocksPerSm>
+struct NarrowGemmSchedule {
+    static constexpr int kBlockM         = BlockM;
+    static constexpr int kBlockN         = BlockN;
+    static constexpr int kBlockK         = BlockK;
+    static constexpr int kWarpsM         = WarpsM;
+    static constexpr int kWarpsN         = WarpsN;
+    static constexpr int kStages         = Stages;
+    static constexpr int kMinBlocksPerSm = MinBlocksPerSm;
+    static constexpr int kWarps          = WarpsM * WarpsN;
+    static constexpr int kThreads        = kWarps * 32;
+    static constexpr int kWarpM          = BlockM / WarpsM;
+    static constexpr int kWarpN          = BlockN / WarpsN;
+    static constexpr int kMmaM           = kWarpM / 16;
+    static constexpr int kMmaN           = kWarpN / 8;
+    static constexpr int kK64PerStage    = BlockK / 64;
+    static constexpr int kCodeRowBytes   = BlockK / 2;
+    static constexpr int kSegmentsPerRow = kCodeRowBytes / 16;
+};
+
+// BlockK 128: 1152 is not a multiple of 256.
 using NarrowSchedule = Nvfp4W4a4MmaSchedule<16, 64, 128, 1, 4, 4, 4>;
+using ResidentDownSchedule = NarrowGemmSchedule<16, 64, 128, 1, 4, kIntermediate / 128, 1>;
 using WideSchedule   = Nvfp4W4a4MmaSchedule<64, 128, 128, 2, 4, 3, 2>;
 
 template <class Schedule, int K>
@@ -190,7 +214,8 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     __trap();
 #else
     using Geometry = Nvfp4Geometry<K>;
-    __shared__ Nvfp4W4a4SharedStorage<Schedule> shared;
+    extern __shared__ __align__(16) unsigned char narrow_dynamic[];
+    auto& shared = *reinterpret_cast<Nvfp4W4a4SharedStorage<Schedule>*>(narrow_dynamic);
     __shared__ int tile_info[3];
     __shared__ int slots[Schedule::kBlockM];
     __shared__ int source_rows[Schedule::kBlockM];
@@ -226,7 +251,9 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     const int n_begin       = static_cast<int>(blockIdx.y) * Schedule::kBlockN;
     const int weight_begin  = expert * kGateUpRows + n_begin;
     constexpr int kKTiles   = K / Schedule::kBlockK;
-    constexpr int kWaitGroups = kKTiles < Schedule::kStages ? kKTiles - 1 : Schedule::kStages - 1;
+    // Resident: every k-tile has its own stage (all loads issued up front, no refill): wait for all once.
+    constexpr bool kResident  = Schedule::kStages >= kKTiles;
+    constexpr int kWaitGroups = kResident ? 0 : Schedule::kStages - 1;
     static_assert(K % Schedule::kBlockK == 0);
     static_assert(!FusedYQuant || (!GateUp && K == kIntermediate));
 
@@ -302,7 +329,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
 
     for (int k_tile = 0; k_tile < kKTiles; ++k_tile) {
         const int stage = k_tile % Schedule::kStages;
-        cp_wait<kWaitGroups>();
+        if (!kResident || k_tile == 0) { cp_wait<kWaitGroups>(); }
         __syncthreads();
 #pragma unroll
         for (int local_k64 = 0; local_k64 < Schedule::kK64PerStage; ++local_k64) {
@@ -735,8 +762,13 @@ void launch_schedule(const GemmParams& params, std::int32_t slots, cudaStream_t 
     const int max_tiles = std::min(kExperts, slots) + slots / Schedule::kBlockM;
     if (max_tiles == 0) { return; }
     const dim3 grid(static_cast<unsigned>(max_tiles), kGateUpRows / Schedule::kBlockN);
-    const cudaError_t status = pdl::launch_dependent({grid, dim3(Schedule::kThreads), 0, stream},
-                                                     nvfp4_expert_gemm_kernel<Schedule, K, GateUp, FusedYQuant>, params);
+    constexpr std::size_t kShared = sizeof(Nvfp4W4a4SharedStorage<Schedule>);
+    auto* kernel = nvfp4_expert_gemm_kernel<Schedule, K, GateUp, FusedYQuant>;
+    cudaError_t status = ::sinfer::ops::set_func_attribute_per_device(
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kShared));
+    if (status == cudaSuccess) {
+        status = pdl::launch_dependent({grid, dim3(Schedule::kThreads), kShared, stream}, kernel, params);
+    }
     if (status != cudaSuccess) {
         throw std::runtime_error(std::string("inkling_moe: nvfp4 expert gemm: ") + cudaGetErrorString(status));
     }
@@ -814,6 +846,16 @@ void launch_prefill(const GemmParams& params, std::int32_t slots, cudaStream_t s
     }
 }
 
+/// TIMING KNOB (removed once measured): SUROGATE_INKLING_RESIDENT_DOWN_SLOTS = the widest round (in slots =
+/// 8 x tokens) whose narrow down holds its whole w2 slice; default 32 (T <= 4); 0 = never.
+int resident_down_max_slots() {
+    static const int value = [] {
+        const char* text = std::getenv("SUROGATE_INKLING_RESIDENT_DOWN_SLOTS");
+        return text != nullptr ? std::atoi(text) : 32;
+    }();
+    return value;
+}
+
 void require(const GemmParams& params) {
     if (params.weights.codes == nullptr || params.weights.scales == nullptr ||
         params.weights.amax == nullptr || params.weights.outer_den == nullptr) {
@@ -841,7 +883,13 @@ void launch_nvfp4_down(const GemmParams& params, std::int32_t slots, GemmSchedul
     if (schedule == GemmSchedule::Narrow) {
         // The y quantisation runs in this kernel's prologue (a_bf16 = y rows); w2 streams before the wait.
         if (p.a_bf16 == nullptr) { throw std::invalid_argument("inkling_moe: narrow NVFP4 down needs the y rows"); }
-        launch_schedule<NarrowSchedule, kIntermediate, false, true>(p, slots, stream);
+        // Smallest rounds hold the whole w2 slice per CTA (all of it requested before the wait); wider narrow
+        // rounds keep the 4-stage ring (more CTAs per SM). Same MMA chain per output either way.
+        if (slots <= resident_down_max_slots()) {
+            launch_schedule<ResidentDownSchedule, kIntermediate, false, true>(p, slots, stream);
+        } else {
+            launch_schedule<NarrowSchedule, kIntermediate, false, true>(p, slots, stream);
+        }
     } else {
         launch_prefill<kIntermediate, false>(p, slots, stream);
     }
