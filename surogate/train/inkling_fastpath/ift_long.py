@@ -282,7 +282,7 @@ class _Shift:
 # LEVEL-1 lever 1: the MoE backward group-major (same S2 math as rig.moe_vec; each 16-expert group's units decoded ONCE
 # per visit per projection; rows of the whole sequence per group, in row blocks of MOE_ROWS)
 # ---------------------------------------------------------------------------------------------------------------
-MOE_ROWS = int(os.environ.get("IFT_MOE_ROWS", "32768"))
+MOE_ROWS = int(os.environ.get("IFT_MOE_ROWS", "8192"))  # lev3-1: 32k rows per block OOMed a 32k row
 # LEVEL-1 lever 3: query-block rows of the flash attention adapted to the key span (fewer, larger blocks; the per-block
 # score tensors [24, rows, keys] fp32 stay under ATTN_BLOCK_BYTES); 0 = the fixed 128 rows
 ATTN_ADAPT = os.environ.get("IFT_ATTN_ADAPT", "1") == "1"
@@ -403,8 +403,9 @@ class MoEGM(torch.autograd.Function):
             r0, r1 = starts[g0], starts[g1 - 1] + cnt[g1 - 1]
             if r1 == r0:
                 continue
-            u13, f13 = w.eng.decode_experts(w.layer, "w13", g0, g1 - g0)
-            u2, f2 = w.eng.decode_experts(w.layer, "w2", g0, g1 - g0)
+            with B._tick("bwd.moe.decode"):
+                u13, f13 = w.eng.decode_experts(w.layer, "w13", g0, g1 - g0)
+                u2, f2 = w.eng.decode_experts(w.layer, "w2", g0, g1 - g0)
             if w.fmt != "nvfp4":
                 f13 = torch.ones_like(f13)
                 f2 = torch.ones_like(f2)
@@ -426,8 +427,10 @@ class MoEGM(torch.autograd.Function):
                     if lora is not None:
                         leaves = [t[g0:g1].detach().requires_grad_() for t in lora]
                         lo = dict(zip(B.LORA_KEYS, leaves))
-                    dn = _moe_rows(xr, grr, eb, pb, cap, g1 - g0, u13, f13, u2, f2, lo, ctx.scale)
-                    grads = torch.autograd.grad(dn, [xr, grr] + leaves, g[tb])
+                    with B._tick("bwd.moe.rows_fwd"):
+                        dn = _moe_rows(xr, grr, eb, pb, cap, g1 - g0, u13, f13, u2, f2, lo, ctx.scale)
+                    with B._tick("bwd.moe.rows_bwd"):
+                        grads = torch.autograd.grad(dn, [xr, grr] + leaves, g[tb])
                 dx.index_add_(0, tb, grads[0])
                 dgam_r[b0:b1] = grads[1]
                 for j, gj in enumerate(grads[2:]):
@@ -437,7 +440,7 @@ class MoEGM(torch.autograd.Function):
         # the routing weights' path back into x (router logits from x, ids fixed)
         dgam = torch.zeros(T, topk, dtype=F32, device=dev)
         dgam[tok, slot] = dgam_r
-        with torch.enable_grad():
+        with torch.enable_grad(), B._tick("bwd.moe.router"):
             xl = x.detach().requires_grad_()
             gm = RA.route_weights(RA._router_logits(xl, w.gate_w), ids)
             dx += torch.autograd.grad(gm, xl, dgam)[0]
