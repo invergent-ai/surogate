@@ -13,6 +13,8 @@
 // independent of the batch (DESIGN.md 11): no atomics, fixed reduction orders.
 #include <cuda_runtime.h>
 
+#include "api/ops/sampling.h"
+
 #include <cstddef>
 #include <cstdint>
 
@@ -191,11 +193,18 @@ void dspark_markov_gate(const float* ctx, std::int32_t j, std::int32_t k, std::i
  */
 /// FP8 fold (fold_codes / fold_scales non-null: per-row e4m3 [domain rows, 256] + fp32 row scales; fold_w ignored):
 /// bias_v = bf16(scale_v * (codes[v] . latent_b) + fold_b[v]) -- the M1 lever `fp8fold`, no acceptance loss.
+/// COUPLED SAMPLED DRAFTS (agent-EN-e2c; `sampling` non-null): a lane whose config is a coupled untruncated sampled row
+/// (SamplingConfig::speculative_coupled, temperature > 0, top_k 0, top_p 1) ranks by z = logit / T + Gumbel keyed by
+/// sample_key(cfg, anchor_positions[b] + draft_index, kSamplePurposeDecode) -- the noise the coupled verify draws that
+/// token with -- instead of the logit: a sampled draft d ~ softmax(logits / T) that equals the target's token whenever
+/// the two Gumbel-max draws agree. Any draft is exact under coupled verification; only acceptance changes. Other lanes
+/// (greedy, top-k / top-p, one-hot verification) keep the greedy draft.
 void dspark_markov_vocab(const void* base, std::int32_t base_rows, std::int32_t row, std::int32_t batch,
                          const void* fold_w, const void* fold_b, const void* latent, std::int32_t domain,
                          const std::int32_t* ids, float* part_val, std::int32_t* part_id, void* bias_out,
                          void* logits_out, cudaStream_t stream, const void* fold_codes = nullptr,
-                         const float* fold_scales = nullptr);
+                         const float* fold_scales = nullptr, const SamplingConfig* sampling = nullptr,
+                         const std::int32_t* anchor_positions = nullptr, std::int32_t draft_index = 0);
 
 /// drafts[j + stride * b] = the id of the largest partial (lowest id on ties) over the `tiles` partials of lane b
 /// (stride = the drafts tensor's first extent, >= k).

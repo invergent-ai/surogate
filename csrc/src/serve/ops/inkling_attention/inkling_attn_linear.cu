@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace sinfer::ops {
 namespace inkling_detail {
@@ -99,16 +100,21 @@ __device__ __forceinline__ void cell_end(float (&acc)[4], float (&part)[4], floa
     part[0] = part[1] = part[2] = part[3] = 0.0F;
 }
 
-/// The activations x of the narrow kernels: written by the previous kernel of the PDL chain, so read through L2 (ld.cg,
-/// coherent) -- never ld.global.nc, whose read-only contract the producer breaks while this grid is resident (the
-/// engine's decode reuses the visit arena's x buffer every visit: the FP8 route decoded garbage, agent-EN 17:4x).
-/// XNc = the old non-coherent load (test-only, InklingAttentionKnobs::linear_x_nc: the regression's negative control).
-template <bool XNc>
+/// The activations x of the narrow kernels are written by the previous kernel of the PDL chain. Never ld.global.nc: the
+/// compiler treats nc loads as invariant and HOISTED them above cudaGridDependencySynchronize (ACQBULK) in the cell-split
+/// kernel, so wo read gated before attention had written it (the FP8 route decoded garbage, agent-EN 17:4x; SASS in
+/// lanes/c/sass). XLoad: 0 = plain ld.global (production: ordered after the wait like every other operand of the
+/// engine's kernels, L1-cached -- each x chunk is re-read by every warp of the CTA), 1 = ld.global.nc (the old form;
+/// test-only negative control, InklingAttentionKnobs::linear_x_nc), 2 = ld.global.cg (L2 only; correct but measured
+/// 1.4-2.4x slower: x re-reads miss L1).
+template <int XLoad>
 __device__ __forceinline__ uint4 load_x(const __nv_bfloat16* ptr) {
-    if constexpr (XNc) {
+    if constexpr (XLoad == 1) {
         return load_ldg<uint4>(ptr);
-    } else {
+    } else if constexpr (XLoad == 2) {
         return __ldcg(reinterpret_cast<const uint4*>(ptr));
+    } else {
+        return load_vec<uint4>(ptr);
     }
 }
 
@@ -130,7 +136,7 @@ inline constexpr int kNarrowRows   = kNarrowWarps * 8;
 inline constexpr int kNarrowStages = 8; // qkvr (K = 2304, 1,075 warps); wo (K = 3072, 288 warps) uses 16: fewer warps,
                                          // so more of each warp's slab in flight (copies grouped in pairs then)
 
-template <int K, bool PerRow, bool XNc = false>
+template <int K, bool PerRow, int XNc = 0>
 __global__ __launch_bounds__(kNarrowWarps * 32) void narrow_kernel(const LinearParams p) {
     constexpr int Cells = K / 128;
     static_assert(Cells % 2 == 0, "cells run in pairs");
@@ -237,7 +243,7 @@ __global__ __launch_bounds__(kNarrowWarps * 32) void narrow_kernel(const LinearP
 // gemm_kernel's (a cell's part is the same chain from zero; acc = fmaf(scale, part, acc) in cell order): same bits.
 inline constexpr int kSplitCpw = 6; // cells a warp
 
-template <int K, bool PerRow, bool XNc = false>
+template <int K, bool PerRow, int XNc = 0>
 __global__ __launch_bounds__((K / 128 / kSplitCpw) * 32) void narrow_split_kernel(const LinearParams p) {
     constexpr int Cells = K / 128;
     constexpr int CW    = Cells / kSplitCpw; // warps
@@ -778,44 +784,36 @@ void inkling_attn_linear(std::span<const InklingProjection> projections, Workspa
     for (int i = 1; i < pr.params.segments; ++i) {
         if ((pr.params.seg[i].k_per == pr.k) != per_row) { fail(op, "projections of one call share their scale cell kind"); }
     }
-    const bool xnc = inkling_attention_knobs().linear_x_nc; // test-only negative control (old ld.global.nc x loads)
+    const int xnc = inkling_attention_knobs().linear_x_nc; // 0 plain (production) / 1 nc (test-only control) / 2 cg
     if (split) {
         const unsigned threads = static_cast<unsigned>(pr.k / 128 / kSplitCpw * 32);
         const pdl::LaunchConfig launch{dim3(static_cast<unsigned>(pr.blocks)), dim3(threads), 0, stream};
-        if (xnc) {
+        const auto go = [&](auto mode) {
+            constexpr int M = decltype(mode)::value;
             if (pr.k == 2304) {
-                CUDA_CHECK(per_row ? pdl::launch_dependent(launch, narrow_split_kernel<2304, true, true>, pr.params)
-                                   : pdl::launch_dependent(launch, narrow_split_kernel<2304, false, true>, pr.params));
+                CUDA_CHECK(per_row ? pdl::launch_dependent(launch, narrow_split_kernel<2304, true, M>, pr.params)
+                                   : pdl::launch_dependent(launch, narrow_split_kernel<2304, false, M>, pr.params));
             } else {
-                CUDA_CHECK(per_row ? pdl::launch_dependent(launch, narrow_split_kernel<3072, true, true>, pr.params)
-                                   : pdl::launch_dependent(launch, narrow_split_kernel<3072, false, true>, pr.params));
+                CUDA_CHECK(per_row ? pdl::launch_dependent(launch, narrow_split_kernel<3072, true, M>, pr.params)
+                                   : pdl::launch_dependent(launch, narrow_split_kernel<3072, false, M>, pr.params));
             }
-        } else if (pr.k == 2304) {
-            CUDA_CHECK(per_row ? pdl::launch_dependent(launch, narrow_split_kernel<2304, true>, pr.params)
-                               : pdl::launch_dependent(launch, narrow_split_kernel<2304, false>, pr.params));
-        } else {
-            CUDA_CHECK(per_row ? pdl::launch_dependent(launch, narrow_split_kernel<3072, true>, pr.params)
-                               : pdl::launch_dependent(launch, narrow_split_kernel<3072, false>, pr.params));
-        }
+        };
+        if (xnc == 1) { go(std::integral_constant<int, 1>{}); } else if (xnc == 2) { go(std::integral_constant<int, 2>{}); } else { go(std::integral_constant<int, 0>{}); }
         return;
     }
     if (!gemm) {
         const pdl::LaunchConfig launch{dim3(static_cast<unsigned>(pr.blocks)), dim3(kNarrowWarps * 32), 0, stream};
-        if (xnc) {
+        const auto go = [&](auto mode) {
+            constexpr int M = decltype(mode)::value;
             if (pr.k == 2304) {
-                CUDA_CHECK(per_row ? pdl::launch_dependent(launch, narrow_kernel<2304, true, true>, pr.params)
-                                   : pdl::launch_dependent(launch, narrow_kernel<2304, false, true>, pr.params));
+                CUDA_CHECK(per_row ? pdl::launch_dependent(launch, narrow_kernel<2304, true, M>, pr.params)
+                                   : pdl::launch_dependent(launch, narrow_kernel<2304, false, M>, pr.params));
             } else {
-                CUDA_CHECK(per_row ? pdl::launch_dependent(launch, narrow_kernel<3072, true, true>, pr.params)
-                                   : pdl::launch_dependent(launch, narrow_kernel<3072, false, true>, pr.params));
+                CUDA_CHECK(per_row ? pdl::launch_dependent(launch, narrow_kernel<3072, true, M>, pr.params)
+                                   : pdl::launch_dependent(launch, narrow_kernel<3072, false, M>, pr.params));
             }
-        } else if (pr.k == 2304) {
-            CUDA_CHECK(per_row ? pdl::launch_dependent(launch, narrow_kernel<2304, true>, pr.params)
-                               : pdl::launch_dependent(launch, narrow_kernel<2304, false>, pr.params));
-        } else {
-            CUDA_CHECK(per_row ? pdl::launch_dependent(launch, narrow_kernel<3072, true>, pr.params)
-                               : pdl::launch_dependent(launch, narrow_kernel<3072, false>, pr.params));
-        }
+        };
+        if (xnc == 1) { go(std::integral_constant<int, 1>{}); } else if (xnc == 2) { go(std::integral_constant<int, 2>{}); } else { go(std::integral_constant<int, 0>{}); }
         return;
     }
     const pdl::LaunchConfig launch{

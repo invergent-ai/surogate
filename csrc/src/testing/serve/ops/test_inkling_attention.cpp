@@ -2353,11 +2353,12 @@ void run_bench_ab() {
 // buffer and ONE wo buffer reused by every visit (as the visit arena does), launched back to back with PDL, eager and as
 // a CUDA graph; each visit's qkvr output (distinct buffers) vs a reference that gives every visit fresh buffers and
 // synchronises between ops. A stale read of the reused buffers shows up as bit differences.
-void test_pdl_chain() {
+void test_pdl_chain_rows(int B) {
     using K = InklingLayerKind;
     if (g_stream == nullptr) { cuda_check(cudaStreamCreateWithFlags(&g_stream, cudaStreamNonBlocking), "stream"); }
     const K kind = K::Local;
-    const int W = 1, B = 8, N = W * B, first = 8191, keys = first + W, R = 4, visits = 24;
+    const int W = 1, N = W * B, first = 8191, keys = first + W, R = 4, visits = 24;
+    const char* linear_route = N > 16 ? "gemm_t" : "narrow";
     const Layer layer(kind, 11);
     const Rows rows = make_rows(W, B, std::vector<int>(B, first), {});
     BenchPlane plane(B, keys + 64);
@@ -2404,9 +2405,11 @@ void test_pdl_chain() {
         if (sync) { cuda_check(cudaStreamSynchronize(g_stream), "sync"); }
     };
     for (int i = 0; i < visits; ++i) { visit(i, ref_gated[i].p, ref_wo[i].p, refs[i].p, true); }
-    bool control = false; // linear_x_nc on: the old ld.global.nc x loads (negative control, reported, not checked)
+    int xmode    = 0;     // linear_x_nc: 0 plain (production), 2 ld.cg (checked); 1 = the old ld.nc (negative control, reported)
+    bool control = false;
+    std::size_t control_bad = 0;
     const auto compare_all = [&](const char* route_in) {
-        const std::string route = std::string(route_in) + (control ? " [x ld.nc control]" : "");
+        const std::string route = std::string(route_in) + (control ? " [x ld.nc control]" : xmode == 2 ? " [x ld.cg]" : "");
         cuda_check(cudaStreamSynchronize(g_stream), "sync");
         std::size_t bad = 0, total = 0;
         int first_bad = -1;
@@ -2422,15 +2425,17 @@ void test_pdl_chain() {
             total += a.size();
             cuda_check(cudaMemset(outs[i].p, 0xff, outs[i].bytes), "poison");
         }
-        std::printf("pdl chain %-36s attention -> wo -> qkvr x %d visits, reused buffers: %zu / %zu outputs bit-different%s\n",
-                    route.c_str(), visits, bad, total,
+        std::printf("pdl chain N=%-2d %-5s %-28s attention -> wo -> qkvr x %d visits, reused buffers: %zu / %zu outputs bit-different%s\n",
+                    N, linear_route, route.c_str(), visits, bad, total,
                     first_bad >= 0 ? (" (first visit " + std::to_string(first_bad) + ")").c_str() : "");
         if (!control) { check(bad == 0, "pdl chain " + route); }
+        if (control) { control_bad += bad; }
     };
-    const bool xnc_saved = ops::inkling_attention_knobs().linear_x_nc;
-    for (const bool ctl : {false, true}) {
-        control                                     = ctl;
-        ops::inkling_attention_knobs().linear_x_nc = ctl;
+    const int xnc_saved = ops::inkling_attention_knobs().linear_x_nc;
+    for (const int mode : {0, 2, 1}) {
+        xmode                                       = mode;
+        control                                     = mode == 1;
+        ops::inkling_attention_knobs().linear_x_nc = mode;
         for (int rep = 0; rep < 3; ++rep) {
             for (int i = 0; i < visits; ++i) { visit(i, gated.p, wout.p, outs[i].p, false); }
             compare_all("eager");
@@ -2449,6 +2454,36 @@ void test_pdl_chain() {
         cudaGraphDestroy(graph);
     }
     ops::inkling_attention_knobs().linear_x_nc = xnc_saved;
+    // Review R4 minor 2: a control that finds nothing means the chain lost its teeth (e.g. a compiler that stops
+    // hoisting) -- say so loudly. The narrow chain (N <= 16) is the one with a known hoist; gemm_t loads x by cp.async
+    // after the wait, so its control is expected to stay clean.
+    if (N <= 16 && control_bad == 0) {
+        std::printf("WARN pdl chain N=%d: the ld.nc negative control found 0 differences -- the test no longer shows that it "
+                    "can catch a stale read\n", N);
+    }
+}
+
+void test_pdl_chain() {
+    test_pdl_chain_rows(8);  // narrow attn_linear (the hoist the fix removed)
+    test_pdl_chain_rows(24); // gemm_t_kernel (N > 16)
+}
+
+// Narrow attn_linear rows (decode / verify widths), x via plain ld.global (production), ld.cg, and the old ld.nc
+// (linear_x_nc 1, which the compiler hoisted above the PDL wait in the cell-split kernel: incorrect, timed for reference).
+void run_bench_linear() {
+    cuda_check(cudaStreamCreateWithFlags(&g_stream, cudaStreamNonBlocking), "stream");
+    const int saved = ops::inkling_attention_knobs().linear_x_nc;
+    for (const int nc : {0, 2, 1}) {
+        ops::inkling_attention_knobs().linear_x_nc = nc;
+        const std::string t = nc == 1 ? " [x ld.nc, old]" : nc == 2 ? " [x ld.cg]" : " [x ld.global]";
+        const auto nm = [&](const char* w) { static std::string x; x = std::string(w) + t; return x.c_str(); };
+        bench_linear(nm("attn_linear qkvr N=1 channel"), 2304, 2304, 1);
+        bench_linear(nm("attn_linear qkvr N=8 channel"), 2304, 2304, 8);
+        bench_linear(nm("attn_linear wo N=1 channel"), 3072, 3072, 1);
+        bench_linear(nm("attn_linear wo N=8 channel"), 3072, 3072, 8);
+        bench_linear(nm("attn_linear wo N=1 1x128"), 3072, 128, 1);
+    }
+    ops::inkling_attention_knobs().linear_x_nc = saved;
 }
 
 // Decode staging A/B (agent-EN-c4): register staging (decode_raw 0) vs the cp.async raw ring (2) vs the auto rule (1),
@@ -2599,6 +2634,10 @@ int main(int argc, char** argv) {
             }
             if (argc > 2 && std::string(argv[2]) == "fold") {
                 run_bench_fold();
+                return 0;
+            }
+            if (argc > 2 && std::string(argv[2]) == "linear") {
+                run_bench_linear();
                 return 0;
             }
             if (argc > 2 && std::string(argv[2]) == "raw") {

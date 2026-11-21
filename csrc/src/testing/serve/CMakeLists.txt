@@ -76,6 +76,28 @@ target_link_libraries(sinfer_inkling_frontend_test PRIVATE sinfer_text Threads::
 add_test(NAME sinfer_inkling_frontend_test COMMAND sinfer_inkling_frontend_test)
 set_tests_properties(sinfer_inkling_frontend_test PROPERTIES SKIP_RETURN_CODE 77)
 set_property(GLOBAL APPEND PROPERTY SINFER_SERVE_TEST_TARGETS sinfer_inkling_frontend_test)
+# ENGINE-INKLING lane V-b: Inkling-2 image requests (renderer with images, Pillow-faithful decode, the 40 px grid, the
+# [4N, 1200] payload) against lane V-a's vision vectors from vLLM (vectors/vision). CPU only, same pattern as above plus
+# the FFmpeg decoder library. Skips (77) without INKLING_MODEL_DIR / INKLING_VECTORS.
+add_executable(sinfer_inkling_vision_test
+  inkling/test_inkling_vision.cpp
+  ${SERVE_ROOT}/family/impl/frontend/inkling_json.cpp
+  ${SERVE_ROOT}/family/impl/frontend/inkling_render.cpp
+  ${SERVE_ROOT}/family/impl/frontend/inkling_vision.cpp
+  ${SERVE_ROOT}/family/impl/frontend/tokenizer.cpp
+  ${SERVE_ROOT}/../tokenizer/tokenizer.cpp
+  ${SERVE_ROOT}/../tokenizer/tok_profile.cpp
+  ${SERVE_ROOT}/../tokenizer/unicode.cpp
+  ${SERVE_ROOT}/../tokenizer/unicode_data.cpp)
+target_include_directories(sinfer_inkling_vision_test PRIVATE
+  ${SERVE_ROOT} ${SERVE_ROOT}/.. ${SERVE_ROOT}/../tokenizer ${SINFER_JSON_INCLUDE}
+  ${SUROGATE_VENDOR_DIR} ${SUROGATE_VENDOR_DIR}/utf8proc ${minja_SOURCE_DIR}/include ${fmt_SOURCE_DIR}/include)
+target_compile_definitions(sinfer_inkling_vision_test PRIVATE FMT_HEADER_ONLY=1)
+target_compile_options(sinfer_inkling_vision_test PRIVATE -UNDEBUG)
+target_link_libraries(sinfer_inkling_vision_test PRIVATE sinfer_text sinfer_media_decode Threads::Threads)
+add_test(NAME sinfer_inkling_vision_test COMMAND sinfer_inkling_vision_test)
+set_tests_properties(sinfer_inkling_vision_test PROPERTIES SKIP_RETURN_CODE 77)
+set_property(GLOBAL APPEND PROPERTY SINFER_SERVE_TEST_TARGETS sinfer_inkling_vision_test)
 # The same sources: Inkling-2 streaming (inkling::StreamParser) -- the concatenated deltas equal the non-streamed
 # message for every parser vector, and deltas come as the tokens do. The frontend gate's streaming check.
 add_executable(sinfer_inkling_stream_test
@@ -178,6 +200,8 @@ sinfer_add_op_test(sinfer_inkling_mix_test SOURCES targets/inkling2/test_inkling
 sinfer_add_op_test(sinfer_inkling_invariance_test SOURCES targets/inkling2/test_inkling_invariance.cpp LIBRARIES sinfer_ops)
 # Lane e1: CUDA graph launch cost by graph shape (plain / PDL / memcpy nodes / split); a bench (exit 77 without a GPU).
 sinfer_add_test(sinfer_inkling_graph_launch_bench SOURCES targets/inkling2/bench_graph_launch.cu LIBRARIES CUDA::cudart)
+# Lane mx: critical-path cost of the mix ops in a decode-like PDL graph, reference vs latency-cut kernels (a bench).
+sinfer_add_op_test(sinfer_inkling_mix_bench SOURCES targets/inkling2/bench_inkling_mix.cu LIBRARIES sinfer_ops)
 # Inkling-2-Mini DSpark drafter ops (ENGINE-INKLING lane e2) vs ref/dspark_ref.py's golden vectors (argument: the
 # vector dir with mtp.safetensors; lanes/e2/card_dspark_test.sh stages it).
 sinfer_add_op_test(sinfer_dspark_test SOURCES targets/inkling2/test_dspark.cpp
@@ -394,6 +418,15 @@ sinfer_add_test(sinfer_inkling_wiring_test
   SOURCES inkling/test_inkling_wiring.cpp
   LIBRARIES sinfer_serve sinfer_engine sinfer_core)
 target_include_directories(sinfer_inkling_wiring_test PRIVATE
+  ${SERVE_ROOT}/family/export
+  ${SERVE_ROOT}/family/impl)
+# ENGINE-INKLING lane V-b: Inkling-2 image requests through the serving layer (raw-chat image collection, translate's
+# acquisition) and Frontend::prepare / count_tokens (vision on / off) against lane V-a's vectors. CPU; skips (77)
+# without INKLING_MODEL_DIR / INKLING_VECTORS.
+sinfer_add_test(sinfer_inkling_vision_wiring_test
+  SOURCES inkling/test_inkling_vision_wiring.cpp
+  LIBRARIES sinfer_serve sinfer_engine sinfer_core)
+target_include_directories(sinfer_inkling_vision_wiring_test PRIVATE
   ${SERVE_ROOT}/family/export
   ${SERVE_ROOT}/family/impl)
 # The tokenizer_config.json chat-template contract: three JSON strings and no

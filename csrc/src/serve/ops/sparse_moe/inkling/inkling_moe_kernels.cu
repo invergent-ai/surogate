@@ -46,8 +46,9 @@ __device__ __forceinline__ int live_count(LiveTokens live) {
 /// are written by a kernel that may still be in flight when this grid is launched (PDL) and live at arena addresses
 /// reused every visit, so they are NEVER read through the non-coherent read-only path (ld.global.nc / __ldg / a
 /// `const __restrict__` pointer the compiler turns into LDG.CONSTANT): explicit ld.global.cg (L2) loads instead.
-/// Same bytes: no bit changes. The bf16 ROW loads (x / y in the quantisers) are plain ld.global (load_row16 in
-/// inkling_gemm_common.cuh, shared with the fused-y down: an L1 hit on the second pass); single-touch reads (logits,
+/// Same bytes: no bit changes. The bf16 ROW loads (x / y in the quantisers) are explicit weak ld.global.ca (load_row16
+/// in inkling_gemm_common.cuh, shared with the fused-y down: an L1 hit on the second pass; a bare dereference of these
+/// `const __restrict__` inputs would be lowered to ld.global.nc, review R4); single-touch reads (logits,
 /// ids, lora rows, combine / softcap operands) are ld.global.cg. Test-only controls (`inkling_test_read_only_loads`):
 /// 1 = the row loads back on ld.global.nc (negative control), 2 = ld.global.cg.
 
@@ -274,9 +275,8 @@ __global__ __launch_bounds__(256) void router_logits_tiled_kernel(const __nv_bfl
 // ---------------------------------------------------------------------------------------------
 /// One warp selects token `token` (< live.tokens): zeroes its fused-combine counters (and its output row
 /// when it is padding), picks the top 8, writes ids / gammas / capture and, with `out.counts`, takes a
-/// rank inside each expert. `L2Logits`: the logits were written by other CTAs of the same grid (read
-/// through L2). Identical arithmetic either way.
-template <bool L2Logits>
+/// rank inside each expert. The logits are read through L2 (ld.cg) on every path: written by the logits kernel or by
+/// other CTAs of the same grid.
 __device__ __forceinline__ void select_token(const float* __restrict__ logits, const float* __restrict__ bias,
                                              LiveTokens live, const RouteOutputs& out, int token, int lane) {
     const int tokens = live.tokens;
@@ -398,7 +398,7 @@ __global__ __launch_bounds__(128) void router_select_kernel(const float* __restr
     pdl::wait_for_dependencies();
     pdl::trigger_dependents();
     const int thread = static_cast<int>(threadIdx.x);
-    select_token<false>(logits, bias, live, out, static_cast<int>(blockIdx.x) * 4 + (thread >> 5), thread & 31);
+    select_token(logits, bias, live, out, static_cast<int>(blockIdx.x) * 4 + (thread >> 5), thread & 31);
     if (out.counts == nullptr) { return; }
     // The last block to finish lays out the rows.
     __shared__ int is_last;
@@ -744,12 +744,12 @@ __global__ __launch_bounds__(kFusedRouteThreads) void route_select_narrow_kernel
         local.counts    = local_counts;
         local.ranks     = local_ranks;
         local.local_ids = local_ids;
-        select_token<true>(logits, bias, live, local, thread >> 5, thread & 31);
+        select_token(logits, bias, live, local, thread >> 5, thread & 31);
         __syncthreads();
         place_rows<kFusedRouteThreads, true>(local, tokens, thread);
         return;
     }
-    select_token<true>(logits, bias, live, out, m_tile * kStagedTileTokens + (thread >> 5), thread & 31);
+    select_token(logits, bias, live, out, m_tile * kStagedTileTokens + (thread >> 5), thread & 31);
     __threadfence();
     __syncthreads();
     if (thread == 0) { role = atomicAdd(out.ticket, 1) == token_tiles - 1; }

@@ -151,13 +151,16 @@ __device__ __forceinline__ void cp_async_cg16_hint(void* smem_dst, const void* g
 }
 
 /// PDL audit (2026-11-21): bf16 activation rows (x, y) are written by a kernel that may still run when the reading
-/// grid launches (PDL), at arena addresses reused every visit. They are read with plain (weak) ld.global after the
-/// dependency wait -- griddepcontrol.wait makes the prerequisite grid's writes visible to such loads -- and NEVER
-/// through the non-coherent path (ld.global.nc / __ldg / LDG.CONSTANT), whose data must stay unchanged for the
-/// reading kernel's whole lifetime, which a PDL-overlapped producer violates. Plain loads keep the L1 hit of the
-/// quantisers' second pass over a row (ld.global.cg measured +2.0 us per NVFP4 call at T=1, 2128f247).
-/// `RowLoad` is a compile-time TEST-ONLY mode (inkling_test_read_only_loads picks the kernel instantiation on the
-/// host): 0 = plain (the only form serving launches), 1 = ld.global.nc (negative control), 2 = ld.global.cg.
+/// grid launches (PDL), at arena addresses reused every visit. They are read with an explicit WEAK ld.global.ca after the
+/// dependency wait -- griddepcontrol.wait makes the prerequisite grid's writes visible to weak loads -- and NEVER
+/// through the non-coherent path (ld.global.nc / __ldg / LDG.CONSTANT): its data must stay unchanged for the reading
+/// kernel's whole lifetime, which a PDL-overlapped producer violates, and the compiler may hoist nc loads above the wait
+/// (lane c's FP8 decode bug, 2026-11-21). Review R4 of M9 (major): mode 0 used to be `*address`, which NVPTX lowers to
+/// ld.global.nc (LDG.E.CONSTANT) on these `const __restrict__` read-only inputs; `__ldca` names the cache operator, so
+/// the load stays weak (no .nc) and keeps the L1 hit of the quantisers' second pass over a row (ld.global.cg measured
+/// +2.0 us per NVFP4 call at T=1, 2128f247). `RowLoad` is a compile-time TEST-ONLY mode (inkling_test_read_only_loads
+/// picks the kernel instantiation on the host): 0 = ld.global.ca (the only form serving launches), 1 = ld.global.nc
+/// (negative control), 2 = ld.global.cg.
 template <int RowLoad = 0>
 __device__ __forceinline__ uint4 load_row16(const uint4* address) {
     if constexpr (RowLoad == 1) {
@@ -165,11 +168,12 @@ __device__ __forceinline__ uint4 load_row16(const uint4* address) {
     } else if constexpr (RowLoad == 2) {
         return __ldcg(address);
     } else {
-        return *address;
+        return __ldca(address);
     }
 }
 
-/// The host side of the test-only row-load mode (one per translation unit; 0 in serving).
+/// The host side of the test-only row-load mode: ONE program-wide instance (an inline function's static), shared by
+/// every caller (set_read_only_control and set_row_load_mode_nvfp4 write the same variable); 0 in serving.
 inline int& row_load_mode_host() {
     static int mode = 0;
     return mode;

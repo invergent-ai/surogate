@@ -65,12 +65,12 @@ struct DSparkDerived {
 
 /// Derives the drafter's load-time weights from lane b's bound draft (w.has_draft); synchronous.
 void derive_dspark(const load::InklingWeights& w, DSparkDerived& out, bool fp8_weights = false, bool fp8_fold = false);
-/// The FP8 Markov fold (default; SUROGATE_SERVE_DSPARK_BF16_FOLD=1 keeps the BF16 fold).
+/// The FP8 Markov fold (opt-in since M9: SUROGATE_SERVE_DSPARK_FP8_FOLD=1; the BF16 fold is the default).
 [[nodiscard]] bool dspark_fp8_fold_requested();
 
 /// SUROGATE_SERVE_DSPARK_BF16_WEIGHTS=1 (read once): keep the drafter's dense linears BF16 on the device (A/B).
 [[nodiscard]] bool dspark_bf16_weights_forced();
-/// The FP8 drafter weights (default; SUROGATE_SERVE_DSPARK_BF16_WEIGHTS=1 keeps BF16).
+/// The FP8 drafter weights (opt-in since M9: SUROGATE_SERVE_DSPARK_FP8_WEIGHTS=1; BF16 is the default).
 [[nodiscard]] bool dspark_fp8_weights_requested();
 /// Device bytes derive_dspark allocates beside the materialized weights (storage + FP8 fold + FP8 linears), resident for
 /// the engine's life; the registry books them before the KV is sized (Package::extra_derived_residency_bytes).
@@ -117,6 +117,10 @@ struct DSparkPropose {
     std::int32_t* drafts                 = nullptr; ///< I32 [draft_stride, B]: draft j of lane b at j + stride * b
     std::int32_t draft_stride            = 0;       ///< >= k; 0: k
     void* hidden_out                     = nullptr; ///< optional BF16 [2304, 8, B]: the block's final hidden (tests)
+    /// Device SamplingConfig [B] (null: greedy drafts for every lane): coupled untruncated sampled lanes draw their
+    /// drafts with the coupled verify's own Gumbel noise (ops::dspark_markov_vocab; SUROGATE_SERVE_DSPARK_SAMPLED_DRAFTS=0
+    /// keeps greedy drafts).
+    const ops::SamplingConfig* sampling  = nullptr;
 };
 
 /// Workspace of one append of `columns` (= W * B) columns / one proposal of `batch` lanes at the widest round.

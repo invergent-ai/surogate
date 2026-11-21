@@ -111,9 +111,15 @@ bool dspark_bf16_weights_forced() {
 }
 
 bool dspark_fp8_weights_requested() {
-    // DEFAULT since fp8ab2 (card 7 16:34): identity 16 / 16, tokens / round 3.59 vs 3.56 (BF16), -0.29 GiB device
-    // with the FP8 fold. SUROGATE_SERVE_DSPARK_BF16_WEIGHTS=1 keeps the BF16 drafter weights.
-    return !dspark_bf16_weights_forced();
+    // OPT-IN (SUROGATE_SERVE_DSPARK_FP8_WEIGHTS=1) since M9: the BF16 drafter is the default again -- h2's drafter A/B on
+    // M7 (perf/h2/m7-55c27326-1121-1757/dab): the FP8 route (W8A16 dspark_gemm_w8 + the FP8 fold) costs ~9.5 % per
+    // stream at 8 streams (T0 105.9 vs 117.1, T1 78.5 vs 86.7 tok/s), equal at 1 stream, same tokens / round.
+    // SUROGATE_SERVE_DSPARK_BF16_WEIGHTS=1 still forces BF16.
+    static const bool fp8 = [] {
+        const char* raw = std::getenv("SUROGATE_SERVE_DSPARK_FP8_WEIGHTS");
+        return raw != nullptr && raw[0] == '1';
+    }();
+    return fp8 && !dspark_bf16_weights_forced();
 }
 
 namespace {
@@ -133,13 +139,14 @@ void dense(WorkspaceArena& work, const DSparkDerived& d, const Weight& w, const 
 } // namespace
 
 bool dspark_fp8_fold_requested() {
-    // DEFAULT since fp8ab2 (with the FP8 weights; CPU r1+r2: no acceptance loss). SUROGATE_SERVE_DSPARK_BF16_FOLD=1
-    // keeps the BF16 fold.
-    static const bool bf16 = [] {
-        const char* raw = std::getenv("SUROGATE_SERVE_DSPARK_BF16_FOLD");
-        return raw != nullptr && raw[0] == '1';
+    // OPT-IN (SUROGATE_SERVE_DSPARK_FP8_FOLD=1) since M9, with the FP8 weights (dspark_fp8_weights_requested); CPU r1+r2:
+    // no acceptance loss. SUROGATE_SERVE_DSPARK_BF16_FOLD=1 still forces the BF16 fold.
+    static const bool fp8 = [] {
+        const char* fp8_raw  = std::getenv("SUROGATE_SERVE_DSPARK_FP8_FOLD");
+        const char* bf16_raw = std::getenv("SUROGATE_SERVE_DSPARK_BF16_FOLD");
+        return fp8_raw != nullptr && fp8_raw[0] == '1' && !(bf16_raw != nullptr && bf16_raw[0] == '1');
     }();
-    return !bf16;
+    return fp8;
 }
 
 namespace {
@@ -509,7 +516,8 @@ void dspark_propose(const load::InklingWeights& w, const DSparkDerived& d, const
                                 j == 0 ? nullptr : state[(j + 1) & 1], state[j & 1], latent, s);
         ops::dspark_markov_vocab(base, G::kVocabPadded, 1 + j, B, d.fp8_fold ? nullptr : d.fold_w, d.fold_b, latent,
                                  G::kVocab, nullptr, part_v, part_i, nullptr, nullptr, s,
-                                 d.fp8_fold ? d.fold_codes : nullptr, d.fp8_fold ? d.fold_scales : nullptr);
+                                 d.fp8_fold ? d.fold_codes : nullptr, d.fp8_fold ? d.fold_scales : nullptr,
+                                 p.sampling, p.sampling != nullptr ? p.anchor_positions : nullptr, j);
         ops::dspark_markov_pick(part_v, part_i, tiles, B, j, stride, p.drafts, s);
     }
 }
@@ -588,6 +596,12 @@ void Variant::dspark_propose(const ModelView& model, const family::DSparkRuntime
     p.drafts           = static_cast<std::int32_t*>(args.drafts.data);
     p.draft_stride     = args.drafts.ne[0];
     p.k                = args.k;
+    // Coupled sampled drafts (dspark.h) unless SUROGATE_SERVE_DSPARK_SAMPLED_DRAFTS=0 (greedy drafts, A/B).
+    static const bool sampled_drafts = [] {
+        const char* raw = std::getenv("SUROGATE_SERVE_DSPARK_SAMPLED_DRAFTS");
+        return raw == nullptr || raw[0] == '\0' || std::atoi(raw) != 0;
+    }();
+    p.sampling = sampled_drafts ? args.sampling : nullptr;
     // The vocabulary pass keeps 16 lanes' latents in shared memory: wider rounds run in groups of 16.
     for (std::int32_t b0 = 0; b0 < args.batch; b0 += 16) {
         p.batch = std::min<std::int32_t>(16, args.batch - b0);
@@ -597,6 +611,7 @@ void Variant::dspark_propose(const ModelView& model, const family::DSparkRuntime
         if (g.lanes != nullptr) { g.lanes += b0; }
         g.table_rows += b0;
         g.drafts += static_cast<std::int64_t>(b0) * p.draft_stride;
+        if (g.sampling != nullptr) { g.sampling += b0; }
         detail::dspark_propose(*im.weights, *im.dspark, dspark_kv(rt), g, *rt.work, rt.stream);
     }
 }

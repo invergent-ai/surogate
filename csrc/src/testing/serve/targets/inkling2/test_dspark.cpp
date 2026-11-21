@@ -557,8 +557,8 @@ int run(const std::string& dir, const std::string& tag) {
                std::to_string(same_c) + " / 21 and " + std::to_string(same_r) + " / 21");
     }
     {
-        // R5: the SERVING DEFAULT drafter (FP8 weights + FP8 Markov fold, since 8a146482) on every tag's inputs (M7
-        // review minor: it ran under fp8all only): drafts vs the reference (>= 19 / 21) / vs the round above
+        // R5: the FP8 drafter (FP8 weights + FP8 Markov fold; the serving default 8a146482 .. M8, opt-in since M9) on
+        // every tag's inputs: drafts vs the reference (>= 19 / 21) / vs the round above
         D::DSparkDerived der8;
         D::derive_dspark(w, der8, true, true);
         DBuf d8(static_cast<std::size_t>(7) * B * 4);
@@ -574,7 +574,7 @@ int run(const std::string& dir, const std::string& tag) {
             same_r += dv[i] == dref[i];
             same_c += dv[i] == dg[i];
         }
-        report("R5 serving-default round (FP8 weights + FP8 fold): drafts == reference (>= 19 / 21) / == the tag's round", same_r >= 19,
+        report("R5 FP8-drafter round (FP8 weights + FP8 fold): drafts == reference (>= 19 / 21) / == the tag's round", same_r >= 19,
                std::to_string(same_r) + " / 21 and " + std::to_string(same_c) + " / 21");
     }
     std::cout << (failures ? "FAIL" : "ALL PASS") << " dspark round (" << tag << ", " << failures << " failures)\n";

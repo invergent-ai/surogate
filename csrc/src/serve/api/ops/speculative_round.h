@@ -11,9 +11,11 @@ namespace sinfer::ops {
 
 // Caller-owned transient capacity for every draft-count and batch-size pair in the inclusive
 // domains. token_domain is the fixed sampling profile; invalid domains throw.
+// split_routes: the target opts in to the split routes of untruncated stochastic rows (exact split + coupled; lane e2):
+// their chunk partials are added. Every target that passes false gets M7's capacity exactly.
 [[nodiscard]] std::size_t speculative_accept_greedy_drafts_workspace_capacity_bytes(
     std::int32_t token_domain, std::int32_t min_drafts, std::int32_t max_drafts,
-    std::int32_t min_batch, std::int32_t max_batch);
+    std::int32_t min_batch, std::int32_t max_batch, bool split_routes = false);
 
 /**
  * Op: speculative_prepare_verify_inputs
@@ -86,6 +88,11 @@ void speculative_prepare_verify_ids(const Tensor& anchors, const Tensor& drafts,
  * Workspace:
  *   Caller-owned transient storage reported by
  *   speculative_accept_greedy_drafts_workspace_capacity_bytes().
+ *
+ * split_routes (opt-in per target; the DSpark / Inkling family -- every other target passes false and runs M7's
+ * launches exactly): untruncated stochastic rows take the split routes -- the exact split (one-hot rule, chunked,
+ * every column in parallel) or, for rows with SamplingConfig::speculative_coupled, the coupled rule (each column's
+ * token = the ordinary sampler's own draw, a draft accepted iff equal). SUROGATE_SPEC_EXACT_SPLIT=0 turns them off.
  */
 void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor& logits,
                                       const Tensor& drafts, const Tensor& current_extents,
@@ -93,7 +100,7 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
                                       Tensor& licensed_counts, Tensor& accepted,
                                       std::int32_t token_domain, const SamplingConfig* configs,
                                       WorkspaceArena& workspace, cudaStream_t stream,
-                                      bool no_drafts = false);
+                                      bool no_drafts = false, bool split_routes = false);
 
 /**
  * Op: speculative_select_accepted_hidden

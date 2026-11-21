@@ -268,7 +268,8 @@ void propose_batch_impl(DFlashBatchContext& state, family::DFlashDecodeState& fr
             // own drafter runs from the anchor at its frontier and writes k drafts.
             family::dspark_propose_if<V>(state.execution.model, dspark_runtime(state),
                                          family::DSparkProposeArgs{anchors, frontiers, lanes, full_rows, drafts,
-                                                                   batch_size, static_cast<std::int32_t>(k)});
+                                                                   batch_size, static_cast<std::int32_t>(k),
+                                                                   frame.sampling});
             return;
         }
         Tensor residual = state.execution.work.alloc(DType::BF16, {config.hidden, columns});

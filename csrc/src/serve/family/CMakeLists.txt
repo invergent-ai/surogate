@@ -10,6 +10,7 @@ target_sources(sinfer_engine PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/inkling_json.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/inkling_parse.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/inkling_render.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/inkling_vision.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/media_cache.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/processor.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/lfm2_processor.cpp
