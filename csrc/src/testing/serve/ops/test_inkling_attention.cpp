@@ -1288,14 +1288,16 @@ struct BenchPlane {
     }
 };
 
+cudaStream_t g_stream = nullptr; // the bench's stream (capturable)
+
 double time_us(const std::function<void()>& f, int reps = 20) {
     for (int i = 0; i < 3; ++i) { f(); }
     cudaEvent_t a, b;
     cudaEventCreate(&a);
     cudaEventCreate(&b);
-    cudaEventRecord(a);
+    cudaEventRecord(a, g_stream);
     for (int i = 0; i < reps; ++i) { f(); }
-    cudaEventRecord(b);
+    cudaEventRecord(b, g_stream);
     cudaEventSynchronize(b);
     float ms = 0.0F;
     cudaEventElapsedTime(&ms, a, b);
@@ -1303,6 +1305,34 @@ double time_us(const std::function<void()>& f, int reps = 20) {
     cudaEventDestroy(b);
     cuda_check(cudaGetLastError(), "bench");
     return 1000.0 * ms / reps;
+}
+
+// Time per call when `calls` calls (call(i), i = 0..calls-1) are replayed as one CUDA graph: no host launch gaps,
+// PDL edges as captured -- how the engine's decode rounds run.
+double time_graph_us(const std::function<void(int)>& call, int calls, int reps = 10) {
+    cuda_check(cudaStreamSynchronize(g_stream), "sync");
+    cudaGraph_t graph;
+    cudaGraphExec_t exec;
+    cuda_check(cudaStreamBeginCapture(g_stream, cudaStreamCaptureModeThreadLocal), "capture");
+    for (int i = 0; i < calls; ++i) { call(i); }
+    cuda_check(cudaStreamEndCapture(g_stream, &graph), "end capture");
+    cuda_check(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
+    for (int i = 0; i < 2; ++i) { cuda_check(cudaGraphLaunch(exec, g_stream), "graph launch"); }
+    cudaEvent_t a, b;
+    cudaEventCreate(&a);
+    cudaEventCreate(&b);
+    cudaEventRecord(a, g_stream);
+    for (int i = 0; i < reps; ++i) { cudaGraphLaunch(exec, g_stream); }
+    cudaEventRecord(b, g_stream);
+    cudaEventSynchronize(b);
+    float ms = 0.0F;
+    cudaEventElapsedTime(&ms, a, b);
+    cudaEventDestroy(a);
+    cudaEventDestroy(b);
+    cudaGraphExecDestroy(exec);
+    cudaGraphDestroy(graph);
+    cuda_check(cudaGetLastError(), "graph bench");
+    return 1000.0 * ms / (static_cast<double>(reps) * calls);
 }
 
 constexpr double kBwGBs  = 1707.0; // lane h, measured decode DRAM bandwidth
@@ -1336,11 +1366,10 @@ void bench_attention(const char* name, InklingLayerKind kind, int W, int B, int 
     DeviceBuffer dout(static_cast<std::size_t>(N) * 3072 * 2);
     Tensor out(dout.p, DType::BF16, {3072, N});
     const auto pv  = plane.view(B * R);
+    const auto call = [&](int i) { ops::inkling_rel_attention(in, kind, views[i % R], pv, work, out, g_stream); };
     int turn = 0;
-    const double us = time_us([&] {
-        ops::inkling_rel_attention(in, kind, views[turn % R], pv, work, out, nullptr);
-        ++turn;
-    }, std::max(20, 2 * R));
+    const double eager = time_us([&] { call(turn++); }, std::max(20, 2 * R));
+    const double us    = time_graph_us(call, std::max(R, W <= G::kMaxSmallColumns ? 16 : 4));
     const bool glob = kind == InklingLayerKind::Global;
     // Bytes: every visible key's K and V once per row (decode / verify); FLOPs: 512 per (query, key, head).
     double keys_read = 0.0, flops = 0.0;
@@ -1351,11 +1380,11 @@ void bench_attention(const char* name, InklingLayerKind kind, int W, int B, int 
     keys_read       = (glob ? keys : std::min(keys, 1024 + W)) * static_cast<double>(B);
     const double gb = keys_read * 8 * 256 / 1e9;
     if (W <= G::kMaxSmallColumns) {
-        std::printf("bench %-40s %9.1f us  %7.1f GB/s  %5.1f %% of %.0f GB/s\n", name, us, gb / (us * 1e-6),
-                    100.0 * gb / (us * 1e-6) / kBwGBs, kBwGBs);
+        std::printf("bench %-40s graph %8.1f us  %7.1f GB/s  %5.1f %% of %.0f GB/s   (eager %.1f us)\n", name, us,
+                    gb / (us * 1e-6), 100.0 * gb / (us * 1e-6) / kBwGBs, kBwGBs, eager);
     } else {
-        std::printf("bench %-40s %9.1f us  %7.1f TFLOP/s  %5.1f %% of %.0f (bf16)\n", name, us, flops / (us * 1e-6) / 1e12,
-                    100.0 * flops / (us * 1e-6) / 1e12 / kBf16TF, kBf16TF);
+        std::printf("bench %-40s graph %8.1f us  %7.1f TFLOP/s  %5.1f %% of %.0f (bf16)   (eager %.1f us)\n", name, us,
+                    flops / (us * 1e-6) / 1e12, 100.0 * flops / (us * 1e-6) / 1e12 / kBf16TF, kBf16TF, eager);
     }
 }
 
@@ -1387,9 +1416,12 @@ void bench_prologue(const char* name, InklingLayerKind kind, int W, int B, int f
     ops::InklingPrologueOutputs qr{Tensor(dqo.p, DType::BF16, {128, 24, N}), Tensor(dro.p, DType::BF16, {16, 24, N})};
     const auto view = rows.view(first + W);
     const auto pv   = plane.view(B);
-    const double us = time_us([&] { ops::inkling_attention_prologue(in, layer.weights(), kind, view, conv, pv, qr, nullptr); });
-    const double gb = N * 20.5e3 / 1e9;
-    std::printf("bench %-40s %9.1f us  %7.1f GB/s (~20.5 KB / column)\n", name, us, gb / (us * 1e-6));
+    const auto call   = [&](int) { ops::inkling_attention_prologue(in, layer.weights(), kind, view, conv, pv, qr, g_stream); };
+    const double eager = time_us([&] { call(0); });
+    const double us    = time_graph_us(call, 16);
+    const double gb    = N * 20.5e3 / 1e9;
+    std::printf("bench %-40s graph %8.1f us  %7.1f GB/s (~20.5 KB / column)   (eager %.1f us)\n", name, us,
+                gb / (us * 1e-6), eager);
 }
 
 void bench_linear(const char* name, int k, int k_per, int columns) {
@@ -1402,24 +1434,26 @@ void bench_linear(const char* name, int k, int k_per, int columns) {
     DeviceBuffer dx = to_device_bf16(x), dout(static_cast<std::size_t>(n) * columns * 2);
     Tensor xt(dx.p, DType::BF16, {k, columns});
     Tensor ot(dout.p, DType::BF16, {n, columns});
+    const auto call = [&](int i) {
+        const ops::InklingProjection pj{&xt, &ws[i % R]->w, 0, &ot};
+        ops::inkling_attn_linear(std::span<const ops::InklingProjection>(&pj, 1), nullptr, g_stream);
+    };
     int turn = 0;
-    const double us = time_us([&] {
-        const ops::InklingProjection pj{&xt, &ws[turn % R]->w, 0, &ot};
-        ops::inkling_attn_linear(std::span<const ops::InklingProjection>(&pj, 1), nullptr, nullptr);
-        ++turn;
-    }, std::max(20, 2 * R));
+    const double eager = time_us([&] { call(turn++); }, std::max(20, 2 * R));
+    const double us    = time_graph_us(call, std::max(R, columns <= 8 ? 16 : 4));
     const double gb = static_cast<double>(n) * k / 1e9, tf = 2.0 * n * k * columns / 1e12;
     if (columns <= 8) {
-        std::printf("bench %-40s %9.1f us  %7.1f GB/s  %5.1f %% of %.0f GB/s\n", name, us, gb / (us * 1e-6),
-                    100.0 * gb / (us * 1e-6) / kBwGBs, kBwGBs);
+        std::printf("bench %-40s graph %8.1f us  %7.1f GB/s  %5.1f %% of %.0f GB/s   (eager %.1f us)\n", name, us,
+                    gb / (us * 1e-6), 100.0 * gb / (us * 1e-6) / kBwGBs, kBwGBs, eager);
     } else {
-        std::printf("bench %-40s %9.1f us  %7.1f TFLOP/s  %5.1f %% of %.0f (bf16)\n", name, us, tf / (us * 1e-6),
-                    100.0 * tf / (us * 1e-6) / kBf16TF, kBf16TF);
+        std::printf("bench %-40s graph %8.1f us  %7.1f TFLOP/s  %5.1f %% of %.0f (bf16)   (eager %.1f us)\n", name, us,
+                    tf / (us * 1e-6), 100.0 * tf / (us * 1e-6) / kBf16TF, kBf16TF, eager);
     }
 }
 
 void run_bench() {
     using K = InklingLayerKind;
+    cuda_check(cudaStreamCreateWithFlags(&g_stream, cudaStreamNonBlocking), "stream");
     bench_attention("attn decode global 1x8k", K::Global, 1, 1, 8191);
     bench_attention("attn decode global 1x64k", K::Global, 1, 1, 65535);
     bench_attention("attn decode global 1x262k", K::Global, 1, 1, 262143);
