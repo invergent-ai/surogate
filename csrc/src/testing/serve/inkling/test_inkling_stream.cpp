@@ -26,6 +26,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <random>
 #include <sstream>
 #include <string>
@@ -75,6 +76,13 @@ std::vector<fs::path> vector_files(const fs::path& dir) {
     }
     std::sort(files.begin(), files.end());
     return files;
+}
+
+// The parser vectors' variant tag ("...-literal", "-cut", "-ws", ...), or "real" for an unchanged real reply.
+std::string variant_of(const std::string& name) {
+    const std::string tail = name.substr(name.rfind('-') + 1);
+    const bool tag = !tail.empty() && std::all_of(tail.begin(), tail.end(), [](char c) { return c >= 'a' && c <= 'z'; });
+    return tag ? tail : "real";
 }
 
 struct Call {
@@ -154,6 +162,7 @@ int main() {
     // (b) incrementality over 1-token rounds
     long long text_tokens = 0, silent_tokens = 0;
     int max_silent = 0;
+    std::map<std::string, int> silent_texts, silent_cases;
     std::string max_silent_case;
     long long text_bytes_total = 0, text_bytes_early = 0;
     int calls_total = 0, calls_opened_early = 0, calls_args_early = 0;
@@ -225,6 +234,8 @@ int main() {
                             ++text_tokens;
                             if (d.reasoning.empty() && d.content.empty()) {
                                 ++silent_tokens;
+                                ++silent_texts[b];
+                                ++silent_cases[variant_of(name)];
                                 ++silent;
                             } else {
                                 silent = 0;
@@ -301,6 +312,16 @@ int main() {
     std::cout << "(b) text tokens (non-whitespace, inside thinking / text blocks) " << text_tokens << ", silent in their own round "
               << silent_tokens << ", longest silent run " << max_silent << (max_silent_case.empty() ? "" : " (" + max_silent_case + ")")
               << "\n";
+    {
+        std::vector<std::pair<int, std::string>> top;
+        for (const auto& [t, c] : silent_texts) { top.emplace_back(c, t); }
+        std::sort(top.rbegin(), top.rend());
+        std::cout << "    silent tokens by text:";
+        for (std::size_t k = 0; k < top.size() && k < 12; ++k) { std::cout << " " << shown(top[k].second) << "x" << top[k].first; }
+        std::cout << "\n    silent tokens by vector kind:";
+        for (const auto& [kind, c] : silent_cases) { std::cout << " " << kind << "=" << c; }
+        std::cout << "\n";
+    }
     std::cout << "    reasoning + content bytes sent before the reply ended: " << text_bytes_early << " / " << text_bytes_total
               << " = " << early * 100.0 << " %\n";
     std::cout << "    tool calls: " << calls_total << ", opened before the reply ended " << calls_opened_early
