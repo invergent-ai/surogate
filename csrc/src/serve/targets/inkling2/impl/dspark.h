@@ -42,13 +42,19 @@ struct DSparkDerived {
     const void* mix_norms  = nullptr; ///< BF16 [2304, 4]: feature_norm of draft layers 0-2, then the Markov one
     const void* w_sp       = nullptr; ///< BF16 [768, 512]   = rnn_proj[:, 0:512]    ([state | w1[prev]])
     const void* w_hf       = nullptr; ///< BF16 [768, 4608]  = rnn_proj[:, 512:5120] ([hidden | f_rnn])
-    const void* fold_w     = nullptr; ///< BF16 [201024, 256] = bf16(unembed . hidden_out), fp64
+    const void* fold_w     = nullptr; ///< BF16 [201024, 256] = bf16(unembed . hidden_out), fp64 (null with fp8_fold)
+    /// FP8 fold (opt-in, SUROGATE_SERVE_DSPARK_FP8_FOLD=1; M1 `fp8fold`: no acceptance loss): per-row e4m3 codes of the
+    /// BF16 fold + fp32 row scales; half the bytes of every Markov vocabulary pass.
+    bool fp8_fold                   = false;
+    const std::uint8_t* fold_codes  = nullptr; ///< U8 [201024, 256]
+    const float* fold_scales        = nullptr; ///< FP32 [201024]
     const void* fold_b     = nullptr; ///< BF16 [201024]      = bf16(unembed . hidden_out_bias), fp64
     const float* inv_freq  = nullptr; ///< FP32 [64] RoPE inverse frequencies (theta 1e6)
     /// FP8 drafter weights (default; M1 `fp8w`: no acceptance loss): the dense linears as per-row e4m3 + scale, run by
     /// ops::dspark_gemm_w8; the BF16 originals then sit in a mapped host bank and are never read again.
     bool fp8 = false;
     DeviceBuffer w8_storage;
+    DeviceBuffer fold_storage; ///< the FP8 fold's codes + scales
     std::array<DSparkLayerW8, 3> w8{};
 };
 
@@ -58,11 +64,13 @@ struct DSparkDerived {
 [[nodiscard]] family::DFlashGeometry dspark_dflash_geometry(const load::ArtifactConfig& config);
 
 /// Derives the drafter's load-time weights from lane b's bound draft (w.has_draft); synchronous.
-void derive_dspark(const load::InklingWeights& w, DSparkDerived& out, bool fp8_weights = false);
+void derive_dspark(const load::InklingWeights& w, DSparkDerived& out, bool fp8_weights = false, bool fp8_fold = false);
+/// The FP8 Markov fold (default; SUROGATE_SERVE_DSPARK_BF16_FOLD=1 keeps the BF16 fold).
+[[nodiscard]] bool dspark_fp8_fold_requested();
 
 /// SUROGATE_SERVE_DSPARK_BF16_WEIGHTS=1 (read once): keep the drafter's dense linears BF16 on the device (A/B).
 [[nodiscard]] bool dspark_bf16_weights_forced();
-/// SUROGATE_SERVE_DSPARK_FP8_WEIGHTS=1 (read once) and not forced BF16: the FP8 drafter weights (opt-in for now).
+/// The FP8 drafter weights (default; SUROGATE_SERVE_DSPARK_BF16_WEIGHTS=1 keeps BF16).
 [[nodiscard]] bool dspark_fp8_weights_requested();
 
 /// The draft KV: planes of draft layers 0 / 1 / 2 (text-pool layers 48 / 49 / 50).

@@ -122,7 +122,10 @@ family::TextGeometry visit_geometry(const artifact::Reader& reader) {
 }
 
 LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized)
-    : backing(std::move(materialized)) {
+    : backing(std::move(materialized)),
+      host_bank(plan.host_bank.objects.empty() ? nullptr : family::HostBank::shared(plan.host_bank)) {
+    // HostBank objects (the FP8 drafter's BF16 sources) resolve to their pinned host bytes from here on.
+    if (host_bank) { host_bank->attach(backing); }
     // Lane b binds the text-only set (no pixel configs): take exactly that set.
     frontend = family::take_text_only_frontend_resources(backing, plan.plan.frontend);
     // The release's chat_template.jinja is for HF tooling: vLLM renders Inkling prompts natively from the request
@@ -136,7 +139,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     model.queries = &queries;
     if (weights.has_draft) {
         // DSpark (lane e2): the fold and the drafter's derived weights; the runtime's DFlash guards need a payload.
-        derive_dspark(weights, dspark, plan.plan.options.draft_linears_host);
+        derive_dspark(weights, dspark, plan.plan.options.draft_linears_host, dspark_fp8_fold_requested());
         model.dspark = &dspark;
     }
 
