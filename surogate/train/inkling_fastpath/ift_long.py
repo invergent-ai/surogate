@@ -29,6 +29,8 @@ BF16, F32 = torch.bfloat16, torch.float32
 CHUNK = int(os.environ.get("IFT_CHUNK", "1024"))
 # TokenChunked token inputs of rows at least this long are saved in pinned host memory (bf16) instead of on the card
 OFFLOAD_MIN = int(os.environ.get("IFT_OFFLOAD_MIN", "8192"))
+# the 48-visit backward as one node with a manual reverse loop (LongModel); 0 = per-visit autograd nodes (EngineVisitH)
+MANUAL = os.environ.get("IFT_MANUAL", "1") == "1"
 EPS = B.EPS
 
 
@@ -501,6 +503,8 @@ class TrainForwardLong:
         self.eng, self.W = eng, W
 
     def build(self, ids, lora=None, banks=None):
+        if MANUAL:
+            return build_manual(self, ids, lora, banks)
         res = forward_host(self.eng, ids, None if banks is None else [L["adapters"] for L in banks.layers])
         return self.graph(ids, res, lora), res
 
@@ -521,3 +525,128 @@ class TrainForwardLong:
         hid = FinalMixH.apply(W, vals["hidden"], [host[s] for s in (0, 1, 2, 3, 6)],
                               *[node[s] for s in (0, 1, 2, 3, 6)])
         return B.HeadLogprob.apply(W, vals["lp"], hid[:-1], ids[1:].contiguous())
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# the whole 48-visit backward as ONE autograd node with a manual reverse loop (no per-visit autograd accumulators:
+# the gradient of a visit's output is kept on the card only when the next visit back produced it, else on the host)
+# ---------------------------------------------------------------------------------------------------------------
+def _head_grad(W, hidden, targets, g):
+    """d/d hidden of sum_t g[t] log softmax(30 tanh(W h_t / 30))[targets[t]] (B.HeadLogprob's backward)."""
+    class _Ctx:
+        pass
+
+    c = _Ctx()
+    c.W = W
+    c.saved_tensors = (hidden, targets)
+    return B.HeadLogprob.backward(c, g)[2]
+
+
+class LongModel(torch.autograd.Function):
+    """lp (the engine's per-target log-probs) as a function of the LoRA tensors; backward = the 48 visits in reverse,
+    each recomputed by visit_torch_long from host values, with gradient accumulators keyed by the producing visit."""
+
+    @staticmethod
+    def forward(ctx, tf, ids, vals, lora_scale, *lora_tensors):
+        ctx.tf, ctx.ids, ctx.vals, ctx.scale = tf, ids, vals, lora_scale
+        ctx.save_for_backward(*lora_tensors)
+        return vals["lp"].clone()
+
+    @staticmethod
+    def backward(ctx, g_lp):
+        tf, ids, vals = ctx.tf, ctx.ids, ctx.vals
+        eng, W = tf.eng, tf.W
+        dev = g_lp.device
+        lt_all = ctx.saved_tensors
+        nl = len(B.LORA_KEYS)
+        lgrads = [None] * len(lt_all)
+        T = ids.numel()
+        visits = eng.visits
+        # producer of every (visit, input slot): the last visit before it that wrote the slot (-1 = x0)
+        last = {0: -1}
+        prod = []
+        for v, vi in enumerate(visits):
+            slots = list(vi.stack) + [vi.partial] + (list(vi.bank) if vi.looped else [])
+            prod.append([last[s] for s in slots])
+            last[vi.next_partial] = v
+        host_vals = {-1: vals["x0"]}
+        for v in range(len(visits)):
+            host_vals[v] = vals["outs"][v]
+        acc_dev, acc_host = {}, {}
+
+        def add_grad(p, gr, next_v):
+            if p < 0 or gr is None:
+                return
+            if p == next_v:  # consumed by the very next iteration: keep it on the card
+                acc_dev[p] = gr if p not in acc_dev else acc_dev[p].add_(gr)
+            else:
+                h = gr.to("cpu")
+                if p in acc_host:
+                    acc_host[p].add_(h)
+                else:
+                    acc_host[p] = h
+
+        # head + final mix
+        with B._tick("bwd.head"):
+            hid = vals["hidden"][:-1].float()
+            g_hid = torch.zeros(T, D, dtype=F32, device=dev)
+            g_hid[:-1] = _head_grad(W, hid, ids[1:].contiguous(), g_lp)
+            del hid
+        fin_slots = (0, 1, 2, 3, 6)
+        fin_prod = [last[s] for s in fin_slots]
+
+        def f_mix(a, b, c, d, e):
+            return RA.inkling_attn_res([a.float(), b.float(), c.float(), d.float()], e.float(), None, W.q_out,
+                                       W.final_norm.reshape(1, D), EPS)[0]
+
+        with torch.enable_grad(), torch.device(dev):
+            ph = [torch.zeros(1, dtype=F32, device=dev).expand(T, D).requires_grad_(p >= 0) for p in fin_prod]
+            hm = tc(f_mix, ph, [0] * 5, [0], store_bf16=[True] * 5, vals=[host_vals[p] for p in fin_prod])
+            want = [t for t in ph if t.requires_grad]
+            gr = torch.autograd.grad(hm, want, g_hid)
+        it = iter(gr)
+        for p, t in zip(fin_prod, ph):
+            if t.requires_grad:
+                add_grad(p, next(it), len(visits) - 1)
+        del g_hid, hm, ph, gr
+        # visits, last to first
+        for v in range(len(visits) - 1, -1, -1):
+            vi = visits[v]
+            g_out = acc_dev.pop(v, None)
+            if v in acc_host:
+                h = acc_host.pop(v).to(dev, non_blocking=True)
+                g_out = h if g_out is None else g_out.add_(h)
+            if g_out is None:
+                continue
+            ps = prod[v]
+            lt = list(lt_all[vi.layer * nl:(vi.layer + 1) * nl]) if ctx.scale is not None else []
+            with torch.enable_grad(), torch.device(dev):
+                ins = [torch.zeros(1, dtype=F32, device=dev).expand(T, D).requires_grad_(p >= 0) for p in ps]
+                leaves = [t.detach().requires_grad_() for t in lt]
+                n = len(vi.stack)
+                lora = dict(zip(B.LORA_KEYS, leaves)) | {"scale": ctx.scale} if ctx.scale is not None else None
+                out = visit_torch_long(W, vi, ins[:n], ins[n], (ins[n + 1], ins[n + 2]) if vi.looped else None,
+                                       vals["routing"][v], lora, act_vals=[host_vals[p] for p in ps])
+                want = [t for t in ins + leaves if t.requires_grad]
+                with B._tick("bwd.autograd"):
+                    gr = torch.autograd.grad(out, want, g_out, allow_unused=True)
+            del out, g_out
+            it = iter(gr)
+            for p, t in zip(ps, ins):
+                if t.requires_grad:
+                    add_grad(p, next(it), v - 1)
+            for j, t in enumerate(leaves):
+                gj = next(it)
+                if gj is None:
+                    continue
+                k = vi.layer * nl + j
+                lgrads[k] = gj if lgrads[k] is None else lgrads[k].add_(gj)
+        return (None, None, None, None, *lgrads)
+
+
+def build_manual(tf: "TrainForwardLong", ids, lora=None, banks=None):
+    """The engine forward + ONE autograd node (LongModel) over the LoRA tensors: lp [T - 1] with grad."""
+    res = forward_host(tf.eng, ids, None if banks is None else [L["adapters"] for L in banks.layers])
+    lt = [lo[k] for lo in lora for k in B.LORA_KEYS] if lora is not None else []
+    scale = lora[0]["scale"] if lora is not None else None
+    return LongModel.apply(tf, ids, res, scale, *lt), res
