@@ -30,8 +30,8 @@ class FakeWorker(TS.WorkerCore):
         self.break_grad = False
 
     def _forward(self, row):
-        rp, _ = replay_rows(row, self.be.visits, self.be.K)
-        lp, cap = self.be.forward(torch.as_tensor(row.ids), replay=rp, lora=self.be.lora)
+        # as the real worker: the forward computes its own routing, and the rollout's capture is only compared with it (_check_routing)
+        lp, cap = self.be.forward(torch.as_tensor(row.ids), replay=None, lora=self.be.lora)
         return lp[1:].detach().numpy().astype(np.float32), {"lp": lp, "cap": cap}
 
     def _check_routing(self, ctx, rp):
