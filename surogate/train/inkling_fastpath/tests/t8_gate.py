@@ -44,23 +44,26 @@ def cmp_t(a, b):
 
 
 def compare(xs: dict, ys: dict, rel_line=REL) -> dict:
-    """Over the union of keys; a key missing on one side counts as a zero tensor there (it must then be zero on the other)."""
-    worst_cos, worst_rel, n, bit = 1.0, 0.0, 0, True
+    """Over the union of keys; a key missing on one side counts as a zero tensor there (it must then be zero on the other). An empty or all-zero comparison does NOT pass."""
+    worst_cos, worst_rel, n, bit, nonzero, shapes = 1.0, 0.0, 0, True, 0, True
     finite = True
     for k in sorted(set(xs) | set(ys), key=str):
         a, b = xs.get(k), ys.get(k)
         a = torch.zeros_like(b) if a is None else a
         b = torch.zeros_like(a) if b is None else b
+        n += 1
+        if a.shape != b.shape:
+            shapes, bit = False, False
+            continue
         finite = finite and bool(torch.isfinite(a).all()) and bool(torch.isfinite(b).all())
         bit = bit and torch.equal(a, b)
         if float(b.double().norm()) == 0 and float(a.double().norm()) == 0:
-            n += 1
             continue
+        nonzero += 1
         c, r = cmp_t(a, b)
         worst_cos, worst_rel = min(worst_cos, c), max(worst_rel, r)
-        n += 1
-    return {"tensors": n, "worst_cos": worst_cos, "worst_rel": worst_rel, "bitwise": bool(bit), "finite": bool(finite),
-            "pass": bool(finite and worst_cos >= COS and worst_rel <= rel_line)}
+    return {"tensors": n, "nonzero": nonzero, "worst_cos": worst_cos, "worst_rel": worst_rel, "bitwise": bool(bit), "finite": bool(finite), "shapes_equal": bool(shapes),
+            "pass": bool(finite and shapes and nonzero > 0 and worst_cos >= COS and worst_rel <= rel_line)}
 
 
 def gate_rows(path):
@@ -235,11 +238,27 @@ def phase_trainer(a, rows):
     return rep
 
 
+G7_LAYERS = {"A": range(18, 24), "B": range(6, 18), "C": range(6, 18), "D1": range(6, 18), "D0": range(0, 6)}
+
+
 def g7_compare(mine: dict, ref: dict, segments) -> dict:
-    """Per segment and for the per-(layer, key) totals over `segments`. Keys: (segment, layer, key)."""
-    out = {"segments": {}}
+    """Per segment and for the per-(layer, key) totals over `segments`. Keys: (segment, layer, key). Vacuous passes are refused: exactly the expected keys on both sides, equal shapes,
+    every tensor non-zero on both sides."""
+    expected = {(sg, L, k) for sg in segments for L in G7_LAYERS[sg] for k in ("B13", "B2")}
+    r = {k: v for k, v in ref.items() if k[0] in segments}
+    problems = []
+    if set(mine) != expected:
+        problems.append(f"step keys differ from the expected {len(expected)}: missing {len(expected - set(mine))}, extra {len(set(mine) - expected)}")
+    if set(r) != expected:
+        problems.append(f"reference keys differ from the expected {len(expected)}: missing {len(expected - set(r))}, extra {len(set(r) - expected)}")
+    for k in sorted(expected & set(mine) & set(r), key=str):
+        if mine[k].shape != r[k].shape:
+            problems.append(f"{k}: shapes {tuple(mine[k].shape)} / {tuple(r[k].shape)}")
+        elif float(mine[k].double().norm()) == 0 or float(r[k].double().norm()) == 0:
+            problems.append(f"{k}: a zero tensor")
+    out = {"segments": {}, "problems": problems[:12], "expected_tensors": len(expected)}
     for sg in segments:
-        out["segments"][sg] = compare({k: v for k, v in mine.items() if k[0] == sg}, {k: v for k, v in ref.items() if k[0] == sg})
+        out["segments"][sg] = compare({k: v for k, v in mine.items() if k[0] == sg}, {k: v for k, v in r.items() if k[0] == sg})
 
     def total(d):
         t = {}
@@ -248,8 +267,8 @@ def g7_compare(mine: dict, ref: dict, segments) -> dict:
                 t[(L, key)] = v.double().clone() if (L, key) not in t else t[(L, key)].add_(v.double())
         return {k: v.float() for k, v in t.items()}
 
-    out["total"] = compare(total(mine), total(ref))
-    out["pass"] = bool(out["total"]["pass"] and all(x["pass"] for x in out["segments"].values()))
+    out["total"] = compare(total(mine), total(r))
+    out["pass"] = bool(not problems and out["total"]["pass"] and all(x["pass"] and x["tensors"] == sum(1 for e in expected if e[0] == sg) for sg, x in out["segments"].items()))
     return out
 
 
