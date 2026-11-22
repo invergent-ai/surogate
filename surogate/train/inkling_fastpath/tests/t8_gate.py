@@ -10,6 +10,7 @@ Phase "trainer" (two cards; four real rows of 16k / 28k / 47k / 57k; K = 18, cen
 Phase "g7" (one card; rows of 16k / 28k / 47k; centred head, seeds "weights", B keys):
   G7  the step's gradient at K = 48 and K = 18 == RX's FROZEN census worker's gradient on the same rows (g7pack/g7_ref.py: snapshot a7ddf69e + rx_coda2 + rx_center, fp32 A): per tensor,
       per segment (A, B, C, D1, D0; at K = 18: A, B) and for the per-layer totals. Line as G1-G3. IF G7 FAILS THE STEP IS NOT CLEARED FOR RX'S LOOP. No census statistic is read.
+  G7c = the same line and comparison on the 57k row (--g7-rows 3), run inside the 8-card gate.
   G7b (diagnostic, no line): the same lean path with RX's fp32 A at K = 18 on the 16k and 28k rows against the reference: is A's bf16 rounding the only difference?
 Line for G1-G3 and G7: every tensor cos >= 0.9999 and relative error <= 1 % (G4: 1e-5), all finite. Whether a comparison is BITWISE is reported beside it; bitwise is expected for G1-G3.
 No adapter is saved; nothing is trained.
@@ -283,26 +284,43 @@ def phase_g7(a, rows):
     import t8_step as TS
 
     card = int(a.cards)
-    n_rows = 3
+    which = [int(x) for x in a.g7_rows.split(",")]
     scfg = StepConfig(max_policy_lag=None)
     base = dict(bin_dir=a.bin, artifact=a.artifact, cards=(card,), head="centred", max_row_tokens=58010, segment_keys=("B13", "B2"), train_keys=("B13", "B2"), run_dir=a.run_dir)
-    ref_of = lambda n: torch.load(os.path.join(a.ref_dir, f"ref_{n}.pt"), map_location="cpu", weights_only=False)
-    rep = {"K": {}, "ref_meta": json.load(open(os.path.join(a.ref_dir, "ref_meta.json")))}
+
+    def wait_for(name):
+        """the reference may run beside this phase, on another card: wait for its file; its failure marker or 40 min without it ends the phase"""
+        path = os.path.join(a.ref_dir, name)
+        for _ in range(2400):
+            if os.path.exists(path):
+                return path
+            if os.path.exists(os.path.join(a.ref_dir, "ref_failed")):
+                raise SystemExit("the reference run failed")
+            time.sleep(1)
+        raise SystemExit(f"no {name} after 40 min")
+
+    ref_of = lambda n: torch.load(wait_for(f"ref_{n}.pt"), map_location="cpu", weights_only=False)
+    rep = {"K": {}, "rows": which}
     for K, segs in ((48, ("A", "B", "C", "D1", "D0")), (18, ("A", "B"))):
         tr = TS.T8Trainer(TS.T8Config(K=K, **base))
         try:
             rep["K"][str(K)] = []
-            for n in range(n_rows):
+            for n in which:
                 o = tr.compute([rows[n]], 0, scfg, seeds="weights")
                 mine = {(sg, L, key): t for (part, sg, L, key), t in o.segments.items()}
                 c = g7_compare(mine, ref_of(n), segs)
-                c.update({"T": rows[n].T, "seconds": o.rows[0]["seconds"], "tok_per_s": rows[n].T / o.rows[0]["seconds"], "q_block": o.rows[0]["q_block"], "oom_retries": o.rows[0]["oom_retries"]})
+                c.update({"T": rows[n].T, "seconds": o.rows[0]["seconds"], "tok_per_s": rows[n].T / o.rows[0]["seconds"], "q_block": o.rows[0]["q_block"], "oom_retries": o.rows[0]["oom_retries"],
+                          "worker": o.metrics["workers"][0]})
                 rep["K"][str(K)].append(c)
                 log(f"G7 K={K} T {rows[n].T}: pass {c['pass']}; total 1-cos {1 - c['total']['worst_cos']:.2e}, rel {c['total']['worst_rel']:.4f}, bitwise {c['total']['bitwise']}; {c['tok_per_s']:.0f} tok/s")
                 del o, mine
         finally:
             tr.close()
     rep["G7"] = all(c["pass"] for v in rep["K"].values() for c in v)
+    rep["ref_meta"] = json.load(open(wait_for("ref_meta.json")))
+    if not {0, 1} <= set(which):                              # the G7b diagnostic reads rows 0 and 1
+        rep["pass"] = rep["G7"]
+        return rep
     # G7b: RX's fp32 A through the lean path (diagnostic)
     eng = E.InklingEngine(a.bin, a.artifact, 0)
     W = B.EngineWeights(eng)
@@ -349,6 +367,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--phase", required=True, choices=("lean", "trainer", "g7"))
     ap.add_argument("--ref-dir", default="")
+    ap.add_argument("--g7-rows", default="0,1,2")
     ap.add_argument("--bin", required=True)
     ap.add_argument("--artifact", required=True)
     ap.add_argument("--rows", required=True)
