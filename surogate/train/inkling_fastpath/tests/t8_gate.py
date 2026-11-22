@@ -7,7 +7,11 @@ Phase "trainer" (two cards; four real rows of 16k / 28k / 47k / 57k; K = 18, cen
   G4  the two-worker step's gradient == the sum of the rows' gradients; its segment sums add up to it.
   G5  the hard gates hold on real rows: replay 0 mismatches, support gate, zero-adapter check.
   G6  host peak per worker <= 20 GiB with the 57k row; no row out of memory at query block 8.
-Line for G1-G4: every tensor cos >= 0.9999 and relative error <= 1 % (G4: 1e-5), all finite. Whether a comparison is BITWISE is reported beside it; bitwise is expected for G1-G3.
+Phase "g7" (one card; rows of 16k / 28k / 47k; centred head, seeds "weights", B keys):
+  G7  the step's gradient at K = 48 and K = 18 == RX's FROZEN census worker's gradient on the same rows (g7pack/g7_ref.py: snapshot a7ddf69e + rx_coda2 + rx_center, fp32 A): per tensor,
+      per segment (A, B, C, D1, D0; at K = 18: A, B) and for the per-layer totals. Line as G1-G3. IF G7 FAILS THE STEP IS NOT CLEARED FOR RX'S LOOP. No census statistic is read.
+  G7b (diagnostic, no line): the same lean path with RX's fp32 A at K = 18 on the 16k and 28k rows against the reference: is A's bf16 rounding the only difference?
+Line for G1-G3 and G7: every tensor cos >= 0.9999 and relative error <= 1 % (G4: 1e-5), all finite. Whether a comparison is BITWISE is reported beside it; bitwise is expected for G1-G3.
 No adapter is saved; nothing is trained.
 """
 from __future__ import annotations
@@ -231,9 +235,101 @@ def phase_trainer(a, rows):
     return rep
 
 
+def g7_compare(mine: dict, ref: dict, segments) -> dict:
+    """Per segment and for the per-(layer, key) totals over `segments`. Keys: (segment, layer, key)."""
+    out = {"segments": {}}
+    for sg in segments:
+        out["segments"][sg] = compare({k: v for k, v in mine.items() if k[0] == sg}, {k: v for k, v in ref.items() if k[0] == sg})
+
+    def total(d):
+        t = {}
+        for (sg, L, key), v in d.items():
+            if sg in segments:
+                t[(L, key)] = v.double().clone() if (L, key) not in t else t[(L, key)].add_(v.double())
+        return {k: v.float() for k, v in t.items()}
+
+    out["total"] = compare(total(mine), total(ref))
+    out["pass"] = bool(out["total"]["pass"] and all(x["pass"] for x in out["segments"].values()))
+    return out
+
+
+def phase_g7(a, rows):
+    from types import SimpleNamespace
+
+    from surogate.inkling_rl.step import StepConfig
+    import ift_backward as B
+    import ift_engine as E
+    import t8_center as RC
+    import t8_lean as TL
+    import t8_step as TS
+
+    card = int(a.cards)
+    n_rows = 3
+    scfg = StepConfig(max_policy_lag=None)
+    base = dict(bin_dir=a.bin, artifact=a.artifact, cards=(card,), head="centred", max_row_tokens=58010, segment_keys=("B13", "B2"), train_keys=("B13", "B2"), run_dir=a.run_dir)
+    ref_of = lambda n: torch.load(os.path.join(a.ref_dir, f"ref_{n}.pt"), map_location="cpu", weights_only=False)
+    rep = {"K": {}, "ref_meta": json.load(open(os.path.join(a.ref_dir, "ref_meta.json")))}
+    for K, segs in ((48, ("A", "B", "C", "D1", "D0")), (18, ("A", "B"))):
+        tr = TS.T8Trainer(TS.T8Config(K=K, **base))
+        try:
+            rep["K"][str(K)] = []
+            for n in range(n_rows):
+                o = tr.compute([rows[n]], 0, scfg, seeds="weights")
+                mine = {(sg, L, key): t for (part, sg, L, key), t in o.segments.items()}
+                c = g7_compare(mine, ref_of(n), segs)
+                c.update({"T": rows[n].T, "seconds": o.rows[0]["seconds"], "tok_per_s": rows[n].T / o.rows[0]["seconds"], "q_block": o.rows[0]["q_block"], "oom_retries": o.rows[0]["oom_retries"]})
+                rep["K"][str(K)].append(c)
+                log(f"G7 K={K} T {rows[n].T}: pass {c['pass']}; total 1-cos {1 - c['total']['worst_cos']:.2e}, rel {c['total']['worst_rel']:.4f}, bitwise {c['total']['bitwise']}; {c['tok_per_s']:.0f} tok/s")
+                del o, mine
+        finally:
+            tr.close()
+    rep["G7"] = all(c["pass"] for v in rep["K"].values() for c in v)
+    # G7b: RX's fp32 A through the lean path (diagnostic)
+    eng = E.InklingEngine(a.bin, a.artifact, 0)
+    W = B.EngineWeights(eng)
+    lora = B.make_lora(eng.dev, seed=0, b_std=0.0)
+    banks = B.EngineBanks(lora, eng.dev)
+    adapters = [L["adapters"] for L in banks.layers]
+    host = [{k: lo[k].detach().cpu() for k in B.LORA_KEYS} for lo in lora]
+    scale = lora[0]["scale"]
+    for lo in lora:
+        for k in B.LORA_KEYS:
+            lo[k].data = lo[k].data.cpu()
+    torch.cuda.empty_cache()
+    rep["G7b"] = []
+    for n in range(2):
+        r = rows[n]
+        ids = torch.as_tensor(np.ascontiguousarray(r.ids), dtype=torch.int32, device=eng.dev)
+        buf = TL.RowBuffers(eng.visits, 30, r.T)
+        v = TL.forward_keep(eng, ids, adapters, buf)
+        g = torch.as_tensor(r.loss_mask[1:].astype(np.float32), device=eng.dev)
+        pos = torch.nonzero(g > 0)[:, 0]
+        sup = RC.logits_and_support(SimpleNamespace(eng=eng), v["hidden"], pos, ids[1:][pos])
+        got = {}
+
+        def on(vis, layer, j, gj):
+            k = (TL.segment_of(vis), layer, B.LORA_KEYS[j])
+            c = gj.float().cpu()
+            got[k] = c if k not in got else got[k].add_(c)
+
+        TL.backward_row(eng, W, ids, v, host, scale, 30, g, buf, on, head_grad=lambda W_, h, t, gg: RC.head_grad_centered(W_, h, gg, sup),
+                        q_block=TL.qb_for(r.T), train_idx=(1, 3))
+        c = g7_compare(got, ref_of(n), ("A", "B"))
+        c["T"] = r.T
+        rep["G7b"].append(c)
+        log(f"G7b T {r.T}: total 1-cos {1 - c['total']['worst_cos']:.2e}, rel {c['total']['worst_rel']:.2e}, bitwise {c['total']['bitwise']}")
+        del v, sup, ids, g, got
+        buf.close()
+        torch.cuda.empty_cache()
+    eng.close()
+    rep["pass"] = rep["G7"]
+    return rep
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--phase", required=True, choices=("lean", "trainer"))
+    ap.add_argument("--phase", required=True, choices=("lean", "trainer", "g7"))
+    ap.add_argument("--ref-dir", default="")
     ap.add_argument("--bin", required=True)
     ap.add_argument("--artifact", required=True)
     ap.add_argument("--rows", required=True)
@@ -242,7 +338,7 @@ def main():
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     rows = gate_rows(a.rows)
-    rep = (phase_lean if a.phase == "lean" else phase_trainer)(a, rows)
+    rep = {"lean": phase_lean, "trainer": phase_trainer, "g7": phase_g7}[a.phase](a, rows)
     json.dump(rep, open(a.out, "w"), indent=1, default=float)
     print(f"T8 GATE {a.phase}: {'PASS' if rep['pass'] else 'FAIL'}", flush=True)
     return 0 if rep["pass"] else 4
