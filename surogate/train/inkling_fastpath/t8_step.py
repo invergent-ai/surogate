@@ -23,10 +23,36 @@ from surogate.inkling_rl.records import Row, replay_rows
 from surogate.inkling_rl.step import StepConfig, behavior_weights_sequence, behavior_weights_token, drop_off_policy, mismatch
 
 LORA_KEYS = ("A13", "B13", "A2", "B2")
+# The code path is part of the gradient's definition: ift_long reads these at import, and its defaults are NOT the path the gates prove (review B1).
+# A0 = lane T's pre-lever stack, the one RX's census worker runs. The trainer sets them for its workers and every worker checks them after import.
+STACKS = {"A0": {"IFT_MOE_GM": "0", "IFT_MOE_DET": "0", "IFT_FAST_GEMM": "0", "IFT_ATTN_ADAPT": "0", "IFT_CHUNK": "1024", "IFT_MOE_FAST": "0",
+                 "IFT_ATTN_TC": "0", "IFT_TF32": "0", "IFT_MOE_ROWS": "8192", "IFT_MOE_PAD_ROWS": "0", "IFT_MANUAL": "1", "IFT_OFFLOAD_MIN": "8192"}}
+WORKER_ENV = {"SUROGATE_INKLING_ATTN_EARLY_META": "0", "MALLOC_ARENA_MAX": "2", "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+              "OMP_NUM_THREADS": "8", "PYTHONUNBUFFERED": "1"}
+_FLAG_ATTR = {"IFT_MOE_GM": "MOE_GM", "IFT_MOE_DET": "MOE_DET", "IFT_FAST_GEMM": "FAST_GEMM", "IFT_ATTN_ADAPT": "ATTN_ADAPT", "IFT_CHUNK": "CHUNK",
+              "IFT_MOE_FAST": "MOE_FAST", "IFT_ATTN_TC": "ATTN_TC", "IFT_TF32": "TF32", "IFT_MOE_ROWS": "MOE_ROWS", "IFT_MOE_PAD_ROWS": "MOE_PAD_ROWS",
+              "IFT_MANUAL": "MANUAL", "IFT_OFFLOAD_MIN": "OFFLOAD_MIN"}
 
 
 class T8GateError(RuntimeError):
     """A hard gate failed: the step returns no gradient."""
+
+
+def verify_stack(name: str) -> dict:
+    """The flags ift_long was imported with == the named stack, else T8GateError. Returns them for the record."""
+    import ift_long as LG
+
+    got, bad = {}, []
+    for env, want in STACKS[name].items():
+        v = getattr(LG, _FLAG_ATTR[env])
+        got[_FLAG_ATTR[env]] = v
+        if (int(v) if isinstance(v, bool) else v) != int(want):
+            bad.append(f"{_FLAG_ATTR[env]} = {v}, stack {name} needs {want}")
+    if os.environ.get("SUROGATE_INKLING_ATTN_EARLY_META") != "0":
+        bad.append("SUROGATE_INKLING_ATTN_EARLY_META is not 0")
+    if bad:
+        raise T8GateError("STACK GATE: " + "; ".join(bad))
+    return got
 
 
 @dataclass
@@ -44,6 +70,45 @@ class T8Config:
     lora_seed: int = 0
     visits: int = 48
     top_k: int = 8
+    stack: str = "A0"               # the code path (STACKS); set for the workers and checked in each of them
+    allow_lagged: bool = False      # False: a row sampled by another adapter version stops the step (its replay gate could not run)
+    row_timeout_s: float = 3600.0   # a worker that answers no request for this long ends the step
+
+
+def validate_config(cfg: T8Config) -> None:
+    """A misspelt option must not silently change the estimator (review M3)."""
+    if cfg.head not in ("centred", "plain"):
+        raise ValueError(f'head {cfg.head!r}: "centred" or "plain"')
+    if not cfg.train_keys or set(cfg.train_keys) - set(LORA_KEYS):
+        raise ValueError(f"train_keys {cfg.train_keys!r}")
+    if set(cfg.segment_keys) - set(cfg.train_keys):
+        raise ValueError(f"segment_keys {cfg.segment_keys!r} must be among train_keys {cfg.train_keys!r}")
+    if not 1 <= int(cfg.K) <= int(cfg.visits):
+        raise ValueError(f"K = {cfg.K}")
+    if cfg.stack not in STACKS:
+        raise ValueError(f"stack {cfg.stack!r}")
+    if cfg.head == "centred" and cfg.allow_lagged:
+        raise ValueError("the centred seed needs the sampling policy's own support: allow_lagged is refused with head='centred'")
+    if len(set(cfg.cards)) != len(cfg.cards) or not cfg.cards:
+        raise ValueError(f"cards {cfg.cards!r}")
+
+
+def lagged(row: Row, version) -> bool:
+    """True when the row's loss tokens were sampled by an adapter version other than `version` (unversioned tokens carry -1)."""
+    if version is None or row.versions is None:
+        return False
+    return bool(set(int(v) for v in row.versions[row.loss_mask]) - {int(version), -1})
+
+
+def check_rows(rows: list, live: list, version, cfg: T8Config) -> None:
+    if not live:
+        raise T8GateError("EMPTY STEP: no row has loss tokens after the refusals")
+    for i in live:
+        if bool(rows[i].loss_mask[0]):
+            raise T8GateError(f"row {i}: loss mask set on position 0 (no prefix predicts it)")
+    late = [i for i in live if lagged(rows[i], version)]
+    if late and not cfg.allow_lagged:
+        raise T8GateError(f"VERSION GATE: {len(late)} rows (first: {late[0]}) were not sampled by adapter version {version}: their replay gate cannot run")
 
 
 @dataclass
@@ -165,17 +230,14 @@ class WorkerCore:
         lp[1:] = lp32.astype(np.float64)
         out = {"i": i, "T": T, "loss_tokens": int(mask.sum())}
         # REPLAY GATE: on-policy rows only (a lagged row was sampled by another adapter version)
-        on_policy = True
-        if version is not None and row.versions is not None:
-            vs = set(int(v) for v in row.versions[mask])
-            on_policy = vs <= {int(version), -1}
+        on_policy = not lagged(row, version)
         if on_policy:
             want = row.engine_lp[1:].astype(np.float32)
             bad = int((lp32[mask[1:]] != want[mask[1:]]).sum())
             if bad:
                 raise T8GateError(f"REPLAY GATE: row {i} (T {T}): {bad} of {int(mask.sum())} loss tokens differ from the rollout's log-probs")
         out["replay_checked"] = bool(on_policy)
-        if rp is not None:
+        if rp is not None and on_policy:
             miss = self._check_routing(ctx, rp)
             if miss:
                 raise T8GateError(f"ROUTING GATE: row {i} (T {T}): {miss} covered positions differ from the rollout's capture")
@@ -257,7 +319,11 @@ class WorkerCore:
         pass
 
     def finish_step(self) -> dict:
-        return {"segments": self.seg_acc, "stats": self.stats()}
+        """The segment sums as ONE tensor + an index (one file descriptor per worker over the pipe, whatever K and the keys)."""
+        keys = sorted(self.seg_acc, key=str)
+        index = [(k, tuple(self.seg_acc[k].shape)) for k in keys]
+        flat = torch.cat([self.seg_acc[k].reshape(-1) for k in keys]) if keys else torch.zeros(0, dtype=torch.float32)
+        return {"seg_index": index, "seg_flat": flat, "stats": self.stats()}
 
     def stats(self) -> dict:
         return {}
@@ -283,11 +349,16 @@ class InlineHandle:
 class ProcHandle:
     """A worker in its own process, one request at a time over a pipe."""
 
-    def __init__(self, proc, conn):
-        self.proc, self.conn = proc, conn
+    def __init__(self, proc, conn, timeout_s: float = 3600.0):
+        self.proc, self.conn, self.timeout_s, self.broken = proc, conn, timeout_s, False
 
     def call(self, name, *args):
+        if self.broken:
+            raise RuntimeError("this worker missed a deadline earlier; its answers can no longer be matched to requests")
         self.conn.send((name, args))
+        if not self.conn.poll(self.timeout_s):
+            self.broken = True
+            raise TimeoutError(f"worker pid {self.proc.pid}: no answer to {name} in {self.timeout_s:.0f} s")
         kind, val = self.conn.recv()
         if kind == "gate":
             raise T8GateError(val)
@@ -297,8 +368,11 @@ class ProcHandle:
 
     def close(self):
         try:
-            self.conn.send(("__exit__", ()))
-            self.proc.join(60)
+            if not self.broken:
+                self.conn.send(("__exit__", ()))
+                self.proc.join(60)
+        except (BrokenPipeError, ConnectionResetError, EOFError, OSError):
+            pass
         finally:
             if self.proc.is_alive():
                 self.proc.terminate()
@@ -402,13 +476,15 @@ def compute_step(handles: list, layout: ParamLayout, flats: list, shapes: list, 
     """One step over `rows` with the given workers (each already holds the current adapter)."""
     if seeds not in ("gspo", "weights"):
         raise ValueError(seeds)
+    validate_config(cfg)
     step_cfg = StepConfig(**{**asdict(step_cfg), "max_row_tokens": cfg.max_row_tokens})
     live, m, r3, scale = plan_rows(rows, version, step_cfg, cfg.visits, cfg.top_k)
     t0 = time.time()
-    for h in handles:
-        h.call("begin_step")
     job = {"step_cfg": step_cfg, "version": version, "seeds": seeds, "scale": scale}
     try:
+        check_rows(rows, live, version, cfg)
+        for h in handles:
+            h.call("begin_step")
         results = run_rows(handles, rows, live, job)
     except T8GateError as e:
         write_stop(cfg.run_dir, str(e))
@@ -425,11 +501,20 @@ def compute_step(handles: list, layout: ParamLayout, flats: list, shapes: list, 
                 grads.append(torch.zeros(tuple(sh[k]), dtype=torch.float32))
     segments = {}
     for f in fin:                                             # worker order
-        for k in sorted(f["segments"], key=str):
-            t = f["segments"][k]
+        off = 0
+        for k, shape in f["seg_index"]:
+            n = int(np.prod(shape))
+            t = f["seg_flat"][off:off + n].view(shape)
+            off += n
             segments[k] = t.double() if k not in segments else segments[k].add_(t.double())
     segments = {k: t.float() for k, t in segments.items()}
     m = aggregate(results, m, r3, scale)
+    m["replay_checked_rows"] = sum(1 for r in results if r["replay_checked"])
+    m["replay_skipped_rows"] = sum(1 for r in results if not r["replay_checked"])
+    if m["replay_skipped_rows"] and not cfg.allow_lagged:
+        write_stop(cfg.run_dir, "replay gate skipped on a row")
+        raise T8GateError(f"VERSION GATE: the replay gate was skipped on {m['replay_skipped_rows']} rows")
+    m["stack"] = cfg.stack
     tokens = sum(r["T"] for r in results)
     m["row_tokens"] = tokens
     m["wall_s"] = wall
@@ -453,6 +538,8 @@ class T8Trainer:
         import t8_worker as TW
         from surogate.inkling_rl.shim import MasterAdamW
 
+        validate_config(cfg)
+        physical = self._physical_cards(cfg.cards)
         self.cfg, self.B = cfg, B
         self.shapes = TW.param_shapes()
         n_all = sum(int(np.prod(s[k])) for s in self.shapes for k in LORA_KEYS)
@@ -465,35 +552,54 @@ class T8Trainer:
         self.work = [torch.nn.Parameter(d[k], requires_grad=True) for d in self.work_layers for k in LORA_KEYS]
         self.opt = MasterAdamW(self.work, lr=5e-5, weight_decay=0.0, max_grad_norm=1.0)  # masters = the exact init; work = bf16(master)
         v_first = cfg.visits - int(cfg.K)
-        if not 0 <= v_first < cfg.visits:
-            raise ValueError(f"K = {cfg.K}")
         visits = [SimpleVisit(v) for v in range(cfg.visits)]
         self.layers = TL.trained_layers(visits, v_first)
         self.layout = ParamLayout(self.shapes, self.layers, cfg.train_keys)
         self.flats = [torch.zeros(self.layout.size, dtype=torch.float32).share_memory_() for _ in cfg.cards]
         ctx = mp.get_context("spawn")
         self.handles = []
-        saved = os.environ.get("CUDA_VISIBLE_DEVICES")
+        child_env = {**STACKS[cfg.stack], **WORKER_ENV}       # what the workers import ift_long and the engine under (review B1)
+        saved = {k: os.environ.get(k) for k in [*child_env, "CUDA_VISIBLE_DEVICES"]}
         try:
-            for c, flat in zip(cfg.cards, self.flats):
+            os.environ.update(child_env)
+            for c, flat in zip(physical, self.flats):
                 os.environ["CUDA_VISIBLE_DEVICES"] = str(c)
                 here, there = ctx.Pipe()
-                p = ctx.Process(target=TW.worker_main, args=(there, cfg, self.work_flat, flat, self.shapes, self.layers), daemon=True)
+                p = ctx.Process(target=TW.worker_main, args=(there, cfg, self.work_flat, flat, self.shapes, self.layers, c), daemon=True)
                 p.start()
                 there.close()
-                self.handles.append(ProcHandle(p, here))
+                self.handles.append(ProcHandle(p, here, cfg.row_timeout_s))
         finally:
-            if saved is None:
-                os.environ.pop("CUDA_VISIBLE_DEVICES", None)
-            else:
-                os.environ["CUDA_VISIBLE_DEVICES"] = saved
-        for h in self.handles:                                # each worker reports after its engine load
-            kind, val = h.conn.recv()
-            if kind != "ok":
-                self.close()
-                raise RuntimeError(f"worker failed to start: {val}")
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        try:
+            for h in self.handles:                            # each worker reports after its engine load and its stack check
+                if not h.conn.poll(900):
+                    raise TimeoutError("a worker did not finish loading in 900 s")
+                kind, val = h.conn.recv()
+                if kind != "ok":
+                    raise RuntimeError(f"worker failed to start: {val}")
+        except Exception:
+            self.close()
+            raise
         if masters is not None:
             self.set_masters(masters)
+
+    @staticmethod
+    def _physical_cards(cards) -> list:
+        """`cards` are physical indices. Under a CUDA_VISIBLE_DEVICES the caller may only name cards it lists (review M5)."""
+        vis = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if vis is not None:
+            allowed = [x.strip() for x in vis.split(",") if x.strip()]
+            if not all(x.isdigit() for x in allowed):
+                raise ValueError(f"CUDA_VISIBLE_DEVICES={vis!r}: only plain card indices are supported")
+            bad = [c for c in cards if str(int(c)) not in allowed]
+            if bad:
+                raise ValueError(f"cards {bad} are not in this process's CUDA_VISIBLE_DEVICES={vis!r} (cards are physical indices)")
+        return [int(c) for c in cards]
 
     # ------------------------------------------------------------------ adapter
     def _refresh(self):
@@ -526,7 +632,14 @@ class T8Trainer:
 
     # ------------------------------------------------------------------ gates and reads
     def check_zero_adapter(self, rows: list) -> list:
-        return [self.handles[0].call("check_zero_adapter", r) for r in rows]
+        """HARD GATE, on every worker. A failure writes STOP."""
+        if not rows:
+            raise ValueError("check_zero_adapter needs at least one row")
+        try:
+            return [h.call("check_zero_adapter", r) for h in self.handles for r in rows]
+        except T8GateError as e:
+            write_stop(self.cfg.run_dir, str(e))
+            raise
 
     def logprobs(self, rows: list) -> list:
         """Per row fp32 [T - 1] with the CURRENT banks, forward only, rows spread over the workers by the step's plan."""

@@ -271,4 +271,5 @@ def backward_row(eng, W, ids, vals: dict, lora_host: list, scale: float, v_first
     finally:
         LG._q_block = saved_q_block
         LG.SINK_DUMMIES.clear()
-    torch.cuda.current_stream(dev).synchronize()  # the last host-accumulator copies, before the arena's slots are reused
+        # also on an out-of-memory error: every queued copy into a host accumulator lands before a retry can zero and reuse its slot
+        torch.cuda.current_stream(dev).synchronize()

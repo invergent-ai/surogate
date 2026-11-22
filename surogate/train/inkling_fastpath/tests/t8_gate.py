@@ -76,7 +76,9 @@ def phase_lean(a, rows):
     import ift_engine as E
     import ift_long as LG
     import t8_lean as TL
+    import t8_step as TS
 
+    rep_stack = TS.verify_stack("A0")
     eng = E.InklingEngine(a.bin, a.artifact, 0)
     W = B.EngineWeights(eng)
     lora = B.make_lora(eng.dev, seed=0, b_std=0.0)
@@ -90,7 +92,7 @@ def phase_lean(a, rows):
     params = [lo[k] for lo in lora for k in B.LORA_KEYS]
     host = [{k: lo[k].detach().cpu() for k in B.LORA_KEYS} for lo in lora]
     scale = lora[0]["scale"]
-    rep = {"rows": []}
+    rep = {"rows": [], "stack": rep_stack}
     for r in rows[:2]:
         T = r.T
         ids = torch.as_tensor(np.ascontiguousarray(r.ids), dtype=torch.int32, device=eng.dev)

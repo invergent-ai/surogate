@@ -49,7 +49,7 @@ def main():
     rows = C.make_rows(10, 2, version)
     scfg = StepConfig(max_policy_lag=1)
     tmp = tempfile.mkdtemp(dir=os.environ.get("TMPDIR"))
-    cfg = TS.T8Config(head="plain", max_row_tokens=10 ** 6, segment_keys=("B13", "B2"), run_dir=tmp, visits=5, top_k=2)
+    cfg = TS.T8Config(head="plain", max_row_tokens=10 ** 6, segment_keys=("B13", "B2"), run_dir=tmp, visits=5, top_k=2, K=5)
     h, lay, fl, sh, _ = C.trainer_parts(2, cfg)
     ref = TS.compute_step(h, lay, fl, sh, cfg, copy.deepcopy(rows), version, scfg, "gspo")
     h, lay, fl, sh, pids = start(2, cfg)

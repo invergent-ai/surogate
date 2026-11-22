@@ -12,7 +12,7 @@ import ift_forward as F
 import t8_center as RC
 import t8_lean as TL
 from ift_engine import InklingEngine
-from t8_step import LORA_KEYS, ParamLayout, T8Config, T8GateError, WorkerCore, serve
+from t8_step import LORA_KEYS, ParamLayout, T8Config, T8GateError, WorkerCore, serve, verify_stack
 
 GIB = 2 ** 30
 
@@ -36,7 +36,9 @@ def work_views(flat: torch.Tensor, shapes: list) -> list:
 
 
 class T8Worker(WorkerCore):
-    def __init__(self, cfg: T8Config, work_flat: torch.Tensor, sum_flat: torch.Tensor, shapes: list, layout_layers: list):
+    def __init__(self, cfg: T8Config, work_flat: torch.Tensor, sum_flat: torch.Tensor, shapes: list, layout_layers: list, card: int = -1):
+        self.stack_flags = verify_stack(cfg.stack)            # before anything runs: the path the gates proved
+        self.card = card
         self.eng = InklingEngine(cfg.bin_dir, cfg.artifact, 0)
         self.dev = self.eng.dev
         self.W = B.EngineWeights(self.eng)
@@ -48,6 +50,10 @@ class T8Worker(WorkerCore):
         self.buffers = None
         self.train_idx = tuple(j for j, k in enumerate(LORA_KEYS) if k in cfg.train_keys)
         self.setup_sums(ParamLayout(shapes, layout_layers, cfg.train_keys), sum_flat, cfg)
+
+    def begin_step(self):
+        super().begin_step()
+        torch.cuda.reset_peak_memory_stats()
 
     # ------------------------------------------------------------------ adapter
     def refresh(self):
@@ -113,7 +119,12 @@ class T8Worker(WorkerCore):
     def _support(self, ctx, row):
         ids = ctx["ids"]
         pos = torch.nonzero(torch.as_tensor(row.loss_mask[1:].copy(), device=self.dev))[:, 0]
-        sup = RC.logits_and_support(SimpleNamespace(eng=self.eng), ctx["res"]["hidden"], pos, ids[1:][pos])
+        try:
+            sup = RC.logits_and_support(SimpleNamespace(eng=self.eng), ctx["res"]["hidden"], pos, ids[1:][pos])
+        except torch.OutOfMemoryError:
+            raise
+        except RuntimeError as e:                             # the support rebuild refused this row: a gate, not a crash
+            raise T8GateError(f"SUPPORT GATE: T {row.T}: {e}") from e
         miss = int((~sup["inside"]).sum())
         if miss:
             raise T8GateError(f"SUPPORT GATE: T {row.T}: {miss} of {int(pos.numel())} sampled tokens are outside the rebuilt support")
@@ -163,7 +174,7 @@ class T8Worker(WorkerCore):
         self._pin_class = cls
 
     def stats(self) -> dict:
-        st = {}
+        st = {"card": self.card, "stack": self.cfg.stack}
         for line in open("/proc/self/status"):
             k = line.split(":")[0]
             if k in ("VmHWM", "VmRSS", "RssAnon", "RssShmem"):
@@ -179,14 +190,14 @@ class T8Worker(WorkerCore):
         self.eng.close()
 
 
-def worker_main(conn, cfg, work_flat, sum_flat, shapes, layers):
+def worker_main(conn, cfg, work_flat, sum_flat, shapes, layers, card=-1):
     """The target of a spawned worker process (the parent set CUDA_VISIBLE_DEVICES to this worker's card before starting it)."""
     try:
-        w = T8Worker(cfg, work_flat, sum_flat, shapes, layers)
+        w = T8Worker(cfg, work_flat, sum_flat, shapes, layers, card)
     except Exception:
         import traceback
 
         conn.send(("error", traceback.format_exc()[-4000:]))
         return
-    conn.send(("ok", {"pid": os.getpid()}))
+    conn.send(("ok", {"pid": os.getpid(), "card": card}))
     serve(conn, w)

@@ -102,7 +102,7 @@ def main():
     scfg = StepConfig(max_policy_lag=1)
     g_ref, m_ref = reference(rows, version, scfg)
     tmp = tempfile.mkdtemp(dir=os.environ.get("TMPDIR"))
-    cfg = TS.T8Config(head="plain", max_row_tokens=10 ** 6, segment_keys=("B13", "B2"), run_dir=tmp, visits=5, top_k=2)
+    cfg = TS.T8Config(head="plain", max_row_tokens=10 ** 6, segment_keys=("B13", "B2"), run_dir=tmp, visits=5, top_k=2, K=5)
     runs = {}
     for n in (1, 2, 3):
         h, lay, fl, sh, _ = trainer_parts(n, cfg)
@@ -134,7 +134,7 @@ def main():
     r2[-1].versions[r2[-1].loss_mask] = version + 5              # off-policy (the shortest row; the longest is the refused one)
     long_T = max(r.T for r in r2)
     assert r2[-1].T < long_T
-    cfg2 = TS.T8Config(head="plain", max_row_tokens=long_T - 1, run_dir=tmp, visits=5, top_k=2)
+    cfg2 = TS.T8Config(head="plain", max_row_tokens=long_T - 1, run_dir=tmp, visits=5, top_k=2, K=5)
     g2, m2 = reference(r2, version, StepConfig(max_policy_lag=1, max_row_tokens=long_T - 1))
     h, lay, fl, sh, _ = trainer_parts(2, cfg2)
     o2 = TS.compute_step(h, lay, fl, sh, cfg2, copy.deepcopy(r2), version, StepConfig(max_policy_lag=1), "gspo")
@@ -174,6 +174,64 @@ def main():
     gate(bad_lp, "REPLAY GATE")
     gate(bad_route, "ROUTING GATE")
     gate(lambda r: None, "FINITE GATE", wbreak=True)
+    def bad_mask0(r):
+        r[2].loss_mask[0] = True
+
+    def lag_one(r):
+        r[6].versions[r[6].loss_mask] = version - 1           # inside max_policy_lag, so plan_rows keeps it
+
+    gate(bad_mask0, "position 0")
+    gate(lag_one, "VERSION GATE")
+    cfg_lag = TS.T8Config(head="plain", max_row_tokens=10 ** 6, run_dir=tmp, visits=5, top_k=2, K=5, allow_lagged=True)
+    rl = copy.deepcopy(rows)
+    lag_one(rl)
+    rl[6].engine_lp = rl[6].engine_lp - 0.25 * rl[6].loss_mask  # a lagged row's log-probs differ; with the explicit option it is counted, not compared
+    h, lay, fl, sh, _ = trainer_parts(2, cfg_lag)
+    ol = TS.compute_step(h, lay, fl, sh, cfg_lag, rl, version, scfg, "gspo")
+    assert ol.metrics["replay_skipped_rows"] == 1 and ol.metrics["replay_checked_rows"] == len(rows) - 1
+    empty = copy.deepcopy(rows)
+    for r in empty:
+        r.loss_mask = np.zeros_like(r.loss_mask)
+    h, lay, fl, sh, _ = trainer_parts(1, cfg)
+    try:
+        TS.compute_step(h, lay, fl, sh, cfg, empty, version, scfg, "gspo")
+        raise AssertionError("an empty step must not return a gradient")
+    except TS.T8GateError as e:
+        assert "EMPTY STEP" in str(e)
+    for bad in (dict(head="centered"), dict(train_keys=("B3",)), dict(segment_keys=("A13",), train_keys=("B13",)), dict(K=0), dict(K=6), dict(stack="F4"),
+                dict(head="centred", allow_lagged=True), dict(cards=(1, 1))):
+        kw = {"head": "plain", "visits": 5, "top_k": 2, "K": 5, "segment_keys": ()} | bad
+        try:
+            TS.validate_config(TS.T8Config(**kw))
+            raise AssertionError(f"accepted {bad}")
+        except ValueError:
+            pass
+    # the stack: the flags this process imported are A0 only if the environment says so
+    import ift_long as LG
+    saved = {a: getattr(LG, a) for a in TS._FLAG_ATTR.values()}
+    env = os.environ.get("SUROGATE_INKLING_ATTN_EARLY_META")
+    os.environ["SUROGATE_INKLING_ATTN_EARLY_META"] = "0"
+    for e, want in TS.STACKS["A0"].items():
+        a = TS._FLAG_ATTR[e]
+        setattr(LG, a, bool(int(want)) if isinstance(saved[a], bool) else int(want))
+    assert TS.verify_stack("A0")["MOE_GM"] is False
+    LG.MOE_GM = True
+    try:
+        TS.verify_stack("A0")
+        raise AssertionError("a wrong stack passed")
+    except TS.T8GateError as e:
+        assert "MOE_GM" in str(e)
+    for a, v in saved.items():
+        setattr(LG, a, v)
+    os.environ.pop("SUROGATE_INKLING_ATTN_EARLY_META") if env is None else os.environ.__setitem__("SUROGATE_INKLING_ATTN_EARLY_META", env)
+    os.environ["CUDA_VISIBLE_DEVICES"] = "2,3"
+    assert TS.T8Trainer._physical_cards((3, 2)) == [3, 2]
+    try:
+        TS.T8Trainer._physical_cards((0, 1))
+        raise AssertionError("cards outside CUDA_VISIBLE_DEVICES accepted")
+    except ValueError:
+        pass
+    del os.environ["CUDA_VISIBLE_DEVICES"]
     print("gates: PASS")
 
     # seeds = "weights": the gradient of sum_row weight x sum_t log pi over the loss tokens
