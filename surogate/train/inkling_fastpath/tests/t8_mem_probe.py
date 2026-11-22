@@ -102,10 +102,7 @@ def main():
     W = B.EngineWeights(eng)
     lora = B.make_lora(eng.dev, seed=0, b_std=0.0)
     banks = B.EngineBanks(lora, eng.dev)
-    for lo in lora:
-        for k in B.LORA_KEYS:
-            lo[k].data = lo[k].data.cpu()
-    torch.cuda.empty_cache()
+    torch.cuda.empty_cache()  # the masters stay on the card: the stock LongModel path needs them there
     mark("masters_banks")
     tf = LG.TrainForwardLong(eng, W)
     _, rows = load_rows(a.rollouts)
