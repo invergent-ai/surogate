@@ -2,7 +2,7 @@
 Real W5 rows picked by length only: batch = the 8 longest <= 58,010 + 24 spread; K = 18, centred head, seeds "weights", B keys, 8 workers on ONE box.
   G8a every hard gate holds on every row (replay, support, zero adapter on every worker, finite), no row refused.
   G8b host peak per worker (VmHWM) <= 20 GiB.
-  G8c lowest box MemAvailable during the step >= 60 GB.
+  G8c lowest box MemAvailable during the step >= 60 GB (the K = 18 batch; the lowest reading over the whole phase is reported beside it).
   G8d A/A: the same 8 rows twice on the 8 workers, gradient and segment sums bitwise equal.
   G9  adapter round trip: after a test update of B (L2 0.03 along the step's gradient) the workers' log-probs == a FRESH engine (release M13b, the rollout engine) loaded with the exported BF16
       adapter, bitwise at every position of 3 rows of about 14k tokens; and the update changed at least one log-prob (otherwise the check is vacuous).
@@ -61,6 +61,16 @@ class MemWatch:
 
 
 def phase_step(a):
+    with MemWatch() as whole:
+        rc, rep = _phase_step(a)
+        rep["min_mem_available_whole_phase_gb"] = whole.low
+    json.dump(rep, open(a.out, "w"), indent=1, default=float)
+    log(f"lowest MemAvailable over the whole phase: {whole.low:.0f} GB")
+    print(f"T8 GATE8 step: {'PASS' if rc == 0 else 'FAIL'}", flush=True)
+    return rc
+
+
+def _phase_step(a):
     from surogate.inkling_rl.step import StepConfig
     import t8_step as TS
 
@@ -71,7 +81,7 @@ def phase_step(a):
     pick = lambda name: [rows[i] for i in groups[name]]
     rep = {"cards": list(cards), "speed": {}}
     for K in (6, 30, 48):                                     # before the K = 18 trainer: the same rows at every K
-        tr = TS.T8Trainer(TS.T8Config(K=K, **base))
+        tr = TS.T8Trainer(TS.T8Config(K=K, **{**base, "segment_keys": ()}))  # no segment sums here: at K = 48 they would be the host-memory peak (review M1)
         try:
             o = tr.compute(pick("speed"), 0, scfg, seeds="weights")
         finally:
@@ -106,6 +116,7 @@ def phase_step(a):
         rep["G8a"] = bool(rep["zero_adapter"] == len(cards) and len(o.rows) == len(batch) and o.metrics["replay_skipped_rows"] == 0 and o.metrics["replay_checked_rows"] == len(batch))
         rep["G8b"] = bool(peak <= 20.0)
         rep["G8c"] = bool(mw.low >= 60.0)
+        json.dump(rep, open(a.out, "w"), indent=1, default=float)  # a later crash keeps G8a-d
         log(f"batch: {rep['batch']['rows']} rows, {rep['batch']['tok_per_s_per_card']:.0f} tok/s per card, host peak {peak:.2f} GiB, lowest MemAvailable {mw.low:.0f} GB; G8a {rep['G8a']} G8b {rep['G8b']} G8c {rep['G8c']}")
         # the test update of G9
         rt = pick("rt")
@@ -128,10 +139,8 @@ def phase_step(a):
         json.dump([{"ids": r.ids.tolist()} for r in rt], open(os.path.join(a.run_dir, "rows_ids.json"), "w"))
     finally:
         tr.close()
-    json.dump(rep, open(a.out, "w"), indent=1, default=float)
     ok = rep["G8a"] and rep["G8b"] and rep["G8c"] and rep["G8d"] and rep["update_changed_logprobs"] > 0
-    print(f"T8 GATE8 step: {'PASS' if ok else 'FAIL'}", flush=True)
-    return 0 if ok else 4
+    return (0 if ok else 4), rep
 
 
 def phase_compare(a):

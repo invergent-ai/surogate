@@ -70,6 +70,15 @@ def main():
         again = TS.compute_step(h, lay, fl, sh, cfg, copy.deepcopy(rows), version, scfg, "gspo")
         assert all(torch.equal(a, b) for a, b in zip(again.grads, ref.grads)), "a step after a failed step must start from zero"
         print("a step after a failed step: PASS")
+        cfg0 = TS.T8Config(head="plain", max_row_tokens=10 ** 6, segment_keys=(), run_dir=tmp, visits=5, top_k=2, K=5)
+        h0, lay0, fl0, sh0, _ = start(2, cfg0)
+        try:
+            o0 = TS.compute_step(h0, lay0, fl0, sh0, cfg0, copy.deepcopy(rows), version, scfg, "gspo")
+            assert o0.segments == {} and all(torch.equal(a, b) for a, b in zip(o0.grads, ref.grads)), "no segment keys"
+        finally:
+            for x in h0:
+                x.close()
+        print("no segment sums over the pipe: PASS")
         os.kill(pids[1], signal.SIGKILL)                       # this test's own child
         res = {}
 
