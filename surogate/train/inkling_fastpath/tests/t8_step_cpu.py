@@ -97,6 +97,8 @@ def rel(a, b):
 def main():
     version = 3
     rows = make_rows(14, 1, version)
+    # a worker takes its rows longest first; the reference gets them in that same order, so that "bitwise" compares the same fp32 summation
+    rows = [rows[i] for i in sorted(range(len(rows)), key=lambda j: (-rows[j].T, j))]
     scfg = StepConfig(max_policy_lag=1)
     g_ref, m_ref = reference(rows, version, scfg)
     tmp = tempfile.mkdtemp(dir=os.environ.get("TMPDIR"))
