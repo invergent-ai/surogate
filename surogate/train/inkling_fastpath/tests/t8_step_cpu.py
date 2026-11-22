@@ -131,7 +131,7 @@ def main():
 
     # refusals, in run_step's way
     r2 = copy.deepcopy(rows)
-    r2[-1].versions[r2[-1].loss_mask] = version - 5              # off-policy (the shortest row; the longest is the refused one)
+    r2[-1].versions[r2[-1].loss_mask] = version + 5              # off-policy (the shortest row; the longest is the refused one)
     long_T = max(r.T for r in r2)
     assert r2[-1].T < long_T
     cfg2 = TS.T8Config(head="plain", max_row_tokens=long_T - 1, run_dir=tmp, visits=5, top_k=2)
