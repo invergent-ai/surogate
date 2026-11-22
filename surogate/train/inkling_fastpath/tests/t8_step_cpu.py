@@ -176,6 +176,7 @@ def main():
     gate(lambda r: None, "FINITE GATE", wbreak=True)
     def bad_mask0(r):
         r[2].loss_mask[0] = True
+        r[2].versions[0] = version                            # else drop_off_policy removes the row for carrying two versions (-1 and this one)
 
     def lag_one(r):
         r[6].versions[r[6].loss_mask] = version - 1           # inside max_policy_lag, so plan_rows keeps it
