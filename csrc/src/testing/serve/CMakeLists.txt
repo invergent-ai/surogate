@@ -1014,3 +1014,11 @@ target_link_libraries(sinfer_inkling_train PRIVATE sinfer_shared CUDA::cudart)
 set_target_properties(sinfer_inkling_train PROPERTIES BUILD_RPATH "$ORIGIN:$ORIGIN/.." CXX_VISIBILITY_PRESET default)
 target_compile_options(sinfer_inkling_train PRIVATE
   $<$<COMPILE_LANGUAGE:CXX>:-fno-fast-math> $<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>)
+# lane T8 (additive): the same shim + explicit S10 attention LoRA (inkling_fastpath/inkling_train_shim_t8.cpp); nothing links it.
+add_library(sinfer_inkling_train_t8 SHARED EXCLUDE_FROM_ALL ${SERVE_ROOT}/inkling_fastpath/inkling_train_shim_t8.cpp)
+target_include_directories(sinfer_inkling_train_t8 PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR} ${SERVE_ROOT} ${SINFER_JSON_INCLUDE} ${SUROGATE_VENDOR_DIR} ${CUDAToolkit_INCLUDE_DIRS})
+target_link_libraries(sinfer_inkling_train_t8 PRIVATE sinfer_shared CUDA::cudart)
+set_target_properties(sinfer_inkling_train_t8 PROPERTIES BUILD_RPATH "$ORIGIN:$ORIGIN/.." CXX_VISIBILITY_PRESET default)
+target_compile_options(sinfer_inkling_train_t8 PRIVATE
+  $<$<COMPILE_LANGUAGE:CXX>:-fno-fast-math> $<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>)
