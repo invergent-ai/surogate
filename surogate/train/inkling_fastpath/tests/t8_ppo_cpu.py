@@ -25,9 +25,7 @@ LR = 2e-5
 
 
 class FakeW(C.FakeWorker):
-    def __init__(self, cfg, flat, layout, be):
-        super().__init__(cfg, flat, layout)
-        self.be = be                                        # one model shared by the workers (inline), as the shared work values
+    """Its own model (worker threads run autograd at the same time; a shared module would race on .grad); the trainer copies the work values in."""
 
     def logprobs_row(self, row):
         with torch.no_grad():
@@ -41,10 +39,19 @@ class FakeTrainer:
         self.shapes = [{k: tuple(d[k].shape) for k in TS.LORA_KEYS} for d in self.be.lora]
         self.layout = TS.ParamLayout(self.shapes, list(range(len(self.shapes))), cfg.train_keys)
         self.flats = [torch.zeros(self.layout.size) for _ in range(n_workers)]
-        self.handles = [TS.InlineHandle(FakeW(cfg, f, self.layout, self.be)) for f in self.flats]
+        self.workers = [FakeW(cfg, f, self.layout) for f in self.flats]
+        self.be = self.workers[0].be
+        self.handles = [TS.InlineHandle(w) for w in self.workers]
         self.cfg = cfg
         self.work = self.be.parameters()
         self.opt = MasterAdamW(self.work, lr=LR, weight_decay=0.0, max_grad_norm=1.0)
+        self._sync()
+
+    def _sync(self):
+        with torch.no_grad():
+            for w in self.workers[1:]:
+                for p, q in zip(w.be.parameters(), self.work):
+                    p.copy_(q)
 
     def logprobs(self, rows):
         return [self.handles[0].call("logprobs_row", r) for r in rows]
@@ -57,7 +64,9 @@ class FakeTrainer:
             g["lr"] = lr
         for p, g in zip(self.work, out.grads):
             p.grad = g
-        return self.opt.step()
+        n = self.opt.step()
+        self._sync()
+        return n
 
 
 def reference(rows, version, n_mb, S):
