@@ -129,6 +129,9 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
                      Guarantees bit-exact gradients.
             - True: Recompute intermediates from checkpoints. Saves ~17% VRAM.
                     Recommended for most training scenarios.
+        qlora_recompute (bool, defaults to True):
+            QLoRA and pre-quantized bases recompute whatever `recompute` says. Set false (with recompute: false)
+            to save their activations instead. Verified with parallelism=dispatch_pp on a pre-quantized NVFP4 base.
         offload_residual (Optional[bool], defaults to False):
             Offload the residuals (of the ffn block; the only remaining part of the block that is not recomputed) to pinned host memory.
             Combined with recompute, the total activation memory consumption becomes independent of the network depth.
@@ -361,6 +364,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
     save_total_limit: int | None = 5
 
     recompute: bool | None = True
+    qlora_recompute: bool | None = True
 
     offload_residual: bool | None = False
 
@@ -444,6 +448,11 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
     lora_alpha: int | None = 32
     lora_dropout: float | None = 0
     lora_dtype: Literal["bf16", "fp32"] | None = "fp32"
+    # The LoRA forward computes its products from the fp32 masters (lora_dtype: fp32) instead of their bf16 work
+    # copies: the expert kernel and dense LoRA (the shared expert) through the same kernel. A bf16 work copy changes
+    # only where an update crosses a rounding step, so with bf16 copies the function moves in rounding jumps, about
+    # as large at lr 1e-6 as at 5e-5 (2026-10-30). The backward keeps the bf16 copies; broadcasts stay bf16.
+    lora_fp32_forward: bool = False
     lora_target_modules: list[str] | None = None
     train_router: bool | None = False
     router_aux_loss_coef: float | None = None
@@ -520,6 +529,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
                 raise ValueError(f"recompute must be true or false, got '{recompute_raw}'")
         else:
             self.recompute = bool(recompute_raw)
+        self.qlora_recompute = bool(cfg.get("qlora_recompute", self.qlora_recompute))
 
         self.offload_residual = cfg.get("offload_residual", self.offload_residual)
         self.offload_saved_tensors = cfg.get("offload_saved_tensors", self.offload_saved_tensors)
@@ -602,6 +612,9 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         self.lora_alpha = cfg.get("lora_alpha", self.lora_alpha)
         self.lora_dropout = float(cfg["lora_dropout"]) if "lora_dropout" in cfg else self.lora_dropout
         self.lora_dtype = cfg.get("lora_dtype", self.lora_dtype)
+        self.lora_fp32_forward = bool(cfg.get("lora_fp32_forward", self.lora_fp32_forward))
+        if self.lora_fp32_forward and self.lora_dtype != "fp32":
+            raise ValueError("lora_fp32_forward needs lora_dtype: fp32 (the forward reads the fp32 masters)")
         self.lora_target_modules = cfg.get("lora_target_modules", ["all"])
         self.train_router = cfg.get("train_router", self.train_router)
         self.router_aux_loss_coef = cfg.get("router_aux_loss_coef", self.router_aux_loss_coef)
@@ -972,9 +985,8 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         # the GPU and OOMs on any model large enough to need dispatch-PP.
         # recompute bounds activation memory (the backward replays the forward per stage).
         # It can be disabled (recompute: false) to trade the free VRAM for skipping the
-        # backward re-forward; the stage scheduler honors either setting.
-        if not self.recompute:
-            logger.info("[dispatch_pp]: recompute disabled (caching stage activations for the backward).")
+        # backward's per-block recompute; the stage scheduler honors either setting
+        # (create_runtime_config settles it for quantized bases and logs the result).
         # offload_residual is INCOMPATIBLE with the stage scheduler (both weight modes):
         # the cross-stage forward handoff reads block hi's residual by name, and
         # offloading it to pinned CPU asynchronously races that read (non-deterministic
@@ -1098,12 +1110,18 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         _is_prequantized = (self.model_info.quant_info or {}).get("quant_method", "").startswith("prequant_")
 
         if self.qlora_bnb or self.qlora_fp8 or self.qlora_fp4 or _is_prequantized:
-            # QLoRA / pre-quantized requires recompute enabled
-            if not self.recompute:
+            # QLoRA / pre-quantized bases recompute unless qlora_recompute: false opts out
+            # (rule since 2026-01, without a recorded reason).
+            if not self.recompute and self.qlora_recompute:
                 self.recompute = True
-                logger.info("[QLoRA]: enabling recompute for memory efficiency.")
+                logger.warning(
+                    "[QLoRA]: recompute: false is overridden for a quantized base; "
+                    "set qlora_recompute: false to save its activations instead."
+                )
             self.use_cuda_graphs = False  # Disable CUDA graphs for QLoRA
             logger.info("[QLoRA]: disabling CUDA graphs.")
+        if self.parallelism == "dispatch_pp" and not self.recompute:
+            logger.info("[dispatch_pp]: recompute disabled (the backward keeps the re-forward's activations).")
 
         if self.lora and self.recompute and self.offload_residual:
             self.use_cuda_graphs = False  # Disable CUDA graphs when offloading residuals with recompute
@@ -1328,6 +1346,8 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
                 self.qlora_config = _surogate.QLoRAConfig.prequant_fp8()
             elif prequant_method == "prequant_nvfp4":
                 self.qlora_config = _surogate.QLoRAConfig.prequant_nvfp4()
+                if self.model_info.quant_info.get("nvfp4_format") == "compressed-tensors":
+                    self.qlora_config.prequant_compressed_tensors = True
             elif prequant_method == "prequant_mxfp4":
                 self.qlora_config = _surogate.QLoRAConfig.prequant_mxfp4()
             elif prequant_method == "prequant_bnb_nf4":

@@ -1311,7 +1311,9 @@ def compile_gated_delta_rule(
 
     # --- 6. Forward h (state recurrence) ---
     h = torch.empty(B, NT, H, K, V, dtype=torch.bfloat16, device="cuda")
-    h0 = torch.randn(B, H, K, V, dtype=torch.bfloat16, device="cuda")
+    # FP32 initial state: a chunked sequence carries the recurrent state across windows, and a BF16
+    # carry rounded it at every window boundary (the kernel accumulates it in FP32 anyway).
+    h0 = torch.randn(B, H, K, V, dtype=torch.float32, device="cuda")
     ht = torch.empty(B, H, K, V, dtype=torch.float32, device="cuda")
     v_new = torch.empty(B, T, H, V, dtype=torch.bfloat16, device="cuda")
     bv_configs = [bv for bv in [32, 64] if bv <= max(V, 32)]
@@ -1326,7 +1328,7 @@ def compile_gated_delta_rule(
             "v_new": "*bf16",
             "g": "*fp32",
             "h": "*bf16",
-            "h0": "*bf16",
+            "h0": "*fp32",
             "ht": "*fp32",
             "T": "i32",
         },

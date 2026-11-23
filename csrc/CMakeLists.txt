@@ -862,6 +862,7 @@ if (BUILD_TESTS OR BUILD_TESTS_INTEGRATION)
         src/testing/kernels/test-matmul-autotune.cpp
         src/testing/kernels/test-mem-eff-splits.cu
         src/testing/kernels/test-lora-accum.cu
+        src/testing/kernels/test-flash-adamw-8bit.cu
         src/testing/kernels/test-chunked-attention.cu
         src/testing/kernels/test-spark-numerics.cu
         src/testing/kernels/test-qwen35-shared.cu
@@ -1347,6 +1348,7 @@ add_library(sinfer_ops STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/launcher/silu_and_mul.cu
 ${SERVE_ROOT}/ops/launcher/head_linear.cu
   ${SERVE_ROOT}/ops/launcher/vision_attention.cu
+  ${SERVE_ROOT}/ops/launcher/vision_attention_fp8.cu
   ${SERVE_ROOT}/ops/launcher/vision_pos_embed.cu
   # Gated DeltaNet Linear Attention core.
   ${SERVE_ROOT}/ops/linear_attention/gated_delta_net/gated_delta_net.cpp
@@ -1522,6 +1524,8 @@ ${SERVE_ROOT}/ops/launcher/head_linear.cu
   ${SERVE_ROOT}/ops/sparse_moe/inkling/inkling_mxfp8_gemm.cu
   ${SERVE_ROOT}/ops/sparse_moe/inkling/inkling_moe.cpp
   ${SERVE_ROOT}/ops/linear/bf16/bf16_cublaslt.cpp
+  ${SERVE_ROOT}/ops/linear/mxfp8/mxfp8.cu
+  ${SERVE_ROOT}/ops/linear/mxfp8/mxfp8_cublaslt.cpp
   ${SERVE_ROOT}/ops/hyper_connection/hyper_connection.cu
   ${SERVE_ROOT}/ops/hyper_connection/manifold.cu
   ${SERVE_ROOT}/ops/ngram_ple/ngram_ple.cu

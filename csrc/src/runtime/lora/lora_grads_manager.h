@@ -69,6 +69,10 @@ public:
         std::vector<std::uint8_t> layer_has_dense_mlp;
         std::vector<std::uint8_t> layer_has_moe;
 
+        /// dispatch-PP stage-local LoRA: gradient buffers for layer l only where layer_local[l] (mirrors the
+        /// weights manager). Empty = every layer.
+        std::vector<std::uint8_t> layer_local;
+
         [[nodiscard]] int effective_moe_intermediate() const {
             return moe_intermediate_size > 0 ? moe_intermediate_size : intermediate_size;
         }

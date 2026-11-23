@@ -290,14 +290,26 @@ public:
         return mBumpOffset;
     }
 
-    // Diagnostics (saved_buffers_* interface).
+    // Diagnostics (saved_buffers_* interface). Retired keys (buffer recycled into the pool,
+    // pointer null) are not counted: their memory is in pool_bytes().
     int count() const {
-        return static_cast<int>(mBuffers.size());
+        int n = 0;
+        for (const auto& [key, buffer] : mBuffers) {
+            if (buffer != nullptr) ++n;
+        }
+        return n;
     }
     std::size_t total_plain_bytes() const {
         std::size_t total = 0;
-        for (const auto& [key, bytes] : mSizes) {
-            if (!is_arena_backed(key)) total += bytes;
+        for (const auto& [key, buffer] : mBuffers) {
+            if (buffer != nullptr && !is_arena_backed(key)) total += size_of(key);
+        }
+        return total;
+    }
+    std::size_t pool_bytes() const {
+        std::size_t total = 0;
+        for (const auto& [buffer, bytes] : mPool) {
+            total += bytes;
         }
         return total;
     }

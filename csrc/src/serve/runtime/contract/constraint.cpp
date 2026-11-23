@@ -145,14 +145,111 @@ void TokenConstraintState::fill_draft_masks(std::span<const TokenId> drafts, std
     }
 }
 
+namespace {
+// What JsonConstraintCompiler::compile_after needs besides the schema, shared by every state.
+struct ReasoningGate {
+    TokenId close = -1;
+    std::vector<TokenId> stops;
+    std::vector<std::uint32_t> separators; // bitmask of the whitespace-only tokens
+    bool stop(TokenId token) const { return std::find(stops.begin(), stops.end(), token) != stops.end(); }
+    bool separator(TokenId token) const {
+        const auto word = static_cast<std::size_t>(token) / 32;
+        return word < separators.size() && ((separators[word] >> (static_cast<std::uint32_t>(token) % 32)) & 1U) != 0;
+    }
+};
+
+class AfterReasoningState final : public TokenConstraintState {
+    enum class Phase { Reasoning, Separator, Answer };
+    std::shared_ptr<const ReasoningGate> gate_;
+    std::shared_ptr<const CompiledTokenConstraint> schema_;
+    std::unique_ptr<TokenConstraintState> answer_; // from the close on: a thought's drafts never fork a grammar
+    Phase phase_ = Phase::Reasoning;
+public:
+    AfterReasoningState(std::shared_ptr<const ReasoningGate> gate, std::shared_ptr<const CompiledTokenConstraint> schema,
+                        std::unique_ptr<TokenConstraintState> answer = nullptr, Phase phase = Phase::Reasoning)
+        : gate_(std::move(gate)), schema_(std::move(schema)), answer_(std::move(answer)), phase_(phase) {}
+    bool stopped() const override { return phase_ == Phase::Answer && answer_->stopped(); }
+    bool try_accept(TokenId token) override {
+        if (token < 0) { return false; }
+        switch (phase_) {
+        case Phase::Reasoning:
+            if (gate_->stop(token)) { return false; }
+            if (token == gate_->close) {
+                answer_ = schema_->create_state();
+                phase_  = Phase::Separator;
+            }
+            return true;
+        case Phase::Separator:
+            if (!gate_->separator(token) && !answer_->try_accept(token)) { return false; }
+            phase_ = Phase::Answer;
+            return true;
+        case Phase::Answer: break;
+        }
+        return answer_->try_accept(token);
+    }
+    void accept(TokenId token) override {
+        if (!try_accept(token)) { throw std::logic_error("token violates JSON constraint: " + std::to_string(token)); }
+    }
+    std::unique_ptr<TokenConstraintState> fork() const override {
+        return std::make_unique<AfterReasoningState>(gate_, schema_, answer_ ? answer_->fork() : nullptr, phase_);
+    }
+    void fill(std::span<int32_t> mask) override {
+        if (phase_ == Phase::Reasoning) {
+            std::fill(mask.begin(), mask.end(), -1);
+            for (const TokenId stop : gate_->stops) {
+                const auto word = static_cast<std::size_t>(stop) / 32;
+                if (stop >= 0 && word < mask.size()) {
+                    mask[word] = static_cast<int32_t>(static_cast<std::uint32_t>(mask[word]) &
+                                                      ~(1U << (static_cast<std::uint32_t>(stop) % 32)));
+                }
+            }
+            return;
+        }
+        answer_->fill(mask);
+        if (phase_ == Phase::Separator) {
+            for (std::size_t word = 0; word < std::min(mask.size(), gate_->separators.size()); ++word) {
+                mask[word] = static_cast<int32_t>(static_cast<std::uint32_t>(mask[word]) | gate_->separators[word]);
+            }
+        }
+    }
+};
+
+class AfterReasoning final : public CompiledTokenConstraint {
+    std::shared_ptr<const ReasoningGate> gate_;
+    std::shared_ptr<const CompiledTokenConstraint> schema_;
+public:
+    AfterReasoning(std::shared_ptr<const ReasoningGate> gate, std::shared_ptr<const CompiledTokenConstraint> schema)
+        : gate_(std::move(gate)), schema_(std::move(schema)) {}
+    std::unique_ptr<TokenConstraintState> create_state() const override {
+        return std::make_unique<AfterReasoningState>(gate_, schema_);
+    }
+};
+
+std::vector<std::uint32_t> whitespace_tokens(const std::vector<std::string>& vocab) {
+    std::vector<std::uint32_t> mask((vocab.size() + 31) / 32, 0U);
+    for (std::size_t id = 0; id < vocab.size(); ++id) {
+        const std::string& text = vocab[id];
+        if (!text.empty() && std::all_of(text.begin(), text.end(),
+                [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; })) {
+            mask[id / 32] |= 1U << (id % 32);
+        }
+    }
+    return mask;
+}
+} // namespace
+
 class JsonConstraintCompiler::Impl {
 public:
     std::shared_ptr<GrammarTokenizer> tokenizer;
+    std::size_t vocabulary = 0;
+    std::vector<std::uint32_t> separators;
     std::mutex mutex;
     std::unordered_map<std::string, std::shared_ptr<const CompiledTokenConstraint>> cache;
+    std::shared_ptr<const ReasoningGate> gate; // compile_after's, for the one close token a model has
     Impl(const std::vector<std::string>& vocab, const std::vector<TokenId>& stops,
          std::function<std::vector<TokenId>(std::string_view)> encode)
-        : tokenizer(std::make_shared<GrammarTokenizer>(vocab, stops, std::move(encode))) {}
+        : tokenizer(std::make_shared<GrammarTokenizer>(vocab, stops, std::move(encode))),
+          vocabulary(vocab.size()), separators(whitespace_tokens(vocab)) {}
 };
 JsonConstraintCompiler::JsonConstraintCompiler(std::vector<std::string> vocab, std::vector<TokenId> stops,
     std::function<std::vector<TokenId>(std::string_view)> encode)
@@ -176,6 +273,21 @@ std::shared_ptr<const CompiledTokenConstraint> JsonConstraintCompiler::compile(c
     } catch (const std::exception& error) {
         throw std::invalid_argument(std::string("invalid or unsupported JSON schema: ") + error.what());
     }
+}
+std::shared_ptr<const CompiledTokenConstraint> JsonConstraintCompiler::compile_after(const std::string& schema, TokenId close) {
+    auto answer = compile(schema);
+    std::lock_guard lock(impl_->mutex);
+    if (!impl_->gate || impl_->gate->close != close) {
+        auto gate = std::make_shared<ReasoningGate>();
+        gate->close = close;
+        gate->stops = impl_->tokenizer->eos;
+        gate->separators = impl_->separators;
+        if (close < 0 || static_cast<std::size_t>(close) >= impl_->vocabulary || gate->stop(close)) {
+            throw std::invalid_argument("the reasoning close token must be a non-stop token of the JSON vocabulary");
+        }
+        impl_->gate = std::move(gate);
+    }
+    return std::make_shared<AfterReasoning>(impl_->gate, std::move(answer));
 }
 namespace {
 class ToolConstraintState final : public TokenConstraintState {

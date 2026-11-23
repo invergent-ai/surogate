@@ -6,6 +6,7 @@
 #include "family/impl/frontend/processor.h"
 #include "family/impl/frontend/test_access.h"
 #include "family/impl/frontend/tokenizer.h"
+#include "runtime/contract/constraint.h"
 
 #include <nlohmann/json.hpp>
 
@@ -890,6 +891,74 @@ int test_closed_thinking_parts() {
     failures += check(messages[3].reasoning_content == "current field" &&
                       messages[3].parts[0].text == current.parts[0].text,
                       "legacy tool response was mistaken for a new user turn");
+    return failures;
+}
+
+// response_format under thinking (JsonConstraintCompiler::compile_after), on the real vocabulary: the schema
+// waits for the reasoning the prompt opened, the model's own close token ends it, and the output splits into
+// the thought and the JSON answer as free text does.
+int test_json_after_reasoning() {
+    const auto& base = official_tokenizer_dir();
+    FrontendResources artifact;
+    artifact.tokenizer_json         = read_file((base + "/tokenizer.json").c_str());
+    artifact.tokenizer_config_json  = read_file((base + "/tokenizer_config.json").c_str());
+    artifact.generation_config_json = read_file((base + "/generation_config.json").c_str());
+    artifact.chat_template_jinja    = "{% for m in messages %}{{ m.role }}:{{ m.content }}\n{% endfor %}"
+                                      "{% if add_generation_prompt %}assistant:<think>\n{% endif %}";
+    auto config                     = nlohmann::json::parse(artifact.tokenizer_config_json);
+    config["chat_template"]         = artifact.chat_template_jinja;
+    artifact.tokenizer_config_json  = config.dump();
+    const Frontend frontend         = FrontendFactory::create_component(artifact, false);
+    sinfer::ChatMessage question;
+    question.role = sinfer::ChatRole::User;
+    question.parts.push_back({.kind = sinfer::MessagePartKind::Text, .text = "Is the report done? Answer in JSON."});
+    sinfer::PromptInput input;
+    input.messages.push_back(std::move(question));
+    input.options.add_generation_prompt = true;
+    input.options.enable_thinking       = true;
+    const auto prompt = frontend.prepare(std::move(input));
+    int failures = check(FrontendFactory::inspect(prompt).starts_in_reasoning,
+                         "a prompt that ends inside <think> was not marked as starting in reasoning");
+    const auto constraint = frontend.compile_json_constraint_after_reasoning(
+        R"({"type":"object","properties":{"done":{"type":"boolean"}},"required":["done"],"additionalProperties":false})");
+    const std::optional<sinfer::TokenId> close = frontend.token_id("</think>");
+    failures += check(constraint != nullptr && close.has_value(),
+                      "a model whose prompt opens <think> had no JSON constraint after its reasoning");
+    if (constraint == nullptr || !close) { return failures; }
+
+    std::vector<sinfer::TokenId> tokens = frontend.encode_fragment("The report has no links, so not yet.\n");
+    const std::size_t closed = tokens.size(); // the close token's index
+    tokens.push_back(*close);
+    for (const char* piece : {"\n\n", "{\"done\": false}"}) {
+        for (const sinfer::TokenId id : frontend.encode_fragment(piece)) { tokens.push_back(id); }
+    }
+    const std::vector<int> stops = official_tokenizer().default_stop_token_ids();
+    std::vector<std::int32_t> mask((official_tokenizer().vocabulary_size() + 31) / 32);
+    const auto allowed = [&](int id) { return ((static_cast<std::uint32_t>(mask[id / 32]) >> (id % 32)) & 1U) != 0; };
+    auto state  = constraint->create_state();
+    bool follows = true;
+    for (std::size_t i = 0; i < tokens.size(); ++i) {
+        state->fill(mask);
+        if (i == 0) {
+            failures += check(!stops.empty() && !allowed(stops.front()) && allowed(*close),
+                              "the reasoning could stop before closing, or could not close");
+        }
+        follows = follows && allowed(tokens[i]) && state->try_accept(tokens[i]);
+    }
+    failures += check(follows, "the constraint refused a thought, its close, the separator or the JSON after it");
+    state->fill(mask);
+    failures += check(allowed(stops.front()), "the finished JSON answer could not stop");
+    auto prose = constraint->create_state();
+    for (std::size_t i = 0; i <= closed; ++i) { prose->accept(tokens[i]); }
+    failures += check(!prose->try_accept(frontend.encode_fragment("Sure").front()),
+                      "prose was allowed once the reasoning closed");
+
+    auto session = frontend.make_output_session(prompt, {});
+    (void)session.preview(tokens, static_cast<std::uint32_t>(tokens.size()), sinfer::FinishReason::OutputLimit);
+    const PublishedOutput output = session.commit_preview();
+    failures += check(channel_text(output, sinfer::OutputChannel::Reasoning).starts_with("The report has no links") &&
+                          channel_text(output, sinfer::OutputChannel::Content) == "{\"done\": false}",
+                      "the JSON answer was not split from the reasoning before it");
     return failures;
 }
 
@@ -2311,6 +2380,7 @@ int main() {
     failures += test_jinja_template_reasoning_effort();
     failures += test_jinja_thinking_retention();
     failures += test_closed_thinking_parts();
+    failures += test_json_after_reasoning();
     failures += test_text_and_image_prepare(frontend);
     failures += test_media_admission_uses_aggregate_resources(frontend);
     failures += test_multimodal_prompt_over_removed_32k_cap(frontend);

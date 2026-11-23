@@ -95,6 +95,17 @@ void convert_dtype(nv_bfloat16* target, const half* source, std::size_t size) {
     convert_dtype_launcher(target, source, size, /*stream=*/0);
 }
 
+/**
+ * @brief Converts FP16 (half) array to FP32.
+ *
+ * @param[out] target Destination array in FP32.
+ * @param[in] source Source array in FP16.
+ * @param size Number of elements to convert.
+ */
+void convert_dtype(float* target, const half* source, std::size_t size) {
+    convert_dtype_launcher(target, source, size, /*stream=*/0);
+}
+
 void convert_dtype(float* target, const nv_bfloat16* source, std::size_t size, cudaStream_t stream) {
     convert_dtype_launcher(target, source, size, stream);
 }

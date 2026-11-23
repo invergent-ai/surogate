@@ -53,6 +53,19 @@ void FP4Quantizer::quantize(const Tensor& input, QuantizedTensor& output, cudaSt
 }
 
 void FP4Quantizer::dequantize(const QuantizedTensor& input, Tensor& output, cudaStream_t stream) {
+    if (input.component_rows > 0 && !input.component_scales.is_null()) {
+        // Stacked from independently quantized components (e.g. routed experts): one global each.
+        dequantize_fp4_block_grouped(output.get<nv_bfloat16>(),
+                                     input.data.get<uint8_t>(),
+                                     input.scales.get<__nv_fp8_e4m3>(),
+                                     input.component_scales.get<float>(),
+                                     input.component_rows,
+                                     input.M,
+                                     input.K,
+                                     mDeviceProps,
+                                     stream);
+        return;
+    }
     dequantize_fp4_block(output.get<nv_bfloat16>(),
                          input.data.get<uint8_t>(),
                          input.scales.get<__nv_fp8_e4m3>(),

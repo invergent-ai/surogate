@@ -148,8 +148,8 @@ struct LoRAAdamW8BitState {
 
     Tensor state1;   // signed char (int8) - softsign-quantized momentum
     Tensor state2;   // unsigned char (uint8) - sqrt-quantized variance
-    Tensor scales1;  // FP16 per-group scales for momentum
-    Tensor scales2;  // FP16 per-group scales for variance
+    Tensor scales1;  // FP32 per-group scales for momentum
+    Tensor scales2;  // FP32 per-group scales for variance
 
     // Multi-tensor optimizer buffers (device memory)
     // Pre-allocated arrays of pointers/sizes to avoid per-step CPU work
