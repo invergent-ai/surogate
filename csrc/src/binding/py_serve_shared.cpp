@@ -69,6 +69,7 @@ public:
         options.enable_auto_tool_choice = true;
         options.max_loras = 1;
         options.max_lora_rank = nb::cast<std::uint32_t>(settings["rank"]);
+        options.max_expert_lora_rank = setting("expert_rank", 0); // 0 = max_lora_rank (Inkling: SkyRL's r64 / r16)
         options.log_stats_interval_ms = 0;
         device_ = options.device;
         std::vector<std::pair<std::uintptr_t, std::uintptr_t>> ranges;

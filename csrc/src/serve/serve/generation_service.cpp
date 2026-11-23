@@ -567,6 +567,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
         engine_options.lora_enable   = true;
         engine_options.lora_slots    = options_.max_loras;
         engine_options.lora_max_rank = options_.max_lora_rank;
+        engine_options.lora_max_expert_rank = options_.max_expert_lora_rank;
         if (!options_.lora_modules.empty()) {
             LoraRegistry registry;
             std::vector<std::pair<std::string, std::string>> modules;

@@ -8,7 +8,8 @@
 // pointer. Each layer's projection has its own, which makes the pointer a
 // sufficient identity and leaves every projection signature unchanged.
 //
-// Every bank is padded to (slots, max_rank), so a shorter adapter is zero-padded
+// Every bank is padded to (slots, max_rank) -- or to its binding's own smaller rank
+// (ModuleBinding::rank; Inkling's expert banks) -- so a shorter adapter is zero-padded
 // rather than given a narrower bank. That costs a little memory -- a rank-8
 // adapter in a rank-64 bank wastes seven eighths of its slot, and the slot is
 // kilobytes -- and buys the thing that matters: one launch geometry regardless of
@@ -45,7 +46,7 @@ public:
 
     /// Writes one adapter's A/B into `slot` of the bank for `base_key`, creating
     /// the bank on first use. `a` is [rank, in] and `b` is [out, rank] in host
-    /// BF16; both are zero-padded up to the bank's max_rank. `scale` (PEFT's
+    /// BF16; both are zero-padded up to the bank's rank (max_rank unless its binding names one). `scale` (PEFT's
     /// alpha/r) is folded into A here, once.
     /// `port` distinguishes outputs that share a base weight. q, k and v come out
     /// of one fused projection, so the weight pointer alone cannot say which of
@@ -68,6 +69,12 @@ public:
         std::int32_t row_offset = 0;
         std::int32_t row_group = 0;
         std::int32_t row_stride = 0;
+        // This bank's rank: 0 = the store's max_rank (every target but Inkling's experts). A smaller
+        // rank gives the bank (slots, rank) instead of (slots, max_rank), and an adapter module of a
+        // larger rank is refused for it. ONLY kernels that read LoraBank::rank may see such a bank: today the
+        // Inkling expert kernels. The attention delta, Qwen's MoE and the generic hooks take store.max_rank()
+        // as the rank and B's row stride, so their bindings must leave this 0.
+        std::int32_t rank = 0;
         [[nodiscard]] std::int32_t checkpoint_out() const noexcept { return source_out ? source_out : out; }
         [[nodiscard]] std::int32_t source_row(std::int32_t i) const noexcept {
             return row_group ? row_offset + (i / row_group) * row_stride + i % row_group
@@ -299,10 +306,14 @@ public:
     void set_active(bool active) noexcept { active_.store(active, std::memory_order_relaxed); }
     [[nodiscard]] std::int32_t slots() const noexcept { return slots_; }
     [[nodiscard]] std::int32_t max_rank() const noexcept { return max_rank_; }
+    /// The rank a binding's bank is built at (ModuleBinding::rank, or max_rank when it names none).
+    [[nodiscard]] std::int32_t binding_rank(const ModuleBinding& binding) const noexcept {
+        return binding.rank > 0 ? binding.rank : max_rank_;
+    }
     /// The device this store's memory lives on, or -1 before anything is built.
     [[nodiscard]] int device() const noexcept { return device_; }
-    /// Device bytes ensure_banks has allocated so far: every bank at every slot and the
-    /// maximum rank, plus the round state.
+    /// Device bytes ensure_banks has allocated so far: every bank at every slot and its
+    /// bank's rank, plus the round state.
     [[nodiscard]] std::size_t device_bytes() const noexcept;
     /// The calling thread's current CUDA device.
     [[nodiscard]] static int current_device();

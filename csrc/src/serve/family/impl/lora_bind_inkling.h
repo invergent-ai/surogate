@@ -18,6 +18,9 @@
 //                                 A shared (the kit's recipe: r16 / alpha 32 on gate_up_proj + down_proj)
 //   mlp.experts.<e>.gate_proj / up_proj  [1152, 2304] (split adapters, if an exporter writes them)
 //   mlp.experts.<e>.down_proj     [2304, 1152]
+// Bank rank: `expert_rank` (--max-expert-lora-rank; 0 = --max-lora-rank) sizes every expert bank, so an engine can
+// serve attention adapters at a higher rank than the experts' (SkyRL's preset: attention r64, experts r16) without
+// padding 128 x 3 expert banks a layer to the attention rank. The expert kernels read each bank's own rank.
 // Plain LoRA only: the kernels read A and B (alpha/r folded into A by the store), never a bank's gain /
 // bias rows, and no base view is registered, so a DoRA magnitude or a bias is refused at load
 // (`prepare_affine` -> "adapter base projection was not registered"). The router takes no adapter.
@@ -40,15 +43,21 @@ inline constexpr std::int32_t kInklingExpertLoraPort = 100;
 /// Registers physical layer `layer`'s expert adapters (both formats: the banks are BF16 on the
 /// GEMMs' activation sides, so their shapes do not depend on the expert codec). Call inside the
 /// engine's construction window, before `ensure_banks` (as `bind_lora_moe`).
-inline void bind_lora_inkling_moe(ops::LoraStore& store, int layer, const ops::InklingMoeWeights& weights) {
+inline void bind_lora_inkling_moe(ops::LoraStore& store, int layer, const ops::InklingMoeWeights& weights,
+                                  std::int32_t expert_rank = 0) {
     using G       = ops::InklingMoeGeometry;
     using Binding = ops::LoraStore::ModuleBinding;
     if (weights.router == nullptr) {
         throw std::invalid_argument("inkling expert LoRA: the layer's router weight (the bank key) is not bound");
     }
-    if (store.max_rank() > G::kMaxAdapterRank) {
-        throw std::invalid_argument("inkling expert LoRA supports --max-lora-rank up to " +
-                                    std::to_string(G::kMaxAdapterRank));
+    if (expert_rank < 0 || expert_rank > store.max_rank()) {
+        throw std::invalid_argument("inkling expert LoRA: --max-expert-lora-rank must lie in [0, --max-lora-rank]");
+    }
+    const std::int32_t rank = expert_rank > 0 ? expert_rank : store.max_rank();
+    if (rank > G::kMaxAdapterRank) {
+        throw std::invalid_argument("inkling expert LoRA supports an expert rank up to " +
+                                    std::to_string(G::kMaxAdapterRank) +
+                                    " (--max-lora-rank, or --max-expert-lora-rank when it is set)");
     }
     const void* key = weights.router;
     std::vector<Binding> table(2); // [0] router, [1] bias: no adapter
@@ -58,9 +67,10 @@ inline void bind_lora_inkling_moe(ops::LoraStore& store, int layer, const ops::I
     }
     for (std::int32_t expert = 0; expert < G::kExperts; ++expert) {
         const std::int32_t port = kInklingExpertLoraPort + 3 * expert;
-        const Binding gate{key, port, G::kHidden, G::kIntermediate};
-        const Binding up{key, port + 1, G::kHidden, G::kIntermediate};
-        const Binding down{key, port + 2, G::kIntermediate, G::kHidden};
+        Binding gate{key, port, G::kHidden, G::kIntermediate};
+        Binding up{key, port + 1, G::kHidden, G::kIntermediate};
+        Binding down{key, port + 2, G::kIntermediate, G::kHidden};
+        gate.rank = up.rank = down.rank = expert_rank; // 0 = the store's max_rank (unchanged default)
         const std::string prefix = "mlp.experts." + std::to_string(expert) + ".";
         store.register_module(layer, prefix + "gate_proj", gate);
         store.register_module(layer, prefix + "up_proj", up);
@@ -96,9 +106,12 @@ inline const ops::InklingMoeAdapters* inkling_moe_round_adapters(const ops::Inkl
     const ops::LoraStore& store = ops::lora_store_for_current_device();
     const ops::LoraBank* table  = store.bank_table(weights.router);
     if (table == nullptr) { return nullptr; }
+    // The expert banks' rank (all of a table's banks share it): the store's max_rank unless the engine set
+    // --max-expert-lora-rank. It sizes the call's low-rank workspace, exactly as max_rank did before.
+    const ops::LoraBank* host = store.host_bank_table(weights.router);
     storage = {};
     storage.table    = table;
-    storage.max_rank = store.max_rank();
+    storage.max_rank = host != nullptr ? host[2].rank : store.max_rank();
     if (round.slots != nullptr) {
         if (first_column < 0 || first_column >= round.slots->ne[0]) {
             throw std::invalid_argument("inkling expert LoRA: the call's columns lie outside the round's slots");

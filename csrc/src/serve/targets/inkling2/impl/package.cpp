@@ -71,12 +71,18 @@ void bind_lora(const detail::LoadedModelData& data, const EngineOptions& options
     if (!options.lora_enable && options.lora_payloads.empty()) { return; }
     ops::LoraStore& store = ops::lora_store_for_current_device();
     family::configure_lora_store(store, options);
+    // The attention delta kernel (ops::inkling_lora_delta) serves ranks 1..64 and reads the store's max_rank as its rank:
+    // refuse a larger --max-lora-rank here, at startup, rather than at the first adapter round.
+    if (store.max_rank() > 64) {
+        throw std::invalid_argument("inkling2 attention LoRA supports --max-lora-rank up to 64");
+    }
     for (std::size_t index = 0; index < data.weights.layers.size(); ++index) {
         const load::InklingLayerWeights& L = data.weights.layers[index];
         if (L.router.qdata == nullptr) { continue; } // not resident on this device
         ops::InklingMoeWeights key;
         key.router = L.router.qdata;
-        family::bind_lora_inkling_moe(store, static_cast<int>(index), key);
+        family::bind_lora_inkling_moe(store, static_cast<int>(index), key,
+                                      static_cast<std::int32_t>(options.lora_max_expert_rank));
         // Attention (vLLM parity): the six qkvr slices under their checkpoint names, the fused `attn.qkvr` twin, wo_ud.
         using Binding = ops::LoraStore::ModuleBinding;
         using C       = detail::TextConfig;
