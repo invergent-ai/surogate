@@ -118,7 +118,7 @@ _VALUE_OPTIONS = {
         --log-stats-interval-ms --max-request-mib --media-cache-mib --media-live-mib
         --media-preprocess-threads --request-log-jsonl --kv-cache-dtype --kv-cache-dtype-skip-layers
         --default-max-tokens --reasoning-parser --tool-call-parser --chat-template --rope-scaling
-        --model-priority --model --lora-modules --max-loras --max-lora-rank
+        --model-priority --model --lora-modules --max-loras --max-lora-rank --max-expert-lora-rank
         --decision-temperature --decision-attempts --gpu-memory-limit-mib --openrouter-models-file
         --kv-admission --kv-admission-headroom --kv-admission-watermark --lora-swap --moe-route
         --overlong-max-tokens --prefix-cache-host-gb --thinking-answer-reserve
