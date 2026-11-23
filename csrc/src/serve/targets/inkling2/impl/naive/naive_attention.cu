@@ -1,4 +1,4 @@
-// NAIVE Inkling-2 attention (lane e1; replaced by lane c's kernels): `inkling_attention_prologue`,
+// NAIVE Inkling-2 attention (replaced by the Inkling attention kernels): `inkling_attention_prologue`,
 // `inkling_rel_attention` and `inkling_gate_sink` of inkling_ref.py, one CTA per column (prologue) and per
 // (column, head) (attention), fp32 throughout. Correctness only.
 

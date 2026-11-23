@@ -279,7 +279,11 @@ void attention_backward_flash_kvprefix(nv_bfloat16* dqkv,
                                        int num_segs = 1,
                                        int max_seqlen_q = 0,
                                        int max_seqlen_k = 0,
-                                       int dq_splits = 0);  ///< deterministic only; 0 = FA2 heuristic
+                                       int dq_splits = 0,  ///< deterministic only; 0 = FA2 heuristic
+                                       // Ordered dQ (cmake/patch_flash_attn.sh): [num_segs][Hq][m_stride] int32, zeroed;
+                                       // replaces the deterministic split accumulators with one fp32 dQ (dq_splits 1).
+                                       int* dq_semaphore = nullptr,
+                                       int dq_semaphore_m_stride = 0);
 
 // Reduce Hq-expanded dK/dV over the whole prefix into FP32 Hkv accumulators.
 void accum_add_dkv(float* dk_accum,

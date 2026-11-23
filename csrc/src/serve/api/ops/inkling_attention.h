@@ -1,16 +1,16 @@
 #pragma once
 
-// Inkling-2-Mini attention (ENGINE-INKLING lane c): the fused prologue, the relative-bias attention
+// Inkling-2-Mini attention: the fused prologue, the relative-bias attention
 // (prefill / decode / verify), the gate-and-sink epilogue, the log-n query scale tau, the load-time
 // relative-projection table, and (PROPOSED) the attention projections.
 //
-// Semantics: the python functions of the same names in rl/engine-inkling-2026-11-21/ref/inkling_ref.py,
-// which follow vLLM's Inkling2 sm_120 path (ref/src/vllm/models/inkling2/nvidia/ops/{sconv,norm,
+// Semantics: the python functions of the same names in the Python reference inkling_ref.py (not in this repository),
+// which follow vLLM's Inkling2 sm_120 path (vllm/models/inkling2/nvidia/ops/{sconv,norm,
 // attention,attention_sm90}.py). Rounding points and the reasons for every choice below:
-// rl/engine-inkling-2026-11-21/lanes/c/DESIGN-attention.md (section numbers cited as "D<n>").
+// the attention design notes (not in this repository; section numbers cited as "D<n>").
 //
-// STATUS: M1 header approved by agent-EN (7e7d4e1a); M2 revision aligns the rows / conv-state / call
-// shape with lane e1's VisitRound contract (lanes/e1/DESIGN-target.md section 4 c): one call per visit,
+// STATUS: M1 header approved (7e7d4e1a); M2 revision aligns the rows / conv-state / call
+// shape with the target's VisitRound contract (target design notes, section 4 c): one call per visit,
 // InPlace / Record conv modes on the visit's LinearAttentionStatePool slots, tau from positions inside.
 //
 // Layout convention (this engine's): the FIRST dimension is the fastest. "[128, 24, N]" is N columns
@@ -86,7 +86,7 @@ enum class InklingLayerKind : std::uint8_t {
  * value (it is a field of InklingAttentionRows, which both entry points take). Global / local group sizes:
  * P1 512 / 128; P2 2,048 (8,192 from key 65,536) / 256; P3 512 below key 65,536, 2,048 to 131,072, 8,192 beyond / 128;
  * P4 (measurement) P3 / 64; P5 (measurement) 256 below 65,536 then P3 / 128. Default = the process default: the
- * compiled kInklingDefaultKeyGroups = P3, FROZEN by lane h's price session (2026-11-21 14:1x: P3 mean -0.93 % vs the
+ * compiled kInklingDefaultKeyGroups = P3, FROZEN by a price measurement (2026-11-21: P3 mean -0.93 % vs the
  * non-invariant BASE, worst +1.1 % at 1x262k; P1 +5.4 %, P2 +10.8 % on their worst probes). P1 / P2 / P4 / P5 are
  * test / measurement options only. SUROGATE_INKLING_ATTN_GROUPS (p1 .. p5), if set when the process first uses these
  * ops, overrides the default (read once; a test override).
@@ -112,7 +112,7 @@ inline constexpr InklingKeyGroups kInklingDefaultKeyGroups = InklingKeyGroups::P
  * empty Tensor meaning every row has W valid columns. `kv_table_rows` is contiguous I32 [B]: the row of
  * the plane's block-table matrix each sequence is on.
  *
- * `envelope` is the same host promise gqa_attention takes (lane e1's VisitBlock carries it); only its
+ * `envelope` is the same host promise gqa_attention takes (the target's VisitBlock carries it); only its
  * `max_visible_keys` is read (the layer kind, not the envelope, decides the window), and only by the
  * prefill route (W > kMaxSmallColumns) and the workspace query: a decode / verify launch plans from
  * (B, W, kind) alone, so a CUDA graph captured for a bucket replays at any context length up to it.
@@ -122,14 +122,12 @@ struct InklingAttentionRows {
     Tensor valid_columns;
     Tensor kv_table_rows;
     GqaExecutionEnvelope envelope{};
-    /// Caller's promise (default false): positions, valid_columns, kv_table_rows and the plane's block tables were
-    /// complete before the step's FIRST kernel (host copies), and the plane's keys before each row's first position
-    /// were written by earlier steps. The attention then reads them before its programmatic-dependency wait and asks
-    /// L2 for its first old blocks, overlapping the prologue. Same bits either way.
+    /// NO EFFECT (2026-11-21): the attention kernels read rows, tables and keys only after their dependency wait, whatever
+    /// the caller sets here. The field stays until its callers are cleaned up.
     bool metadata_static = false;
     /// The key-group cut (see InklingKeyGroups); engine and trainer must pass the same value.
     InklingKeyGroups key_groups = InklingKeyGroups::Default;
-    /// Optional persistent state (lane d's InklingMoeOptions::state pattern): device memory of
+    /// Optional persistent state (the InklingMoeOptions::state pattern): device memory of
     /// inkling_attention_state_bytes() bytes, ZEROED ONCE by the caller when allocated, written by nothing else, never
     /// shared by two calls in flight (one per stream; calls on one stream are ordered). Not the transient workspace.
     /// With it the decode / verify split route's last-CTA fold takes its arrival counters from here and the last CTA
@@ -144,7 +142,7 @@ struct InklingAttentionRows {
 
 /**
  * Process-wide tuning knobs of these ops: read ONCE from the environment when the process first uses them
- * (SUROGATE_INKLING_ATTN_GROUPS / _SPLITS / _CTAS / _PARTIAL_MB / _L2AHEAD / _PDL_TRIGGER / _VARIANT / _EARLY_META,
+ * (SUROGATE_INKLING_ATTN_GROUPS / _SPLITS / _CTAS / _PARTIAL_MB / _L2AHEAD / _PDL_TRIGGER / _VARIANT,
  * SUROGATE_INKLING_PREFILL_KS), never per call. Every knob changes the plan or the speed only, never the bits, except
  * `variant` (a numerics experiment; 17 = production) and `default_groups` (the cut for rows that pass Default).
  * Tests and benches may edit them between calls through inkling_attention_knobs(): not thread safe, never in serving.
@@ -157,16 +155,16 @@ struct InklingAttentionKnobs {
     int l2_ahead                    = -1;   // blocks asked of L2 ahead (-1: off; measured slower on every route)
     bool pdl_trigger                = true; // trigger dependents at kernel entry
     int variant                     = 17;   // numerics variant bits (production 17)
-    bool early_meta                 = true; // honour InklingAttentionRows::metadata_static
+    bool early_meta                 = true; // NO EFFECT (2026-11-21): the early metadata read is deleted; kept for the layout
     std::size_t partial_cap_bytes   = std::size_t{1} << 30; // split-route partials above this -> one worker
     // Prefill route (W > 16) only: split partials above this -> one worker (SUROGATE_INKLING_ATTN_PREFILL_PARTIAL_MB,
-    // default 64). Bounds the workspace an 8,192-column chunk reserves at long context (agent-EN 15:4x: the 1 GiB cap
+    // default 64). Bounds the workspace an 8,192-column chunk reserves at long context (measured: the 1 GiB cap
     // reserved 1,025 MiB at 262k); a wide chunk has CTAs from its columns, a narrow tail at long context runs unsplit.
     std::size_t prefill_partial_cap_bytes = std::size_t{64} << 20;
     // Decode / verify split route: the last worker CTA of a (row, KV head) folds its 3 x W rows (no fold_kernel launch)
     // when W x slots <= this (SUROGATE_INKLING_ATTN_FUSED_FOLD; 0 = fold_kernel always). Same bits either way.
-    // Default 0: measured SLOWER than fold_kernel under graphs + PDL (perf18 16:0x: global 1x8k 18.2 -> 20.5 us, local
-    // 6.0 -> 6.7, verify W8 19.6 -> 29.6; lanes/c/NOTES.md PERF LOG).
+    // Default 0: measured SLOWER than fold_kernel under graphs + PDL (global 1x8k 18.2 -> 20.5 us, local
+    // 6.0 -> 6.7, verify W8 19.6 -> 29.6).
     int fused_fold_max = 0;
     // inkling_attn_linear, N <= 16: the cell-split narrow kernel (a row tile's cells over several warps, joined in cell
     // order) for 0 = no projection, 1 = wo_ud (K = 3,072) only, 2 = wo_ud and qkvr (SUROGATE_INKLING_LINEAR_SPLIT). Same
@@ -180,19 +178,42 @@ struct InklingAttentionKnobs {
     // fold_kernel: rows of <= 32 slots take the scan-free path (SUROGATE_INKLING_ATTN_FOLD_FAST=0 = always the scan).
     // Same bits either way.
     bool fold_fast = true;
+    // inkling_attn_linear, N > 16 (SUROGATE_INKLING_LINEAR_GEMM): 0 = gemm_kernel (x = MMA operand A), 1 = gemm_t_kernel
+    // (codes = operand A in fragment order from a shared widen pass, x = operand B), 2 = gemm_t_kernel widening each
+    // warp's own A fragments (no widened tile). Same bits on every route (test attn_linear width: 0 bit-different).
+    // Default 2 by measurement (gemm2, one RTX 5090, graph, us, gemm 0 / 1 / 2): qkvr N=8192 channel 1718 / 1607 /
+    // 1496, 1x128 1874 / 1771 / 1658; qkvr N=4096 channel 863 / 809 / 754; wo N=8192 channel 618 / 592 / 549.
+    int linear_gemm = 2;
+    // Decode / verify with one row tile (W <= 5), not the in-kernel prologue (SUROGATE_INKLING_ATTN_DECODE_RAW): 0 =
+    // register-staged blocks (one block's codes in flight), 1 = the cp.async raw ring (two blocks in flight; ~72 KB smem:
+    // one CTA an SM) when workers x 8 x B <= SMs, 2 = the ring always. Same bits either way.
+    // Measured SLOWER (raw1, one RTX 5090, meta 1, us, raw 0 / 2): local 1x8k 6.4 / 7.4, global 1x8k 18.4 / 19.1, local
+    // 8x8k 15.6 / 21.0, global 1x64k 94.5 / 106.0, verify W3 local 6.3 / 7.0 -> default 0 (kept, tested bitwise).
+    // (Those timings predate 2026-11-21, when the ring still staged old blocks before the PDL wait.) The environment accepts
+    // 0 only: a nonzero value throws at the knobs' first read (engine load: workspace sizing). Only the op test selects
+    // 1 / 2, by setting this field.
+    int decode_raw = 0;
+    // Fused fold arrival (fused_fold_max > 0 only; SUROGATE_INKLING_ATTN_FOLD_FENCE_LIGHT): fence.acq_rel.gpu + a relaxed
+    // atomic (Marlin's barrier pattern) instead of __threadfence (MEMBAR.SC.GPU + CCTL.IVALL) + atomicAdd. Same bits.
+    bool fold_fence_light = true;
+    // Narrow attn_linear x loads (SUROGATE_INKLING_LINEAR_X): 0 = plain ld.global (production), 1 = ld.global.nc (the
+    // earlier form the compiler hoisted above the PDL wait: FP8-route decode garbage; TEST-ONLY negative control),
+    // 2 = ld.global.cg (correct, measured 1.4-2.4x slower). The environment accepts 0 and 2 only: value 1 throws at the
+    // knobs' first read (engine load: workspace sizing); only the op test selects 1, by setting this field.
+    int linear_x_nc = 0;
 };
 [[nodiscard]] InklingAttentionKnobs& inkling_attention_knobs();
 
 /// InPlace (prefill, decode, the narrow MTP round): each row's slot is read, then replaced by the
 /// window after its last valid column. Record (speculative verify): the slot is only read; every valid
-/// column's raw K / V input is written to `records`, and lane e1's fold commits the accepted prefix.
+/// column's raw K / V input is written to `records`, and the target's fold commits the accepted prefix.
 enum class InklingConvMode : std::uint8_t {
     InPlace,
     Record,
 };
 
 /**
- * The K / V short-convolution state of one visit (lane e1's LinearAttentionStatePool, DESIGN-target.md
+ * The K / V short-convolution state of one visit (the target's LinearAttentionStatePool, DESIGN-target.md
  * section 2: per visit and slot BF16 [6656, 3], channels [K 0..1023 | V 1024..2047 | attn | mlp], oldest
  * tap first, values = the bf16 conv INPUTS).
  *
@@ -256,7 +277,7 @@ struct InklingAttentionWeights {
 };
 
 /**
- * THE call per visit (lane e1's contract, DESIGN-target.md 4 c): prologue + attention + gate and sink.
+ * THE call per visit (the target's contract, design section 4 c): prologue + attention + gate and sink.
  * Writes the visit's K / V to `cache`, updates or records the conv state, and writes `out` = contiguous
  * BF16 [3072, N], the wo_ud input (invalid columns and idle rows exact zero). Forms as gqa_attention A1:
  * a decode / verify block (B rows of W <= 16 columns) or a prefill segment (B = 1, W = its length).
@@ -276,7 +297,7 @@ void inkling_attention(const InklingProjections& projections, const InklingAtten
                                                                      GqaExecutionEnvelope envelope,
                                                                      InklingKeyGroups key_groups = InklingKeyGroups::Default);
 
-// ---- The component ops (op tests against lane a's vectors; also callable on their own). ------------
+// ---- The component ops (op tests against the reference's vectors; also callable on their own). ------------
 
 /// Prologue outputs: q_out BF16 [128, 24, N] (clipped, tau-scaled) and r_out BF16 [16, 24, N]
 /// (clipped, tau-scaled), both contiguous. Read by inkling_rel_attention of the same visit.
@@ -370,7 +391,7 @@ void inkling_rel_attention_out_lse(const InklingAttentionInputs& inputs, Inkling
                                    Tensor& out, Tensor& lse, cudaStream_t stream);
 
 /**
- * Training entry (agent-EN 11:3x; lane g1b's engine-op IR): THE production attention -- same plan, kernels and per-row
+ * Training entry (the trainer's engine-op IR): THE production attention -- same plan, kernels and per-row
  * arithmetic as inkling_rel_attention on every route -- writing in the same pass the gated output `out` (contiguous
  * BF16 [3072, N]), the pre-gate output `o` (contiguous FP32 [128, 24, N]) and the natural `lse` (contiguous FP32
  * [24, N]); invalid columns and idle rows are zero in all three. Bitwise: out == inkling_rel_attention's, o / lse ==
@@ -400,7 +421,7 @@ void inkling_attention_train(const InklingProjections& projections, const Inklin
                              cudaStream_t stream);
 
 /**
- * DSpark draft block attention (agent-EN-e2b, 13:35; ref/dspark_ref.py DSparkRef.attention): q BF16 [128, 24, N]
+ * DSpark draft block attention (dspark_ref.py DSparkRef.attention): q BF16 [128, 24, N]
  * contiguous (N = W * B; W = the 8 block columns of a lane), keys from the draft plane (paged unit-scale FP8 e4m3, the
  * block's own K / V already written there at [P_b, P_b + 8)). Every column of a lane passes the block's last position
  * P_b + 7 in rows.positions, so all its rows see one key set. window = 0: global; else keys with pos - key < window
@@ -442,16 +463,16 @@ void inkling_rel_proj_table(const Tensor& rel_proj, Tensor& table, cudaStream_t 
 /**
  * Test and debug only: the dense relative logits rel[d, h, n] = bf16(r_out[:, h, n] . rel_proj[:, d])
  * for d in [0, 1024), FP32-accumulated on the same k16 MMA the attention kernels use -- the `rel`
- * tensor of lane a's PrologueOut. `rel` contiguous BF16 [1024, 24, N].
+ * tensor of the reference's PrologueOut. `rel` contiguous BF16 [1024, 24, N].
  */
 void inkling_rel_logits(const Tensor& r_out, const Tensor& rel_table, Tensor& rel,
                         cudaStream_t stream);
 
-// ---- The FP8 attention projections (D6; agent-EN 08:2x: lane c's, per-channel and 1x128 cells first). ------
+// ---- The FP8 attention projections (D6; per-channel and 1x128 cells first). ------
 
 /**
  * One projection of a visit: out[0:rows, n] = W[row_begin : row_begin + rows, :] . x[:, n], rows = out.ne[0].
- * x: contiguous, 16-byte aligned BF16 [K, N]. weight: an FP8 attention object as lane b binds it -- the block
+ * x: contiguous, 16-byte aligned BF16 [K, N]. weight: an FP8 attention object as the weight bindings bind it -- the block
  * route's Weight (QuantLayout::Fp8Block128, e4m3 codes [n][k], fp32 scale grid, cell scale_ne = (k, 1)
  * per-channel / (128, 1) 1x128 / (128, 128) 128x128). out: BF16 [rows, N], dim 0 contiguous, any column stride
  * (a slice of a larger output). BF16 weights (the oracle path) are not taken here: ops::linear / linear_rows.

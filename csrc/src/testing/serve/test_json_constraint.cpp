@@ -71,5 +71,55 @@ int main() {
     }
     state->fill(mask);
     assert(allowed(256));
-    std::cout << "JSON masks, completion, isolation, local recursion, and unsupported schemas passed\n";
+
+    // compile_after: the reasoning region a prompt opened stays the model's own until its close token.
+    std::vector<std::string> thinking_vocab = vocab;
+    thinking_vocab.push_back("");     // 257: the close token, special (it spells no JSON text)
+    thinking_vocab.push_back("\n\n"); // 258: the separator a template writes after it
+    JsonConstraintCompiler thinking(thinking_vocab, {256});
+    const std::string object = R"({"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false})";
+    auto gated = thinking.compile_after(object, 257)->create_state();
+    gated->fill(mask);
+    assert(allowed('x') && allowed('{') && allowed(257) && allowed(258) && !allowed(256)); // any text but a stop
+    for (unsigned char token : std::string("Free text, even {\"ok\": maybe")) { gated->accept(token); }
+    assert(!gated->try_accept(256) && !gated->stopped());
+    auto before_close = gated->fork();
+    gated->accept(257);
+    gated->fill(mask);
+    assert(allowed('{') && allowed(258) && allowed('\n') && !allowed('x') && !allowed(256));
+    gated->accept(258);
+    gated->fill(mask);
+    assert(allowed('{') && !allowed(258) && !allowed('x')); // one separator, then the schema
+    for (unsigned char token : std::string("{\"ok\":true}")) {
+        gated->fill(mask);
+        assert(allowed(token));
+        gated->accept(token);
+    }
+    gated->fill(mask);
+    assert(allowed(256) && !allowed('x'));
+    gated->accept(256);
+    assert(gated->stopped());
+    before_close->fill(mask);
+    assert(allowed('x') && !allowed(256)); // a fork keeps its own phase
+    auto direct = thinking.compile_after(object, 257)->create_state();
+    direct->accept(257);
+    assert(!direct->try_accept('x') && direct->try_accept('{')); // the answer may start right after the close
+    // Speculative drafts across the close: each column is masked by the phase its prefix reaches.
+    auto drafting = thinking.compile_after(object, 257)->create_state();
+    std::vector<int32_t> draft_masks(9 * 4);
+    drafting->fill_draft_masks(std::vector<TokenId>{'a', 257, '{'}, draft_masks);
+    const auto draft_allowed = [&](std::size_t column, int token) {
+        return (static_cast<uint32_t>(draft_masks[column * 9 + token / 32]) >> (token % 32)) & 1U;
+    };
+    assert(draft_allowed(0, 'x') && !draft_allowed(0, 256) && draft_allowed(1, 257));
+    assert(draft_allowed(2, '{') && draft_allowed(2, 258) && !draft_allowed(2, 'x'));
+    assert(draft_allowed(3, '"') && !draft_allowed(3, 'x'));
+    drafting->fill(mask);
+    assert(allowed('x')); // draft exploration never advances the live state
+    for (const TokenId bad : {TokenId{256}, TokenId{-1}, TokenId{259}}) {
+        bool rejected = false;
+        try { (void)thinking.compile_after(object, bad); } catch (const std::invalid_argument&) { rejected = true; }
+        assert(rejected);
+    }
+    std::cout << "JSON masks, completion, isolation, local recursion, unsupported schemas and JSON after reasoning passed\n";
 }

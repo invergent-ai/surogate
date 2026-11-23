@@ -1,4 +1,4 @@
-# agent-EN-f2 (ENGINE-INKLING lane f2), 2026-11-21.
+# Inkling-2 reference driver, 2026-11-21.
 # Reference driver: runs INSIDE the vLLM image vllm/vllm-openai:inkling-2-mini-x86_64-7cb5dae (CPU only, no card,
 # --network none) and reproduces what that vLLM server does with an OpenAI chat request for Inkling-2-Mini, using the
 # server's own classes, without the GPU-only ModelConfig:

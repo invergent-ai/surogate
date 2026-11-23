@@ -1,6 +1,6 @@
-// ENGINE-INKLING lane f2: the native Inkling-2 frontend against vLLM's own Python, token for token.
+// The native Inkling-2 frontend against vLLM's own Python, token for token.
 //
-// Vectors (rl/engine-inkling-2026-11-21/vectors, made by tools/inkling_ref_driver.py inside the vLLM Inkling image):
+// Vectors (not in this repository; made by tools/inkling_ref_driver.py inside the vLLM Inkling image):
 //   renderer/*.json          request body -> prompt token ids (or the request error vLLM raises)
 //   renderer/tokenizer/tokenize.jsonl   text -> ids (special tokens split, and parsed)
 //   parser/*.json            output token ids + request -> detokenized text, reasoning, content, tool calls, finish
@@ -77,7 +77,7 @@ std::string first_diff(const std::vector<int>& a, const std::vector<int>& b) {
     return o.str();
 }
 
-// The renderer vectors to check against: renderer-099 (owner rule 2026-11-21 17:40: a request that sets no reasoning
+// The renderer vectors to check against: renderer-099 (the engine's default since 2026-11-21: a request that sets no reasoning
 // effort renders at 0.99; those vectors expect vLLM's ids for the same body with chat_template_kwargs.reasoning_effort
 // = 0.99, every other vector is vLLM's own as in renderer/). renderer/ (vLLM's default 0.9) only where 099 is missing.
 fs::path renderer_set(const fs::path& vectors) {

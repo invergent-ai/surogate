@@ -1,4 +1,4 @@
-"""the step's process machinery on the fake model: two spawned workers == two inline workers bitwise (shared sums, segment tensors over the pipe);
+"""The step's process machinery on the fake model: two spawned workers == two inline workers bitwise (shared sums, segment tensors over the pipe);
 a gate failure in a worker arrives as T8GateError; a dead worker ends the step with an error, it does not hang."""
 import copy
 import os

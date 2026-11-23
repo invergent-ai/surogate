@@ -1,5 +1,5 @@
 #pragma once
-// Inkling-2 (inkling2_loop) weight bindings: lane b's half of the target (ARTIFACT.md, interface I-1).
+// Inkling-2 (inkling2_loop) weight bindings: the loader half of the target (ARTIFACT.md, interface I-1).
 //
 // Two steps, as every target binds:
 //   bind_artifact()  -- requires every object of the artifact with its format and shape, chooses a placement
@@ -7,7 +7,7 @@
 //                       `inkling2/config.json` resource into `ArtifactConfig`. Host only: no device is touched.
 //   load_weights()   -- after materialisation: the physical weight sets as Weights / Tensors / raw pointers.
 //
-// The 24 PHYSICAL layers are bound once. The 48 visits (lane e1's served geometry) point at these structs; a core
+// The 24 PHYSICAL layers are bound once. The 48 visits (the target's served geometry) point at these structs; a core
 // layer's three passes share one weight set (and so one LoRA bank: the Weights alias the same bytes).
 // Every value is the checkpoint's word: the AttnRes / cross-pass queries are RAW (the consumer applies the
 // reference's 2304^-0.5), the NVFP4 per-expert global is the raw amax + denominator, never folded.
@@ -32,7 +32,7 @@ namespace sinfer::targets::inkling2::load {
 enum class ExpertFormat : std::uint8_t { Nvfp4, Mxfp8 };
 
 /// The attention projection weights to serve. Bf16 = the faithful oracle path (always in the artifact);
-/// Fp8 = the artifact's `attn/fp8-<scheme>/...` objects (owner ruling 06:58: the default once DESIGN 10.1 has
+/// Fp8 = the artifact's `attn/fp8-<scheme>/...` objects (the default once DESIGN 10.1 has
 /// picked the scheme).
 struct AttentionChoice {
     bool fp8 = false;
@@ -157,14 +157,14 @@ struct BindOptions {
     /// Bind the DSpark drafter to the device (MTP on); otherwise its objects are validated only.
     bool draft = false;
     /// The drafter's dense linears (q k v o k_ctx v_ctx gate up down) in a mapped host bank instead of the device: the
-    /// target re-quantises them to FP8 on the device at load (lane e2, DSpark FP8 drafter weights).
+    /// target re-quantises them to FP8 on the device at load (DSpark FP8 drafter weights).
     bool draft_linears_host = false;
     /// Placement of one physical layer's objects (a pipeline stage keeps its own visits' layers; a core layer
     /// is needed by every stage that runs one of its passes). Unset: the placement in force for every layer.
     std::function<artifact::TensorPlacement(std::int32_t layer)> layer_placement;
     /// Placement of the embedding / norms / head / queries. Unset: the placement in force.
     std::optional<artifact::TensorPlacement> globals_placement;
-    /// A pipeline stage's share of the globals (the 2-card path, lanes/e1/DESIGN-2card.md); each unset one takes
+    /// A pipeline stage's share of the globals (the 2-card path); each unset one takes
     /// `globals_placement`, so a 1-card engine places exactly what it placed before.
     ///  embedding:     `text/embedding` + `text/embedding_norm` -- the stage that embeds (the first). A DSpark
     ///                 drafter reads the anchor's normalized embedding too: its stage needs the rows (or this group).

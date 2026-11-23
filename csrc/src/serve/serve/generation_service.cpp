@@ -195,6 +195,11 @@ void validate_routing_request(const GenerationRequest& request) {
     }
 }
 
+// Inkling-2 images: the per-prompt count the serving layer checks before fetching any image (vLLM's default for
+// --limit-mm-per-prompt). The frontend enforces its configured limit (FrontendOptions::image_limit_per_prompt) with
+// vLLM's words; this bound only keeps an over-limit request from being fetched first.
+constexpr std::uint64_t kInklingServiceImageLimit = 999;
+
 [[noreturn]] void throw_preparation_cancelled();
 
 [[noreturn]] void throw_media_error(const sinfer::product::media_acquire::Error& exception) {
@@ -562,6 +567,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
         engine_options.lora_enable   = true;
         engine_options.lora_slots    = options_.max_loras;
         engine_options.lora_max_rank = options_.max_lora_rank;
+        engine_options.lora_max_expert_rank = options_.max_expert_lora_rank;
         if (!options_.lora_modules.empty()) {
             LoraRegistry registry;
             std::vector<std::pair<std::string, std::string>> modules;
@@ -671,9 +677,9 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
                 const std::vector<sinfer::TokenId> separator = engine_->encode_fragment("\n\n");
                 thinking_guard_close_.insert(thinking_guard_close_.end(), separator.begin(), separator.end());
             } else if (inkling_vocabulary_ && close_text == "<|end_message|>") {
-                // Inkling-2 opens every block after a thought with <|message_model|>: in agent-IK's 24,609 real
+                // Inkling-2 opens every block after a thought with <|message_model|>: in 24,609 real
                 // replies with a thinking block the model never ended right after it, and vLLM's own token counts
-                // match that header before every block (rl/engine-inkling-2026-11-21/lanes/f2/guard/).
+                // match that header before every block (measured on recorded sessions).
                 thinking_guard_close_.push_back(inkling_vocabulary_->tokens.message_model);
             }
         } else {
@@ -768,7 +774,11 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& original,
         }
         try {
             prepared.inkling_request = std::make_shared<const sinfer::family::frontend_internal::inkling::ChatRequest>(
-                sinfer::family::frontend_internal::inkling::parse_chat_request(*request.raw_chat_body));
+                sinfer::family::frontend_internal::inkling::parse_chat_request(
+                    *request.raw_chat_body,
+                    // Vision on: the frontend enforces the configured per-prompt count with vLLM's words; off: vLLM at
+                    // image limit 0 ("At most 0 image(s) may be provided in one prompt.").
+                    options_.enable_vision ? kInklingServiceImageLimit : 0));
         } catch (const std::invalid_argument& error) {
             throw ApiException(ApiError{.status = 400, .message = error.what()});
         }
@@ -1131,6 +1141,16 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& request,
                                            std::function<bool()> is_cancelled,
                                            const PreparationGate& before_prepare) const {
     validate_token_media(request);
+    if (inkling_vocabulary_ && request.raw_chat_body && !request.raw_chat_images.empty()) {
+        // As prepare(): vLLM's renderer refuses an image request at image limit 0 in its own words, before the
+        // vision gate below and before any image is fetched.
+        try {
+            (void)sinfer::family::frontend_internal::inkling::parse_chat_request(
+                *request.raw_chat_body, options_.enable_vision ? kInklingServiceImageLimit : 0);
+        } catch (const std::invalid_argument& error) {
+            throw ApiException(ApiError{.status = 400, .message = error.what()});
+        }
+    }
     const bool request_has_media = request.media_item_count() != 0;
     if (request_has_media && !options_.enable_vision) {
         const std::invalid_argument error("Vision is disabled for this server");
@@ -1185,7 +1205,7 @@ vllm_qwen3::Result GenerationService::vllm_qwen3_parse(const PreparedRequest& pr
     vllm_qwen3::Result parsed = vllm_qwen3::parse(input, *qwen3_vocabulary_, prepared.tools);
     // SUROGATE_SERVE_TOOL_PARSE_TRACE=FILE: one JSON line per parsed generation -- the parser's input (token ids,
     // text, tools, tool_choice, thinking) and its result -- so the parse can be checked against vLLM's own parser
-    // offline (rl/engine-goal-2026-10-19/toolcall/check_trace.py).
+    // offline.
     static const char* trace_path = std::getenv("SUROGATE_SERVE_TOOL_PARSE_TRACE");
     if (trace_path != nullptr) {
         static std::mutex trace_mutex;

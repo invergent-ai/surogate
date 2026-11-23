@@ -1,4 +1,4 @@
-"""S3: the base trainer's per-visit recompute (ift_long.visit_torch_long, copied unchanged apart from the lines marked T8) with the S10 attention
+"""S3: the engine-op trainer's per-visit recompute (ift_long.visit_torch_long, copied unchanged apart from the lines marked T8) with the S10 attention
 LoRA of the engine (targets/inkling2/impl/lora_attention.h, ops::inkling_lora_delta): on the six qkvr slices (q, r, gate, sink from x_q;
 k from x_k; v from x_v) after the base projection, and on wo_ud from the gated attention output, each as out = bf16(float(bf16(base)) + delta),
 delta = fp32 (x . a) . b with a = bf16(bf16(A) x alpha / r) (the store's fold; exact for alpha / r = 0.5) and b = bf16(B). Gradients for A and B

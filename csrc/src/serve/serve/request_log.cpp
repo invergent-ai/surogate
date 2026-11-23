@@ -553,8 +553,12 @@ std::string format_server_start_json(
     const std::string& server_instance_id, std::uint64_t timestamp, const ServeOptions& options,
     const sinfer::ModelSamplingDefaults& sampling_defaults, const std::string& public_model_id,
     const sinfer::LoadSummary& load, const sinfer::MemorySummary& memory,
-    const ServerLogEnvironment& environment, std::optional<std::uint64_t> artifact_size_bytes) {
+    const ServerLogEnvironment& environment, std::optional<std::uint64_t> artifact_size_bytes,
+    std::optional<bool> kv_on_demand_effective) {
     Json record = event_base(server_instance_id, timestamp, "server_start");
+    // What the engine does, not what the option asks: a default DSpark engine holds OnDemand here and reserves.
+    const bool kv_on_demand =
+        kv_on_demand_effective.value_or(options.kv_admission.mode != sinfer::KvAdmission::Reserve);
 
     Json artifact_size = nullptr;
     if (artifact_size_bytes.has_value()) { artifact_size = *artifact_size_bytes; }
@@ -599,7 +603,7 @@ std::string format_server_start_json(
           {"max_concurrency", options.max_concurrency},
           {"max_pending_requests", options.max_pending_requests},
           {"pending_timeout_ms", options.pending_timeout_ms},
-          {"kv_admission", options.kv_admission.mode == sinfer::KvAdmission::Reserve ? "reserve" : "ondemand"},
+          {"kv_admission", kv_on_demand ? "ondemand" : "reserve"},
           {"kv_admission_headroom_tokens", options.kv_admission.headroom_tokens},
           {"kv_admission_watermark", options.kv_admission.watermark},
           {"prefill_chunk", options.prefill_chunk},
@@ -780,7 +784,8 @@ void JsonlRequestLog::write_server_start(const ServeOptions& options,
                                          const sinfer::ModelSamplingDefaults& sampling_defaults,
                                          const std::string& public_model_id,
                                          const sinfer::LoadSummary& load,
-                                         const sinfer::MemorySummary& memory) {
+                                         const sinfer::MemorySummary& memory,
+                                         bool kv_on_demand_effective) {
     if (!enabled()) { return; }
     std::error_code error;
     const std::uintmax_t size = std::filesystem::file_size(options.artifact_path, error);
@@ -788,7 +793,8 @@ void JsonlRequestLog::write_server_start(const ServeOptions& options,
         error ? std::nullopt : std::optional<std::uint64_t>(size);
     append(format_server_start_json(server_instance_id_, unix_time_ms(), options, sampling_defaults,
                                     public_model_id, load, memory,
-                                    query_server_log_environment(options.device), artifact_size));
+                                    query_server_log_environment(options.device), artifact_size,
+                                    kv_on_demand_effective));
 }
 
 void JsonlRequestLog::write_request_start(const RequestLogContext& context) {

@@ -97,6 +97,9 @@ enum class KvAdmission : std::uint8_t {
 
 struct KvAdmissionOptions {
     KvAdmission mode               = KvAdmission::OnDemand;
+    /// Set only by an explicit --kv-admission ondemand. A DSpark engine stays on Reserve without it
+    /// (window-bounded KV): its recompute has not been shown on every route. No other engine reads it.
+    bool explicit_on_demand        = false;
     /// Decode tokens a request is entitled to beyond its prompt when it is admitted.
     std::uint32_t headroom_tokens  = 256;
     /// Fraction of the KV pool an admission leaves free while other requests run, so their
@@ -235,6 +238,8 @@ struct EngineOptions {
     /// launch geometry the projection hooks and a captured graph both need.
     std::uint32_t lora_slots    = 0;
     std::uint32_t lora_max_rank = 0;
+    /// The routed-expert banks' rank where a target sizes them apart (Inkling-2-Mini); 0 = lora_max_rank.
+    std::uint32_t lora_max_expert_rank = 0;
     /// Prepare the adapter machinery even with no adapters named: banks are
     /// preallocated and the delta kernels captured, so adapters loaded later
     /// through the runtime endpoints work under the graphs recorded at startup.
@@ -324,7 +329,7 @@ struct EngineOptions {
     // under automatic sizing) and every page past it is admitted through a device-wide gate
     // on free memory, so co-resident engines share the device's idle KV.
     bool elastic_kv_overcommit         = false;
-    // Lane f1: set by the pipeline on each stage when its explicit kv_capacity is the shared
+    // Window KV: set by the pipeline on each stage when its explicit kv_capacity is the shared
     // resolution of `--kv-capacity auto` (construct_pipeline). The stage then plans as under auto
     // where that matters -- an elastic window class (layouts_impl.h kv_window_elastic) -- which is
     // what the preflight that resolved the shared capacity assumed. False everywhere else.
@@ -462,6 +467,12 @@ public:
 struct ExecutionOptions {
     /// Empty means unconstrained output; otherwise a JSON Schema for the generated text.
     std::string json_schema;
+    /// With json_schema and a prompt that opened a reasoning region: the reasoning stays the model's own, the
+    /// schema constrains the answer after the model's close token, and the output is split into the two as
+    /// for free text (vLLM's structured outputs under a reasoning parser). Otherwise -- false, a prompt that
+    /// opens no region, or a model with no single close token -- the schema constrains the output from its
+    /// first token, all of it answer text.
+    bool json_after_reasoning = false;
     /// Native tool-call delimiters and argument schemas; mutually exclusive with json_schema.
     std::string structural_tag;
     SamplingOverrides sampling;
@@ -704,6 +715,10 @@ struct PromptOptions {
 struct PromptInput {
     std::vector<ChatMessage> messages;
     PromptOptions options;
+    /// The images of `options.raw_chat_request` (Inkling-2 vision): their bytes, acquired by the serving
+    /// layer from the body's image_url / input_image parts, in the body's order (message order, part order). Empty for
+    /// every other checkpoint, whose media travel inside `messages`.
+    std::vector<OwnedMedia> raw_chat_media;
 };
 
 struct PromptSummary {
@@ -1063,6 +1078,12 @@ struct RuntimeStats {
     std::uint32_t kv_granule_pages             = 0;
     std::uint32_t kv_pages_resident_at_granule = 0;
     std::size_t kv_page_bytes                  = 0;
+    // Elastic window class (M3-C) of the main pool; zero without one (see PagedKVOccupancy).
+    std::uint32_t kv_window_mapped_pages       = 0;
+    std::uint32_t kv_window_charged_pages      = 0;
+    std::uint32_t kv_window_floor_pages        = 0;
+    std::uint32_t kv_window_granule_pages      = 0;
+    std::size_t kv_window_page_bytes           = 0;
     // Times the queue head could not be given a lane although the admission ledger found it
     // unblocked -- it is waiting on pages the ledger cannot attribute, most often KV still
     // committed to a retained GPU prefix. A benign retry, but a rising count means admission

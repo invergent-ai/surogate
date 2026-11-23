@@ -1,9 +1,9 @@
-// Inkling-2-Mini relative-bias attention (ENGINE-INKLING lane c): ONE batch- and path-invariant per-row arithmetic
+// Inkling-2-Mini relative-bias attention: ONE batch- and path-invariant per-row arithmetic
 // for decode, MTP verify, prefill, chunked prefill and the trainer's forward; the group fold; the gate-and-sink
-// epilogue. Semantics: api/ops/inkling_attention.h; numerics: lanes/c/DESIGN-attention.md section 1 (A1-A7).
+// epilogue. Semantics: api/ops/inkling_attention.h; numerics: attention design notes, section 1 (A1-A7).
 // Reference: vLLM's ops/attention_sm90.py `_rel_attention_kernel`, ops/attention.py `_gate_sink_kernel`.
 //
-// INVARIANCE (agent-EN decision 10:2x, FEASIBILITY-ANSWER.md; lanes/c/NOTES.md "INVARIANT ATTENTION"). The bits of a
+// INVARIANCE. The bits of a
 // row (query token x head) depend only on its own q / r / gate / sink, its position and the keys in the plane --
 // never on the batch, the width W, the envelope, the chunk cut, the split count or the other rows of a tile:
 // - Keys go in fixed GROUPS whose boundaries depend only on the absolute key position (GroupSpec from the call's
@@ -110,7 +110,7 @@ struct AttnParams {
     // div.rn (else div.full), 16 lse with accurate log2f (else lg2.approx), 32 l = l * alpha + sum unfused.
     int variant;
     int l2_ahead;    // blocks asked of L2 ahead of their loads (SUROGATE_INKLING_ATTN_L2AHEAD, default 4; 0 = off)
-    int metadata_static; // InklingAttentionRows::metadata_static: rows / tables / old keys readable before the PDL wait
+    int reserved_metadata; // always 0 (was metadata_static; the slot keeps every kernel's parameter offsets)
     int window;          // Local: keys with pos - key < window (1,024; the DSpark draft's 1,032)
     int pdl_trigger; // trigger dependents at entry (SUROGATE_INKLING_ATTN_PDL_TRIGGER, default 1)
     // Decode split route with the fused fold: per (row b, KV head) arrival counters [B][8], zero when the kernel starts
@@ -118,6 +118,7 @@ struct AttnParams {
     std::int32_t* fold_counters;
     int final_mode; // the fused fold's output (kGated / kOutLse / kTrain / kDraft)
     int fold_fast;  // fold_kernel's scan-free path for short rows (InklingAttentionKnobs::fold_fast)
+    int fold_fence_light; // fused fold arrival: fence.acq_rel.gpu + relaxed atomic (else __threadfence + atomicAdd)
     // In-kernel prologue (plain decode, W = 1, InPlace; the fused call only): the prologue's parameters. Each CTA forms
     // its 3 heads' q / r itself (q_values / r_value: prologue_kernel's functions) and the CTA whose groups hold the new
     // key runs kv_unit for its KV head (plane codes + the conv slot it alone reads). q / r stay in shared memory.
@@ -505,16 +506,11 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
     constexpr int kSS      = Smem::kStripStride;
     extern __shared__ __align__(16) unsigned char attn_smem_raw[];
     Smem& sm = *reinterpret_cast<Smem*>(attn_smem_raw);
-    // With static metadata (the caller's promise, InklingAttentionRows::metadata_static) the rows, the block tables and
-    // the keys before the round's first position are read before the programmatic-dependency wait (they were written
-    // before the step's first kernel); q / r / gate / sink and the round's own keys only after it.
-    const bool early_meta = p.metadata_static != 0;
-    if (!early_meta) {
-        pdl::wait_for_dependencies();
-        // Dependents (the fold, or the next op: the wo projection streams its weights before its own wait) may launch
-        // now; they read nothing of ours before their wait, which waits for this grid to finish.
-        if (p.pdl_trigger != 0) { pdl::trigger_dependents(); }
-    }
+    // Every load of this kernel (rows, block tables, positions, keys, q / r / gate / sink) follows the dependency wait.
+    pdl::wait_for_dependencies();
+    // Dependents (the fold, or the next op: the wo projection streams its weights before its own wait) may launch
+    // now; they read nothing of ours before their wait, which waits for this grid to finish.
+    if (p.pdl_trigger != 0) { pdl::trigger_dependents(); }
 
     const int tid  = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
@@ -585,10 +581,6 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
         if (g_start >= g_stop) {
             if constexpr (kFusable) {
                 if (p.fold_counters != nullptr && active == 0 && worker == 0) {
-                    if (early_meta) {
-                        pdl::wait_for_dependencies();
-                        if (p.pdl_trigger != 0) { pdl::trigger_dependents(); }
-                    }
                     fold_set<Local>(p, b, kvh, valid, attn_smem_raw, static_cast<int>(sizeof(Smem)));
                 }
             }
@@ -622,19 +614,43 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
         rg1[i]        = rvalid[i] ? group_of(gs, rpos[i]) : -1;
     }
 
-    if (early_meta) {
-        // Ask L2 for the first two blocks of this worker whose keys all precede the round (written by earlier steps),
-        // so their loads after the wait hit L2: the position -> table -> page -> code chain overlaps the prologue.
-        if (g_start < g_stop && (tid == 0 || tid == 32)) {
-            const int kb0 = max(group_begin(gs, g_start), lo) >> 6;
-            for (int kb = kb0; kb < kb0 + 2 && kb * kBn + kBn - 1 < pmin; ++kb) {
-                const std::int64_t off = kv_page_offset(table_row[(kb * kBn) >> kPageShift], kvh, 0);
-                prefetch_l2_bulk((tid == 0 ? p.k_pages : p.v_pages) + off, kBn * Geo::kHeadDim);
-            }
+    // Block cursor over the worker's groups, each group's blocks in key order.
+    struct Cursor {
+        int g, kb, kb_end;
+    };
+    const auto start = [&](Cursor& c, int g) {
+        c.g = g;
+        if (g < g_stop) {
+            c.kb     = max(group_begin(gs, g), lo) >> 6;
+            c.kb_end = ((min(group_begin(gs, g + 1), hi) - 1) >> 6) + 1;
         }
-        pdl::wait_for_dependencies();
-        if (p.pdl_trigger != 0) { pdl::trigger_dependents(); }
-    }
+    };
+    const auto advance = [&](Cursor& c) {
+        if (++c.kb == c.kb_end) { start(c, c.g + 1); }
+    };
+
+    // Land block kb's K and V codes in raw slot `slot`; keys outside [lo, hi) are zero-filled and never read.
+    const auto stage = [&](int kb, int slot) {
+        const int k0           = kb * kBn;
+        const std::int32_t pg  = table_row[k0 >> kPageShift];
+        const std::int64_t off = kv_page_offset(pg, kvh, k0 & (kPageTokens - 1));
+#pragma unroll
+        for (int i = 0; i < (2 * kBn * 8 + Threads - 1) / Threads; ++i) { // fixed trip count (unrolled)
+            const int c = tid + i * Threads;
+            if (c >= 2 * kBn * 8) { break; }
+            const int which = c / (kBn * 8);
+            const int cc    = c - which * (kBn * 8);
+            const int key   = cc >> 3;
+            const int part  = cc & 7;
+            const int kabs  = k0 + key;
+            std::uint8_t* dst = sm.raw + (slot * 2 + which) * (kBn * Geo::kHeadDim) + key * Geo::kHeadDim + part * 16;
+            const std::uint8_t* src = (which ? p.v_pages : p.k_pages) + off + key * Geo::kHeadDim + part * 16;
+            cp_async_zfill<16>(dst, src, (kabs >= lo && kabs < hi) ? 16 : 0);
+        }
+    };
+    // (Raw ring) Load cursor.
+    Cursor ld;
+    start(ld, g_start);
 
     // Q (eight k16 steps) and R fragments, in registers for the whole walk.
     unsigned af[QSmem ? 1 : 8][4];
@@ -746,40 +762,12 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
         for (int i = 0; i < DTW * 4; ++i) { sm.fold_a[warp][i][lane] = 0.0F; }
     }
 
-    // Block cursor over the worker's groups, each group's blocks in key order.
-    struct Cursor {
-        int g, kb, kb_end;
-    };
-    const auto start = [&](Cursor& c, int g) {
-        c.g = g;
-        if (g < g_stop) {
-            c.kb     = max(group_begin(gs, g), lo) >> 6;
-            c.kb_end = ((min(group_begin(gs, g + 1), hi) - 1) >> 6) + 1;
-        }
-    };
-    const auto advance = [&](Cursor& c) {
-        if (++c.kb == c.kb_end) { start(c, c.g + 1); }
-    };
-
-    // Land block kb's K and V codes in raw slot `slot`; keys outside [lo, hi) are zero-filled and never read.
-    const auto stage = [&](int kb, int slot) {
-        const int k0           = kb * kBn;
-        const std::int32_t pg  = table_row[k0 >> kPageShift];
-        const std::int64_t off = kv_page_offset(pg, kvh, k0 & (kPageTokens - 1));
-        for (int c = tid; c < 2 * kBn * 8; c += Threads) {
-            const int which = c / (kBn * 8);
-            const int cc    = c - which * (kBn * 8);
-            const int key   = cc >> 3;
-            const int part  = cc & 7;
-            const int kabs  = k0 + key;
-            std::uint8_t* dst = sm.raw + (slot * 2 + which) * (kBn * Geo::kHeadDim) + key * Geo::kHeadDim + part * 16;
-            const std::uint8_t* src = (which ? p.v_pages : p.k_pages) + off + key * Geo::kHeadDim + part * 16;
-            cp_async_zfill<16>(dst, src, (kabs >= lo && kabs < hi) ? 16 : 0);
-        }
-    };
     // Widen raw slot `slot` into the swizzled bf16 tiles (16-byte chunk c of key row k at c ^ (k & 7)).
     const auto widen = [&](int slot) {
-        for (int c = tid; c < 2 * kBn * 16; c += Threads) {
+#pragma unroll
+        for (int i = 0; i < (2 * kBn * 16 + Threads - 1) / Threads; ++i) { // fixed trip count (unrolled)
+            const int c = tid + i * Threads;
+            if (c >= 2 * kBn * 16) { break; }
             const int which = c / (kBn * 16);
             const int cc    = c - which * (kBn * 16);
             const int key   = cc >> 4;
@@ -1028,8 +1016,7 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
         l[0] = l[1] = 0.0F;
     };
 
-    Cursor ld, cu;
-    start(ld, g_start);
+    Cursor cu;
     start(cu, g_start);
     // Ask L2 for a block's K and V page slices (8 KB each, contiguous): one thread each, no registers.
     const auto prefetch_block_l2 = [&](int kb) {
@@ -1058,8 +1045,11 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
                     k[i] = ok ? __ldcg(reinterpret_cast<const int2*>(p.k_pages + o)) : make_int2(0, 0);
                     v[i] = ok ? __ldcg(reinterpret_cast<const int2*>(p.v_pages + o)) : make_int2(0, 0);
                 } else {
-                    k[i] = ok ? load_ldg<int2>(p.k_pages + o) : make_int2(0, 0);
-                    v[i] = ok ? load_ldg<int2>(p.v_pages + o) : make_int2(0, 0);
+                    // Weak ld.global.ca, not ld.global.nc: the round's newest keys are written by the prologue (the PDL
+                    // predecessor) and nc loads may be hoisted above the dependency wait (the FP8 decode bug; review R4
+                    // of M9: no LDG.CONSTANT on producer-written operands). Same bytes, still L1-cached.
+                    k[i] = ok ? __ldca(reinterpret_cast<const int2*>(p.k_pages + o)) : make_int2(0, 0);
+                    v[i] = ok ? __ldca(reinterpret_cast<const int2*>(p.v_pages + o)) : make_int2(0, 0);
                 }
             }
         };
@@ -1112,7 +1102,6 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
             }
         }
     } else {
-#pragma unroll
         for (int s = 0; s < Raw; ++s) {
             if (ld.g < g_stop) {
                 stage(ld.kb, s);
@@ -1203,12 +1192,26 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
             __shared__ int last_flag;
             __syncthreads();
             if (tid == 0) {
-                __threadfence();
                 std::int32_t* counter = p.fold_counters + b * Geo::kKvHeads + kvh;
-                last_flag             = atomicAdd(counter, 1) == active - 1 ? 1 : 0;
-                if (last_flag != 0) {
-                    *counter = 0; // every worker arrived: back to zero (persistent state)
+                if (p.fold_fence_light != 0) {
+                    // Marlin's barrier pattern (ops/linear/marlin/vendor/marlin_template.h barrier_release /
+                    // barrier_acquire): fence.acq_rel.gpu, then a relaxed gpu-scope atomic; the last arrival's own
+                    // fence.acq_rel.gpu orders its CTA's partial loads (after the barrier below) after every worker's.
+                    asm volatile("fence.acq_rel.gpu;" ::: "memory");
+                    int old = 0;
+                    asm volatile("atom.relaxed.gpu.global.add.s32 %0, [%1], 1;" : "=r"(old) : "l"(counter) : "memory");
+                    last_flag = old == active - 1 ? 1 : 0;
+                    if (last_flag != 0) {
+                        *counter = 0; // every worker arrived: back to zero (persistent state; next use = a later grid)
+                        asm volatile("fence.acq_rel.gpu;" ::: "memory");
+                    }
+                } else {
                     __threadfence();
+                    last_flag = atomicAdd(counter, 1) == active - 1 ? 1 : 0;
+                    if (last_flag != 0) {
+                        *counter = 0; // every worker arrived: back to zero (persistent state)
+                        __threadfence();
+                    }
                 }
             }
             __syncthreads();
@@ -1470,7 +1473,6 @@ InklingAttentionKnobs& knobs() {
         x.l2_ahead          = std::clamp(env_int("SUROGATE_INKLING_ATTN_L2AHEAD", -1), -1, 16);
         x.pdl_trigger       = env_int("SUROGATE_INKLING_ATTN_PDL_TRIGGER", 1) != 0;
         x.variant           = env_int("SUROGATE_INKLING_ATTN_VARIANT", 17);
-        x.early_meta        = env_int("SUROGATE_INKLING_ATTN_EARLY_META", 1) != 0;
         x.partial_cap_bytes = static_cast<std::size_t>(std::max(0, env_int("SUROGATE_INKLING_ATTN_PARTIAL_MB", 1024))) << 20;
         x.prefill_partial_cap_bytes =
             static_cast<std::size_t>(std::max(0, env_int("SUROGATE_INKLING_ATTN_PREFILL_PARTIAL_MB", 64))) << 20;
@@ -1478,6 +1480,25 @@ InklingAttentionKnobs& knobs() {
         x.linear_split      = std::clamp(env_int("SUROGATE_INKLING_LINEAR_SPLIT", x.linear_split), 0, 2);
         x.fused_prologue    = env_int("SUROGATE_INKLING_ATTN_FUSED_PROLOGUE", x.fused_prologue ? 1 : 0) != 0;
         x.fold_fast         = env_int("SUROGATE_INKLING_ATTN_FOLD_FAST", 1) != 0;
+        x.linear_gemm       = std::clamp(env_int("SUROGATE_INKLING_LINEAR_GEMM", x.linear_gemm), 0, 2);
+        // The decode raw ring is test-only (measured slower on every decode row). The environment never selects it, in any
+        // binary; the op test sets the knob field directly.
+        if (env_int("SUROGATE_INKLING_ATTN_DECODE_RAW", 0) != 0) {
+            throw std::invalid_argument(
+                std::string("SUROGATE_INKLING_ATTN_DECODE_RAW=") + std::getenv("SUROGATE_INKLING_ATTN_DECODE_RAW") +
+                " is refused: the raw-ring decode path is test-only (measured slower on every decode row). Unset it, or use 0 "
+                "(production).");
+        }
+        x.fold_fence_light  = env_int("SUROGATE_INKLING_ATTN_FOLD_FENCE_LIGHT", x.fold_fence_light ? 1 : 0) != 0;
+        // Mode 1 (ld.global.nc on x) is a known-broken negative control: FP8-route decode garbage (review R5 minor 10). The
+        // environment never selects it, in any binary; the op test sets the knob field directly.
+        const int linear_x  = env_int("SUROGATE_INKLING_LINEAR_X", x.linear_x_nc);
+        if (linear_x == 1) {
+            throw std::invalid_argument(
+                "SUROGATE_INKLING_LINEAR_X=1 is refused: it selects the known-broken ld.global.nc load of the attention "
+                "projection input (FP8-route decode garbage). Unset it, or use 0 (production) or 2 (ld.global.cg).");
+        }
+        x.linear_x_nc       = std::clamp(linear_x, 0, 2);
         return x;
     }();
     return k;
@@ -1514,6 +1535,8 @@ struct Plan {
     bool fused     = false; // decode split route: the last worker CTA folds (no fold_kernel launch)
     bool pro       = false; // the in-kernel prologue (set by the fused call; W = 1 rows)
     int counters   = 0;     // fused: arrival counters (8 per row)
+    int raw        = 0;     // decode / verify, one row tile (W <= 5): 2 = the cp.async raw ring (both blocks of a
+                            // 128-key group in flight at once), 0 = register staging
     dim3 grid;
 };
 
@@ -1566,21 +1589,28 @@ Plan make_plan(InklingLayerKind kind, const GroupSpec& gs, std::int32_t width, s
     // The fused fold where its one CTA's chains are short (InklingAttentionKnobs::fused_fold_max; same bits either way).
     plan.fused    = plan.decode && plan.workers > 1 && static_cast<long>(width) * plan.max_slots <= knobs().fused_fold_max;
     plan.counters = plan.fused ? Geo::kKvHeads * batch : 0;
+    // Raw-ring decode (InklingAttentionKnobs::decode_raw): ~72 KB of shared memory, one CTA an SM, so only where the grid
+    // fits one wave at one CTA an SM (auto) or always (2). Same bits either way.
+    const int draw = knobs().decode_raw;
+    if (plan.decode && plan.mtiles == 1 &&
+        (draw == 2 || (draw == 1 && static_cast<long>(plan.workers) * Geo::kKvHeads * batch <= sms))) {
+        plan.raw = 2;
+    }
     plan.grid = plan.decode ? dim3(static_cast<unsigned>(plan.workers), Geo::kKvHeads, static_cast<unsigned>(batch))
                             : dim3(static_cast<unsigned>((width + kPrefillRows - 1) / kPrefillRows), Geo::kQHeads,
                                    static_cast<unsigned>(batch * plan.workers));
     return plan;
 }
 
-template <bool Local, bool Decode, int MTiles, int KS, int Mode, bool Pro = false>
+template <bool Local, bool Decode, int MTiles, int KS, int Mode, bool Pro = false, int RawSel = -1>
 void launch_kernel(const Plan& plan, const AttnParams& p, cudaStream_t stream) {
-    constexpr int Raw   = (Decode || KS > 1) ? 0 : pick_raw<MTiles, KS, Mode != kPartial>();
+    constexpr int Raw   = RawSel >= 0 ? RawSel : (Decode || KS > 1) ? 0 : pick_raw<MTiles, KS, Mode != kPartial>();
     constexpr int bytes = static_cast<int>(sizeof(AttnSmem<MTiles, KS, Raw, Mode != kPartial, false>));
     static_assert(bytes <= kSmemLimit, "inkling attention: shared memory over the sm_120 limit");
     auto* kernel = rel_attention_kernel<Local, Decode, MTiles, KS, Mode, Raw, Pro>;
     // Per device (ops/kernel/func_attribute.cuh): the 2-card visit split launches this kernel on both cards; a
     // function-local static configured only the first and the second card's launch failed (cudaErrorInvalidValue,
-    // gpubox2 cards 5 + 6, 17:25).
+    // measured on two RTX 5090 cards).
     CUDA_CHECK(set_func_attribute_per_device(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
     const pdl::LaunchConfig launch{plan.grid, dim3(MTiles * KS * 32), static_cast<std::size_t>(bytes), stream};
     CUDA_CHECK(pdl::launch_dependent(launch, kernel, p));
@@ -1597,6 +1627,7 @@ void dispatch_mode(const Plan& plan, const AttnParams& p, cudaStream_t stream) {
         if constexpr (Mode == kGated || Mode == kPartial) {
             if (plan.pro) { return launch_kernel<Local, true, 1, 4, Mode, true>(plan, p, stream); }
         }
+        if (plan.raw == 2) { return launch_kernel<Local, true, 1, 4, Mode, false, 2>(plan, p, stream); }
         return launch_kernel<Local, true, 1, 4, Mode>(plan, p, stream);
     case 2: return launch_kernel<Local, true, 2, 2, Mode>(plan, p, stream);
     case 3: return launch_kernel<Local, true, 3, 2, Mode>(plan, p, stream);
@@ -1674,8 +1705,9 @@ AttnParams make_params(const InklingAttentionInputs& in, const InklingAttentionR
     p.variant         = k.variant & (1 | 8 | 16 | 32);
     p.l2_ahead        = std::clamp(k.l2_ahead, -1, 16); // -1: the route's default (run)
     p.pdl_trigger     = k.pdl_trigger ? 1 : 0;
-    p.metadata_static = (rows.metadata_static && k.early_meta) ? 1 : 0;
+    p.reserved_metadata = 0;
     p.fold_fast       = k.fold_fast ? 1 : 0;
+    p.fold_fence_light = k.fold_fence_light ? 1 : 0;
     p.window          = Geo::kWindow;
     return p;
 }

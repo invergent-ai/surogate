@@ -261,6 +261,16 @@ sinfer::PromptInput to_prompt_input(const GenerationRequest& request,
     input.options.add_vision_id         = false;
     input.options.tool_jsons            = effective_tool_jsons(request);
     input.options.raw_chat_request      = request.raw_chat_body;
+    if (request.raw_chat_body && !request.raw_chat_images.empty()) {
+        if (!acquire_media) { throw std::logic_error("media acquisition callback is not configured"); }
+        input.raw_chat_media.reserve(request.raw_chat_images.size());
+        for (const ContentPart& part : request.raw_chat_images) {
+            if (part.kind != ContentKind::Image) {  // a URL the chat parser could not take (collect_raw_chat_images)
+                throw ApiException(ApiError{.status = 400, .message = part.text, .param = "messages", .code = "invalid_media"});
+            }
+            input.raw_chat_media.push_back(acquire_media(part));
+        }
+    }
     return input;
 }
 
@@ -274,6 +284,9 @@ sinfer::RequestOptions to_request_options(const GenerationRequest& request,
          std::any_of(request.tools.begin(), request.tools.end(), [](const ToolDefinition& tool) { return tool.strict; }));
     // Match vLLM: tool-derived constraints take precedence over response_format.
     options.execution.json_schema = constrained_tools ? std::string{} : request.json_schema;
+    // vLLM's structured outputs wait for the end of the reasoning its reasoning parser reads: a thinking model
+    // reasons first and answers in the schema. Without a parser the output is one text, constrained throughout.
+    options.execution.json_after_reasoning = server.reasoning_format != ReasoningFormat::None;
     if (!options.execution.json_schema.empty() && (request.ignore_eos || request.min_tokens != 0 || !request.stop_strings.empty())) {
         invalid_sampling("JSON response formats require ignore_eos=false, min_tokens=0, and no custom stops", "response_format");
     }

@@ -5,7 +5,7 @@
 
 namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS {
 
-// ---- Window-bounded KV pages (lane f1; rl/engine-inkling-2026-11-21/lanes/f1/DESIGN-window-kv.md)
+// ---- Window-bounded KV pages (window-bounded KV design)
 
 bool ProgramImplCore::window_paging() const noexcept { return decoder->text_kv.pool().has_window_class(); }
 
@@ -93,7 +93,7 @@ std::vector<Tensor> ProgramImplCore::prefix_state_tensors(const SequenceState& s
     }
     if (linear == 0 && decoder->linear_attention.layer_count() != 0) {
         // Every served layer attends and still keeps a short-conv state of its own (Inkling: one
-        // per visit in the linear-attention pool, lanes/e1/DESIGN-target.md section 2): the state
+        // per visit in the linear-attention pool, target design notes, section 2): the state
         // layers are the served layers. No other target gets here: a hybrid stack has layers that
         // do not attend, a pure attention stack has no state layers.
         if (decoder->linear_attention.layer_count() != static_cast<std::uint32_t>(cfg.layers)) {

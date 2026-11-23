@@ -1,8 +1,12 @@
 #include "ops/parallel_rows.h"
 #include "api/ops/linear.h"
+#include "api/ops/linear_bias.h"
 
+#include "core/device.h"
 #include "ops/direct_bf16_weight.h"
 #include "ops/op_tester.h"
+
+#include <cuda_runtime.h>
 
 #include <algorithm>
 #include <cmath>
@@ -154,6 +158,119 @@ int run_bf16_linear() {
     return failures;
 }
 
+// The fused routes a vision tower's blocks take (ops::try_linear_epilogue,
+// ops::try_linear_bias_accumulate), at its four shapes, against an FP64 reference.
+enum class FusedKind { Bias, GeluTanhBias, BiasAccumulate };
+
+double gelu_tanh(double value) {
+    constexpr double kSqrt2OverPi = 0.79788456080286535588;
+    return 0.5 * value * (1.0 + std::tanh(kSqrt2OverPi * (value + 0.044715 * value * value * value)));
+}
+
+int run_bf16_fused_case(DeviceWeight& weight, std::int32_t tokens, FusedKind kind) {
+    const std::int32_t rows                          = weight.host.n;
+    const std::int32_t hidden                        = weight.host.k;
+    const std::vector<std::uint16_t> activation_bits = make_activation_bits(hidden, tokens);
+    const std::vector<float> activation              = materialize(activation_bits);
+    DeviceBuffer device_activation                   = to_device(activation_bits);
+    std::vector<std::uint16_t> bias_bits(static_cast<std::size_t>(rows));
+    for (std::int32_t row = 0; row < rows; ++row) {
+        bias_bits[static_cast<std::size_t>(row)] =
+            f32_to_bf16(static_cast<float>(((row * 37 + 11) % 97) - 48) * (1.0F / 64.0F));
+    }
+    DeviceBuffer device_bias = to_device(bias_bits);
+    // The accumulating form starts from a residual; the others must overwrite whatever is there.
+    std::vector<std::uint16_t> initial_bits(static_cast<std::size_t>(rows) * tokens);
+    for (std::size_t index = 0; index < initial_bits.size(); ++index) {
+        initial_bits[index] =
+            kind == FusedKind::BiasAccumulate
+                ? f32_to_bf16(static_cast<float>(static_cast<int>((index * 13 + 5) % 61) - 30) *
+                              (1.0F / 16.0F))
+                : static_cast<std::uint16_t>(0x7fc0); // NaN: must not leak through
+    }
+    GuardedDeviceBuffer guarded_output(initial_bits.size() * sizeof(std::uint16_t));
+    guarded_output.fill(0xff);
+    CUDA_CHECK(cudaMemcpy(guarded_output.data(), initial_bits.data(),
+                          initial_bits.size() * sizeof(std::uint16_t), cudaMemcpyHostToDevice));
+
+    Tensor x(device_activation.p, DType::BF16, {hidden, tokens});
+    Tensor bias(device_bias.p, DType::BF16, {rows});
+    Tensor output(guarded_output.data(), DType::BF16, {rows, tokens});
+    const char* name = kind == FusedKind::Bias           ? "bias"
+                       : kind == FusedKind::GeluTanhBias ? "gelu_tanh_bias"
+                                                         : "bias_accumulate";
+    const std::string label = std::string("BF16 fused ") + name + " [" + std::to_string(rows) +
+                              "," + std::to_string(hidden) + "] T=" + std::to_string(tokens);
+    const bool served =
+        kind == FusedKind::BiasAccumulate
+            ? ops::try_linear_bias_accumulate(x, weight.view(), bias, output, nullptr)
+            : ops::try_linear_epilogue(x, weight.view(), bias,
+                                       kind == FusedKind::Bias
+                                           ? ops::LinearEpilogue::Bias
+                                           : ops::LinearEpilogue::GeluTanhBias,
+                                       output, nullptr);
+    cuda_synchronize();
+    if (!served) {
+        // A plain contiguous BF16 weight with no adapter is exactly what the route exists for.
+        std::cerr << label << ": the fused route declined\n";
+        return 1;
+    }
+
+    int failures = guarded_output.verify_guards(label);
+    const std::vector<std::uint16_t> output_bits =
+        from_device<std::uint16_t>(guarded_output.data(), initial_bits.size());
+    std::vector<double> actual;
+    std::vector<double> expected;
+    for (const std::int32_t row : sampled_rows(rows)) {
+        for (const std::int32_t token : sampled_tokens(tokens)) {
+            const std::size_t at = static_cast<std::size_t>(token) * rows + row;
+            double value = dot_fp64(weight.host, row,
+                                    std::span<const float>(activation.data() +
+                                                               static_cast<std::size_t>(token) *
+                                                                   hidden,
+                                                           hidden)) +
+                           bf16_to_f32(bias_bits[static_cast<std::size_t>(row)]);
+            if (kind == FusedKind::GeluTanhBias) { value = gelu_tanh(value); }
+            if (kind == FusedKind::BiasAccumulate) { value += bf16_to_f32(initial_bits[at]); }
+            actual.push_back(bf16_to_f32(output_bits[at]));
+            expected.push_back(value);
+        }
+    }
+    failures += verify_reduction(label, actual, expected, kA16Tolerance);
+    if (from_device<std::uint16_t>(device_activation, activation_bits.size()) != activation_bits) {
+        std::cerr << label << " modified its activation\n";
+        ++failures;
+    }
+    failures += weight.verify_preserved(label + " weight");
+    return failures;
+}
+
+int run_bf16_fused() {
+    int failures = 0;
+    // The 1152-wide vision tower: qkv, attention output, fc1, fc2.
+    struct Shape {
+        std::int32_t n, k;
+        FusedKind kinds[2];
+        int kind_count;
+    };
+    const Shape shapes[] = {
+        {3456, 1152, {FusedKind::Bias}, 1},
+        {1152, 1152, {FusedKind::BiasAccumulate, FusedKind::Bias}, 2},
+        {4304, 1152, {FusedKind::GeluTanhBias}, 1},
+        {1152, 4304, {FusedKind::BiasAccumulate}, 1},
+    };
+    std::uint32_t seed = 421U;
+    for (const Shape& shape : shapes) {
+        DeviceWeight weight(make_patterned(shape.n, shape.k, seed++));
+        for (int index = 0; index < shape.kind_count; ++index) {
+            for (const std::int32_t tokens : {1, 17, 784, 3136}) {
+                failures += run_bf16_fused_case(weight, tokens, shape.kinds[index]);
+            }
+        }
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -163,9 +280,11 @@ int main() {
     }
 
     try {
-        const int failures = run_bf16_linear();
-        std::cout << (failures == 0 ? "OK" : "FAIL") << " BF16_A16 Linear\n";
-        return failures == 0 ? 0 : 1;
+        const int linear_failures = run_bf16_linear();
+        std::cout << (linear_failures == 0 ? "OK" : "FAIL") << " BF16_A16 Linear\n";
+        const int fused_failures = run_bf16_fused();
+        std::cout << (fused_failures == 0 ? "OK" : "FAIL") << " BF16 fused epilogue/accumulate\n";
+        return linear_failures + fused_failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
         std::cerr << "BF16_A16 Linear: " << error.what() << '\n';
         return 1;

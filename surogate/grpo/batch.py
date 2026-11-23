@@ -36,6 +36,19 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
     if training_example.completion_turn_ids is not None:
         turn_ids = [-1] * len(training_example.prompt_ids) + training_example.completion_turn_ids
 
+    trial_idx = None
+    if training_example.trial_idx is not None:
+        trial_idx = [int(training_example.trial_idx)] * len(input_ids)
+    group_idx = None
+    if training_example.group_idx is not None:
+        group_idx = [int(training_example.group_idx)] * len(input_ids)
+    policy_version = None
+    if training_example.completion_versions is not None:
+        if len(training_example.completion_versions) != len(training_example.completion_ids):
+            raise ValueError(f"completion_versions has {len(training_example.completion_versions)} entries for "
+                             f"{len(training_example.completion_ids)} completion tokens")
+        policy_version = [-1] * len(training_example.prompt_ids) + [int(v) for v in training_example.completion_versions]
+
     # Routing replay rows ride along token for token ([len, layers, top_k] int16 bytes).
     routed, dims = training_example.routed_experts, training_example.routed_experts_dims
     if routed is not None:
@@ -57,6 +70,12 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
             teacher_logprobs = teacher_logprobs[:seq_len]
         if turn_ids is not None:
             turn_ids = turn_ids[:seq_len]
+        if trial_idx is not None:
+            trial_idx = trial_idx[:seq_len]
+        if policy_version is not None:
+            policy_version = policy_version[:seq_len]
+        if group_idx is not None:
+            group_idx = group_idx[:seq_len]
         if routed is not None:
             routed = routed[: seq_len * 2 * int(dims[0]) * int(dims[1])]
 
@@ -75,6 +94,10 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         assert len(teacher_logprobs) == len(input_ids), f"teacher_logprobs: {len(teacher_logprobs)}"
     if turn_ids is not None:
         assert len(turn_ids) == len(input_ids), f"turn_ids: {len(turn_ids)}"
+    if trial_idx is not None:
+        assert len(trial_idx) == len(input_ids), f"trial_idx: {len(trial_idx)}"
+    if policy_version is not None:
+        assert len(policy_version) == len(input_ids), f"policy_version: {len(policy_version)}"
 
     return MicroBatch(
         input_ids=input_ids,
@@ -87,6 +110,9 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         turn_ids=turn_ids,
         routed_experts=routed,
         routed_experts_dims=dims,
+        trial_idx=trial_idx,
+        policy_version=policy_version,
+        group_idx=group_idx,
     )
 
 
@@ -157,6 +183,19 @@ def packed_samples_into_micro_bs(
                     if bin_content.turn_ids is None:
                         bin_content.turn_ids = [-1] * bin_len_before
                     bin_content.turn_ids.extend(sample.turn_ids or [-1] * len(sample.input_ids))
+                if bin_content.trial_idx is not None or sample.trial_idx is not None:
+                    # The same backfill: -1 marks tokens of samples without a trial index.
+                    if bin_content.trial_idx is None:
+                        bin_content.trial_idx = [-1] * bin_len_before
+                    bin_content.trial_idx.extend(sample.trial_idx or [-1] * len(sample.input_ids))
+                if bin_content.policy_version is not None or sample.policy_version is not None:
+                    if bin_content.policy_version is None:
+                        bin_content.policy_version = [-1] * bin_len_before
+                    bin_content.policy_version.extend(sample.policy_version or [-1] * len(sample.input_ids))
+                if bin_content.group_idx is not None or sample.group_idx is not None:
+                    if bin_content.group_idx is None:
+                        bin_content.group_idx = [-1] * bin_len_before
+                    bin_content.group_idx.extend(sample.group_idx or [-1] * len(sample.input_ids))
                 _extend_routing(bin_content, bin_len_before, sample)
                 bin_content.position_ids.extend(sample.position_ids)
                 bin_content.lora_num_tokens[idx] += len(sample.input_ids)
@@ -186,6 +225,12 @@ def pad_micro_batch(micro_batch: MicroBatch, pad_to_multiple_of: int) -> MicroBa
         micro_batch.teacher_logprobs.extend([0.0] * padding_size)
     if micro_batch.turn_ids is not None:
         micro_batch.turn_ids.extend([-1] * padding_size)
+    if micro_batch.trial_idx is not None:
+        micro_batch.trial_idx.extend([-1] * padding_size)
+    if micro_batch.policy_version is not None:
+        micro_batch.policy_version.extend([-1] * padding_size)
+    if micro_batch.group_idx is not None:
+        micro_batch.group_idx.extend([-1] * padding_size)
     if micro_batch.routed_experts is not None and micro_batch.routed_experts_dims:
         micro_batch.routed_experts += no_route_bytes(padding_size, micro_batch.routed_experts_dims)
     # Send padding to the last lora so tokens have ascending lora idx

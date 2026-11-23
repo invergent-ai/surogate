@@ -137,8 +137,8 @@ struct AdamW8BitOptimizer::Impl {
         bool use_zero_copy = false;
         Tensor state1;   // int8 softsign-quantized momentum
         Tensor state2;   // uint8 sqrt-quantized variance
-        Tensor scales1;  // FP16 per-group scales for momentum
-        Tensor scales2;  // FP16 per-group scales for variance
+        Tensor scales1;  // FP32 per-group scales for momentum
+        Tensor scales2;  // FP32 per-group scales for variance
     };
 
     /// Where one trainable parameter's state lives, and which of its elements this rank updates.
@@ -282,14 +282,14 @@ void AdamW8BitOptimizer::init_state(dsl::DslModel& model, cudaStream_t stream) {
     state.state2 =
         model.mAllocator->allocate(ETensorDType::BYTE, "adamw8bit_state2", alloc_kind, {(long)state.total_state_elems});
     state.scales1 =
-        model.mAllocator->allocate(ETensorDType::FP16, "adamw8bit_scales1", alloc_kind, {(long)state.num_groups});
+        model.mAllocator->allocate(ETensorDType::FP32, "adamw8bit_scales1", alloc_kind, {(long)state.num_groups});
     state.scales2 =
-        model.mAllocator->allocate(ETensorDType::FP16, "adamw8bit_scales2", alloc_kind, {(long)state.num_groups});
+        model.mAllocator->allocate(ETensorDType::FP32, "adamw8bit_scales2", alloc_kind, {(long)state.num_groups});
 
     init_flash_adamw8bit_state(reinterpret_cast<signed char*>(state.state1.template get<std::byte>()),
                                reinterpret_cast<unsigned char*>(state.state2.template get<std::byte>()),
-                               state.scales1.template get<half>(),
-                               state.scales2.template get<half>(),
+                               state.scales1.template get<float>(),
+                               state.scales2.template get<float>(),
                                state.total_state_elems,
                                stream);
 
@@ -545,8 +545,8 @@ void AdamW8BitOptimizer::update(dsl::DslModel& model,
         signed char* s1 = reinterpret_cast<signed char*>(state.state1.template get<std::byte>()) + slot.state_offset;
         unsigned char* s2 =
             reinterpret_cast<unsigned char*>(state.state2.template get<std::byte>()) + slot.state_offset;
-        half* sc1 = state.scales1.template get<half>() + group_offset;
-        half* sc2 = state.scales2.template get<half>() + group_offset;
+        float* sc1 = state.scales1.template get<float>() + group_offset;
+        float* sc2 = state.scales2.template get<float>() + group_offset;
 
         if (val.DType == ETensorDType::FP32) {
             if (grad_view.DType == ETensorDType::FP32) {

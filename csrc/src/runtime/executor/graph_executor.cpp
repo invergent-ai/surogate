@@ -1599,7 +1599,9 @@ long GraphExecutor::estimate_backward_stack_peak(long B, long T) {
     // flags (`large_bwd_temps_on_stack`, `ffn_temps_on_stack`) that used to
     // be queried via `mRunState`.
     compile_graphs(B, T);
-    return graph_backward_stack_peak(mCompiledBackward.get(), mRunState.buffer_plan());
+    return graph_backward_stack_peak(mCompiledBackward.get(), mRunState.buffer_plan(), [this](const std::string& param) {
+        return mWeights.is_trainable(param);
+    });
 }
 
 void GraphExecutor::set_internal_graphs_enabled(bool enabled) {
@@ -2061,6 +2063,22 @@ void GraphExecutor::set_sequence_chunk(int idx, int count, const IModel::ChunkPa
 
 void GraphExecutor::zero_sequence_chunk_dkv() {
     if (mCompiledExecutor) mCompiledExecutor->zero_sequence_chunk_dkv();
+}
+
+void GraphExecutor::zero_sequence_chunk_dkv(int lo, int hi) {
+    if (mCompiledExecutor) mCompiledExecutor->zero_sequence_chunk_dkv(lo, hi);
+}
+
+void GraphExecutor::save_sequence_chunk_state(int lo, int hi, int slot, int chunks) {
+    if (mCompiledExecutor) mCompiledExecutor->save_sequence_chunk_state(lo, hi, slot, chunks);
+}
+
+bool GraphExecutor::restore_sequence_chunk_state(int lo, int hi, int slot, int chunks) {
+    return mCompiledExecutor && mCompiledExecutor->restore_sequence_chunk_state(lo, hi, slot, chunks);
+}
+
+void GraphExecutor::invalidate_sequence_chunk_snapshots() {
+    if (mCompiledExecutor) mCompiledExecutor->invalidate_sequence_chunk_snapshots();
 }
 
 ExecutionResult GraphExecutor::execute_eval(const ExecutionRequest& request, NCCLCommunicator& comm) {
@@ -2537,20 +2555,20 @@ void GraphExecutor::set_skip_grad_reduce(bool skip) {
     if (mCompiledExecutor) mCompiledExecutor->set_skip_grad_reduce(skip);
 }
 
-std::vector<std::byte> GraphExecutor::read_named_bytes(const std::string& name) {
-    std::vector<std::byte> host;
+surogate::PinnedBytes GraphExecutor::read_named_bytes(const std::string& name) {
+    surogate::PinnedBytes host;
     if (!mCompiledExecutor) return host;
     const Tensor* t = mCompiledExecutor->try_get_tensor(name);
     if (!t || !t->Data || t->bytes() == 0) {
         return host;
     }
-    host.resize(t->bytes());
+    host.resize(t->bytes());  // pooled pinned block, not zero-filled: the copy below is one DMA
     CUDA_CHECK(cudaMemcpyAsync(host.data(), t->Data, t->bytes(), cudaMemcpyDeviceToHost, mRunState.MainStream));
     CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
     return host;
 }
 
-void GraphExecutor::set_inject_named(std::vector<std::pair<std::string, std::vector<std::byte>>> items) {
+void GraphExecutor::set_inject_named(StageBoundary items) {
     if (mCompiledExecutor) mCompiledExecutor->set_inject_named(std::move(items));
 }
 
@@ -2568,6 +2586,39 @@ void GraphExecutor::dispatch_reset_stack() {
 
 void GraphExecutor::reset_saved_cache() {
     if (mCompiledExecutor) mCompiledExecutor->reset_saved_cache();
+}
+
+std::size_t GraphExecutor::retire_saved_layers(int lo, int hi, const char* phase, int stage) {
+    if (!mCompiledExecutor) return 0;
+    const std::size_t retired =
+        mCompiledExecutor->retire_saved_layers(mCompiledForward.get(), mCompiledBackward.get(), lo, hi);
+    static const bool trace = [] {
+        const char* env = std::getenv("SUROGATE_DPP_MEM_TRACE");
+        return env != nullptr && env[0] != '\0' && env[0] != '0';
+    }();
+    if (trace) {
+        const auto& cache = mCompiledExecutor->saved_cache();
+        std::size_t free_b = 0, total_b = 0;
+        (void)sinfer::device_mem_get_info(&free_b, &total_b);
+        constexpr double MiB = 1024.0 * 1024.0;
+        std::fprintf(stderr,
+                     "[dpp-mem] device=%d phase=%s stage=%d blocks=%d-%d retired=%.0fMiB saved=%d/%.0fMiB "
+                     "pool=%.0fMiB stack_used=%.0fMiB stack_peak=%.0fMiB stack_cap=%.0fMiB free=%.0fMiB\n",
+                     mRunState.DeviceId,
+                     phase ? phase : "-",
+                     stage,
+                     lo,
+                     hi,
+                     retired / MiB,
+                     cache.count(),
+                     cache.total_plain_bytes() / MiB,
+                     cache.pool_bytes() / MiB,
+                     mRunState.Stack.bytes_used() / MiB,
+                     mRunState.Stack.max_utilization() / MiB,
+                     mRunState.Stack.capacity() / MiB,
+                     free_b / MiB);
+    }
+    return retired;
 }
 
 std::vector<float> GraphExecutor::last_block_hidden_f32() {

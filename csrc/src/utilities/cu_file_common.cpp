@@ -105,6 +105,8 @@ void convert_tensor_dispatch(std::byte* target,
         convert_dtype(reinterpret_cast<nv_bfloat16*>(target), reinterpret_cast<const float*>(source), size);
     } else if (t_type == ETensorDType::BF16 && s_type == ETensorDType::FP16) {
         convert_dtype(reinterpret_cast<nv_bfloat16*>(target), reinterpret_cast<const half*>(source), size);
+    } else if (t_type == ETensorDType::FP32 && s_type == ETensorDType::FP16) {
+        convert_dtype(reinterpret_cast<float*>(target), reinterpret_cast<const half*>(source), size);
     } else if (t_type == ETensorDType::BF16 && s_type == ETensorDType::FP8_E4M3) {
         convert_dtype(reinterpret_cast<nv_bfloat16*>(target), reinterpret_cast<const __nv_fp8_e4m3*>(source), size);
     } else if ((t_type == ETensorDType::BYTE || s_type == ETensorDType::BYTE) &&

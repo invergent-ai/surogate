@@ -16,8 +16,7 @@ namespace sinfer::ops::detail::inkling {
 /// The expert tile `tile` when each expert's routed rows (offsets[e] .. offsets[e + 1]) are cut
 /// into tiles of `TileRows`: writes {expert, row_begin, row_end} to `result` (expert -1 = past
 /// the round's tiles). Every thread of the block calls it; one barrier inside.
-/// `ThroughL2`: read the offsets with ld.global.cg (a kernel reading them before its dependency
-/// wait must not see a stale L1 line).
+/// `ThroughL2`: read the offsets with ld.global.cg. Callers load the routing only after their dependency wait.
 template <int TileRows, bool ThroughL2 = false>
 __device__ __forceinline__ void find_expert_tile(const std::int32_t* offsets, int tile,
                                                  int (&result)[3]) {
@@ -148,6 +147,35 @@ __device__ __forceinline__ void cp_async_cg16_hint(void* smem_dst, const void* g
     } else {
         asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" : : "r"(smem_addr(smem_dst)), "l"(gmem_src));
     }
+}
+
+/// PDL audit (2026-11-21): bf16 activation rows (x, y) are written by a kernel that may still run when the reading
+/// grid launches (PDL), at arena addresses reused every visit. They are read with an explicit WEAK ld.global.ca after the
+/// dependency wait -- griddepcontrol.wait makes the prerequisite grid's writes visible to weak loads -- and NEVER
+/// through the non-coherent path (ld.global.nc / __ldg / LDG.CONSTANT): its data must stay unchanged for the reading
+/// kernel's whole lifetime, which a PDL-overlapped producer violates, and the compiler may hoist nc loads above the wait
+/// (the FP8 attention decode bug, 2026-11-21). Review R4 of M9 (major): mode 0 used to be `*address`, which NVPTX lowers to
+/// ld.global.nc (LDG.E.CONSTANT) on these `const __restrict__` read-only inputs; `__ldca` names the cache operator, so
+/// the load stays weak (no .nc) and keeps the L1 hit of the quantisers' second pass over a row (ld.global.cg measured
+/// +2.0 us per NVFP4 call at T=1, 2128f247). `RowLoad` is a compile-time TEST-ONLY mode (inkling_test_read_only_loads
+/// picks the kernel instantiation on the host): 0 = ld.global.ca (the only form serving launches), 1 = ld.global.nc
+/// (negative control), 2 = ld.global.cg.
+template <int RowLoad = 0>
+__device__ __forceinline__ uint4 load_row16(const uint4* address) {
+    if constexpr (RowLoad == 1) {
+        return __ldg(address);
+    } else if constexpr (RowLoad == 2) {
+        return __ldcg(address);
+    } else {
+        return __ldca(address);
+    }
+}
+
+/// The host side of the test-only row-load mode: ONE program-wide instance (an inline function's static), shared by
+/// every caller (set_read_only_control and set_row_load_mode_nvfp4 write the same variable); 0 in serving.
+inline int& row_load_mode_host() {
+    static int mode = 0;
+    return mode;
 }
 
 /// fp32 -> bf16 -> fp32: the reference's bf16 store of gate_up followed by the SiTU's load.

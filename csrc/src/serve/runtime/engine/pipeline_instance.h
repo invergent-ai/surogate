@@ -141,7 +141,7 @@ public:
             boundary.resize(groups_);
         }
         width_ = std::max<std::uint32_t>(1, stages_.front()->program->speculative_round_width());
-        // DSpark (ENGINE-INKLING lane e1): the drafter lives on the stage with the head and proposes each round's
+        // DSpark: the drafter lives on the stage with the head and proposes each round's
         // drafts before the first stage launches (prepare_drafts). One group, so that stage is idle at that moment.
         if constexpr (requires(Stage& st) { st.program->pipeline_drafts_on_head(); }) {
             drafts_on_head_ = stages_.size() > 1 && stages_.back()->program->pipeline_drafts_on_head();
@@ -435,7 +435,7 @@ public:
         for (Stage* stage : stages_) { pressure = stage->program->kv_service_pressure() || pressure; }
         return pressure;
     }
-    /// Lane f1 M3-C: every stage compacts its elastic window class (no-op without one). The
+    /// M3-C: every stage compacts its elastic window class (no-op without one). The
     /// executor calls it only while no group is in flight.
     void kv_round_boundary() noexcept {
         for (std::size_t s = 0; s < stages_.size(); ++s) {
@@ -588,7 +588,13 @@ private:
             f.verifying = kind == FlightKind::Decode ? !stages_[0]->program->speculative_round_is_narrow(lanes.size())
                 : !stages_[0]->program->speculative_round_is_narrow(0);
             f.dflash_window = stages_[0]->program->select_dflash_draft_window(lanes);
-            prepare_drafts(lanes, budgets, f.dflash_window);
+            try {
+                prepare_drafts(lanes, budgets, f.dflash_window);
+            } catch (...) {
+                f.active  = false; // no flight without a handle (M8b review; the program cleared its lanes)
+                f.between = false;
+                throw;
+            }
         }
         f.result       = GroupResult{};
         // A decode round's residual is exactly `width` columns per lane (one, or the verify's

@@ -47,6 +47,9 @@ Common server options (full list: surogate serve --engine-help):
   --dflash-model PATH           separate Muse-Glimmer DFlash GGUF checkpoint
   --mmproj PATH                 matching vision projector for a supported vision GGUF
   --offload-vision               store image encoder/projector weights in system RAM
+  --vision-fp8                   run the image encoder's block projections in MXFP8 on a
+                                 Blackwell GPU (twice the BF16 math rate; outputs change by
+                                 FP8 rounding; ~0.4 GB of FP8 weights beside the BF16 ones)
   --offload-embeddings           store token embeddings in system RAM
   --offload-output-head          store output-head weights in system RAM
   --decision-temperature T       calibrate the decisions endpoint: answers are read from
@@ -115,8 +118,11 @@ _VALUE_OPTIONS = {
         --log-stats-interval-ms --max-request-mib --media-cache-mib --media-live-mib
         --media-preprocess-threads --request-log-jsonl --kv-cache-dtype --kv-cache-dtype-skip-layers
         --default-max-tokens --reasoning-parser --tool-call-parser --chat-template --rope-scaling
-        --model-priority --model --lora-modules --max-loras --max-lora-rank
+        --model-priority --model --lora-modules --max-loras --max-lora-rank --max-expert-lora-rank
         --decision-temperature --decision-attempts --gpu-memory-limit-mib --openrouter-models-file
+        --kv-admission --kv-admission-headroom --kv-admission-watermark --lora-swap --moe-route
+        --overlong-max-tokens --prefix-cache-host-gb --thinking-answer-reserve
+        --thinking-retention --thinking-retention-mb --thinking-retention-ttl
     """.split()),
     "generate": _COMMON_VALUES | frozenset("""
         --prompt --messages --max-new --max-context --prefill-chunk --kv-dtype
@@ -132,7 +138,7 @@ _SWITCH_OPTIONS = {
         --elastic-kv-overcommit --enforce-eager --no-prefix-reuse --batch-invariant
         --enable-prefix-caching --no-enable-prefix-caching --enable-auto-tool-choice
         --enable-sleep-mode --enable-lora --thinking --preserve-thinking --cors --data-parallel
-        --capture-routing
+        --capture-routing --vision-fp8 --thinking-loop-guard
     """.split()),
     "generate": _COMMON_SWITCHES | frozenset("""
         --raw-output --print-token-ids --prefill-warmup --no-cuda-graph

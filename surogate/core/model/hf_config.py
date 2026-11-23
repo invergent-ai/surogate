@@ -177,6 +177,15 @@ class HfConfigFactory:
                     res["quant_bits"] = weights["num_bits"]
                 res["weight_strategy"] = weights.get("strategy")
                 res["weight_group_size"] = weights.get("group_size")
+            # An NVFP4 group (e.g. the routed experts of our NVFP4 export, beside per-channel FP8 dense layers) loads
+            # as a pre-quantized NVFP4 base. The prequant loader takes every other module as the checkpoint stores
+            # it: per-channel FP8 stays FP8 (codes + row scales), BF16 loads full precision.
+            if isinstance(groups, dict) and any(
+                isinstance(g, dict) and g.get("format") == "nvfp4-pack-quantized" for g in groups.values()
+            ):
+                res["quant_method"] = "prequant_nvfp4"
+                res["nvfp4_format"] = "compressed-tensors"
+                res["quant_bits"] = 4
         elif quant_method is not None:
             res["quant_method"] = quant_method
         return res or None

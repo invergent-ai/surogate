@@ -1,6 +1,6 @@
-# agent-EN-f2 (ENGINE-INKLING lane f2), 2026-11-21.
-# Builds the renderer corpus: OpenAI chat bodies as agent-IK's gateway sent them to vLLM for Inkling-2-Mini, rebuilt
-# from the REAL surogates sessions of agent-IK's reads (read only: /mnt/data/work/rl/inkling-2026-11-21).
+# Inkling-2 renderer vectors, 2026-11-21.
+# Builds the renderer corpus: OpenAI chat bodies as a gateway sent them to vLLM for Inkling-2-Mini, rebuilt
+# from REAL surogates sessions (read only: the directory $INKLING_READS_DIR).
 #
 # What is real and what is not (the gateway ran RECORD_BODY=0, so no request body was recorded):
 #  - conversation = the harness's own replay (surogates.harness.loop_context_replay._rebuild_messages over the session's
@@ -12,9 +12,10 @@
 #    guidance) -- real harness text, not the exact recorded system message (record sys_sha kept in meta for reference).
 #  - tools = NOT recorded: the harness's real builtin tool schemas (ToolRegistry.get_schemas of surogates/tools/builtin,
 #    dumped by dump_tools.py), the count matched to the record's n_tools where possible.
-#  - gateway step (eff_gateway_ik.py, surogates path): setdefault PIN (T 1.0, top_p 1.0, top_k -1), chat_template_kwargs
+#  - gateway step (the gateway's surogates path): setdefault PIN (T 1.0, top_p 1.0, top_k -1), chat_template_kwargs
 #    {enable_thinking: True, preserve_thinking: True} under the request's own, model "cand", stream False.
-# Run with the surogates venv: /mnt/data/work/rl/surogates/.venv/bin/python -I build_corpus.py OUT.jsonl
+# Run with the surogates venv: SUROGATES_REPO=<surogates checkout> INKLING_READS_DIR=<session records> \
+#   <surogates venv>/bin/python -I build_corpus.py OUT.jsonl
 import hashlib
 import json
 import os
@@ -22,14 +23,24 @@ import re
 import sys
 from types import SimpleNamespace
 
-sys.path.insert(0, "/mnt/data/work/repos/surogates")
+
+
+def _required_env(name, what):
+    value = os.environ.get(name)
+    if not value:
+        sys.exit(f"build_corpus.py: set {name} to {what}")
+    return value
+
+
+SUROGATES_REPO = _required_env("SUROGATES_REPO", "a checkout of the surogates harness")
+sys.path.insert(0, SUROGATES_REPO)
 import surogates.harness.loop as L  # noqa: E402
 import surogates.harness.loop_context_replay as R  # noqa: E402
 import surogates.harness.title_generator as T  # noqa: E402
 
-IK = "/mnt/data/work/rl/inkling-2026-11-21"
+IK = _required_env("INKLING_READS_DIR", "the directory with the recorded surogates sessions")
 HERE = os.path.dirname(os.path.abspath(__file__))
-PROMPTS = "/mnt/data/work/repos/surogates/surogates/harness/prompts"
+PROMPTS = os.path.join(SUROGATES_REPO, "surogates/harness/prompts")
 PIN = {"temperature": 1.0, "top_p": 1.0, "top_k": -1}
 CTK = {"enable_thinking": True, "preserve_thinking": True}
 TITLE_SHA = "fea53892ede7"

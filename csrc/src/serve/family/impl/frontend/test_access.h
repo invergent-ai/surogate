@@ -13,6 +13,9 @@ class FrontendTestAccess {
 public:
     [[nodiscard]] static Frontend create_component(const FrontendResources& resources,
                                                    bool vision_enabled = true);
+    /// The same with every frontend option given (Inkling-2 vision tests: image limit, per-image cap).
+    [[nodiscard]] static Frontend create_component_with(const FrontendResources& resources,
+                                                        const FrontendOptions& options);
     [[nodiscard]] static const PreparedPromptData& inspect(const PreparedPrompt& prompt);
     /// Runs the artifact-resource validation the Frontend constructor runs, so
     /// the tokenizer_config.json contract is testable from three JSON strings

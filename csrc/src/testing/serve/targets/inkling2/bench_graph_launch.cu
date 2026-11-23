@@ -1,4 +1,4 @@
-// Lane e1 (agent-EN 15:0x): why is the inkling2 decode CUDA graph slower than eager? lane h's nsys: cudaGraphLaunch
+// Why is the inkling2 decode CUDA graph slower than eager? An nsys profile: cudaGraphLaunch
 // takes ~0.81 ms of host time for the 745-node decode graph and the GPU idles until it returns. This bench captures
 // straight chains of N kernels (each spinning ~`spin_us` like a decode kernel) in several shapes and reports the host
 // time of the launch call(s) and the wall time to completion:

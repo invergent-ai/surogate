@@ -1,11 +1,11 @@
 #pragma once
 
-// Inkling-2-Mini's DSpark drafter as the target runs it (ENGINE-INKLING lane e2, rl/engine-inkling-2026-11-21/lanes/e2/
-// DESIGN-dspark.md): the load-time derived weights and the two round entries -- append context, propose -- that the
+// Inkling-2-Mini's DSpark drafter as the target runs it (DSpark design
+// notes): the load-time derived weights and the two round entries -- append context, propose -- that the
 // family's DFlash runtime reaches through the Variant's DSpark leaves. Op semantics: api/ops/dspark.h
-// (ref/dspark_ref.py). The drafter's GEMMs run on lane e1's invariant GEMM (inkling_gemm_inv[_group]).
+// (dspark_ref.py). The drafter's GEMMs run on the target's invariant GEMM (inkling_gemm_inv[_group]).
 //
-// Draft KV (agent-EN 13:5x): text-pool planes 48 / 49 / 50 = draft layers 0 / 1 / 2, FP8 e4m3 unit scale, the
+// Draft KV: text-pool planes 48 / 49 / 50 = draft layers 0 / 1 / 2, FP8 e4m3 unit scale, the
 // sequence's own block-table row; layers 0 and 2 read a block-anchored window of 1,024 keys before the anchor.
 
 #include "targets/inkling2/impl/load/bindings.h"
@@ -63,14 +63,14 @@ struct DSparkDerived {
 /// as sink layers {0, 1, 2, 3}; block 8. Checks the artifact's dspark block is Inkling-2-Mini's.
 [[nodiscard]] family::DFlashGeometry dspark_dflash_geometry(const load::ArtifactConfig& config);
 
-/// Derives the drafter's load-time weights from lane b's bound draft (w.has_draft); synchronous.
+/// Derives the drafter's load-time weights from the bindings' bound draft (w.has_draft); synchronous.
 void derive_dspark(const load::InklingWeights& w, DSparkDerived& out, bool fp8_weights = false, bool fp8_fold = false);
-/// The FP8 Markov fold (default; SUROGATE_SERVE_DSPARK_BF16_FOLD=1 keeps the BF16 fold).
+/// The FP8 Markov fold (opt-in since M9: SUROGATE_SERVE_DSPARK_FP8_FOLD=1; the BF16 fold is the default).
 [[nodiscard]] bool dspark_fp8_fold_requested();
 
 /// SUROGATE_SERVE_DSPARK_BF16_WEIGHTS=1 (read once): keep the drafter's dense linears BF16 on the device (A/B).
 [[nodiscard]] bool dspark_bf16_weights_forced();
-/// The FP8 drafter weights (default; SUROGATE_SERVE_DSPARK_BF16_WEIGHTS=1 keeps BF16).
+/// The FP8 drafter weights (opt-in since M9: SUROGATE_SERVE_DSPARK_FP8_WEIGHTS=1; BF16 is the default).
 [[nodiscard]] bool dspark_fp8_weights_requested();
 /// Device bytes derive_dspark allocates beside the materialized weights (storage + FP8 fold + FP8 linears), resident for
 /// the engine's life; the registry books them before the KV is sized (Package::extra_derived_residency_bytes).
@@ -80,13 +80,13 @@ void derive_dspark(const load::InklingWeights& w, DSparkDerived& out, bool fp8_w
 /// The draft KV: planes of draft layers 0 / 1 / 2 (text-pool layers 48 / 49 / 50).
 struct DSparkKv {
     std::array<ops::DSparkPagedPlane, 3> planes{};
-    /// The same planes as the pool's batch views, for lane c's inkling_draft_attention (FP8 planes only).
+    /// The same planes as the pool's batch views, for inkling_draft_attention (FP8 planes only).
     std::array<PagedKVBatchLayerView, 3> views{};
-    std::uint32_t max_visible_keys = 0;  ///< the sequence capacity (lane c's workspace / split plan)
+    std::uint32_t max_visible_keys = 0;  ///< the sequence capacity (the attention workspace / split plan)
     bool naive_attention           = false; ///< ops::dspark_block_attention (BF16 planes, or the A/B knob)
 };
 
-/// SUROGATE_SERVE_DSPARK_NAIVE_ATTN=1 (read once): the naive block attention instead of lane c's (A/B only).
+/// SUROGATE_SERVE_DSPARK_NAIVE_ATTN=1 (read once): the naive block attention instead of the Inkling kernel's (A/B only).
 [[nodiscard]] bool dspark_naive_attention_forced();
 
 /// Context append: the committed columns' target features -> each draft layer's context K / V in its plane, and
@@ -117,6 +117,10 @@ struct DSparkPropose {
     std::int32_t* drafts                 = nullptr; ///< I32 [draft_stride, B]: draft j of lane b at j + stride * b
     std::int32_t draft_stride            = 0;       ///< >= k; 0: k
     void* hidden_out                     = nullptr; ///< optional BF16 [2304, 8, B]: the block's final hidden (tests)
+    /// Device SamplingConfig [B] (null: greedy drafts for every lane): coupled untruncated sampled lanes draw their
+    /// drafts with the coupled verify's own Gumbel noise (ops::dspark_markov_vocab; SUROGATE_SERVE_DSPARK_SAMPLED_DRAFTS=0
+    /// keeps greedy drafts).
+    const ops::SamplingConfig* sampling  = nullptr;
 };
 
 /// Workspace of one append of `columns` (= W * B) columns / one proposal of `batch` lanes at the widest round.

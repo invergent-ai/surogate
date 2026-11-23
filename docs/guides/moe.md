@@ -77,7 +77,7 @@ merge_adapter: true
 lora: true
 lora_rank: 16
 lora_alpha: 32
-lora_dtype: bf16
+lora_dtype: bf16  # fp32: FP32 masters, expert LoRA gradients accumulated in FP32 (more memory)
 
 # Target expert projections (applied per-expert)
 lora_target_modules:

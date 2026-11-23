@@ -1,11 +1,11 @@
-// Inkling-2 weight bindings (lane b, M3) against the converted artifact, host only: every object is bound with the
+// Inkling-2 weight bindings (M3) against the converted artifact, host only: every object is bound with the
 // expected format and shape and `Binder::finish()` accepts the plan (each object consumed and placed exactly once),
 // for the oracle (BF16 attention) choice, with and without the drafter, and with every placement validate-only.
 // When the artifact carries the FP8 per-channel attention (the production candidate `*.attn-fp8pc.sinfer`), also for
 // that choice: the FP8 objects go to the device, the BF16 attention is validated only, and the planned device bytes
 // differ from the oracle plan by exactly the attention objects' sizes. A scheme the artifact lacks is refused.
 // The 1-card oracle plan places every tensor but the FP8 variants (19,525,154,400 device bytes, the figure of the code
-// before the per-stage globals split); the 2-stage plan of lanes/e1/DESIGN-2card.md (cut at visit 30) holds the
+// before the per-stage globals split); the 2-stage plan of the 2-card design (cut at visit 30) holds the
 // embedding on stage 0 only, the head + final norm and the drafter on stage 1 only, the small globals on both, and
 // each physical layer on the stages that run one of its visits.
 // Needs INKLING2_ARTIFACT (skips otherwise). No device is touched: placements are planned, never materialised.
@@ -106,7 +106,7 @@ void test_one_card_and_two_stages(const Reader& reader, const load::ArtifactConf
     require(card.device.size() == tensors && card.bytes == expected, "1-card plan = every non-FP8 tensor");
     require(card.bytes == 19525154400ULL, "1-card device bytes unchanged by the split (19,525,154,400)");
 
-    // 2 stages, cut at visit 30 (e1's Package::pipeline_stage_bounds): stage s keeps the layers its visits use.
+    // 2 stages, cut at visit 30 (Package::pipeline_stage_bounds): stage s keeps the layers its visits use.
     const std::int32_t cut = 30;
     std::array<std::set<int>, 2> resident;
     for (std::int32_t v = 0; v < static_cast<std::int32_t>(c.visits.size()); ++v) {

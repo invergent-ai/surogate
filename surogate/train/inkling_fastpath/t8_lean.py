@@ -1,7 +1,7 @@
-"""the lean per-row backward (plan item U1).
+"""The lean per-row backward for Inkling-2-Mini (plan item U1).
 
-The math is the base trainer's (ift_long.visit_torch_long, one recompute per visit from the engine's visit outputs) and the reverse loop is
-ift_long.LongModel / the reference gradient worker's truncated CodaModel. What is new here is only where things live:
+The math is the engine-op trainer's (ift_long.visit_torch_long, one recompute per visit from the engine's visit outputs) and the reverse loop is
+ift_long.LongModel / the census worker's truncated CodaModel. What is new here is only where things live:
 - only the visit outputs the last K visits read are copied to the host (K = 6 / 18 / 30 / 48 -> 10 / 22 / 34 / 49 of 49 buffers);
 - those buffers and the gradient accumulators come from ONE exact-size pinned arena per worker (torch's pinned allocator keeps freed blocks);
 - nothing is accumulated on the card: gradients leave per visit through `on_grad`;

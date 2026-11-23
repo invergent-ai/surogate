@@ -1,23 +1,23 @@
-// COPY of inkling_train_shim.cpp (6a9c4a18) with ONE addition, marked "T8:": the S10
+// T8 variant: COPY of inkling_train_shim.cpp (6a9c4a18) with ONE addition, marked "T8:": the S10
 // attention LoRA (targets/inkling2/impl/lora_attention.h) on the six qkvr slices and wo_ud, from bank tables the trainer passes
 // EXPLICITLY (forward.cpp reads them from the engine's LoRA store). Same op, same slices, same order as forward.cpp 2b and step 4.
-// Built as libsinfer_inkling_train_t8.so; the original shim is unchanged. ABI 3 (ift_run_visit takes one more pointer).
+// Built as libsinfer_inkling_train_t8.so; the base shim is unchanged. ABI 3 (ift_run_visit takes one more pointer).
 //
-// The engine-op trainer's fast route.
+// The engine-op trainer's FAST route.
 //
 // libsinfer_inkling_train.so: an extern "C" shim over the SAME libsinfer.so the rollout engine runs, so a torch
 // training loop (surogate/train/inkling_fastpath/) can drive the engine's own Inkling forward and get the engine's
 // bits (DESIGN.md 11: one shared, batch- and path-invariant forward for engine and trainer).
 //
 // What it does:
-// - ift_load: loads a `.sinfer` artifact with the engine's own loader (the engine's bind + the engine's derived queries and
+// - ift_load: loads a `.sinfer` artifact with the engine's own loader (the loader's bind + the target's derived queries and
 //   rel tables; the DSpark drafter is not bound) into engine-owned device memory.
 // - ift_run_visit: ONE visit of the 48, a copy of `targets/inkling2/impl/forward.cpp::run_visit` restricted to one
 //   prompt segment (B = 1, column 0, positions 0..T-1) -- the same op calls with the same arguments, in the same
-//   order (attention inputs / looped blend, qkvr projections, the engine's attention, wo_ud, attention-output conv, MLP
-//   input, the engine's MoE with the routed-expert capture, MLP-output conv). Copied, not re-derived: every difference
+//   order (attention inputs / looped blend, qkvr projections, the attention op, wo_ud, attention-output conv, MLP
+//   input, the MoE op with the routed-expert capture, MLP-output conv). Copied, not re-derived: every difference
 //   from forward.cpp is marked "T:". The M2 test (engine dump per visit + prompt log-probs) proves the copy.
-// - ift_embed / ift_final_hidden / ift_head_logprob: the Variant's embed and final-mix hooks and the engine's
+// - ift_embed / ift_final_hidden / ift_head_logprob: the Variant's embed and final-mix hooks and the target's
 //   `inkling_head_logprob` (= the value of every log-prob the engine returns).
 // - ift_tensor: device views of the loaded weights for the torch backward (no copy).
 // Every entry returns 0 on success, else -1 with the reason in ift_last_error() (no exception crosses the C ABI).
@@ -65,7 +65,7 @@ constexpr std::int64_t kColumn  = C::residual;
 constexpr int kTileColumns      = 1024;
 constexpr int kConvChannels     = ops::InklingMixGeometry::kConvChannels;
 using G                         = ops::InklingMixGeometry;
-/// The attention op's key-group cut, passed explicitly (forward.cpp kKeyGroups, frozen).
+/// The attention op's key-group cut, passed explicitly (forward.cpp kKeyGroups; frozen at P3).
 constexpr ops::InklingKeyGroups kKeyGroups = ops::InklingKeyGroups::P3;
 
 thread_local std::string t_error;
@@ -360,13 +360,13 @@ struct VisitTaps {
     void* attn_out  = nullptr; ///< BF16 [2304, T]
     void* mlp_in    = nullptr; ///< BF16 [2304, T]
     void* moe_out   = nullptr; ///< BF16 [2304, T]
-    // the engine's training call (when any of q / r / o / lse is set; else the production call)
+    // the attention op's training call (when any of q / r / o / lse is set; else the production call)
     void* att_q     = nullptr; ///< BF16 [128, 24, T]
     void* att_r     = nullptr; ///< BF16 [16, 24, T]
     void* att_tau   = nullptr; ///< FP32 [T] (global visits)
     void* att_o     = nullptr; ///< FP32 [128, 24, T]
     void* att_lse   = nullptr; ///< FP32 [24, T]
-    // the engine's MoE taps (InklingMoeTaps)
+    // the MoE op's taps (InklingMoeTaps)
     void* moe_gammas  = nullptr; ///< FP32 [T * 8]
     void* moe_gate_up = nullptr; ///< BF16 [T * 8][2304]
     void* moe_y       = nullptr; ///< BF16 [T * 8][1152]
@@ -476,8 +476,8 @@ void run_visit(Round& rd, int v, const VisitTaps& taps) {
         copy_tap(taps.k_dyn, k_dyn, s);
         copy_tap(taps.v_dyn, v_dyn, s);
     }
-    // 3. attention: the engine's invariant op (the training entry when the caller asks for q / r / tau / o / lse; it is
-    //    the production call's arithmetic on every route; the engine's training entry).
+    // 3. attention: the invariant attention op (the training entry when the caller asks for q / r / tau / o / lse; it is
+    //    the production call's arithmetic on every route; the attention op's training entry).
     Tensor gated = rd.work.alloc(DType::BF16, {C::attn_width, T});
     const ops::InklingConvStateView state = state_view(rd);
     {
@@ -570,7 +570,7 @@ void run_visit(Round& rd, int v, const VisitTaps& taps) {
     Tensor mlp_in = rd.work.alloc(DType::BF16, {D, T, 1});
     mlp_input(rd, vi, L, attn_out, mlp_in);
     copy_tap(taps.mlp_in, mlp_in, s);
-    // 7. MoE: the engine's op, routed experts captured per VISIT
+    // 7. MoE: the MoE op, routed experts captured per VISIT
     Tensor moe_out = rd.work.alloc(DType::BF16, {D, T});
     {
         ops::InklingMoeCapture capture;
@@ -592,7 +592,7 @@ void run_visit(Round& rd, int v, const VisitTaps& taps) {
         moe_taps.down    = taps.moe_down;
         moe_taps.logits  = static_cast<float*>(taps.moe_logits);
         if (moe_taps.gammas || moe_taps.gate_up || moe_taps.y || moe_taps.down || moe_taps.logits) {
-            options.taps = &moe_taps; // T: the engine's taps (test / debug / trainer; the bits are the call's)
+            options.taps = &moe_taps; // T: the MoE op's taps (test / debug / trainer; the bits are the call's)
         }
         const Tensor x(mlp_in.data, DType::BF16, {D, T});
         ops::inkling_moe(x, moe_weights(L), moe_out, rd.work, s, options);
@@ -715,7 +715,7 @@ std::size_t ift_head_workspace_bytes(std::int32_t T) {
     return ops::inkling_head_logprob_workspace_bytes(C::output_rows, T) + 4096;
 }
 
-/// Bytes of the persistent per-stream state (the engine's MoE counters + the engine's fold counters); zero it ONCE.
+/// Bytes of the persistent per-stream state (the MoE op's counters + the attention op's fold counters); zero it ONCE.
 std::size_t ift_state_bytes() { return Variant::visit_target_state_bytes(); }
 
 /// residual slot 0 <- embed_norm(embed[ids]). x: BF16 [7 x 2304, T] (column-major: column t at x + t * 16128).
@@ -788,7 +788,7 @@ int ift_final_hidden(void* handle, void* x, std::int32_t T, void* hidden, void* 
     });
 }
 
-/// out[t] = log p(ids[t] | hidden[:, t]) exactly as the engine returns it (the engine's inkling_head_logprob).
+/// out[t] = log p(ids[t] | hidden[:, t]) exactly as the engine returns it (the target's inkling_head_logprob).
 int ift_head_logprob(void* handle, const void* hidden, std::int32_t T, const std::int32_t* ids, float* out, void* ws,
                      std::size_t ws_bytes, void* stream) {
     return guarded([&] {
@@ -894,7 +894,7 @@ int ift_tensor(void* handle, const char* name, std::int64_t* desc) {
     });
 }
 
-/// the engine's exact unit decode of one physical layer's expert bank (the backward's dX operand, STE): `which` 0 = w13
+/// The MoE op's exact unit decode of one physical layer's expert bank (the backward's dX operand, STE): `which` 0 = w13
 /// (k 2304, rows interleaved gate / up), 1 = w2 (k 1152). unit: BF16 [count * 2304][k]; factor: FP32 [count]
 /// (NVFP4 amax[e] / den; MXFP8 1). dX = sum_slots (dY . unit[e]) * factor[e].
 int ift_decode_experts(void* handle, int layer, int which, std::int32_t first, std::int32_t count, void* unit,

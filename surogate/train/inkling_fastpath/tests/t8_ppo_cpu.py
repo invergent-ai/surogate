@@ -1,4 +1,4 @@
-"""S2 pass line: SkyRL's update on the fake model, ours against a reference written with SkyRL's OWN loss functions (AST-loaded,
+"""S2 pass line (PLAN-SKYRL.md): SkyRL's update on the fake model, ours against a reference written with SkyRL's OWN loss functions (AST-loaded,
 pinned): old log-probs at the start weights, n mini-batches (1 and 4) each with its own token mean and one AdamW step (lr 2e-5). Per mini-batch the
 gradient within rel 1e-5 and the masters after the batch within rel 1e-5 of the reference; GRPO advantages from t8_skyrl; the mini-batch cut never splits
 a group; the stale gate (first mini-batch == old log-probs, bitwise) and the replay gate on the old log-probs both fire on a bad input."""

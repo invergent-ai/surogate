@@ -14,6 +14,7 @@
 
 #include <cublasLt.h>
 
+#include "kernels/kernels.h"
 #include "runtime/dsl/graph_compiler.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "runtime/lora/lora_config.h"
@@ -98,6 +99,28 @@ inline void apply_lora_slices_forward(const std::vector<dsl::LoRASlice>& slices,
             throw std::invalid_argument("LoRA projection shape mismatch at layer " + std::to_string(layer_idx) + ": " +
                                         slice_label(slice));
 
+        if (lora_fp32_forward_enabled() && dropout == 0.0f && output_2d.DType == ETensorDType::BF16 &&
+            input_2d.DType == ETensorDType::BF16) {
+            // SUROGATE_LORA_FP32_FORWARD: the fp32 masters through the expert kernel as a one-expert group, so
+            // dense LoRA (the shared expert) moves smoothly with every update like the routed experts.
+            auto* master = get_layer_weight_by_target(weights->get_master_block(layer_idx, stream), slice.id);
+            if (master && master->has_value() && master->A.DType == ETensorDType::FP32 &&
+                master->B.DType == ETensorDType::FP32 &&
+                lora_dense_forward_f32w(output_2d.get<nv_bfloat16>() + slice.offset,
+                                        total_out,
+                                        input_2d.get<nv_bfloat16>(),
+                                        master->A.get<float>(),
+                                        master->B.get<float>(),
+                                        BT,
+                                        in_features,
+                                        size,
+                                        rank,
+                                        scaling,
+                                        /*accumulate=*/true,
+                                        stream)) {
+                continue;
+            }
+        }
         const unsigned seed = compute_dropout_seed(*run_state, layer_idx, slice);
         apply_lora_contribution(output_2d,
                                 slice.offset,

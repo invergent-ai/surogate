@@ -1,6 +1,6 @@
 // Inkling-2-Mini attention prologue, log-n tau, relative-projection table and the dense relative
-// logits (test route). ENGINE-INKLING lane c; semantics: api/ops/inkling_attention.h and
-// lanes/c/DESIGN-attention.md sections 1 (P1-P8), 2 and 3. Reference: vLLM's
+// logits (test route). Semantics: api/ops/inkling_attention.h and
+// the attention design notes, sections 1 (P1-P8), 2 and 3. Reference: vLLM's
 // ops/sconv.py `_attn_prologue_kernel` / `_kv_conv_tile` / `_tap_sum`, ops/norm.py `_l2_clip` /
 // `qr_clip_rel_tokens`, ops/attention.py `compute_log_scaling_tau`.
 

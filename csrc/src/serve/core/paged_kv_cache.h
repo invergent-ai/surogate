@@ -105,7 +105,7 @@ struct PagedKVPoolSpec {
     std::uint32_t window_lane_pages     = 0;
     std::uint32_t window_image_pages    = 0;
     std::uint32_t window_forward_tokens = 0;
-    // M3-C (lanes/f1/DESIGN-M3-kv-lever.md C; elastic pools only): the window planes are
+    // M3-C (KV-lever design C; elastic pools only): the window planes are
     // demand-mapped in their own region, whose guaranteed size is `window_floor_pages`; every
     // reserved allocation is charged `window_lane_charge` window pages in THIS pool's page ledger
     // (as main-page equivalents), shared-prefix window images their own pages when captured.
@@ -229,6 +229,13 @@ struct PagedKVOccupancy {
     std::uint32_t mapped_pages              = 0;
     std::uint32_t capacity_pages            = 0; ///< pages admission may commit (see PagedKVPoolSpec)
     std::size_t page_bytes                  = 0; ///< bytes one page occupies across every plane
+    // Elastic window class (M3-C); zero without one. Window pages are counted in window pages of
+    // `window_page_bytes` each (all window planes), not in main pages.
+    std::uint32_t window_mapped_pages       = 0; ///< window pages whose granule is mapped
+    std::uint32_t window_charged_pages      = 0; ///< window pages charged to holders in the main ledger
+    std::uint32_t window_floor_pages        = 0; ///< the class's guaranteed (planned) pages
+    std::uint32_t window_granule_pages      = 0; ///< window pages per mapping granule
+    std::size_t window_page_bytes           = 0;
 };
 
 class PagedKVPool : private KvWindowPageSource {

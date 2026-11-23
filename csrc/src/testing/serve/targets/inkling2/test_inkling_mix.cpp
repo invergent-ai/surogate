@@ -1,8 +1,8 @@
-// Inkling-2-Mini hidden-stream ops (lane e1), tests T1-T5 of lanes/e1/DESIGN-target.md 8 against
+// Inkling-2-Mini hidden-stream ops, tests T1-T5 of the target design (section 8) against
 // double-precision CPU ports of the `inkling_ref.py` functions of the same names. The inputs are on
 // the bf16 grid the kernels read; outputs rounded to bf16 by the reference are compared within one
 // bf16 ulp, fp32 outputs within a few fp32 ulps of the reduction, conv states exactly.
-// When lane a's golden vectors exist (vectors/<op>/), a second test reads them; this one needs none.
+// When the golden vectors exist (vectors/<op>/), a second test reads them; this one needs none.
 
 #include "api/ops/inkling_mix.h"
 #include "ops/op_tester.h"
@@ -210,7 +210,7 @@ int test_attn_res(const AttnResCase& c, std::uint32_t seed) {
     std::vector<double> ref(out_n), limit(out_n);
     // The kernel sums the N mix terms in fp32: where they cancel (|mix| << sum |term|) its value carries an absolute
     // error of a few fp32 ulps of the terms, which no relative bf16 bound on |ref| covers (5 of 592k elements at
-    // T = 257 in session 1, 10:30). Limit = the output's own rounding (1 bf16 ulp, or the fp32 bound) + 8 fp32 ulps
+    // T = 257 in one session). Limit = the output's own rounding (1 bf16 ulp, or the fp32 bound) + 8 fp32 ulps
     // of sum |term|, carried through the norm.
     constexpr double kF32Ulp = 1.0 / 16777216.0;
     for (int t = 0; t < T; ++t) {

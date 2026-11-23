@@ -1,12 +1,14 @@
 #include "ops/launcher/sampled_logprob.h"
 
 #include "core/device.h"
+#include "core/device_memory_error.h"
 #include "api/ops/sampled_logprob.h"
 #include <algorithm>
 #include "ops/common/warp.cuh"
 
 #include <cmath>
 #include <cstdint>
+#include <string>
 #include <cuda_bf16.h>
 
 namespace sinfer::ops::detail {
@@ -251,7 +253,19 @@ std::vector<TokenScore> score_logprobs_batch(const Tensor& logits, std::span<con
         throw std::invalid_argument("invalid log-probability scoring arguments");
     }
     void* storage = nullptr;
-    CUDA_CHECK(cudaMallocAsync(&storage, columns * (sizeof(RawTokenScores) + sizeof(TokenId)), stream));
+    const std::size_t storage_bytes = columns * (sizeof(RawTokenScores) + sizeof(TokenId));
+    // A full device is a DeviceOutOfMemory, which the executor survives (the round's requests
+    // fail with a retryable 429), not an abort of the whole engine: on 2026-11-23 an Inkling-2-Mini engine
+    // with 4 MiB left died here (CUDA_CHECK aborts) instead of failing one round
+    // (out-of-memory diagnosis, finding F3).
+    if (const cudaError_t allocated = cudaMallocAsync(&storage, storage_bytes, stream); allocated != cudaSuccess) {
+        if (allocated == cudaErrorMemoryAllocation) {
+            (void)cudaGetLastError();
+            throw DeviceOutOfMemory("log-probability scoring: cudaMallocAsync of " + std::to_string(storage_bytes) +
+                                    " bytes failed: out of memory");
+        }
+        CUDA_CHECK(allocated);
+    }
     auto* device_out = static_cast<RawTokenScores*>(storage);
     auto* device_tokens = reinterpret_cast<TokenId*>(device_out + columns);
     std::vector<RawTokenScores> host(columns);

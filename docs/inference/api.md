@@ -302,7 +302,16 @@ before using it.
 The constraint applies while generating, including streaming. An answer stopped by a token or
 context limit can still be incomplete; check `finish_reason` before parsing it. Use sufficient
 `max_tokens`, keep `ignore_eos` false and `min_tokens` at zero, and omit custom `stop` strings. JSON is
-returned as answer content without a separate reasoning response.
+returned as answer content.
+
+With thinking on, a model whose template opens its reasoning in the prompt (Qwen3.5 and Qwen3.6
+templates do) reasons first, and the schema constrains the answer that follows its reasoning, as
+vLLM's structured outputs do under a reasoning parser. The reasoning itself is not constrained,
+except that the reply cannot end before the reasoning is closed. It is returned separately
+(`reasoning_content`, a Responses reasoning item) and counts toward `max_tokens`, so leave room for
+both: a reply cut off while still reasoning has no JSON yet. Requests without thinking, a
+server started with `--reasoning-parser none`, and models whose reasoning is not a span the prompt
+opens are constrained from the first generated token, with no separate reasoning.
 
 Structured requests work on single- and multi-GPU servers, including MTP and DFlash speculative
 decoding. The speed benefit depends on how often the proposed tokens satisfy the requested

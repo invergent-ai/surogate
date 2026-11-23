@@ -1,9 +1,9 @@
-// S1 (ENGINE-INKLING lane c, agent-EN GO 15:3x): the split full-vocabulary draw
+// S1: the split full-vocabulary draw
 // (sampling_full_vocab_partial_kernel + finalize) against the one-CTA-per-row kernel it replaces, through the whole
 // ops::sample() op, on every row kind the engine serves: greedy, temperature 1 with per-(request, position) seeds,
 // min_p, penalties with token counts, top-p, top-k, other temperatures, logit bias / barred tokens / bitmask, and
 // forced ties (quantised logits, several +inf logits in different chunks, fully barred rows), at Inkling's shape
-// (FP32 logits, 201,024 tokens) and W4g's (BF16 logits, 151,669 of 151,936 physical rows). Every row's token and every
+// (FP32 logits, 201,024 tokens) and a Qwen3-shaped model's (BF16 logits, 151,669 of 151,936 physical rows). Every row's token and every
 // row's token counts must be identical. `bench` times sample() on both routes.
 
 #include "api/ops/sampling.h"

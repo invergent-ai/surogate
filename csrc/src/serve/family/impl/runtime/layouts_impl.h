@@ -89,7 +89,7 @@ geometry_global_geometry_layers(const family::TextGeometry& g) {
     return out;
 }
 
-/// Window-bounded KV pages (lane f1, rl/engine-inkling-2026-11-21/lanes/f1/DESIGN-window-kv.md):
+/// Window-bounded KV pages (window-bounded KV design):
 /// on unless SUROGATE_SERVE_KV_WINDOW_PAGING=0, which keeps every windowed layer on full-context
 /// pages as before (the A/B for token identity).
 [[nodiscard]] inline bool kv_window_paging_enabled() {
@@ -306,7 +306,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     std::vector<std::int32_t> layer_windows = variant_kv_layer_windows<Variant>(plan.geometry);
     // Extra text-pool planes a target appends after its own (DSpark's draft KV, family/impl/runtime/dspark_round.h),
     // with their windows; empty for every other target, which leaves the pool exactly as it was.
-    // A pipeline puts them on the LAST stage only (the drafter runs beside the head; e1 / f1c 15:30, 2-card 1M).
+    // A pipeline puts them on the LAST stage only (the drafter runs beside the head; 2-card 1M).
     const bool stage_holds_last_layer =
         plan.pipeline_stage_last == 0 || plan.pipeline_stage_last >= static_cast<std::int32_t>(plan.geometry.layers);
     const std::vector<std::int32_t> extra_kv_planes =
@@ -338,7 +338,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                                             static_cast<std::uint32_t>(effective_prefill_chunk),
                                             image_windows, rounds);
         if (plan.kv_window_elastic && plan.elastic_kv) {
-            // M3-C (lanes/f1/DESIGN-M3-kv-lever.md C): the static bound above becomes the virtual
+            // M3-C (KV-lever design C): the static bound above becomes the virtual
             // span; the device holds the round transient (+ a granule) and what holders are charged.
             window_class.elastic         = true;
             window_class.lane_charge     = kv_window_lane_charge(window_tokens);
@@ -1174,7 +1174,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                 text_envelope);
                     const std::size_t accept =
                         ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
-                            plan.geometry.token_domain, window, window, batch, batch);
+                            plan.geometry.token_domain, window, window, batch, batch,
+                            family::dspark_drafter<Variant>()); // split routes: DSpark targets only
                     const std::size_t proposal =
                         window == 0 ? 0 : dflash_proposal_capacity(round_width, batch);
                     out.dflash_round =
@@ -1234,13 +1235,13 @@ void validate_target_options(const EngineOptions& options,
             throw std::invalid_argument("kv_capacity must be at least max_context");
         }
         const std::uint32_t requested_pages = page_count(options.kv_capacity.explicit_tokens);
-        // Lane f1: a pipeline stage's explicit capacity that is the shared resolution of auto came
-        // from the capacity curve itself, whose maximum counts an elastic window class's charge per
-        // lane (lanes x (logical + charge)); the planner clamps it to that curve. Capping it at
-        // lanes x logical refused every 2-stage --kv-capacity auto --max-num-seqs 1 engine (the
-        // preflight resolves logical + charge: 1,059,776 tokens at 1M; e1b, BOARD 17:27).
-        if (requested_pages < minimum_pages ||
-            (requested_pages > maximum_pages64 && !options.kv_capacity_resolved_automatically)) {
+        // The upper bound is the capacity curve's maximum, which make_sequence_planner_impl
+        // checks once it is known: with an elastic window class it counts every lane's window
+        // charge (lanes x (logical + charge)), so an automatic capacity resolved at that maximum
+        // can be passed back explicitly. Capping it at lanes x logical here refused every
+        // 2-stage --kv-capacity auto --max-num-seqs 1 engine (the preflight resolves
+        // logical + charge: 1,059,776 tokens at 1M).
+        if (requested_pages < minimum_pages) {
             throw std::invalid_argument(
                 "kv_capacity is outside the usable range for max_context and max_concurrency");
         }
@@ -1449,7 +1450,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             impl->request_transient_capacity_bytes, "request transient reservation"),
         checked_add(impl->graph_allowance_bytes, impl->persistent.checkpoints.reservation_bytes(),
                     "conversation snapshot allowance"), "sequence graph allowance");
-    // Lane f1 (diagnostics, SUROGATE_SERVE_PLAN_DUMP=1): the device reservation by part, one line per candidate.
+    // Window KV (diagnostics, SUROGATE_SERVE_PLAN_DUMP=1): the device reservation by part, one line per candidate.
     static const bool plan_dump = std::getenv("SUROGATE_SERVE_PLAN_DUMP") != nullptr;
     if (plan_dump) {
         const auto mib = [](std::size_t bytes) { return static_cast<double>(bytes) / (1024.0 * 1024.0); };
@@ -1539,13 +1540,24 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .elastic_kv                = options.elastic_kv,
         .elastic_kv_overcommit     = options.elastic_kv_overcommit,
         .kv_window_elastic         = [&] {
-            // Lane f1 M3-C: the window class follows demand when the cache is sized to the device.
+            // M3-C: the window class follows demand on the elastic pool.
             const char* raw = std::getenv("SUROGATE_SERVE_KV_WINDOW_ELASTIC");
             if (raw != nullptr && *raw != '\0') { return options.elastic_kv && std::strcmp(raw, "0") != 0; }
-            // A pipeline stage's explicit capacity that is the shared resolution of auto counts as
-            // auto (EngineOptions::kv_capacity_resolved_automatically; the preflight assumed it).
+            // An explicit capacity plans as auto does, so the same token count reserves the same
+            // memory: the window pages are charged to the Main pages instead of a static class sized
+            // for every lane at once. Before, an explicit capacity kept that static class beside
+            // the full count of Main pages: Inkling-2-Mini with DFlash, 8 lanes at 262,144, reserved
+            // 2,746 MiB of window class where auto held a 672 MiB floor, and the capacity auto had
+            // resolved (558,592 tokens) was refused at startup when passed back explicitly.
+            // A pipeline stage with an operator's explicit capacity keeps the static class: the
+            // stages' charges differ, and only the auto preflight shares pages net of them
+            // (runtime/engine/pipeline_kv_share.h); a stage whose explicit capacity is that shared
+            // resolution counts as auto (EngineOptions::kv_capacity_resolved_automatically).
+            const bool pipeline_stage =
+                !(options.pipeline_stage_first == 0 && options.pipeline_stage_last == 0) &&
+                (options.pipeline_stage_first > 0 || options.pipeline_stage_last < geometry.layers);
             return options.elastic_kv && (options.kv_capacity.mode == KvCapacityMode::Automatic ||
-                                          options.kv_capacity_resolved_automatically);
+                                          options.kv_capacity_resolved_automatically || !pipeline_stage);
         }(),
         .proposal_head             = options.speculative.proposal_head,
         .features                  = family::startup_features(options),
@@ -1579,19 +1591,28 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
     auto planner     = std::make_unique<family::detail::SequencePlannerImpl<Variant>>();
     planner->inputs  = inputs;
     planner->minimum = build_sequence_candidate(inputs, minimum_pages);
-    // Lane f1 M3-C: an elastic window class charges every text allocation its window pages in the
+    // M3-C: an elastic window class charges every text allocation its window pages in the
     // main ledger, so one full-context request needs logical_pages + charge and every lane at full
     // context max_concurrency x that. Without it the curve topped out at max_concurrency x
     // logical_pages: --max-num-seqs 1 --max-model-len 98304 resolved 1,536 pages and refused a
-    // 92.6k prompt (1,447 pages + 175 charged) with nothing else in the pool (e1, card 7 14:35).
+    // 92.6k prompt (1,447 pages + 175 charged) with nothing else in the pool (one RTX 5090).
     // The lane term of the minimum keeps its meaning (every graph-capture row holds one page, now
     // charged one window page as well). Zero charge (every model without an elastic window class)
     // leaves the curve as it was.
+    // An operator's explicit capacity (not a pipeline stage's shared resolution of auto).
+    const bool operator_capacity =
+        options.kv_capacity.mode == KvCapacityMode::Explicit && !options.kv_capacity_resolved_automatically;
     if (const std::uint32_t charge = planner->minimum->persistent.kv_window_lane_charge_pages; charge != 0) {
         const std::uint64_t per_lane = static_cast<std::uint64_t>(logical_pages) + charge;
+        // An operator's explicit capacity also holds every lane with one page and its window
+        // charge at once, as the static class did (one page a lane, the window beside it): the
+        // default --max-model-len capacity of a small-window model with many lanes would
+        // otherwise admit fewer lanes than it has (Gemma 3, 8,192 x 16 lanes: 223 pages, two
+        // short requests). Auto keeps its own minimum; it resolves far above it.
+        const std::uint64_t lane_term =
+            operator_capacity ? charge : planner->minimum->persistent.kv_window_page_charge_pages;
         const std::uint64_t minimum64 = std::max<std::uint64_t>(
-            per_lane, static_cast<std::uint64_t>(inputs.max_concurrency) *
-                          (1ULL + planner->minimum->persistent.kv_window_page_charge_pages));
+            per_lane, static_cast<std::uint64_t>(inputs.max_concurrency) * (1ULL + lane_term));
         maximum_pages64 = static_cast<std::uint64_t>(inputs.max_concurrency) * per_lane;
         if (maximum_pages64 > std::numeric_limits<std::uint32_t>::max()) {
             throw std::overflow_error("maximum Main KV page count exceeds uint32");
@@ -1600,7 +1621,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         // Every candidate lays out the curve's whole span: with the span following the page count
         // past lanes x logical_pages, a plane's granule rounding made bytes per page differ between
         // the minimum, minimum + 1 and the resolved count, and small auto shapes (16,384 x 4,
-        // 32,768 x 4) refused to start: "physical sequence layout is not affine" (M5, lanes h / f2b).
+        // 32,768 x 4) refused to start: "physical sequence layout is not affine" (M5).
         inputs.main_page_virtual_floor = static_cast<std::uint32_t>(maximum_pages64);
         planner->inputs  = inputs;
         planner->minimum = build_sequence_candidate(inputs, minimum_pages);
@@ -1609,12 +1630,30 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         }
     }
     const auto maximum_pages = static_cast<std::uint32_t>(maximum_pages64);
+    // Window KV: the upper bound validate_target_options leaves to the curve. A pipeline stage's shared
+    // capacity resolved from auto is the smallest stage's resolution of its own curve, so it never exceeds
+    // this stage's maximum (lanes x (logical + window charge)); one that does means the stages planned
+    // different curves, and clamping it here would give this stage a pool the others do not share.
+    if (options.kv_capacity.mode == KvCapacityMode::Explicit && options.kv_capacity_resolved_automatically &&
+        page_count(options.kv_capacity.explicit_tokens) > maximum_pages) {
+        throw std::invalid_argument(
+            "pipeline stage KV capacity " + std::to_string(options.kv_capacity.explicit_tokens) +
+            " tokens exceeds this stage's maximum of " +
+            std::to_string(static_cast<std::uint64_t>(maximum_pages) * kPagedKVPageSize) +
+            " (max_concurrency x (max_context + window charge))");
+    }
+    // An operator's explicit capacity: at most what every lane at full context holds (with an
+    // elastic window class, its charge too), the curve's maximum and auto's largest resolution.
+    if (operator_capacity && page_count(options.kv_capacity.explicit_tokens) > maximum_pages) {
+        throw std::invalid_argument("kv_capacity is outside the usable range for max_context and max_concurrency");
+    }
     planner->curve   = runtime::SequenceCapacityCurve{
           .main_page_tokens                     = static_cast<std::uint32_t>(kPagedKVPageSize),
           .minimum_main_page_groups             = minimum_pages,
           .maximum_main_page_groups             = maximum_pages,
           .minimum_device_reservation_bytes     = planner->minimum->device_reservation_bytes,
           .bytes_per_additional_main_page_group = 0,
+          .window_lane_charge_pages             = planner->minimum->persistent.kv_window_lane_charge_pages,
     };
     if (minimum_pages < maximum_pages) {
         auto adjacent = build_sequence_candidate(inputs, minimum_pages + 1U);

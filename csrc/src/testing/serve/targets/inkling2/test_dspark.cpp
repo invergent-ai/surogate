@@ -1,4 +1,4 @@
-// DSpark drafter ops (ENGINE-INKLING lane e2) against the golden vectors of ref/dspark_ref.py (make_vectors),
+// DSpark drafter ops against the golden vectors of the Python reference dspark_ref.py (make_vectors),
 // op by op with the REFERENCE's inputs (each op isolated), then the Markov chain end to end, then batch
 // invariance. Weights come from the checkpoint's mtp.safetensors; the target rows the drafter shares (embed rows
 // of the anchors, a slice of the unembed) and the fold from the vectors.
@@ -200,7 +200,7 @@ std::vector<std::uint16_t> slice(const std::vector<std::uint16_t>& v, std::size_
                                       v.begin() + static_cast<std::ptrdiff_t>(begin + n));
 }
 
-/// out BF16 / FP32 [n, tokens] = W [n, k] . x [k, tokens] on lane e1's invariant GEMM.
+/// out BF16 / FP32 [n, tokens] = W [n, k] . x [k, tokens] on the invariant GEMM (api/ops/inkling_mix.h).
 /// Tag fp8all: the drafter's dense linears run the FP8 route (per-row e4m3 + scale, ops::dspark_gemm_w8) exactly as
 /// the engine does after derive_dspark(fp8); the head and rnn_proj GEMMs stay BF16.
 bool g_fp8_weights = false;
@@ -386,7 +386,7 @@ int run(const std::string& dir, const std::string& tag) {
     kv.planes = {p0.view(), p1.view(), p2.view()};
     kv.max_visible_keys = static_cast<std::uint32_t>(max_pos);
     if (fp8) {
-        // lane c's inkling_draft_attention reads the same pages through the pool's batch-view form (FP8 planes only)
+        // inkling_draft_attention reads the same pages through the pool's batch-view form (FP8 planes only)
         const Plane* pls[3] = {&p0, &p1, &p2};
         for (int l = 0; l < 3; ++l) {
             const Plane& pl = *pls[l];
@@ -400,7 +400,7 @@ int run(const std::string& dir, const std::string& tag) {
             kv.views[static_cast<std::size_t>(l)] = v;
         }
     } else {
-        kv.naive_attention = true; // lane c's kernel takes FP8 planes only
+        kv.naive_attention = true; // inkling_draft_attention takes FP8 planes only
     }
     DBuf f_rnn(static_cast<std::size_t>(G::kHidden) * B * 2);
     WorkspaceArena work(std::max(D::dspark_append_workspace_bytes(1024),
@@ -557,8 +557,8 @@ int run(const std::string& dir, const std::string& tag) {
                std::to_string(same_c) + " / 21 and " + std::to_string(same_r) + " / 21");
     }
     {
-        // R5: the SERVING DEFAULT drafter (FP8 weights + FP8 Markov fold, since 8a146482) on every tag's inputs (M7
-        // review minor: it ran under fp8all only): drafts vs the reference (>= 19 / 21) / vs the round above
+        // R5: the FP8 drafter (FP8 weights + FP8 Markov fold; the serving default 8a146482 .. M9, opt-in since M10) on
+        // every tag's inputs: drafts vs the reference (>= 19 / 21) / vs the round above
         D::DSparkDerived der8;
         D::derive_dspark(w, der8, true, true);
         DBuf d8(static_cast<std::size_t>(7) * B * 4);
@@ -574,7 +574,7 @@ int run(const std::string& dir, const std::string& tag) {
             same_r += dv[i] == dref[i];
             same_c += dv[i] == dg[i];
         }
-        report("R5 serving-default round (FP8 weights + FP8 fold): drafts == reference (>= 19 / 21) / == the tag's round", same_r >= 19,
+        report("R5 FP8-drafter round (FP8 weights + FP8 fold): drafts == reference (>= 19 / 21) / == the tag's round", same_r >= 19,
                std::to_string(same_r) + " / 21 and " + std::to_string(same_c) + " / 21");
     }
     std::cout << (failures ? "FAIL" : "ALL PASS") << " dspark round (" << tag << ", " << failures << " failures)\n";

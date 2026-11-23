@@ -54,7 +54,8 @@ __device__ __forceinline__ unsigned vision_attention_swz_addr(unsigned lane_base
     return lane_base + ((ck | as) ^ r);
 }
 
-__global__ void vision_attention_prepare_tiles_kernel(const std::int32_t* cu_seqlens,
+// Internal linkage: the BF16 and e4m3 launchers each include this header and launch it.
+static __global__ void vision_attention_prepare_tiles_kernel(const std::int32_t* cu_seqlens,
                                                       std::int32_t segments,
                                                       VisionAttentionTile* tiles,
                                                       std::int32_t max_tiles,

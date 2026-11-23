@@ -1,8 +1,8 @@
 #pragma once
 
-// Device helpers shared by the Inkling attention kernels (ENGINE-INKLING lane c). Every arithmetic
+// Device helpers shared by the Inkling attention kernels. Every arithmetic
 // helper here reproduces one operation of vLLM's Inkling2 sm_120 kernels exactly as they issue it
-// (lanes/c/DESIGN-attention.md section 1): explicit PTX for the approximate instructions, `__f*_rn`
+// (attention design notes, section 1): explicit PTX for the approximate instructions, `__f*_rn`
 // where the reference compiles with `enable_fp_fusion=False` (nvcc contracts `a * b + c` by default).
 
 #include "api/ops/inkling_attention.h"
@@ -103,7 +103,13 @@ __device__ __forceinline__ void mma_bf16_nv(float& c0, float& c1, float& c2, flo
 
 /// Ask L2 to fetch [ptr, ptr + bytes) (bytes a multiple of 16; no registers, no shared memory, no completion to wait for).
 __device__ __forceinline__ void prefetch_l2_bulk(const void* ptr, unsigned bytes) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
     asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(ptr), "r"(bytes) : "memory");
+#else
+    // cp.async.bulk is sm_90+; below it the hint is dropped (the sm_89 cubin of the serve build must compile).
+    (void)ptr;
+    (void)bytes;
+#endif
 }
 
 /// Non-coherent global loads the compiler may not move (a register ring's distance stays as written).

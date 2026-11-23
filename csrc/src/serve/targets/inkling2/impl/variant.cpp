@@ -1,5 +1,5 @@
 // Inkling-2-Mini Variant: the residual hooks, the LM head, the state / window declarations, and the refusing
-// leaves; the instantiation of the family runtime over this Variant (lane e1, DESIGN-target.md 1).
+// leaves; the instantiation of the family runtime over this Variant (target design notes, 1).
 
 #include "targets/inkling2/impl/variant.h"
 #include "targets/inkling2/impl/visits.h"
@@ -58,7 +58,7 @@ std::vector<GraphExecutionProfile> Variant::mtp_graph_profiles(std::uint32_t, st
 
 std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t capacity, std::uint32_t,
                                                                   std::uint32_t) {
-    // DSpark (lane e2): the verify's split follows the global visits' bands, as an ordinary round's; the drafter's
+    // DSpark: the verify's split follows the global visits' bands, as an ordinary round's; the drafter's
     // own attention plans from the round shape alone.
     return ordinary_graph_profiles(capacity);
 }
@@ -106,7 +106,7 @@ void Variant::lm_head(const ModelView& model, const Tensor& hidden, Tensor& logi
         throw std::logic_error("inkling2: the LM head writes FP32 [201024, T] logits from a [2304, T] hidden");
     }
     const std::int32_t tokens = hidden.ne[1] * hidden.ne[2];
-    // The invariant GEMM (agent-EN 10:2x): a column's logits do not depend on how many columns share the head.
+    // The invariant GEMM: a column's logits do not depend on how many columns share the head.
     ops::inkling_gemm_inv(model.output_head.qdata, C::output_rows, C::hidden, hidden.data, tokens, logits.data,
                           DType::FP32, C::output_rows, {}, nullptr, 0, stream);
     ops::inkling_softcap_f32(static_cast<float*>(logits.data), C::output_rows, tokens, C::output_rows,

@@ -145,7 +145,8 @@ std::string format_server_start_json(const std::string& server_instance_id,
                                      const sinfer::LoadSummary& load,
                                      const sinfer::MemorySummary& memory,
                                      const ServerLogEnvironment& environment,
-                                     std::optional<std::uint64_t> artifact_size_bytes);
+                                     std::optional<std::uint64_t> artifact_size_bytes,
+                                     std::optional<bool> kv_on_demand_effective = std::nullopt);
 std::string format_request_start_json(const std::string& server_instance_id,
                                       std::uint64_t timestamp_unix_ms,
                                       const RequestLogContext& context);
@@ -183,7 +184,7 @@ public:
     void write_server_start(const ServeOptions& options,
                             const sinfer::ModelSamplingDefaults& sampling_defaults,
                             const std::string& public_model_id, const sinfer::LoadSummary& load,
-                            const sinfer::MemorySummary& memory);
+                            const sinfer::MemorySummary& memory, bool kv_on_demand_effective);
     void write_request_start(const RequestLogContext& context);
     void write_request_rejected(const RequestRejectionLogContext& context);
     void write_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);

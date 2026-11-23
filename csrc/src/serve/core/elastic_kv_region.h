@@ -97,6 +97,25 @@ public:
     /// within it, demand at the limit trades a free granule for the one it needs, and the pool
     /// chooses pages so that the granules holding pages fit inside it.
     [[nodiscard]] std::uint32_t granule_limit() const noexcept;
+    /// Bytes of this region's limit that another region maps on its behalf: an elastic window
+    /// class (M3-C) books its holders' window pages in this pool's page ledger, but maps them in
+    /// its own region, so automatic sizing planned them once, inside this region's cap. The
+    /// granule limit leaves them out, so the two regions together stay inside the plan. Before
+    /// this, both could fill at once: on 2026-11-23 an Inkling-2-Mini engine mapped the main pool towards its
+    /// cap while eight lanes held window pages, left 4 MiB free and aborted
+    /// (out-of-memory diagnosis, finding F1). When the new limit is below what
+    /// is mapped, the free granules go back at the next round boundary (flush_reserve_release; the
+    /// pipelined executor flushes at its idle boundaries, kv_round_boundary).
+    void set_foreign_bytes(std::size_t bytes) noexcept;
+    /// The region that maps the foreign bytes. Whatever it maps past its own limit is left out
+    /// of this region's limit too, so the two stay inside the plan while its emptied or
+    /// partly used granules wait to go back. Both regions must outlive each other's use: the
+    /// pool that owns them both sets this once.
+    void set_foreign_region(const ElasticKvRegion& other) noexcept;
+    /// Mapped past the granule limit (its entitlement fell, e.g. a window class whose holders left):
+    /// the free granules go back at the next round boundary. A worker unmap otherwise keeps up to
+    /// the trim threshold of emptied granules, past the entitlement the plan counted.
+    void release_above_limit() noexcept;
     /// Which granules are mapped right now (one entry per granule, nonzero when mapped). A
     /// snapshot: the worker may map or unmap a free granule a moment later.
     [[nodiscard]] std::vector<std::uint8_t> mapped_granule_mask() const;

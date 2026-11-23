@@ -69,8 +69,9 @@ bool attach_resident_qlora_fp4_cache(modules::MatmulContext& ctx,
         return false;
     }
     const auto* qt = provider->ensure_quantized_resident(weight_name, run_state.MainStream);
+    // Stacked per-component global scales (pre-quantized experts) have no single amax for the GEMM: dequant path.
     if (!qt || qt->format != qlora::QuantFormat::FP4_BLOCK_2D || qt->data.is_null() || qt->scales.is_null() ||
-        qt->is_on_host()) {
+        qt->is_on_host() || qt->component_rows > 0) {
         return false;
     }
     if (qt->M <= 0 || qt->K <= 0 || qt->K % 2 != 0) {

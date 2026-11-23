@@ -1,12 +1,12 @@
-"""ENGINE-INKLING lane T: the trainer's Inkling forward through the engine's own ops (ift_engine.InklingEngine).
+"""The trainer's Inkling forward through the engine's own ops (ift_engine.InklingEngine).
 
 forward(eng, ids) runs embed -> 48 visits -> final mix on ONE prompt segment (positions 0..T-1, B = 1) exactly as
-the engine's prefill does, and returns what the LEVEL-0 backward needs (lanes/T/NOTES.md PLAN 3):
+the engine's prefill does, and returns what the LEVEL-0 backward needs:
   x0       bf16 [T, 2304]   the normed embedding (stack slot 0)
   outs[v]  bf16 [T, 2304]   visit v's output (the stack slot it wrote: kVisits[v].next_partial)
   routing  int32 [48, T, 8] the routed experts of every visit (the engine's own routing; R3 by construction)
   hidden   bf16 [T, 2304]   the final-norm output the LM head reads
-Prompt log-probs: logprobs(eng, hidden, ids) = the engine's returned values (lane e1's inkling_head_logprob).
+Prompt log-probs: logprobs(eng, hidden, ids) = the engine's returned values (the engine's inkling_head_logprob).
 """
 
 from __future__ import annotations

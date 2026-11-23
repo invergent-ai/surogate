@@ -38,7 +38,7 @@ def _function_body(source: str, signature: str) -> str:
 def test_guard_precedes_optimizer_update():
     src = TRAINER.read_text()
     guard = src.index(GUARD)
-    update = src.index("result = self.trainer.update_with_config(opt_config, step + 1)")
+    update = src.index("result = self.trainer.update_with_config(opt_config, step)")
     total = src.index('loss_tokens = int(sum(int(mb["loss_mask"].sum()) for mb in micro_batches))')
     assert total < guard < update, "guard must sit between the loss-token total and the optimizer update"
 
