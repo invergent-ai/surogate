@@ -74,7 +74,10 @@ def gate_rows(path):
     rows = []
     for n in range(sum(1 for k in z.files if k.startswith("ids_"))):
         ids, mask, lp = z[f"ids_{n}"].astype(np.int64), z[f"mask_{n}"].astype(bool), z[f"lp_{n}"].astype(np.float64)
-        rows.append(Row(ids=ids, loss_mask=mask, engine_lp=lp, advantage=0.0, versions=None, teacher_lp=None, routed=None, notes={"weight": 1.0}))
+        notes = {"weight": 1.0}
+        if f"fin_{n}" in z.files:
+            notes["final_mask"] = z[f"fin_{n}"].astype(bool)
+        rows.append(Row(ids=ids, loss_mask=mask, engine_lp=lp, advantage=0.0, versions=None, teacher_lp=None, routed=None, notes=notes))
     return rows
 
 

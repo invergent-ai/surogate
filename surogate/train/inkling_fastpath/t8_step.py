@@ -266,6 +266,9 @@ class WorkerCore:
             if bad:
                 raise T8GateError(f"REPLAY GATE: row {i} (T {T}): {bad} of {int(mask.sum())} loss tokens differ from the rollout's log-probs")
         out["replay_checked"] = bool(on_policy)
+        fm = row.notes.get("final_mask")
+        if on_policy and fm is not None:  # the final-reply tokens the replay gate just covered (RX: they are in the loss)
+            out["replay_final_tokens"] = int((np.asarray(fm, dtype=bool) & mask).sum())
         # the routing gate compares THIS forward's own routing with the rollout's capture: in "ppo" mode only the first mini-batch runs at the
         # start weights (proven by the stale gate); later mini-batches run at moved weights, where a near-tie routing decision may flip (review B1)
         if rp is not None and on_policy and (mode != "ppo" or job.get("minibatch_index", 0) == 0):
@@ -568,6 +571,7 @@ def compute_step(handles: list, layout: ParamLayout, flats: list, shapes: list, 
         raise T8GateError(f"VERSION GATE: the replay gate was skipped on {m['replay_skipped_rows']} rows")
     m["stack"] = cfg.stack
     m["stale_checked_rows"] = sum(1 for r in results if r.get("stale_checked"))
+    m["replay_checked_final_tokens"] = sum(r.get("replay_final_tokens", 0) for r in results)
     dd = [r["rollout_train_abs_diff"] for r in results if "rollout_train_abs_diff" in r]
     if dd:  # SkyRL's logged statistic, reported beside the bitwise replay gate
         m["rollout_train_logprobs_abs_diff_mean"] = sum(x[0] for x in dd) / max(m["total_tokens"], 1)

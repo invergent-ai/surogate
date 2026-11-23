@@ -9,6 +9,10 @@ a gradient. Real rows of 16,009 / 28,002 / 47,014 / 57,431 tokens (gate_rows.npz
       sampled at the zero adapter); then, at the non-zero test adapter, the stale gate (mini-batch 1 forward == the recomputed old log-probs, bitwise,
       stale_checked_rows >= 1) and the replay gate on the old log-probs (here against the trainer's own log-probs: plumbing only) hold; mini-batch 2 runs at
       moved weights (some ratio != 1); all gradients finite; A and B masters both changed; host peak per worker reported (all four keys, K = 48, the 57k row).
+  G16 (2 cards; rows of 26,745 / 29,937 / 50,024 tokens WITH final-reply tokens in the loss mask, gate_rows_fin.npz, picked by length only; added
+      2026-11-23 12:3x before any run): at the zero adapter the workers' log-probs == the rollout's at EVERY loss token, counted separately over the
+      final-reply tokens (1,505) and the rest: 0 mismatches in both; then one `ppo_batch` (1 mini-batch, plain head) on them completes, finite, with
+      replay_checked_final_tokens == 1,505 and the stale gate on every row.
 """
 from __future__ import annotations
 
@@ -157,9 +161,49 @@ def phase_g12(a, rows):
     return rep
 
 
+def phase_g16(a, rows):
+    from surogate.inkling_rl.step import StepConfig
+    import t8_skyrl as KS
+    import t8_step as TS
+
+    cards = tuple(int(x) for x in a.cards.split(","))
+    tr = TS.T8Trainer(TS.T8Config(bin_dir=a.bin, artifact=a.artifact, cards=cards, K=48, head="plain", max_row_tokens=58010, segment_keys=(),
+                                  train_keys=("A13", "B13", "A2", "B2"), run_dir=a.run_dir))
+    rep = {}
+    try:
+        lpz = tr.logprobs(rows)
+        fin_bad = rest_bad = fin_n = rest_n = 0
+        for r, x in zip(rows, lpz):
+            m = r.loss_mask[1:]
+            f = r.notes["final_mask"][1:] & m
+            o = m & ~f
+            eq = x.view(np.int32) == r.engine_lp[1:].astype(np.float32).view(np.int32)
+            fin_bad += int((~eq & f).sum())
+            rest_bad += int((~eq & o).sum())
+            fin_n += int(f.sum())
+            rest_n += int(o.sum())
+        rep["replay_zero_adapter"] = {"final_tokens": fin_n, "final_mismatches": fin_bad, "other_tokens": rest_n, "other_mismatches": rest_bad}
+        log(f"G16 replay at the zero adapter: {rep['replay_zero_adapter']}")
+        for k, r in enumerate(rows):
+            r.group_idx = 0 if k < 2 else 1
+            r.trial_idx = k
+        KS.grpo_advantages_rows(rows, {0: 1.0, 1: 0.0, 2: 1.0})
+        res = TS.ppo_batch(tr, rows, 0, 2e-5, 1, StepConfig(max_policy_lag=None))
+        o, n = res[0]
+        rep["step"] = {"grad_norm": n, "finite": all(bool(torch.isfinite(g).all()) for g in o.grads), "replay_checked_final_tokens": o.metrics["replay_checked_final_tokens"],
+                       "stale_checked_rows": o.metrics["stale_checked_rows"], "tok_per_s_per_card": o.metrics["tok_per_s_per_card"],
+                       "host_peak_gib": max(w["VmHWM_gib"] for w in o.metrics["workers"])}
+        log(f"G16 step: {rep['step']}")
+        rep["pass"] = bool(fin_n > 0 and fin_bad == 0 and rest_bad == 0 and rep["step"]["finite"] and rep["step"]["replay_checked_final_tokens"] == fin_n
+                           and rep["step"]["stale_checked_rows"] == len(rows))
+    finally:
+        tr.close()
+    return rep
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--phase", required=True, choices=("g10", "g12"))
+    ap.add_argument("--phase", required=True, choices=("g10", "g12", "g16"))
     ap.add_argument("--bin", required=True)
     ap.add_argument("--artifact", required=True)
     ap.add_argument("--rows", required=True)
@@ -168,7 +212,7 @@ def main():
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     rows = GT.gate_rows(a.rows)
-    rep = (phase_g10 if a.phase == "g10" else phase_g12)(a, rows)
+    rep = {"g10": phase_g10, "g12": phase_g12, "g16": phase_g16}[a.phase](a, rows)
     json.dump(rep, open(a.out, "w"), indent=1, default=float)
     print(f"T8 GATE S1 {a.phase}: {'PASS' if rep['pass'] else 'FAIL'}", flush=True)
     return 0 if rep["pass"] else 4
