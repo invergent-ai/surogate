@@ -1,35 +1,39 @@
 #!/bin/bash
-# ENGINE-INKLING lane h: run the roofline kit on ONE gpubox2 card, only after agent-EN relayed "go" for that card.
-# Run from node-3. Usage:
-#   run.sh start <card>[,<card2>] --go [kit options, e.g. --only gap,dram]  start detached on gpubox2, poll, fetch
+# Run the Inkling-2-Mini roofline kit on ONE card of a remote GPU host (built there by build.sh).
+# Run from a control machine. Usage:
+#   run.sh start <card>[,<card2>] --go [kit options, e.g. --only gap,dram]  start detached on BUILD_HOST, poll, fetch
 #                                     (two cards: device 0 = the first; the host part then also times P2P 0 <-> 1)
 #   run.sh stop                                                            kill our running kit (PID + cmdline check)
-#   run.sh fetch <stamp>                                                   copy a finished run back to NFS
+#   run.sh fetch <stamp>                                                   copy a finished run back to RESULTS_DIR
+# --go confirms that the card may be used for the run. Environment: BUILD_HOST (ssh host, required); REMOTE_DIR (the
+# kit's directory there, as in build.sh, default $HOME/inkling-roofline there); RESULTS_DIR (local, default results/
+# next to this script).
 # Guards: refuses a card with any compute process or > 1 GiB used; CUDA_DEVICE_ORDER=PCI_BUS_ID so <card> is the
-# nvidia-smi index. Results: rl/engine-inkling-2026-11-21/perf/results/roofline-<stamp>/ (roofline.jsonl = stdout,
+# nvidia-smi index. Results: $RESULTS_DIR/roofline-<stamp>/ (roofline.jsonl = stdout,
 # roofline.stderr, smi.csv sampled every 0.5 s, gpu-info.txt).
 set -euo pipefail
-R=/home/densemax2/effrl/build-inkling/h/roofline
-NFS=/mnt/data/work/rl/engine-inkling-2026-11-21/perf/results
+HERE=$(cd "$(dirname "$0")" && pwd)
+BUILD_HOST=${BUILD_HOST:?set BUILD_HOST to the ssh host that runs the kit}
+R=${REMOTE_DIR:-$(ssh "$BUILD_HOST" 'echo "$HOME/inkling-roofline"')}
+NFS=${RESULTS_DIR:-$HERE/results}
 cmd=${1:?start|stop|fetch}; shift
 
 fetch() {
   local stamp=$1
   mkdir -p "$NFS/roofline-$stamp"
-  rsync -a "gpubox2:$R/runs/$stamp/" "$NFS/roofline-$stamp/"
+  rsync -a "$BUILD_HOST:$R/runs/$stamp/" "$NFS/roofline-$stamp/"
   echo "fetched: $NFS/roofline-$stamp"
 }
 
 case "$cmd" in
 start)
   card=${1:?card}; shift
-  [ "${1:-}" = "--go" ] || { echo "refusing: pass --go only after agent-EN relayed go for card $card"; exit 2; }
+  [ "${1:-}" = "--go" ] || { echo "refusing: pass --go to confirm that card $card may be used"; exit 2; }
   shift
   stamp=$(TZ=Europe/Bucharest date +%m%d-%H%M%S)
-  ssh gpubox2 bash -s -- "$card" "$stamp" "$@" <<'EOF'
+  ssh "$BUILD_HOST" bash -s -- "$R" "$card" "$stamp" "$@" <<'EOF'
 set -euo pipefail
-card=$1; stamp=$2; shift 2
-R=/home/densemax2/effrl/build-inkling/h/roofline
+R=$1; card=$2; stamp=$3; shift 3
 D=$R/runs/$stamp; mkdir -p $D
 for c in ${card//,/ }; do   # <card> may be a list, e.g. 6,7 (P2P): every card must be idle
   uuid=$(nvidia-smi --query-gpu=uuid --format=csv,noheader -i $c)
@@ -52,17 +56,17 @@ echo $! > $R/kit.pid
 echo "started stamp=$stamp pid=$(cat $R/kit.pid) card=$card"
 EOF
   # poll until the kit exits (it prints {"bench":"done"} last), then stop the sampler and fetch
-  while ssh gpubox2 "kill -0 \$(cat $R/kit.pid) 2>/dev/null"; do
-    ssh gpubox2 "tail -n 1 $R/runs/$stamp/roofline.stderr" 2>/dev/null || true
+  while ssh "$BUILD_HOST" "kill -0 \$(cat $R/kit.pid) 2>/dev/null"; do
+    ssh "$BUILD_HOST" "tail -n 1 $R/runs/$stamp/roofline.stderr" 2>/dev/null || true
     sleep 15
   done
-  ssh gpubox2 "p=\$(cat $R/runs/$stamp/smi.pid); ps -o args= -p \$p | grep -q '^nvidia-smi -i' && kill \$p || true"
+  ssh "$BUILD_HOST" "p=\$(cat $R/runs/$stamp/smi.pid); ps -o args= -p \$p | grep -q '^nvidia-smi -i' && kill \$p || true"
   fetch "$stamp"
   grep -c '"ok":false' "$NFS/roofline-$stamp/roofline.jsonl" | sed 's/^/ok:false lines: /' || true
   ;;
 stop)
-  ssh gpubox2 bash -s <<'EOF'
-R=/home/densemax2/effrl/build-inkling/h/roofline
+  ssh "$BUILD_HOST" bash -s -- "$R" <<'EOF'
+R=$1
 p=$(cat $R/kit.pid 2>/dev/null) || { echo "no pid file"; exit 0; }
 if ps -o args= -p "$p" | grep -q "^$R/inkling_roofline"; then kill "$p"; echo "killed kit pid $p"; else echo "pid $p is not our kit (or gone)"; fi
 for f in $R/runs/*/smi.pid; do q=$(cat "$f"); ps -o args= -p "$q" 2>/dev/null | grep -q '^nvidia-smi -i' && kill "$q" && echo "killed sampler $q"; done

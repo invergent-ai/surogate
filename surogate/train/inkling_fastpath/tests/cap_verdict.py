@@ -1,4 +1,4 @@
-"""Lane T: the verdict of the capped session, from its two reports, by the PASS line written in lanes/T/NOTES.md BEFORE the session:
+"""The verdict of the capped session, from its two reports, by the PASS line written BEFORE the session:
 (1) the 28-32k row completes its update without running out of memory; (2) the step's tok/s is measured at ~16k and ~32k, with 8k beside
 them; (3) the capped arm meets the unchanged line (cos >= 0.9999, rel err <= 1 %) at 1k / 4k / 8k vs A1, A0 and ift_backward, with A/A
 exactly 0.0, finite. Anything else is FAIL.

@@ -1,4 +1,4 @@
-# agent-EN-f2 (ENGINE-INKLING lane f2), 2026-11-21.
+# Inkling-2 renderer edge cases, 2026-11-21.
 # Hand-built request bodies that exercise every branch of vLLM's Inkling2 renderer and request handling that the real
 # harness corpus (build_corpus.py) does not reach: reasoning-effort levels (named, numeric, numeric strings, invalid),
 # tool_choice / parallel_tool_calls instructions, developer tools, content parts, empty strings, continue_final_message,

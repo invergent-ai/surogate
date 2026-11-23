@@ -312,7 +312,7 @@ QType qtype_for(NumericFormat format) {
     case NumericFormat::FP8_E4M3FN_ROW_F32S:
         return QType::FP8_E4M3FN_ROW_F32S;
     case NumericFormat::FP8_E4M3FN_1X128_F32S:
-        // No QType of its own (core/tensor.h is not this lane's file): the block route's qtype
+        // No QType of its own (core/tensor.h is left unchanged here): the block route's qtype
         // with a [128 columns x 1 row] scale cell, which the existing FP8 block kernels refuse
         // (they accept only 128x128 and k x 1 cells) instead of misreading.
         return QType::FP8_E4M3FN_BLK128_F32S;

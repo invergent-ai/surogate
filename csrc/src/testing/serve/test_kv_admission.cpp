@@ -189,7 +189,7 @@ void test_requeue_and_forced() {
     check(sinfer::runtime::parse_kv_forced_preemption(nullptr).every == 0, "unset is off");
 }
 
-/// Lane f1 (review R6 finding 1): the growth reach covers every write of a round. Without a draft
+/// Window KV (review R6 finding 1): the growth reach covers every write of a round. Without a draft
 /// block it is the value every model had before; with DSpark's block of 8 and k <= 7 it covers
 /// [frontier, frontier + max(extent + 1, 8)) for every extent, as launch_dflash_round maps it.
 void test_round_reach() {
@@ -235,7 +235,7 @@ void test_round_reach() {
           "with both switches at their defaults a sampled row is recomputable, as before");
 }
 
-/// Lane f1: without an explicit --kv-admission ondemand every engine takes the rule it had before the DSpark opt-in; with it, the
+/// Window KV: without an explicit --kv-admission ondemand every engine takes the rule it had before the DSpark opt-in; with it, the
 /// only engine that changes is a one-card DSpark engine in on-demand mode.
 void test_engine_on_demand() {
     using sinfer::runtime::kv_engine_on_demand;
@@ -253,7 +253,7 @@ void test_engine_on_demand() {
     check(changed == 1, "the explicit flag changes exactly one engine kind");
 }
 
-/// Lane f1 (review R5 minors 11 c, 12): what a pipeline stage counts against the run's need, and the page size the
+/// Window KV (review R5 minors 11 c, 12): what a pipeline stage counts against the run's need, and the page size the
 /// shared pool is converted with.
 void test_pipeline_held_tokens() {
     using sinfer::runtime::pipeline_stage_held_tokens;

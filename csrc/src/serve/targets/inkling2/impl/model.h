@@ -1,6 +1,6 @@
 #pragma once
 
-// Inkling-2-Mini: the loaded model as the family runtime sees it (lane e1). Lane b's bindings
+// Inkling-2-Mini: the loaded model as the family runtime sees it. The weight bindings
 // (`impl/load/bindings.h`) bind and materialise the 24 physical layers; this file adds what the target
 // derives at load (the pre-scaled AttnRes / message queries, ARTIFACT.md 5) and the 48-visit ModelView whose
 // FullLayer entries are aliases into the physical layers (DESIGN-target.md 0.2, 4 (b)).
@@ -36,7 +36,7 @@ struct DerivedQueries {
     /// Per core layer j (layer 6 + j): FP32 [D, 4] = (cross[2j], kv[2j], kv[2j + 1], cross[2j + 1]) x scale:
     /// the message queries of the streams attn, k, v, mlp.
     std::array<Tensor, TextConfig::core_end - TextConfig::core_start> message{};
-    /// Lane c's relative-bias tables, one per physical layer (inkling_rel_proj_table of `attn/rel_proj` at load):
+    /// The attention's relative-bias tables, one per physical layer (inkling_rel_proj_table of `attn/rel_proj` at load):
     /// BF16 [16, kRelTableRows], shared by the passes of a core layer.
     DeviceBuffer rel_storage;
     std::array<Tensor, TextConfig::physical_layers> rel_table{};
@@ -46,7 +46,7 @@ struct DerivedQueries {
 struct InklingModel {
     const load::InklingWeights* weights   = nullptr;
     const DerivedQueries* queries         = nullptr;
-    const DSparkDerived* dspark           = nullptr; ///< set when the drafter is bound (lane e2)
+    const DSparkDerived* dspark           = nullptr; ///< set when the drafter is bound (DSpark)
 };
 
 /// The `FullAttentionProjectionWeights` of a visit: its physical layer and where it sits in the schedule.
@@ -59,7 +59,7 @@ struct VisitPayload {
 /// No linear-attention layers: the GDN payload exists because the runtime's types name one.
 struct NoGdnPayload {};
 
-/// The `PostMixerWeights` of a visit (lane d's MoE reads the physical layer's banks).
+/// The `PostMixerWeights` of a visit (the MoE op reads the physical layer's banks).
 struct MoePayload {
     const load::InklingLayerWeights* layer = nullptr;
     std::int32_t visit                     = 0;
@@ -72,7 +72,7 @@ struct BindingPlan {
     load::BindingPlan plan;
     family::TextGeometry geometry; ///< the served (48-visit) geometry
     family::StartupFeatures features;
-    /// Objects bound HostBank (today only the DSpark dense linears under FP8 drafter weights, lane e2).
+    /// Objects bound HostBank (today only the DSpark dense linears under FP8 drafter weights).
     family::HostBankPlan host_bank;
 };
 
@@ -98,7 +98,7 @@ public:
     family::FrontendResources frontend;
     load::InklingWeights weights;
     DerivedQueries queries;
-    DSparkDerived dspark; ///< the drafter's load-time derivations (lane e2); empty without `--speculative dflash`
+    DSparkDerived dspark; ///< the drafter's load-time derivations (DSpark); empty without `--speculative dflash`
     InklingModel model;
     RuntimeModelView runtime;
 };

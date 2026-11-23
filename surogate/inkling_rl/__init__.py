@@ -1,6 +1,6 @@
-"""Inkling-2-Mini RL glue (lane agent-EN-RL, ENGINE-INKLING 2026-11-21).
+"""Inkling-2-Mini RL glue.
 
-The kit's RL loop (repos/surogate3.7-35b, branch ow-template) talks to its trainer through files only:
+The kit's RL loop (an external RL recipe, branch ow-template) talks to its trainer through files only:
   - rollouts:   <run_dir>/rollouts/step_<N>/rollouts.bin  (msgpack TrainingBatch, the kit's sg_types schema)
   - broadcasts: <run_dir>/broadcasts/step_<N>/{adapter_model.safetensors, adapter_config.json, STABLE}
   - metrics:    <surogate_metrics_path> (JSON lines) and train.log lines the kit's guards parse

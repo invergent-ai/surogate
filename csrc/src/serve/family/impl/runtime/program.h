@@ -627,7 +627,7 @@ public:
     [[nodiscard]] bool kv_under_pressure() const noexcept;
     /// Round boundary: perform a reserve release another engine asked for, report pressure.
     bool kv_service_pressure() noexcept;
-    void kv_round_boundary() noexcept; ///< lane f1 M3-C: window-class compaction (pipelined executor)
+    void kv_round_boundary() noexcept; ///< M3-C: window-class compaction (pipelined executor)
 
     /// --kv-admission (DESIGN-kv-admission.md), set once by the executor before any request is
     /// planned. On demand only where a recompute reproduces a sequence: not on a pipeline stage
@@ -666,7 +666,7 @@ public:
         void* data = nullptr;
         ~PinnedBoundary() { if (data != nullptr) { cudaFreeHost(data); } }
     } stage_export, stage_import;
-    // DSpark on a pipeline (ENGINE-INKLING lane e1): the drafter stage's verify ids / positions for the round
+    // DSpark on a pipeline: the drafter stage's verify ids / positions for the round
     // (export, on the stage with the head) and their copy on the first stage (import). Empty for every other target.
     PinnedBoundary dspark_draft_export, dspark_draft_import;
     std::size_t stage_boundary_bytes_ = 0;
@@ -1096,7 +1096,7 @@ private:
                                         std::uint32_t nominal);
     void trim_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
                           std::uint32_t backend_tokens = 0);
-    // Window-bounded KV pages (lane f1, prefix_cache_impl.h; DESIGN-window-kv.md). All of them do
+    // Window-bounded KV pages (prefix_cache_impl.h). All of them do
     // nothing unless the text pool has a window class, which only a model with windowed layers has.
     [[nodiscard]] bool window_paging() const noexcept;
     /// Frontiers whose window the sequence must keep: its rewrite checkpoint, and the one its

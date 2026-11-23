@@ -1,9 +1,9 @@
 #pragma once
 
-// Inkling-2 image preprocessing (ENGINE-INKLING lane V-b): the bytes of one image -> the decoder-token grid and the
+// Inkling-2 image preprocessing: the bytes of one image -> the decoder-token grid and the
 // vision tower's input, bit-identical to vLLM (image vllm/vllm-openai:inkling-2-mini-x86_64-7cb5dae).
 //
-// Reference, read in rl/engine-inkling-2026-11-21/ref/src/vllm/models/inkling2/:
+// Reference, read in the vLLM image's vllm/models/inkling2/:
 //   processing.py   decode_image (Pillow on the original bytes, JPEG EOI fix, NO EXIF, alpha composited on an 8 px
 //                   checkerboard 204 / 153 as (rgb*a + bg*(255-a) + 127) // 255), Inkling2ImageProcessor (no resize:
 //                   the image is padded bottom / right with -1 to ceil(H/40) x ceil(W/40) cells, one decoder token per
@@ -13,8 +13,8 @@
 //                   in fp32 without FMA, stored as bf16.
 // The payload handed to the engine (PreparedMediaPayload) is those rows in MERGE order -- cell by cell in raster order,
 // inside a cell (dy, dx) = (0,0), (0,1), (1,0), (1,1) -- i.e. 4 consecutive rows per decoder token, the layout the
-// family's vision path uses. vLLM's tower reads them in native raster order; the encoder (lane V-c) owns that mapping.
-// Test: sinfer_inkling_vision_test over rl/engine-inkling-2026-11-21/vectors/vision (lane V-a's vectors from vLLM).
+// family's vision path uses. vLLM's tower reads them in native raster order; the vision encoder owns that mapping.
+// Test: sinfer_inkling_vision_test over the vision vectors (generated from vLLM).
 
 #include "media/decode/decode.h"
 
@@ -31,12 +31,12 @@ inline constexpr int kNativePatch      = 20;  // the ViT's patch (native_patch_s
 inline constexpr int kMergeSize        = 2;   // adapter_merge_size: 2 x 2 native patches per decoder token
 inline constexpr int kPatchFeatures    = kNativePatch * kNativePatch * 3;  // 1,200: (py, px, channel)
 inline constexpr int kPatchesPerToken  = kMergeSize * kMergeSize;
-/// vLLM's per-image limit at --max-num-batched-tokens 4096 (the encoder cache size; agent-EN's decision for ours).
+/// vLLM's per-image limit at --max-num-batched-tokens 4096 (the encoder cache size; ours uses the same).
 inline constexpr std::uint32_t kDefaultMaxImageTokens = 4'096;
 /// vLLM's per-prompt image count when --limit-mm-per-prompt does not name images (config/multimodal.py).
 inline constexpr std::uint32_t kDefaultImagesPerPrompt = 999;
 
-/// Which of vLLM's two decodes the pixels follow (lane V-a measured on a running vLLM, 18:0x: a chat request's image
+/// Which of vLLM's two decodes the pixels follow (measured on a running vLLM: a chat request's image
 /// never reaches processing.py's decode_image -- the chat parser hands the Inkling processor the image vLLM's generic
 /// ImageMediaIO already converted).
 enum class DecodePath : std::uint8_t {

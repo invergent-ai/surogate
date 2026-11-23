@@ -154,7 +154,7 @@ __device__ __forceinline__ void cp_async_cg16_hint(void* smem_dst, const void* g
 /// dependency wait -- griddepcontrol.wait makes the prerequisite grid's writes visible to weak loads -- and NEVER
 /// through the non-coherent path (ld.global.nc / __ldg / LDG.CONSTANT): its data must stay unchanged for the reading
 /// kernel's whole lifetime, which a PDL-overlapped producer violates, and the compiler may hoist nc loads above the wait
-/// (lane c's FP8 decode bug, 2026-11-21). Review R4 of M9 (major): mode 0 used to be `*address`, which NVPTX lowers to
+/// (the FP8 attention decode bug, 2026-11-21). Review R4 of M9 (major): mode 0 used to be `*address`, which NVPTX lowers to
 /// ld.global.nc (LDG.E.CONSTANT) on these `const __restrict__` read-only inputs; `__ldca` names the cache operator, so
 /// the load stays weak (no .nc) and keeps the L1 hit of the quantisers' second pass over a row (ld.global.cg measured
 /// +2.0 us per NVFP4 call at T=1, 2128f247). `RowLoad` is a compile-time TEST-ONLY mode (inkling_test_read_only_loads

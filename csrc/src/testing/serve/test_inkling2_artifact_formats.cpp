@@ -1,4 +1,4 @@
-// Inkling-2 artifact formats in the C++ reader (lane b, ARTIFACT.md I-1): the two formats the
+// Inkling-2 artifact formats in the C++ reader (artifact contract I-1): the two formats the
 // Inkling artifact adds (MXFP8, FP8_E4M3FN_1X128_F32S) parse, size and route like the Python
 // writer says; every existing format keeps its size. With INKLING2_ARTIFACT set to a converted
 // Inkling-2-Mini artifact, the reader also opens it and checks the objects the target binds.

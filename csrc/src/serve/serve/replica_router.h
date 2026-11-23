@@ -36,7 +36,7 @@ struct RoutingKey {
 /// Only the conversation's OWN prefix counts. Every conversation of one agent opens with the same
 /// tools and system prompt, so that head is in the cache of every replica that ever served one;
 /// preferring it drew each new task onto a replica already hosting another, and two 200k-token
-/// conversations on a 460k-token cache evicted each other on every turn (2026-10-17, gpubox1/2:
+/// conversations on a 460k-token cache evicted each other on every turn (2026-10-17, two GPU hosts:
 /// 48 and 71 full re-reads of 214k-262k prompts, 76-80% of all re-read tokens). The router tells a
 /// head from a conversation by what followed it: a prefix that requests continued in two
 /// different ways is shared (`Fork`), and a match that ends on one is no reason to stay.

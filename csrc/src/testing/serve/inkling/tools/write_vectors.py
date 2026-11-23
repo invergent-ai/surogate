@@ -1,4 +1,4 @@
-# agent-EN-f2: join request bodies with the reference driver's outputs into one vector file per case.
+# Join request bodies with the reference driver's outputs into one vector file per case.
 # python3 write_vectors.py KIND OUT_DIR BODIES.jsonl REF_OUT.jsonl [BODIES.jsonl REF_OUT.jsonl ...]
 #   KIND renderer: {"case","source","meta","body","expected":{"prompt_token_ids"} | {"error"}}
 #   KIND parser:   {"case","source","meta","body","prompt_token_ids","output_token_ids","engine_finish_reason",

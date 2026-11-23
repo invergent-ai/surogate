@@ -1,7 +1,7 @@
 """The kit's own trainer-side sources, byte copies pinned by sha256, loaded WITHOUT importing their modules.
 
 kit/loss_041f2c0c.py.txt      = the deployed GSPO loss (pkg-async-r3's loss.py, the kit env's sha_loss 041f2c0cc9652d8b;
-                                source rl/trainer-check-2026-11-06/trainer-patch/new/loss.py)
+                                source: the trainer patch set's new/loss.py)
 kit/config_ea32d191.py.txt    = the GRPOLossConfig of the same patch set (trainer-check new/config.py ea32d1918ca33dbc:
                                 gspo, seq_ratio_old, seq_clip_*, behavior_is_cap, aggregation; the deployed r3 config
                                 2b766bd6 adds only behavior_is_level, which step.py implements)

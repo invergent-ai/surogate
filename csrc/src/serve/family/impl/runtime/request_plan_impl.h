@@ -256,7 +256,7 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
         throw std::invalid_argument("resumed request does not describe its generated tokens");
     }
     base->resume = options.resume;
-    // Lane f1: a DSpark row whose tokens depend on its drafts (top_p < 1, top_k > 0, min_p, one-hot verification) keeps
+    // Window KV: a DSpark row whose tokens depend on its drafts (top_p < 1, top_k > 0, min_p, one-hot verification) keeps
     // its whole reservation and is never preempted, unless SUROGATE_SERVE_KV_TRUNCATED_ONDEMAND=1. true for other models.
     const bool recompute_allowed = [&] {
         if (!family::dspark_drafter<Variant>() || speculative_backend != SpeculativeBackend::DFlash) { return true; }

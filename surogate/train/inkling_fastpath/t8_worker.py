@@ -1,4 +1,4 @@
-"""Lane T8: one card's worker for the row-parallel step (t8_step.WorkerCore + the engine). The forward is the engine's; the backward is t8_lean.backward_row."""
+"""One card's worker for the row-parallel step (t8_step.WorkerCore + the engine). The forward is the engine's; the backward is t8_lean.backward_row."""
 from __future__ import annotations
 
 import os

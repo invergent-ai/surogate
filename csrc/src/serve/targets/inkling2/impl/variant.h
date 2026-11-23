@@ -51,7 +51,7 @@ struct Variant {
 
     // ---- the visit schedule (family/impl/runtime/visit_round.h) ----
     static constexpr bool visit_schedule = true;
-    /// Logits stay FP32 after the softcap (agent-EN 08:2x; the reference's head_dtype float32).
+    /// Logits stay FP32 after the softcap (the reference's head_dtype float32).
     static constexpr bool logits_fp32 = true;
     /// `--kv-cache-dtype auto` resolves to FP8 e4m3 (unit scale) for this target.
     static constexpr bool kv_storage_fp8_default = true;
@@ -59,7 +59,7 @@ struct Variant {
     /// Runs visits [round.first_visit, round.last_visit) over the round (DESIGN-target.md 1.2 / 1.4).
     static void run_visits(const ModelView& model, family::VisitRound& round);
     /// Workspace one `run_visits` call needs at the widest round of the phase.
-    /// Persistent state for the compute stream: lane d's `InklingMoeOptions::state` (zeroed once by the program).
+    /// Persistent state for the compute stream: the MoE op's `InklingMoeOptions::state` (zeroed once by the program).
     [[nodiscard]] static std::size_t visit_target_state_bytes();
     [[nodiscard]] static std::size_t visit_workspace_capacity_bytes(const family::TextGeometry& geometry,
                                                                     family::TextPhase phase,
@@ -71,14 +71,14 @@ struct Variant {
     /// The conv state: one "state layer" per visit, [K 1024 | V 1024 | attn 2304 | mlp 2304] x 3 taps.
     [[nodiscard]] static LinearAttentionStatePoolSpec visit_state_spec(const family::TextGeometry& geometry,
                                                                      std::int32_t slots);
-    /// The KV plane windows (lane f1's hook): 1,024 for the 40 local visits, 0 for the 8 global ones.
+    /// The KV plane windows (the window-bounded KV hook): 1,024 for the 40 local visits, 0 for the 8 global ones.
     [[nodiscard]] static std::vector<std::int32_t> kv_layer_windows(const family::TextGeometry& geometry);
 
-    // ---- DSpark (lane e2, family/impl/runtime/dspark_round.h, impl/dspark.cpp): the drafter through the DFlash
+    // ---- DSpark (family/impl/runtime/dspark_round.h, impl/dspark.cpp): the drafter through the DFlash
     // runtime; its draft KV = text-pool planes 48 / 49 / 50 (draft layers 0 / 1 / 2) when geometry.dflash is set ----
     static constexpr bool dspark_drafter              = true;
-    /// Measured DSpark round graph (f1c 15:24, 262,144 x 8 lanes: 20 MiB for 8 exact-b graphs at k = 7, 80 MiB for the
-    /// 32 of --spec-adaptive = 2.5 MiB each; e2b mtp5g: 2.0 MiB at 1 lane): 8 MiB per class (3.2x margin) instead of
+    /// Measured DSpark round graph (262,144 x 8 lanes: 20 MiB for 8 exact-b graphs at k = 7, 80 MiB for the
+    /// 32 of --spec-adaptive = 2.5 MiB each; 2.0 MiB at 1 lane): 8 MiB per class (3.2x margin) instead of
     /// the family's 64 / 96 MiB.
     static constexpr std::uint64_t dflash_graph_allowance_per_class_bytes = 8ULL * 1024ULL * 1024ULL;
     static constexpr std::uint32_t dspark_first_plane = TextConfig::layers;
@@ -94,7 +94,7 @@ struct Variant {
     /// JSON, 1 message structure, 2 thinking (also: no marker within 4,096 tokens), 3 answer text.
     [[nodiscard]] static std::uint8_t dspark_content_kind(std::span<const TokenId> ledger);
     /// The draft cap of a lane under --spec-adaptive. stats == nullptr (the default policy "static"): per content kind
-    /// (lanes/e2/k_policy.py) -- tool-call JSON 7, structure 7, thinking 3, text 2. Otherwise (opt-in policy "lane"):
+    /// (a CPU k-policy study) -- tool-call JSON 7, structure 7, thinking 3, text 2. Otherwise (opt-in policy "lane"):
     /// the window of {0, 1, 2, 3, 7} with the most tokens per unit of 1-stream round time at this request's own
     /// acceptance on the kind (family::DSparkLaneStats).
     [[nodiscard]] static std::uint32_t dspark_draft_cap(std::span<const TokenId> ledger,

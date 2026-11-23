@@ -1,4 +1,4 @@
-// Inkling-2-Mini (lane e1): BF16 x BF16 -> FP32 GEMM through cuBLASLt, for the two products the
+// Inkling-2-Mini: BF16 x BF16 -> FP32 GEMM through cuBLASLt, for the two products the
 // reference keeps in fp32 -- the loop controllers' gain / forget projection (`torch.bmm(...,
 // out_dtype=float32)`) and the LM head (head_dtype float32). Same plan-cache pattern as
 // ops/linear/bf16/bf16_cublaslt.cpp, with an FP32 output layout.

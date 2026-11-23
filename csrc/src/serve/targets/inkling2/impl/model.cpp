@@ -1,5 +1,5 @@
-// Inkling-2-Mini loaded model (lane e1): the 48-visit served geometry, the ModelView whose 48 FullLayer entries
-// alias the 24 physical layers lane b binds, and the load-time query arithmetic (ARTIFACT.md 5).
+// Inkling-2-Mini loaded model: the 48-visit served geometry, the ModelView whose 48 FullLayer entries
+// alias the 24 physical layers the loader binds, and the load-time query arithmetic (ARTIFACT.md 5).
 
 #include "targets/inkling2/impl/model.h"
 #include "targets/inkling2/impl/visits.h"
@@ -110,7 +110,7 @@ family::TextGeometry visit_geometry(const artifact::Reader& reader) {
     std::vector<std::string> types(C::layers);
     for (int v = 0; v < C::layers; ++v) { types[v] = kVisits[v].global ? "full_attention" : "sliding_attention"; }
     family::TextGeometry g = family::TextGeometry::resolved_moe(values, types);
-    // The DSpark drafter's geometry for the DFlash runtime (lane e2), whenever the artifact carries the drafter; it
+    // The DSpark drafter's geometry for the DFlash runtime (DSpark), whenever the artifact carries the drafter; it
     // is used only under `--speculative dflash`.
     const load::ArtifactConfig config = load::parse_artifact_config(reader.payload("inkling2/config.json").data);
     if (config.dspark) { g.dflash = dspark_dflash_geometry(config); }
@@ -127,10 +127,10 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
       host_bank(plan.host_bank.objects.empty() ? nullptr : family::HostBank::shared(plan.host_bank)) {
     // HostBank objects (the FP8 drafter's BF16 sources) resolve to their pinned host bytes from here on.
     if (host_bank) { host_bank->attach(backing); }
-    // Lane b binds the text-only set (no pixel configs): take exactly that set.
+    // The loader binds the text-only set (no pixel configs): take exactly that set.
     frontend = family::take_text_only_frontend_resources(backing, plan.plan.frontend);
     // The release's chat_template.jinja is for HF tooling: vLLM renders Inkling prompts natively from the request
-    // (renderers/inkling_encoding.py), and so does lane f2's frontend, which takes that path only when the artifact
+    // (renderers/inkling_encoding.py), and so does the Inkling frontend, which takes that path only when the artifact
     // states no template. The engine's Jinja reader also cannot parse this one. `--chat-template` still overrides.
     frontend.chat_template_jinja.clear();
     weights  = load::load_weights(plan.plan, backing);
@@ -139,7 +139,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     model.weights = &weights;
     model.queries = &queries;
     if (weights.has_draft) {
-        // DSpark (lane e2): the fold and the drafter's derived weights; the runtime's DFlash guards need a payload.
+        // DSpark: the fold and the drafter's derived weights; the runtime's DFlash guards need a payload.
         derive_dspark(weights, dspark, plan.plan.options.draft_linears_host, dspark_fp8_fold_requested());
         model.dspark = &dspark;
         // The host bank holds the drafter's BF16 dense linears (~0.49 GiB pinned), read once above to quantise them;

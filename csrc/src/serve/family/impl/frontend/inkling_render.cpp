@@ -15,8 +15,8 @@ namespace {
 constexpr std::pair<std::string_view, double> kNamedEffort[] = {
     {"none", 0.0}, {"minimal", 0.1}, {"low", 0.2}, {"medium", 0.7}, {"high", 0.9}, {"xhigh", 0.99}, {"max", 0.99}};
 // The effort a request that sets none is rendered with. vLLM's renderer default (inkling_encoding.DEFAULT_REASONING_EFFORT)
-// is 0.9; OWNER RULE 2026-11-21 17:40 (rl/engine-inkling-2026-11-21/LANE-RULES.md 20): "always use inkling at 0.99
-// reasoning effort" -- our default is 0.99 (= 'xhigh' / 'max'). A request that names an effort (top-level
+// is 0.9; deployment rule since 2026-11-21: Inkling is always served at reasoning effort 0.99
+// -- our default is 0.99 (= 'xhigh' / 'max'). A request that names an effort (top-level
 // reasoning_effort, chat_template_kwargs.reasoning_effort: a level, a number, a numeric string) keeps it; absent, null and
 // "auto" (dropped by the kwargs merge) take this default. Test: sinfer_inkling_frontend_test over vectors/renderer-099
 // (the default-effort requests expect vLLM's ids for the same body with chat_template_kwargs.reasoning_effort = 0.99).

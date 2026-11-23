@@ -1,4 +1,4 @@
-// NAIVE Inkling-2 routed experts (lane e1; replaced by lane d's `inkling_moe`): `inkling_route`,
+// NAIVE Inkling-2 routed experts (replaced by the `inkling_moe` op): `inkling_route`,
 // `inkling_quant_nvfp4_4o6`, `inkling_quant_mxfp8`, `inkling_softcap_swiglu` and `inkling_moe(act_quant=True)` of
 // inkling_ref.py. One warp per (token-slot, output row) with an fp32 dot over dequantised operands. Tokens are
 // processed in tiles of kTile to bound the scratch. Correctness only.
@@ -170,7 +170,7 @@ __global__ void __launch_bounds__(256) quant_kernel(const bf16* x, int k, int nv
                 v6[i]  = e2m1_value(xb[i] * inv6);
                 v4[i]  = e2m1_value(xb[i] * inv4);
                 // |rec - x| with rec = (v * s) * outer fused into one rounding, as the reference kernel
-                // compiles it (lane d: 3 of 36,864 blocks flip their choice unfused).
+                // compiles it (measured: 3 of 36,864 blocks flip their choice unfused).
                 e6s[i] = fabsf(fmaf(v6[i] * s6, outer, -xb[i]));
                 e4s[i] = fabsf(fmaf(v4[i] * s4, outer, -xb[i]));
             }

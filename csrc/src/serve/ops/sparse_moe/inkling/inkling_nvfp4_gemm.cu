@@ -184,7 +184,7 @@ __device__ __forceinline__ void load16_bf16(const __nv_bfloat16* source, float* 
 }
 
 /// `PlainDown` (the plain narrow down, kPlainDownMinTokens): A = the y rows quantised by the standalone kernel.
-/// ROUTING AND THE WAIT (coordinator's ruling 2026-11-21; the exception review R4 of M9 granted is withdrawn): the narrow
+/// ROUTING AND THE WAIT (rule since 2026-11-21; the exception review R4 of M9 granted is withdrawn): the narrow
 /// downs (fused-y and plain) load the routing (`offsets`, `sorted`) only AFTER their dependency wait, and request the w2
 /// stages, whose addresses come from the routing, after it too. No load of data a predecessor writes may sit above the
 /// wait, not even as a prefetch hint: the launch order of the kernels in between is not a substitute for the acquire.

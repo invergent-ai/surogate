@@ -1,7 +1,7 @@
 #pragma once
 
-// Window-bounded KV pages (ENGINE-INKLING lane f1; design: rl/engine-inkling-2026-11-21/lanes/f1/
-// DESIGN-window-kv.md). Host-only bookkeeping of one sequence's pages in a paged pool's WINDOW
+// Window-bounded KV pages (design: the window-bounded KV design
+// notes). Host-only bookkeeping of one sequence's pages in a paged pool's WINDOW
 // class -- the planes of layers that attend through a sliding window. Such a plane only ever
 // reads the last `window` keys before a query, so the pages behind the window go back to the
 // class's free list and their block-table entries point at a zeroed sentinel page.
@@ -269,7 +269,7 @@ struct KvWindowClassSize {
     return out;
 }
 
-// ---- M3-C: the elastic window class (lanes/f1/DESIGN-M3-kv-lever.md section C) ---------------
+// ---- M3-C: the elastic window class (KV-lever design, section C) ---------------
 // The class's planes are demand-mapped in granules of `granule_pages` pages (2 MiB per plane:
 // Inkling's 80 window planes of 64 KiB per page give 32 pages, 160 MiB, per granule). The pool's
 // static bound above stays the VIRTUAL span; physical memory is (a) a floor the engine always

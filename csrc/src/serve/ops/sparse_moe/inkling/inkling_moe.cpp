@@ -39,8 +39,8 @@ constexpr std::size_t kAlignment = 256;
 /// Rounds below this width take the narrow tile schedules (same arithmetic; a speed choice).
 constexpr std::int32_t kNarrowMaxTokens = 64;
 /// Narrow NVFP4 rounds this wide quantise y once per row (standalone kernel) and run the plain down instead of the
-/// fused-y down, which re-quantises its rows in every one of its 36 N tiles. Measured (agent-EN-d5, gpubox1 card 1,
-/// cold, P5, three sessions 17:35-17:52): T=32 250.5 -> 244.7 us, T=64 290.6 -> 280.5; T=8 / 16 slower (+0.5 / +2):
+/// fused-y down, which re-quantises its rows in every one of its 36 N tiles. Measured (one RTX 5090,
+/// cold, P5, three sessions): T=32 250.5 -> 244.7 us, T=64 290.6 -> 280.5; T=8 / 16 slower (+0.5 / +2):
 /// the fused form stays below 32. Same bits (width-invariance and capture tests).
 constexpr std::int32_t kPlainDownMinTokens = 32;
 

@@ -1,4 +1,4 @@
-// Lane e1 (agent-EN-e1c): the wo plan's OP GATE (lanes/e1/NOTES.md 'wo BF16 KERNEL'). What one wo GEMM (2304 x 3072, BF16)
+// The wo plan's OP GATE ('wo BF16 KERNEL'). What one wo GEMM (2304 x 3072, BF16)
 // adds to a decode-like PDL graph, generic kernel vs narrow kernel, same binary:
 //   graph S    = 48 x a 4 us spin kernel (stands for the attention / fold before wo; PDL, triggers its dependents at once);
 //   graph G, N = 48 x (spin, then wo on the next of 8 weight copies = 113 MB > L2, so every call streams from DRAM).

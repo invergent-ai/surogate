@@ -34,14 +34,14 @@ struct FrontendOptions {
     /// domain and has no Vision tokens at all, and asserting the family's would
     /// reject a correct artifact.
     bool registered_tokenizer = true;
-    /// Inkling-2 only (ENGINE-INKLING lane V-b), read when vision_enabled: vLLM's per-prompt image count
+    /// Inkling-2 only, read when vision_enabled: vLLM's per-prompt image count
     /// (--limit-mm-per-prompt, vLLM's default 999) and the per-image token cap (vLLM's encoder cache size, 4,096 at
     /// --max-num-batched-tokens 4096). Both refusals carry vLLM's words.
     std::uint32_t image_limit_per_prompt = 999;
     std::uint32_t max_image_tokens       = 4'096;
     /// Inkling-2 pixels: true = what vLLM's server feeds the encoder for a chat request (Pillow, EXIF transpose,
     /// alpha on white, a JPEG lacking EOI refused), false = vLLM's Inkling processor's own decode_image (no EXIF,
-    /// alpha on a checkerboard, EOI appended), which vLLM's server never reaches for chat (lane V-a, 18:0x).
+    /// alpha on a checkerboard, EOI appended), which vLLM's server never reaches for chat (measured on a running vLLM).
     bool image_decode_as_served = true;
 };
 

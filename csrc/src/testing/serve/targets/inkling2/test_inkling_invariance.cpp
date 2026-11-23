@@ -1,4 +1,4 @@
-// Inkling-2-Mini lane e1: BITWISE batch- and path-invariance of the e1 ops (agent-EN 10:2x decision, item 3).
+// Inkling-2-Mini: BITWISE batch- and path-invariance of the hidden-stream ops (design decision, item 3).
 //
 // Every check compares bits, never a tolerance: the same column computed
 //   - in a round of 300 columns, alone, in a window of 8 / 37 / 128 / 257, or beside other problems of a batch
@@ -601,9 +601,9 @@ int test_controller_tail(std::uint32_t seed, int streams, int dq, int n) {
                      2);
 }
 
-// ------------------------------------------------------------------------------- I8 lane mx: fast == reference
+// ------------------------------------------------------------------------------- I8 mix: fast == reference
 //
-// The latency-cut decode / verify kernels (inkling_mix.cu, lane mx) against the reference kernels, bit for bit, over
+// The latency-cut decode / verify kernels (inkling_mix.cu) against the reference kernels, bit for bit, over
 // every source count, addend, query count, stream count, width and conv row shape the engine uses (and the edges:
 // positions 0..2, rows with fewer valid columns, an empty row, in-place residual).
 
@@ -998,7 +998,7 @@ int test_lora_delta(std::uint32_t seed) {
     return failures;
 }
 
-/// I10 PDL chain (agent-EN 17:5x, after lane c's FP8 decode finding): the decode-shaped chain of e1's split GEMMs as the
+/// I10 PDL chain (after the attention FP8 decode finding): the decode-shaped chain of the split GEMMs as the
 /// engine runs it -- per visit, the dynamic-tap GEMM 32 x 2304 (split 9: split kernel -> reduce_kernel) then a 2304 x 32
 /// GEMM back to the stream -- 24 visits with ONE reused workspace, ONE reused tap buffer and two alternating stream
 /// buffers, launched back to back on one stream (every launch a PDL dependent of the previous kernel), eager and as a

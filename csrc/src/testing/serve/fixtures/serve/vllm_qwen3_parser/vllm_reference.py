@@ -10,7 +10,7 @@ GPU needed):
 
     CUDA_VISIBLE_DEVICES= python vllm_reference.py TOKENIZER_DIR corpus.jsonl [--write]
 
-The rows were drawn from a larger corpus (rl/engine-goal-2026-10-19/toolcall on the project disk: 27,667 outputs,
+The rows were drawn from a larger corpus (not in this repository: 27,667 outputs,
 all identical): Surogate3.7-35B-A3B NVFP4 outputs on BFCL v4 (our engine's text answers, the calls vLLM returned,
 rebuilt as the model writes them), the tool-argument cases of fixtures/serve/vllm_tool_arguments, and mutations of
 them (unknown names, missing closers, text after and between calls, calls inside reasoning, thinking off,

@@ -104,7 +104,7 @@ int main() {
     {
         // Adapter banks: an automatic capacity without a draft head or with a DFlash drafter is
         // sized after them, MTP and explicit policies before them (as before they were allocated
-        // first). DFlash since lanes/OOM F4 (2026-11-23): its graph allowance (320 MiB on W5 at 8
+        // first). DFlash since fix F4 (2026-11-23): its graph allowance (320 MiB on Inkling-2-Mini at 8
         // lanes) does not hold about 1.1 GiB of rank-16 banks, and the uncounted banks took the
         // whole headroom of an RL engine that then ran out of memory.
         using sinfer::SpeculativeBackend;

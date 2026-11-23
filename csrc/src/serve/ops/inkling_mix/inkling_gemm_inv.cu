@@ -1,4 +1,4 @@
-// Batch- and path-invariant BF16 GEMM for the inkling2 target (api/ops/inkling_mix.h, agent-EN 10:2x decision).
+// Batch- and path-invariant BF16 GEMM for the inkling2 target (api/ops/inkling_mix.h).
 //
 // The per-element chain is the one of ops/linear/bf16/bf16_invariant_gemm.cu (k16 MMA steps in increasing k from a
 // zero accumulator, k tiles of 64 zero-padded, no split-K by width, no cross-warp reduction); this copy adds what the
@@ -50,8 +50,8 @@ struct Schedule {
 
 // The shared kernel's three tiles (measured there on an RTX 5090); the choice follows speed only.
 using Tile16x8  = Schedule<16, 8, 16, 8, 6>;
-// Decode widths with few row tiles (wo_ud: 144 one-warp CTAs on 170 SMs walked k = 3072 at ~0.84 TB/s, lane h's nsys
-// 14:49): the same tile with 7 stages in flight instead of 5. The pipeline depth moves no product: same bits.
+// Decode widths with few row tiles (wo_ud: 144 one-warp CTAs on 170 SMs walked k = 3072 at ~0.84 TB/s, per an nsys
+// profile): the same tile with 7 stages in flight instead of 5. The pipeline depth moves no product: same bits.
 using Tile16x8Deep = Schedule<16, 8, 16, 8, 8>; // the loop waits for STAGES - 1 groups; PTX takes at most 7
 using Tile32x32 = Schedule<32, 32, 16, 16, 4>;
 using Tile64x64 = Schedule<64, 64, 32, 32, 3>;
@@ -211,7 +211,7 @@ __global__ __launch_bounds__(S::kThreads) void gemm_inv_kernel(const __grid_cons
 /// out = p[0] + p[1] + ... + p[splits - 1], added in that order, one thread per output element. The partials are read
 /// through L2 (ld.global.cg), never the non-coherent read-only path: they are written by the split GEMM just before this
 /// kernel in the PDL chain (this grid may be resident while it runs) and the visit arena reuses their address every
-/// visit, which breaks ld.global.nc's read-only-for-the-kernel's-lifetime contract (lane c's FP8 decode finding 17:47).
+/// visit, which breaks ld.global.nc's read-only-for-the-kernel's-lifetime contract (the FP8 attention decode finding).
 template <typename OutT>
 __global__ void __launch_bounds__(256) reduce_kernel(const float* partial, OutT* __restrict__ out,
                                                      std::int32_t rows, std::int32_t tokens, std::int32_t batch,
@@ -236,7 +236,7 @@ __global__ void __launch_bounds__(256) reduce_kernel(const float* partial, OutT*
     }
 }
 
-// ---- wo at decode widths (lanes/e1/NOTES.md 'wo BF16 KERNEL'; default OFF, SUROGATE_SERVE_INKLING_WO_NARROW=1 = on) -----
+// ---- wo at decode widths (default OFF, SUROGATE_SERVE_INKLING_WO_NARROW=1 = on) -----
 // gemm_inv_kernel<Tile16x8Deep, Bf16> for T <= 8, one problem, n % 16 == 0, k % 64 == 0: the same one-warp 16 x 8 tile, the
 // same copy pipeline, the same smem placement, the same m16n8k16 chain and the same store, so the same bits. What differs
 // is when the addresses are computed: each thread's 4 weight + 2 activation pieces and its 8 fragment offsets once, before
@@ -339,7 +339,7 @@ __global__ __launch_bounds__(32) void gemm_inv_narrow_kernel(const __grid_consta
 
 // The switch: default OFF; SUROGATE_SERVE_INKLING_WO_NARROW=1 or inkling_gemm_inv_use_narrow(true) = the narrow kernel (same bits).
 // MTP off on M11: 1x8k +3.57 %, 8x8k +2.89 %. MTP on at 8x8k on M13 (the served shape): gain -0.13 %, 95 % CI [-0.73, +0.48] %, which
-// the registered line reads as not passed (lanes/e1/NOTES.md 'STEP B RESULT').
+// the registered line reads as not passed.
 std::atomic<int> g_wo_narrow{-1};
 
 bool use_wo_narrow() {

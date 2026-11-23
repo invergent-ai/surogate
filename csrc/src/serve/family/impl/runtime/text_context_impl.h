@@ -2041,7 +2041,7 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, in
     debug_probe<Variant>("post_mlp_residual", x, cfg_.n_layers, s);
 }
 
-// A visit-schedule target's round (ENGINE-INKLING lane e1): the entry staged its columns and embedded into
+// A visit-schedule target's round: the entry staged its columns and embedded into
 // `x`; the target's `run_visits` replaces the layer loop. Discarded for every other target.
 template <class Tap>
 void TextContext::run_visit_round(Tensor& x, Tap& tap, std::span<const family::VisitSegment> segments,

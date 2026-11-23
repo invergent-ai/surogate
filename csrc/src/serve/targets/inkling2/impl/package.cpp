@@ -1,5 +1,5 @@
-// Inkling-2-Mini package (lane e1): the registry's questions for the `inkling2` artifact. Bindings are lane
-// b's (`impl/load/`); the served geometry, the model view and the visit schedule are this target's.
+// Inkling-2-Mini package: the registry's questions for the `inkling2` artifact. Bindings are the
+// loader's (`impl/load/`); the served geometry, the model view and the visit schedule are this target's.
 
 #include <api/targets/inkling2/package.h>
 #include <api/family/frontend_resources.h>
@@ -64,7 +64,7 @@ load::AttentionChoice attention_choice() {
     return choice;
 }
 
-/// S10, experts first (the kit's recipe trains expert w13 / w2): lane d's binding (family/impl/lora_bind_inkling.h)
+/// S10, experts first (the kit's recipe trains expert w13 / w2): the MoE binding (family/impl/lora_bind_inkling.h)
 /// per PHYSICAL layer, keyed on its router weight. Every pass of a core layer reads the same bank table, so one
 /// adapter serves all its visits; adapters name physical layers (the trainer exports them that way).
 void bind_lora(const detail::LoadedModelData& data, const EngineOptions& options) {
@@ -136,7 +136,7 @@ std::size_t Package::extra_derived_residency_bytes(const EngineOptions& options)
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
                                      WeightsProfile weights_profile) {
     load::BindOptions bind;
-    // The 2-card visit split (lanes/e1/DESIGN-2card.md): a pipeline stage runs visits [first, last) of the 48 and
+    // The 2-card visit split (2-card design): a pipeline stage runs visits [first, last) of the 48 and
     // keeps on its device the physical layers those visits use (a core layer is on every stage that runs one of its
     // passes); the other layers are validated only. The family hands the residual (the whole AttnRes stack, 7 x 2304
     // per column) across the boundary and keeps each stage's KV planes and conv states.
@@ -159,7 +159,7 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
     if (bind.attention.fp8 != (weights_profile == WeightsProfile::Fp8Attention)) {
         throw std::logic_error("inkling2: the weights profile and the attention choice disagree");
     }
-    // DSpark (lane e2): `--speculative dflash` binds the artifact's drafter and runs it through the DFlash runtime.
+    // DSpark: `--speculative dflash` binds the artifact's drafter and runs it through the DFlash runtime.
     bind.draft = options.speculative.backend == SpeculativeBackend::DFlash;
     // BF16 drafter weights by default since M9 (h2's A/B: the FP8 route is ~9.5 % slower at 8 streams); with
     // SUROGATE_SERVE_DSPARK_FP8_WEIGHTS=1 the BF16 dense linears sit in the host bank (attached in LoadedModelData,
@@ -180,7 +180,7 @@ SINFER_TARGET_CONSTRUCT_LOADED_MODEL();
 Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineOptions& options) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
     bind_lora(model.impl_->data, options);
-    // The generic tokenizer frontend: token-id prompts and plain text until lane f2's native renderer is wired.
+    // The generic tokenizer frontend: token-id prompts and plain text until the native Inkling renderer is wired.
     return family::make_frontend(model.impl_->data.frontend,
                                  family::FrontendOptions{
                                      .vision_enabled           = false,
@@ -201,9 +201,9 @@ Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device, c
 }
 
 std::vector<int> Package::pipeline_stage_bounds(int stage_count) {
-    // 2 stages: cut after visit 30 (the end of core pass 1; f1c's DESIGN-2card-1M.md 3, counting KV, not only weights).
+    // 2 stages: cut after visit 30 (the end of core pass 1; 2-card 1M design, 3, counting KV, not only weights).
     // Card 0 = prelude + core passes 0-1 (layers 0-17, 5 global visits, embedding); card 1 = core pass 2 + coda + head
-    // (+ DSpark's planes / drafter): layers 6-23, 3 global visits. At 1M both cards land near 22 GiB (f1c's estimate).
+    // (+ DSpark's planes / drafter): layers 6-23, 3 global visits. At 1M both cards land near 22 GiB (design estimate).
     // SUROGATE_SERVE_INKLING_STAGE_CUT=<visit> overrides the cut (measurement only).
     if (stage_count != 2) { throw std::invalid_argument("inkling2: the visit split is defined for 2 stages"); }
     int cut = 30;

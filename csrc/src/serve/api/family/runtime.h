@@ -217,7 +217,7 @@ public:
     /// conversation to the host while the copy stream is free.
     void background_offload() noexcept;
     void evict_archived_prefixes() noexcept;
-    /// Lane f1: the shared-prefix cache's entries go (their pages return once no running or
+    /// Window KV: the shared-prefix cache's entries go (their pages return once no running or
     /// retained fork borrows them). Admission calls it when a head is short and no retained lane
     /// is left to evict, which is otherwise the only thing that drops them.
     void drop_shared_prefixes() noexcept;
@@ -240,7 +240,7 @@ public:
     /// device asked, and reports whether the device is under pressure.
     bool kv_service_pressure() noexcept;
     /// Round boundary with no round in flight (the pipelined executor; the lockstep one does it in
-    /// kv_service_pressure): compacts an elastic window class (lane f1 M3-C). No-op without one.
+    /// kv_service_pressure): compacts an elastic window class (M3-C). No-op without one.
     void kv_round_boundary() noexcept;
     void reset_memory_peaks() noexcept;
     /// --kv-admission (DESIGN-kv-admission.md): set once by the executor, before any request.
@@ -296,7 +296,7 @@ public:
                                           std::uint32_t tokens, std::int32_t mixed_base = -1);
     void adopt_pipeline_decode_features(std::span<const std::uint32_t> lanes,
                                          std::span<const std::byte> packet);
-    /// DSpark on a pipeline (ENGINE-INKLING lane e1): true on the stage with the head when it proposes each round's
+    /// DSpark on a pipeline: true on the stage with the head when it proposes each round's
     /// drafts ahead of the first stage (false for every other target); that stage's proposal for the round the driver
     /// is about to launch; the first stage's pinned draft import the driver copies it into (null elsewhere).
     [[nodiscard]] bool pipeline_drafts_on_head() const noexcept;

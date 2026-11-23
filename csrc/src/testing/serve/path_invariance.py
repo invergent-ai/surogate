@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Path-invariance gate (lane f1, rl/engine-inkling-2026-11-21 FEASIBILITY 10:05 item 3).
+"""Path-invariance gate (window-KV feasibility check, item 3).
 
 The log-probs of the same tokens must not depend on the path the engine took to the prefix. This harness reaches one
 token sequence S = P + X by several paths and compares the log-probs of the K tokens Z generated greedily after it,
@@ -17,14 +17,14 @@ Paths
             unrelated prompt in between that needs the retained lane's pages: the prefix spills to the host tier and
             S restores it from there (checked: GET /kv_stats host "restores" grows across S's request)
   relocate@b  as cut@b on an engine whose window pages are relocated at EVERY round boundary (elastic window class,
-            SUROGATE_SERVE_KV_WINDOW_ELASTIC=1 + SUROGATE_SERVE_KV_WINDOW_SHUFFLE=1, lane f1 M3-C): S's suffix reads
+            SUROGATE_SERVE_KV_WINDOW_ELASTIC=1 + SUROGATE_SERVE_KV_WINDOW_SHUFFLE=1, M3-C): S's suffix reads
             windows from pages moved between all of its rounds (--relocate, on by default for windowed models)
   relocate-decode  the decode path on that engine, compared with the decode path (not the reference): relocation
             between decode rounds must not change a bit
 Exit status 0 iff every path equals the reference bitwise; the JSON report has the per-path detail.
 
-Example (gpubox2, Gemma 3 270M fixture):
-  path_invariance.py --engine ~/en-f1/bin3/surogate-engine --artifact ~/en-f1/fixtures/gemma-3-270m-it.sinfer \
+Example (a GPU host, Gemma 3 270M fixture):
+  path_invariance.py --engine /path/to/surogate-engine --artifact /path/to/gemma-3-270m-it.sinfer \
       --card 7 --port 18761 --material material.txt --engine-args "--kv-cache-dtype fp8" --out report.json
 """
 import argparse
@@ -128,7 +128,7 @@ def relocated(engine):
 
 
 def keep(report, name, result):
-    """A relocate path counts only if its engine moved pages (an engine without lane f1's elastic window class, or a
+    """A relocate path counts only if its engine moved pages (an engine without the elastic window class, or a
     model without windowed layers, ignores the knobs): otherwise it goes to report["skipped"], out of the verdict."""
     if result.get("relocated_pages", 0) > 0:
         report["paths"][name] = result

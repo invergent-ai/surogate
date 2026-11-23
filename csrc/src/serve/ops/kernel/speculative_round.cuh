@@ -128,10 +128,10 @@ __global__ void speculative_accept_wide_kernel(
     }
 }
 
-// ---- Split route for untruncated stochastic rows (agent-EN-e2c, 2026-11-21) -------------------------------------
+// ---- Split route for untruncated stochastic rows ---------------------------------------------------------------
 // speculative_accept_wide_kernel draws an untruncated row's verify columns with ONE CTA, column after column
 // (sampling_untruncated_exact: two passes over the vocabulary, the second with a double-precision exp per token).
-// Measured on Inkling (201k vocabulary, lane h M6 rows): ~1.1 ms per verified column, ~8 ms of a k = 7 round at
+// Measured on Inkling (201k vocabulary, M6 benchmark rows): ~1.1 ms per verified column, ~8 ms of a k = 7 round at
 // temperature 1, while MTP-off decoding pays nothing for temperature 1 (its draw is split over chunks since S1).
 // These three kernels compute the same draws with sampling_untruncated_exact's per-token expressions unchanged, cut
 // into kSamplerFullVocabChunkItems-token chunks, every verified column in parallel:
@@ -306,7 +306,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_exact_finalize_kern
     }
 }
 
-// ---- Coupled route (agent-EN-e2c, 2026-11-21): untruncated rows with cfg.speculative_coupled -------------------
+// ---- Coupled route : untruncated rows with cfg.speculative_coupled -------------------
 // Each verified column's token is drawn EXACTLY as ordinary decoding draws the token that follows the column's fed
 // token: the Gumbel-max over sampling_adjusted_logit(x) * (1 / T), above the min_p floor, keyed by (seed, the fed
 // token's cache position = lengths[row] + col, kSamplePurposeDecode) -- sampling_full_vocab_kernel's per-token

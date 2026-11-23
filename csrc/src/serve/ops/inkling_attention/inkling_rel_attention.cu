@@ -1,9 +1,9 @@
-// Inkling-2-Mini relative-bias attention (ENGINE-INKLING lane c): ONE batch- and path-invariant per-row arithmetic
+// Inkling-2-Mini relative-bias attention: ONE batch- and path-invariant per-row arithmetic
 // for decode, MTP verify, prefill, chunked prefill and the trainer's forward; the group fold; the gate-and-sink
-// epilogue. Semantics: api/ops/inkling_attention.h; numerics: lanes/c/DESIGN-attention.md section 1 (A1-A7).
+// epilogue. Semantics: api/ops/inkling_attention.h; numerics: attention design notes, section 1 (A1-A7).
 // Reference: vLLM's ops/attention_sm90.py `_rel_attention_kernel`, ops/attention.py `_gate_sink_kernel`.
 //
-// INVARIANCE (agent-EN decision 10:2x, FEASIBILITY-ANSWER.md; lanes/c/NOTES.md "INVARIANT ATTENTION"). The bits of a
+// INVARIANCE. The bits of a
 // row (query token x head) depend only on its own q / r / gate / sink, its position and the keys in the plane --
 // never on the batch, the width W, the envelope, the chunk cut, the split count or the other rows of a tile:
 // - Keys go in fixed GROUPS whose boundaries depend only on the absolute key position (GroupSpec from the call's
@@ -1046,7 +1046,7 @@ __global__ __launch_bounds__(MTiles * KS * 32, Decode ? 2 : 1) void rel_attentio
                     v[i] = ok ? __ldcg(reinterpret_cast<const int2*>(p.v_pages + o)) : make_int2(0, 0);
                 } else {
                     // Weak ld.global.ca, not ld.global.nc: the round's newest keys are written by the prologue (the PDL
-                    // predecessor) and nc loads may be hoisted above the dependency wait (lane c's FP8 decode bug; review R4
+                    // predecessor) and nc loads may be hoisted above the dependency wait (the FP8 decode bug; review R4
                     // of M9: no LDG.CONSTANT on producer-written operands). Same bytes, still L1-cached.
                     k[i] = ok ? __ldca(reinterpret_cast<const int2*>(p.k_pages + o)) : make_int2(0, 0);
                     v[i] = ok ? __ldca(reinterpret_cast<const int2*>(p.v_pages + o)) : make_int2(0, 0);
@@ -1610,7 +1610,7 @@ void launch_kernel(const Plan& plan, const AttnParams& p, cudaStream_t stream) {
     auto* kernel = rel_attention_kernel<Local, Decode, MTiles, KS, Mode, Raw, Pro>;
     // Per device (ops/kernel/func_attribute.cuh): the 2-card visit split launches this kernel on both cards; a
     // function-local static configured only the first and the second card's launch failed (cudaErrorInvalidValue,
-    // gpubox2 cards 5 + 6, 17:25).
+    // measured on two RTX 5090 cards).
     CUDA_CHECK(set_func_attribute_per_device(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
     const pdl::LaunchConfig launch{plan.grid, dim3(MTiles * KS * 32), static_cast<std::size_t>(bytes), stream};
     CUDA_CHECK(pdl::launch_dependent(launch, kernel, p));

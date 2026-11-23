@@ -1,7 +1,7 @@
-// Inkling-2-Mini FP8 attention projections, W8A16 (ENGINE-INKLING lane c; DESIGN-attention.md section 6,
-// agent-EN 08:2x: per-channel and 1x128 scale cells first).
+// Inkling-2-Mini FP8 attention projections, W8A16 (attention design notes, section 6:
+// per-channel and 1x128 scale cells first).
 //
-// Weights: the block route's FP8 Weight as lane b binds it -- e4m3 codes [n][k] row-major and an fp32 scale grid
+// Weights: the block route's FP8 Weight as the loader binds it -- e4m3 codes [n][k] row-major and an fp32 scale grid
 // [n / rows_per][k / k_per] row-major, cell = (scale_ne[0] = k_per, scale_ne[1] = rows_per): per-channel (k, 1),
 // 1x128 (128, 1), 128x128 (128, 128). Activations stay BF16 (never quantised); every code is widened exactly; the
 // dot products accumulate in fp32 and each 128-column cell's partial is multiplied by its scale in fp32 before it
@@ -9,7 +9,7 @@
 //
 // Two kernels, chosen by the column count N of the call: a narrow MMA kernel for N <= 16 (decode, verify: bytes-bound,
 // every code read once and widened once) and a tile GEMM beyond; both issue the same per-element MMA chain, so the
-// output bits do not depend on N (agent-EN 10:2x). One launch covers up to four projections that share K and N (a
+// output bits do not depend on N. One launch covers up to four projections that share K and N (a
 // 3-input visit's q-side, K and V row ranges, each from its own input).
 
 #include "ops/inkling_attention/inkling_attention_common.h"
@@ -57,7 +57,7 @@ __device__ __forceinline__ int segment_of(const LinearParams& p, int block) {
     return s;
 }
 
-// ---- the ONE per-element arithmetic (both kernels; agent-EN decision 10:2x: width-invariant attn_linear) -----------
+// ---- the ONE per-element arithmetic (both kernels; width-invariant attn_linear) -----------
 // Output (token t, weight row r) is a chain of bf16 m16n8k16 MMA steps with fp32 accumulation, x as operand A (m =
 // tokens) and the exactly widened codes as operand B (n = weight rows). K is walked in 32-column chunks in order; a
 // chunk is two steps: step A puts K offsets 8 l + {0, 1} at k slots 2 l + {0, 1} and 8 l + {2, 3} at 2 l + 8 + {0, 1}
@@ -102,8 +102,8 @@ __device__ __forceinline__ void cell_end(float (&acc)[4], float (&part)[4], floa
 
 /// The activations x of the narrow kernels are written by the previous kernel of the PDL chain. Never ld.global.nc: the
 /// compiler treats nc loads as invariant and HOISTED them above cudaGridDependencySynchronize (ACQBULK) in the cell-split
-/// kernel, so wo read gated before attention had written it (the FP8 route decoded garbage, agent-EN 17:4x; SASS in
-/// lanes/c/sass). XLoad: 0 = plain ld.global (production: ordered after the wait like every other operand of the
+/// kernel, so wo read gated before attention had written it (the FP8 route decoded garbage; seen in the
+/// SASS). XLoad: 0 = plain ld.global (production: ordered after the wait like every other operand of the
 /// engine's kernels, L1-cached -- each x chunk is re-read by every warp of the CTA), 1 = ld.global.nc (the old form;
 /// test-only negative control, InklingAttentionKnobs::linear_x_nc), 2 = ld.global.cg (L2 only; correct but measured
 /// 1.4-2.4x slower: x re-reads miss L1).
@@ -479,8 +479,8 @@ __global__ __launch_bounds__(128) void gemm_kernel(const LinearParams p) {
 }
 
 // ---- GEMM, operand roles transposed: codes = MMA operand A, x = operand B (N > 16) --------------------------------
-// gemm1 (lanes/c NOTES, 16:5x) measured gemm_kernel 5.4-5.9 % slower than BASE ee8d2f30 at N = 8,192. SASS (agent-EN-c4,
-// lanes/c/sass/gemm_{cur,base}.sass): 105 MOVs per 64-K step in gemm_kernel's main loop (BASE: 8). An A fragment
+// gemm1 measured gemm_kernel 5.4-5.9 % slower than BASE ee8d2f30 at N = 8,192. SASS (gemm_kernel,
+// current vs BASE): 105 MOVs per 64-K step in gemm_kernel's main loop (BASE: 8). An A fragment
 // interleaves tokens gid / gid + 8 at 4-byte grain ({u.x, v.x, u.y, v.y}), which no LDS.128 of a K-contiguous x tile
 // yields, so every MMA's A quad was assembled by MOVs. Here the roles are transposed: the widened codes are operand A
 // (the widen pass writes them straight in fragment order: one LDS.128 = one step's A quad {row gid, row gid + 8} x

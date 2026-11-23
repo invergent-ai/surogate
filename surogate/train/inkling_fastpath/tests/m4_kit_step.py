@@ -1,5 +1,5 @@
-"""Lane T M4: one kit GSPO step from ENGINE rollouts on the engine-op trainer (backend_engine.EngineBackend) with
-agent-EN-RL's glue (surogate.inkling_rl: records.Row, step.run_step = the deployed loss sha 041f2c0c, shim.MasterAdamW,
+"""M4: one kit GSPO step from ENGINE rollouts on the engine-op trainer (backend_engine.EngineBackend) with
+the RL glue (surogate.inkling_rl: records.Row, step.run_step = the deployed loss sha 041f2c0c, shim.MasterAdamW,
 adapter.export_adapter / the engine's fold).
 
   prep    <ad_dir>                       the step-0 adapter v0 = the trainer's own masters (seed 0, B = 0), BF16
