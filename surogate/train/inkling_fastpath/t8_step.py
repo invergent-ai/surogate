@@ -1,4 +1,4 @@
-"""Lane T8: the row-parallel GSPO step for W5 (lanes/T8/STEP-API.md; PLAN.md U1). One coordinator, one worker per card, each row on one card.
+"""Lane T8: the row-parallel GSPO step for W5 (interface: STEP-API; plan item U1). One coordinator, one worker per card, each row on one card.
 
 The per-row arithmetic is `inkling_rl.step.run_step`'s, split in two so that it can run on several cards:
  - plan_rows (coordinator): off-policy drop, refusals, R3 counters, the loss scale. Same order and rules as run_step, lines 126-167 and 193-196.
@@ -32,7 +32,7 @@ def param_keys(attn_rank: int) -> tuple:
     """The per-layer key order of every flat layout, master list and gradient list (experts first, so j < 4 are the expert keys)."""
     return LORA_KEYS + (ATTN_KEYS if attn_rank else ())
 # The code path is part of the gradient's definition: ift_long reads these at import, and its defaults are NOT the path the gates prove (review B1).
-# A0 = lane T's pre-lever stack, the one RX's census worker runs. The trainer sets them for its workers and every worker checks them after import.
+# A0 = lane T's pre-lever stack, the one the census worker runs. The trainer sets them for its workers and every worker checks them after import.
 STACKS = {"A0": {"IFT_MOE_GM": "0", "IFT_MOE_DET": "0", "IFT_FAST_GEMM": "0", "IFT_ATTN_ADAPT": "0", "IFT_CHUNK": "1024", "IFT_MOE_FAST": "0",
                  "IFT_ATTN_TC": "0", "IFT_TF32": "0", "IFT_MOE_ROWS": "8192", "IFT_MOE_PAD_ROWS": "0", "IFT_MANUAL": "1", "IFT_OFFLOAD_MIN": "8192"}}
 WORKER_ENV = {"SUROGATE_INKLING_ATTN_EARLY_META": "0", "MALLOC_ARENA_MAX": "2", "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
@@ -79,14 +79,14 @@ class T8Config:
     visits: int = 48
     top_k: int = 8
     stack: str = "A0"               # the code path (STACKS); set for the workers and checked in each of them
-    attn_rank: int = 0              # S10 attention LoRA rank on the seven slices; 0 = none; 64 = the owner's choice (SkyRL: 128)
+    attn_rank: int = 0              # S10 attention LoRA rank on the seven slices; 0 = none; 64 = the chosen rank (SkyRL: 128)
     attn_alpha: float = 32.0        # scale alpha / rank (0.5 at rank 64)
     allow_lagged: bool = False      # False: a row sampled by another adapter version stops the step (its replay gate could not run)
     row_timeout_s: float = 3600.0   # a worker that answers no request for this long ends the step
     lean_host: bool = False         # S4 (a): no per-row copy of a visited-once layer's gradient (added straight into the worker's sum; looped
                                     # layers keep their per-row sum until their last visit: same additions in the same order, bitwise).
                                     # A row that runs out of card memory after its first add is NOT retried: the step fails (STOP, masters restored).
-    # RX's per-attempt gradient sketches (LOOP-W5.md 4.3): for every attempt (row.trial_idx), the gradient of its summed loss-token log-prob term
+    # per-attempt gradient sketches for the loop's signal read: for every attempt (row.trial_idx), the gradient of its summed loss-token log-prob term
     # BEFORE the advantage, on the attention keys of the named VISITS and on every sketch_expert_stride-th coordinate of each expert key (physical
     # layer totals), written to sketch_dir per worker at the end of the step. In "ppo" mode the row's gradient is divided by its seed factor -A / N
     # (exact at ratio 1, i.e. the first mini-batch; later: the sum of r_t x grad log pi over the unclipped tokens). Rows with A = 0 are counted, not sketched.
@@ -361,7 +361,7 @@ class WorkerCore:
                 raise T8GateError(f"REPLAY GATE: row {i} (T {T}): {bad} of {int(mask.sum())} loss tokens differ from the rollout's log-probs")
         out["replay_checked"] = bool(on_policy)
         fm = row.notes.get("final_mask")
-        if on_policy and fm is not None:  # the final-reply tokens the replay gate just covered (RX: they are in the loss)
+        if on_policy and fm is not None:  # the final-reply tokens the replay gate just covered (they are in the loss)
             out["replay_final_tokens"] = int((np.asarray(fm, dtype=bool) & mask).sum())
         # the routing gate compares THIS forward's own routing with the rollout's capture: in "ppo" mode only the first mini-batch runs at the
         # start weights (proven by the stale gate); later mini-batches run at moved weights, where a near-tie routing decision may flip (review B1)
@@ -724,7 +724,7 @@ def compute_step(handles: list, layout: ParamLayout, flats: list, shapes: list, 
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# the trainer object agent-RX's loop holds (STEP-API.md)
+# the trainer object the RL loop holds (STEP-API)
 # ---------------------------------------------------------------------------------------------------------------------
 class T8Trainer:
     """One spawned worker per card. A script using it must guard its entry point with `if __name__ == "__main__"` (spawn re-imports it)."""
@@ -837,7 +837,7 @@ class T8Trainer:
 
     def export_adapter(self, out_dir: str, dtype: str = "BF16", meta: dict | None = None) -> str:
         """The engine's adapter file. Expert-only: the kit's writer (unchanged). With attention LoRA: t8_adapter's combined PEFT-native file
-        (r = attn_rank, lora_alpha = attn_alpha, rank_pattern 16 for the experts; agent-ELORA's served form)."""
+        (r = attn_rank, lora_alpha = attn_alpha, rank_pattern 16 for the experts; the engine's served form)."""
         layers = [{k: v.numpy() for k, v in d.items()} for d in self.masters()]
         if self.cfg.attn_rank:
             import t8_adapter as TA

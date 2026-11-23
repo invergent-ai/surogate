@@ -1,5 +1,5 @@
 """Lane T8, S0 pass line (PLAN-SKYRL.md): on 200 fixed random inputs (+ edge cases) our port == SkyRL's OWN functions, loaded from its file by AST
-(sha256-pinned copies in lanes/T8/skyrl_ref): advantages, per-token loss, reduced loss, and the per-token seed d loss / d logp, to 1e-12 relative (fp64).
+(sha256-pinned copies of SkyRL faae9039's ppo_utils.py / torch_utils.py in $T8_SKYRL_REF, named *_faae9039.py.txt): advantages, per-token loss, reduced loss, and the per-token seed d loss / d logp, to 1e-12 relative (fp64).
 Edge cases: a group of one, a group with std 0, negative advantages hitting the dual clip, ratios beyond the 20 clip, rows with no loss token."""
 import ast
 import hashlib
@@ -15,7 +15,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 import t8_skyrl as K  # noqa: E402
 
-REF = os.environ.get("T8_SKYRL_REF", "/data/surogate/work/rl/engine-inkling-2026-11-21/lanes/T8/skyrl_ref")
+REF = os.environ.get("T8_SKYRL_REF", "")
 PINS = {"ppo_utils_faae9039.py.txt": "82f14312eeb45b46", "torch_utils_faae9039.py.txt": None}
 
 
@@ -42,6 +42,9 @@ class Cfg:
 
 
 def main():
+    if not REF or not os.path.isdir(REF):
+        print("SKIP: set T8_SKYRL_REF to a directory holding SkyRL faae9039's ppo_utils.py and torch_utils.py as ppo_utils_faae9039.py.txt / torch_utils_faae9039.py.txt")
+        return 0
     tu = load("torch_utils_faae9039.py.txt", ["masked_mean", "safe_exp_delta"], {"torch": torch})
     env = {"torch": torch, "np": np, "defaultdict": defaultdict, "Optional": __import__("typing").Optional, "Tuple": tuple, "List": list,
            "Float": object, "masked_mean": tu.masked_mean, "safe_exp_delta": tu.safe_exp_delta, "AlgorithmConfig": object,

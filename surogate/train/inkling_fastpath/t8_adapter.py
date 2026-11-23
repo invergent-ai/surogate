@@ -1,10 +1,10 @@
-"""Lane T8, S5: the adapter file for SkyRL's LoRA shape at the owner's ranks (STEP-API.md ADAPTER FORMAT + agent-ELORA's answer 07:54), PEFT-native form:
+"""Lane T8, S5: the adapter file for SkyRL's LoRA shape at the chosen ranks, in the PEFT-native form the engine's loader accepts:
   adapter_config: r 64, lora_alpha 32, rank_pattern {experts: 16} (no alpha_pattern: the experts' scale is 32 / 16 = 2, attention 32 / 64 = 0.5);
   tensors per PHYSICAL layer L (the kit's prefix, as the expert names the engine already binds):
     <P>.L.attn.{wq_du, wr_du, gate_attn, attn_sink_proj, wk_dv, wv_dv, wo_ud}.lora_A.weight [64, in] / .lora_B.weight [out, 64]  (in 2304; wo_ud 3072)
     <P>.L.mlp.experts.<e>.{gate_up_proj, down_proj}.lora_{A,B}.weight                                                    (rank 16; the kit's writer)
 B unscaled: the engine folds the scale into A at upload, bank A = bf16(bf16(A) x scale) = what the trainer's banks hold (power-of-two scales: exact).
-The engine serves it with --enable-lora --max-lora-rank 64 --max-expert-lora-rank 16 (agent-ELORA, inkling/ELORA 12e16b22)."""
+The engine serves it with --enable-lora --max-lora-rank 64 --max-expert-lora-rank 16 (the engine flag --max-expert-lora-rank keeps the expert slots at rank 16)."""
 from __future__ import annotations
 
 import json

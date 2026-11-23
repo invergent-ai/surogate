@@ -1,5 +1,5 @@
 """Lane T8, S3 card gate (PLAN-SKYRL.md): attention LoRA r64 / alpha 32 (scale 0.5) on the seven S10 slices. PASS LINES, written before any run (also in
-lanes/T8/NOTES.md; REVISED 12:3x after the Opus review, still before any run). Nothing is trained; no adapter is kept. Adapter: attention A = the
+the lane notes; REVISED after a code review, still before any run). Nothing is trained; no adapter is kept. Adapter: attention A = the
 trainer's kaiming init, B = N(0, 0.2) (seed 13; large, so that each delta is far above one bf16 ulp of the base); experts at the zero adapter.
 Row: the first 4,096 tokens of gate_rows.npz row 1.
   G13 forward wiring, every one of the 48 visits, on the SAME visit inputs: (a) run with no attention adapter, (b) qkvr adapter only, (c) qkvr + wo_ud.
@@ -7,12 +7,12 @@ Row: the first 4,096 tokens of gate_rows.npz row 1.
       attn_partial(c) == bf16(attn_partial(b) + (gated(b) . a_o^T) . b_o^T). Line: >= 99.9 % of elements bitwise equal and every element within one bf16
       ulp (the engine sums in fp32 fma chains, torch in another order); the deltas are non-zero; and the T8 shim's base forward (no adapter) gives
       the ROLLOUT's recorded log-probs bitwise at the loss tokens (the copy changed nothing else; review M2).
-      AMENDED after run s3-1 (13:0x), pending the coordinator's approval, both reported against BOTH lines: (i) the base check runs on the WHOLE
+      AMENDED after run s3-1, approved in review before the rerun, both reported against BOTH lines: (i) the base check runs on the WHOLE
       16,009-token gate row 0 (its loss tokens start at 14,404; s3-1 compared a 4,096-token prefix that holds no loss token, i.e. against the
       export's zeros: invalid by construction); (ii) "every element within one bf16 ulp" is replaced by "every element within one bf16 ulp OR within
       1e-5 x the slice's largest |delta|": where base + delta nearly cancels, the result's ulp is far below the fp32 rounding of a 64-term delta
       (s3-1: >= 99.98 % of elements bitwise in every slice, 243 of 288 slices had some element beyond one ulp).
-      APPROVED by the coordinator 13:1x with conditions, fixed here BEFORE the rerun: per slice the worst element's distance in ulps and the share of
+      Conditions of that approval, fixed here BEFORE the rerun: per slice the worst element's distance in ulps and the share of
       elements beyond one ulp are reported; the cancellation explanation is checked on the elements beyond one ulp: it HOLDS iff, in every slice
       that has such elements, the median of |want| / max(|base|, |delta|) over them is <= 0.25 (|base + delta| small against its parts); if it does not
       hold, G13 FAILS whatever the amended line says.
@@ -230,7 +230,7 @@ def main():
     log(f"G13 base forward of the T8 shim vs the rollout: {base_bad} mismatches of {int(m1.sum())}")
     rep["G13_pass_as_registered"] = bool(ok and base_bad == 0 and int(m1.sum()) > 0)
     rep["G13_cancellation_explanation_holds"] = bool(cancel_ok)
-    rep["G13_pass"] = bool(ok2 and cancel_ok and base_bad == 0 and int(m1.sum()) > 0)   # the amended line (approved 13:1x) + the cancellation check
+    rep["G13_pass"] = bool(ok2 and cancel_ok and base_bad == 0 and int(m1.sum()) > 0)   # the amended line + the cancellation check
     log(f"G13: registered line {rep['G13_pass_as_registered']}; amended line + cancellation check {rep['G13_pass']} (cancellation holds: {cancel_ok}); base {base_bad} of {int(m1.sum())}")
     rep["G15_pass"] = bool(ok15 and len(rep["G15"]) == 6)
     # ---------------------------------------------------------------- G14: gradients of the attention keys

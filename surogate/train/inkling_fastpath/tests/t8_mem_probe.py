@@ -1,4 +1,4 @@
-"""Lane T8, U0: where a worker's host memory goes (lanes/T8/PLAN.md U0). One card, about 10 minutes, no adapter saved, nothing trained.
+"""Lane T8, U0: where a worker's host memory goes (plan item U0). One card, about 10 minutes, no adapter saved, nothing trained.
 Reads /proc/self/status and torch's pinned-host allocator stats after each phase:
  1. after import; 2. after the engine load (does the engine keep a host copy of its weights?);
  3. the pinned allocator alone: tensors of 61 / 70 / 140 / 267 MB, freed, then its cache emptied (does it round to powers of two and keep freed blocks?);

@@ -1,4 +1,4 @@
-"""Lane T8, S1 + S2 card gate (PLAN-SKYRL.md). PASS LINES, written before any run (also in lanes/T8/NOTES.md). No adapter is kept; nothing is trained beyond
+"""Lane T8, S1 + S2 card gate (SkyRL plan S1 + S2). PASS LINES, written before any run (also in the lane notes). No adapter is kept; nothing is trained beyond
 two test optimizer steps on 4 rows whose result is discarded.
 Expert adapters at SkyRL's shape (r16 / alpha 32 per expert, A AND B trained), A = the kaiming-uniform seed-0 masters, B = N(0, 1e-3) (seed 11) so that A has
 a gradient. Real rows of 16,009 / 28,002 / 47,014 / 57,431 tokens (gate_rows.npz), full backward K = 48, plain head.
@@ -10,10 +10,10 @@ a gradient. Real rows of 16,009 / 28,002 / 47,014 / 57,431 tokens (gate_rows.npz
       stale_checked_rows >= 1) and the replay gate on the old log-probs (here against the trainer's own log-probs: plumbing only) hold; mini-batch 2 runs at
       moved weights (some ratio != 1); all gradients finite; A and B masters both changed; host peak per worker reported (all four keys, K = 48, the 57k row).
   G16 (2 cards; rows of 26,745 / 29,937 / 50,024 tokens WITH final-reply tokens in the loss mask, gate_rows_fin.npz, picked by length only; added
-      2026-11-23 12:3x before any run): at the zero adapter the workers' log-probs == the rollout's at EVERY loss token, counted separately over the
+      2026-11-23, before any run): at the zero adapter the workers' log-probs == the rollout's at EVERY loss token, counted separately over the
       final-reply tokens (1,505) and the rest: 0 mismatches in both; then one `ppo_batch` (1 mini-batch, plain head) on them completes, finite, with
       replay_checked_final_tokens == 1,505 and the stale gate on every row.
-  G17 (2 cards; the 4 gate rows 16k / 28k / 47k / 57k; written 2026-11-23 12:5x before any run): S4 (a) + (b), `lean_host`: one `compute`
+  G17 (2 cards; the 4 gate rows 16k / 28k / 47k / 57k; written 2026-11-23 before any run): S4 (a) + (b), `lean_host`: one `compute`
       (seeds "weights", K = 48, four expert keys, segment sums off) with lean_host off and on: gradients BITWISE equal on every tensor; host peak per
       worker (VmHWM, the 57k row's worker) reported for both; tok/s for both (the per-visit pinned-pool emptying costs time).
 """

@@ -1,9 +1,9 @@
-// ENGINE-INKLING lane T8 (agent-T8): COPY of lane T's inkling_train_shim.cpp (6a9c4a18) with ONE addition, marked "T8:": the S10
+// Lane T8: COPY of lane T's inkling_train_shim.cpp (6a9c4a18) with ONE addition, marked "T8:": the S10
 // attention LoRA (lane e1, targets/inkling2/impl/lora_attention.h) on the six qkvr slices and wo_ud, from bank tables the trainer passes
 // EXPLICITLY (forward.cpp reads them from the engine's LoRA store). Same op, same slices, same order as forward.cpp 2b and step 4.
 // Built as libsinfer_inkling_train_t8.so; lane T's shim is unchanged. ABI 3 (ift_run_visit takes one more pointer).
 //
-// ENGINE-INKLING lane T (agent-EN-T): the engine-op trainer's FAST route (lanes/T/NOTES.md PLAN).
+// Lane T: the engine-op trainer's FAST route.
 //
 // libsinfer_inkling_train.so: an extern "C" shim over the SAME libsinfer.so the rollout engine runs, so a torch
 // training loop (surogate/train/inkling_fastpath/) can drive the engine's own Inkling forward and get the engine's
@@ -477,7 +477,7 @@ void run_visit(Round& rd, int v, const VisitTaps& taps) {
         copy_tap(taps.v_dyn, v_dyn, s);
     }
     // 3. attention: lane c's invariant op (the training entry when the caller asks for q / r / tau / o / lse; it is
-    //    the production call's arithmetic on every route, lanes/c/NOTES.md TRAINING ENTRY).
+    //    the production call's arithmetic on every route; lane c's training entry).
     Tensor gated = rd.work.alloc(DType::BF16, {C::attn_width, T});
     const ops::InklingConvStateView state = state_view(rd);
     {

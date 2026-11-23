@@ -1,11 +1,11 @@
-"""Lane T8: the lean per-row backward for W5 (lanes/T8/PLAN.md U1, STEP-API.md).
+"""Lane T8: the lean per-row backward for W5 (plan item U1).
 
 The math is lane T's (ift_long.visit_torch_long, one recompute per visit from the engine's visit outputs) and the reverse loop is
-ift_long.LongModel / RX's rx_coda2.CodaModel. What is new here is only where things live:
+ift_long.LongModel / the census worker's truncated CodaModel. What is new here is only where things live:
 - only the visit outputs the last K visits read are copied to the host (K = 6 / 18 / 30 / 48 -> 10 / 22 / 34 / 49 of 49 buffers);
 - those buffers and the gradient accumulators come from ONE exact-size pinned arena per worker (torch's pinned allocator keeps freed blocks);
 - nothing is accumulated on the card: gradients leave per visit through `on_grad`;
-- the attention query block follows RX's rule (a smaller block at long rows), with a retry on out-of-memory in the caller.
+- the attention query block follows the census worker's rule (a smaller block at long rows), with a retry on out-of-memory in the caller.
 """
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ from ift_engine import Segment
 D, EPS = B.D, B.EPS
 BF16, F32 = torch.bfloat16, torch.float32
 FINAL_SLOTS = (0, 1, 2, 3, 6)
-# RX's rule (census_grad.py QB_STEPS, measured on a 32 GB card that also holds the engine): (longest row, query block); floor 8
+# the census worker's rule (QB_STEPS, measured on a 32 GB card that also holds the engine): (longest row, query block); floor 8
 QB_STEPS = ((32768, 128), (50000, 64), (100000, 32), (200000, 16))
 SEGMENTS = (("A", 42), ("B", 30), ("C", 18), ("D1", 6), ("D0", 0))
 
@@ -201,7 +201,7 @@ def backward_row(eng, W, ids, vals: dict, lora_host: list, scale: float, v_first
     buffers.reset()
     qb = q_block if q_block is not None else qb_for(T)
     saved_q_block = LG._q_block
-    LG._q_block = lambda T_, window, hq=24: qb  # one block for local and global visits, as RX's worker
+    LG._q_block = lambda T_, window, hq=24: qb  # one block for local and global visits, as the census worker
 
     def sink_for(p, next_v):
         if p < v_first:  # produced before the trained visits: nothing there receives a gradient

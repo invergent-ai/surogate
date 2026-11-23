@@ -1,4 +1,4 @@
-"""Lane T8, the 8-card gate of U1. PASS LINES, written before any run (also in lanes/T8/NOTES.md). One test step; nothing is trained and the test adapter is deleted after the check.
+"""Lane T8, the 8-card gate of U1. PASS LINES, written before any run (also in the lane notes). One test step; nothing is trained and the test adapter is deleted after the check.
 Real W5 rows picked by length only: batch = the 8 longest <= 58,010 + 24 spread; K = 18, centred head, seeds "weights", B keys, 8 workers on ONE box.
   G8a every hard gate holds on every row (replay, support, zero adapter on every worker, finite), no row refused.
   G8b host peak per worker (VmHWM) <= 20 GiB.

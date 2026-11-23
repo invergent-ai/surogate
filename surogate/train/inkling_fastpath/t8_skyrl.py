@@ -1,4 +1,4 @@
-"""Lane T8, S0: SkyRL's policy loss, advantage and reduction for the W5 trainer (lanes/T8/PLAN-SKYRL.md; SkyRL faae9039, preset `lora`).
+"""Lane T8, S0: SkyRL's policy loss, advantage and reduction for the W5 trainer (SkyRL faae9039, preset `lora`).
 
 Written from SkyRL's code, line for line, in fp64 on the host (the per-row seeds of our step):
 - GRPO advantage (`ppo_utils.py:1411-1460`, `compute_grpo_outcome_advantage`): per group, mean of the scores and torch.std (unbiased), both in fp32 as SkyRL's calls give them; a group of
@@ -105,7 +105,7 @@ BLOCKS = {"before": range(0, 6), "inside": range(6, 18), "after": range(18, 24)}
 
 
 def first_order_by_block(grad_ascent: list, delta: list, keys: tuple, blocks: dict = BLOCKS) -> dict:
-    """RX's follow read (LOOP-W5.md 4.2): the predicted first-order change <g, dθ> per layer block and in all.
+    """The loop's follow read: the predicted first-order change <g, dθ> per layer block and in all.
     grad_ascent: per (layer, key) in the trainer's gradient order (layer-major, `keys` per layer), the gradient of the quantity whose change is
     predicted (e.g. sum over the trained rows of A x sum_t log pi: StepOut.grads of seeds="weights" with weight = the advantage, sense "ascent";
     or -N x StepOut.grads of the FIRST ppo mini-batch, where the ratio is exactly 1 and nothing is clipped). delta: the update, same order

@@ -1,4 +1,4 @@
-"""Lane T8, S4 (a) + (b) `lean_host` on CPU (coordinator 12:3x): t8_step.accumulate_row, the function the real worker uses.
+"""Lane T8, S4 (a) + (b) `lean_host` on CPU: t8_step.accumulate_row, the function the real worker uses.
  1. lean_host on == off, BITWISE, on Inkling's real visit -> layer table (looped layers visited 3 times), at K = 48 and K = 18;
  2. default path: an out-of-memory row is retried with the query block halved and gives the same sums as a clean run;
  3. lean_host: out of memory BEFORE the first addition -> retried (nothing added yet); AFTER it -> RuntimeError, no retry;
@@ -127,7 +127,7 @@ def main():
     assert all(torch.equal(a, b) for a, b in zip(tr.opt.masters, m0)) and not tr.opt.opt.state, "masters / optimizer not restored"
     assert os.path.exists(os.path.join(tmp, "STOP")), "no STOP file"
     print("end to end: the step fails loudly, STOP written, masters and optimizer restored: PASS")
-    # RX's per-attempt sketches (accumulate_row + WorkerCore._sketch_row)
+    # per-attempt sketches (accumulate_row + WorkerCore._sketch_row)
     keys = TS.param_keys(64)
     sh2 = [{k: (3, 5) for k in keys} for _ in range(24)]
     w = fake_worker(True, 0, sh2, keys)
