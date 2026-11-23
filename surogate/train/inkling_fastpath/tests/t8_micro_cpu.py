@@ -189,7 +189,7 @@ def main():
     for f in ("masters/theta0.pt", "masters/theta1.pt"):
         torch.save({}, os.path.join(run, f))
     rt = [n for n, r in prow.items() if r.group_idx == 0]
-    rep0 = {"M2_trainer": True, "M3": True, "M4": True, "M6_trainer": True, "round_trip_rows": rt}
+    rep0 = {"M2_trainer": True, "M3": True, "M4": True, "M6_trainer": True, "round_trip_rows": rt, "zero_adapter": {"all_bitwise": True}}
     rng = np.random.default_rng(3)
     moved = {n: (MI.lp_at_mask(old[n] - rng.random(len(old[n])).astype(np.float32) * 1e-2, prow[n].loss_mask)) for n in prow}
 
@@ -198,7 +198,7 @@ def main():
         for k in range(parts):
             np.savez(os.path.join(rd, f"{name}.part{k}.npz"), **{f"lp_{n}": val[n] for n in ns[k::parts]})
 
-    def scenario(tag, edit=None, drop=None):
+    def scenario(tag, edit=None, drop=None, partial=None):
         for f in os.listdir(rd):
             os.remove(os.path.join(rd, f))
         V = {"base": {n: MI.lp_at_mask(old[n], prow[n].loss_mask) for n in prow}, "U12": moved}
@@ -207,11 +207,12 @@ def main():
         write("U12", moved, prow)
         for w in ("R12", "U4") + MI.ROUND2:
             if w != drop:
-                write(w, moved, prow)
-        np.savez(os.path.join(run, "roundtrip", "trainer_U12.npz"), **{f"lp_{n}": moved[n] for n in rt})
+                write(w, moved, [n for n in prow if not (w == partial and n == rt[0])])
+        for w in MI.RT_ADAPTERS:
+            np.savez(os.path.join(run, "roundtrip", f"trainer_{w}.npz"), **{f"lp_{n}": moved[n] for n in rt})
         if edit:
             name, n = edit
-            fname = os.path.join(run, "roundtrip", "trainer_U12.npz") if name == "trainer_U12" else \
+            fname = os.path.join(run, "roundtrip", f"{name}.npz") if name.startswith("trainer_") else \
                 os.path.join(rd, [f for f in os.listdir(rd) if f.startswith(name + ".part") and f"lp_{n}" in np.load(os.path.join(rd, f)).files][0])
             z = dict(np.load(fname))
             t = int(np.flatnonzero(prow[n].loss_mask)[0])
@@ -237,13 +238,18 @@ def main():
         assert json.load(open(os.path.join(rd, w + ".json")))["head"] == "plain"
     assert not os.path.exists(os.path.join(rd, "trainer_U12.npz"))
     for tag, edit, flag in (("Z", ("Z", rt[0]), "M1"), ("U12", ("U12", rt[-1]), "M5"), ("base", ("base", max(prow)), "M2"),
-                            ("trainer", ("trainer_U12", rt[0]), "M5")):
+                            ("trainer", ("trainer_U12", rt[0]), "M5"), ("R12", ("R12", rt[0]), "M5"), ("trainerU4", ("trainer_U4", rt[-1]), "M5")):
         rc, rep = scenario(tag, edit=edit)
         assert rc != 0 and not rep[flag], (tag, rep)
     rc, rep = scenario("drop", drop="R12")
     assert rc != 0 and not rep["M6"], rep
     rc, rep = scenario("drop2", drop="U12_after")               # round 2 is reported, not a line
     assert rc == 0 and rep["pass"] and not rep["reads_complete"]["U12_after"], rep
+    rc, rep = scenario("partial", partial="U12_inside")           # a read on some rows only: parts kept, no reads/<X>.npz, recorded
+    assert rc == 0 and rep["pass"] and rep["reads_incomplete"].get("U12_inside") == len(prow) - 1, rep
+    assert not os.path.exists(os.path.join(rd, "U12_inside.npz")) and not os.path.exists(os.path.join(rd, "U12_inside.json"))
+    g_ = json.load(open(os.path.join(run, "gates.json")))
+    assert g_["replay"]["mismatch_tokens"] == 0 and g_["replay"]["rows_checked"] == len(prow) and g_["zero_adapter"]["bitwise"] is True
     # a row read twice
     for f in os.listdir(rd):
         os.remove(os.path.join(rd, f))

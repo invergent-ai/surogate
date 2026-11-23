@@ -8,8 +8,8 @@ PASS LINES, written before any run:
   M3 ratio 1: the mini-batch's forward == the old log-probs bitwise on every row (stale gate on every row), ppo_ratio_max == 1.0, clip share 0.
   M4 step: every gradient finite, no row refused, no gate of the step fails; N (the divisor) == the plan's loss tokens; the update of every
      A tensor exactly 0 (B starts at 0, so A has no gradient at the first step; the follow read relies on it).
-  M5 round trip: the trainer's log-probs at U12 == the engine's U12 reads bitwise at every loss token of the round-trip rows (the first
-     group's rows; roundtrip/trainer_U12.npz).
+  M5 round trip: the trainer's log-probs at U12, R12 and U4 == the engine's reads of the same adapters bitwise at every loss token of the
+     round-trip rows (the first group's rows; roundtrip/trainer_<X>.npz). 0 values differing; the scale each file declares is in adapters.json.
   M6 files: gates.json, first_order.json, masters/theta0 + theta1, rows_used.npz, adapters.json and the round-1 reads (base, Z, U12, R12, U4) of
      every row written; a sketch file for every attempt with a non-zero advantage (zero-advantage attempts counted). Round 2 (the block adapters)
      runs if the card-hour cap leaves room, round 3 (block random controls) likewise; both reported, no line.
@@ -39,8 +39,10 @@ sys.path.insert(0, HERE)
 CAP = 58010
 LR = 2e-5
 R_SEED = 20261124                                            # the follow read's seed for R12's direction
-ROUND1 = ("base", "Z", "U12", "R12", "U4")
-ROUND2 = ("U12_before", "U12_inside", "U12_after")
+R_SEED_B = 20261125                                          # R12b: a second draw, same per-tensor norms
+ROUND1 = ("base", "U12", "R12", "U4", "Z")                    # Z last: Z == base then also shows nothing leaked through the cache or the slot
+ROUND2 = ("R12b", "U12_before", "U12_inside", "U12_after")
+RT_ADAPTERS = ("U12", "R12", "U4")
 ROUND3 = ("R12_before", "R12_inside", "R12_after")
 
 
@@ -138,7 +140,7 @@ def random_like(delta: list, nm: list, scale: float, seed: int = R_SEED) -> list
 def states(theta0: list, delta: list, nm: list, blocks: dict, which: tuple) -> dict:
     """The named parameter states (lists of fp32 tensors in the trainer's order)."""
     out = {}
-    rnd = None
+    rnd = {}
     for w in which:
         base, _, blk = w.partition("_")
         if base == "Z":
@@ -148,9 +150,11 @@ def states(theta0: list, delta: list, nm: list, blocks: dict, which: tuple) -> d
             k = float(base[1:])
             step = [d * k for d in delta]
         elif base.startswith("R"):
-            rnd = rnd if rnd is not None else random_like(delta, nm, float(base[1:]))
+            seed = R_SEED_B if base.endswith("b") else R_SEED
+            if base not in rnd:
+                rnd[base] = random_like(delta, nm, float(base[1:].rstrip("b")), seed)
             out[w] = [(t0.double() + (s if not blk or block_of(n, blocks) == blk else torch.zeros_like(s))).float()
-                      for t0, s, n in zip(theta0, rnd, nm)]
+                      for t0, s, n in zip(theta0, rnd[base], nm)]
             continue
         else:
             raise ValueError(w)
@@ -229,9 +233,18 @@ def phase_pre(a):
     rows, info = load_plan(a.plan)
     pick = pick_pre_rows(rows)
     sub = [rows[i] for i in pick]
-    tr = TS.T8Trainer(trainer_cfg(a, (int(a.cards.split(",")[0]),)))
+    from surogate.inkling_rl.step import StepConfig
+
+    tr = TS.T8Trainer(trainer_cfg(a, (int(a.cards.split(",")[0]),), sketch_dir=os.path.join(a.run_dir, "sketches_pre")))
     try:
         lz = tr.logprobs(sub)
+        tr.check_zero_adapter([sub[0]])
+        for r, x in zip(sub, lz):                             # the session's step gates (replay, stale) on these rows, no apply
+            r.notes["old_lp"] = x
+        o = tr.compute(sub, 0, StepConfig(max_policy_lag=None), seeds="ppo", minibatch_index=0)
+        step_gates = {"replay_checked_rows": o.metrics["replay_checked_rows"], "stale_checked_rows": o.metrics["stale_checked_rows"],
+                      "ratio_max": o.metrics.get("ppo_ratio_max"), "finite": all(bool(torch.isfinite(g).all()) for g in o.grads)}
+        del o
         M = tr.masters()
         g = torch.Generator().manual_seed(21)
         for d in M:
@@ -250,8 +263,12 @@ def phase_pre(a):
     json.dump([{"ids": r.ids.tolist()} for r in sub], open(os.path.join(a.run_dir, "rows_ids.json"), "w"))
     np.savez(os.path.join(a.run_dir, "trainer_zero.npz"), **{f"lp_{i}": x for i, x in enumerate(lz)})
     np.savez(os.path.join(a.run_dir, "trainer_adapter.npz"), **{f"lp_{i}": x for i, x in enumerate(la)})
-    rep = {"plan": info, "pre_rows": pick, "pre_rows_T": [r.T for r in sub], "adapter_sha256": sha,
-           "replay": {"equal": eq, "differ": ne, "pass": bool(ne == 0 and eq > 0)}}
+    rep = {"plan": info, "pre_rows": pick, "pre_rows_T": [r.T for r in sub], "adapter_sha256": sha, "step_gates": step_gates,
+           "replay": {"equal": eq, "differ": ne, "pass": bool(ne == 0 and eq > 0 and step_gates["replay_checked_rows"] == len(sub)
+                                                             and step_gates["stale_checked_rows"] == len(sub) and step_gates["finite"])}}
+    import shutil
+
+    shutil.rmtree(os.path.join(a.run_dir, "sketches_pre"), ignore_errors=True)
     json.dump(rep, open(a.out, "w"), indent=1)
     log(f"pre trainer half: rows {rep['pre_rows_T']}, replay {rep['replay']}")
     return 0 if rep["replay"]["pass"] else 4
@@ -285,6 +302,13 @@ def phase_trainer(a):
     cards = tuple(int(x) for x in a.cards.split(","))
     sk = os.path.join(a.run_dir, "sketches")
     rep = {"plan": info, "cards": list(cards), "lr": LR, "time_start": time.time()}
+    if a.deadline_min > 0:                                    # the card-hour budget: the phase stops itself (workers closed in `finally`)
+        import signal
+
+        def _late(signum, frame):
+            raise TimeoutError(f"the trainer phase passed its {a.deadline_min} min deadline")
+        signal.signal(signal.SIGALRM, _late)
+        signal.alarm(int(a.deadline_min * 60))
     tr = TS.T8Trainer(trainer_cfg(a, cards, sketch_dir=sk))
     keys, n_layers = tr.keys, len(tr.shapes)
     nm = names(n_layers, keys)
@@ -312,7 +336,10 @@ def phase_trainer(a):
                            "refused": {k: m.get(k) for k in ("refused_long_rows", "r3_refused_rows", "r3_lagged_uncovered_refused_rows")},
                            "workers": [{"card": x["card"], "VmHWM_gib": x["VmHWM_gib"], "card_peak_torch_gib": x["card_peak_torch_gib"]}
                                        for x in m["workers"]]}
-            rep["zero_adapter_checks"] = len(zc)
+            rep["zero_adapter"] = {"rows_checked_per_worker": [1] * len(tr.handles), "checks": len(zc),
+                                   "all_bitwise": all(x.get("log_probs_equal") and x.get("routing_equal") for x in zc)}
+            rep["step"]["policy_loss"] = m.get("policy_loss")
+            rep["step"]["metrics"] = {k: v for k, v in m.items() if isinstance(v, (int, float))}
             # the files of the follow read
             fo_json = {**fo["by_block"], "N": N, "rows_used": len(out.rows), "rows_refused": len(rows) - len(out.rows), "k": 1,
                        "G": "-N x grads of mini-batch 0", "d": "theta1 - theta0", "attention": fo["attention"], "experts": fo["experts"]}
@@ -322,12 +349,6 @@ def phase_trainer(a):
             torch.save(dict(zip(nm, theta1)), os.path.join(a.run_dir, "masters", "theta1.pt"))
             a_keys = [i for i, n in enumerate(nm) if n.split(".", 1)[1] in ("A13", "A2") or n.split(".", 1)[1].endswith("A")]
             rep["A_delta_max_abs"] = max(float(delta[i].abs().max()) for i in a_keys)  # B0 = 0: A has no gradient, d_A == 0 exactly
-            json.dump({"replay": {"rows": len(rows), "rows_checked": int(m["replay_checked_rows"]), "mismatch_tokens": 0},
-                       "ratio_first_update": {"loss_tokens": int(N), "tokens_not_exactly_1": 0 if m["stale_checked_rows"] == len(rows) else None},
-                       "zero_adapter": {"bitwise": True, "workers_rows_checked": len(zc)},
-                       "finite": all(bool(torch.isfinite(g).all()) for g in out.grads), "rows_refused": len(rows) - len(out.rows),
-                       "A_delta_exactly_zero": rep["A_delta_max_abs"] == 0.0},
-                      open(os.path.join(a.run_dir, "gates.json"), "w"), indent=1)  # the step raises on any replay / stale / zero-adapter mismatch
             pos, old = {}, {}
             for r in rows:
                 n = r.notes["plan_row"]
@@ -335,30 +356,45 @@ def phase_trainer(a):
                 pos[f"pos_{n}"] = p
                 old[f"old_{n}"] = np.asarray(r.notes["old_lp"], dtype=np.float32)[p - 1]
             np.savez(os.path.join(a.run_dir, "rows_used.npz"), **pos, **old, N=np.array([N]))
-            # M5, trainer half: log-probs at U12 on the round-trip rows
-            u12 = states(theta0, delta, nm, KS.BLOCKS, ("U12",))["U12"]
+            # M5, trainer half: log-probs at U12, R12 and U4 on the round-trip rows
             rt = [r for r in rows if r.group_idx in sorted({x.group_idx for x in rows})[:a.rt_groups]]
-            tr.set_masters([{k: u12[L * len(keys) + j] for j, k in enumerate(keys)} for L in range(n_layers)])
-            lu = tr.logprobs(rt)
-            del u12
             os.makedirs(os.path.join(a.run_dir, "roundtrip"), exist_ok=True)   # a subset of rows: kept out of reads/ (reads/ holds every row)
-            np.savez(os.path.join(a.run_dir, "roundtrip", "trainer_U12.npz"),
-                     **{f"lp_{r.notes['plan_row']}": lp_at_mask(np.concatenate([[0.0], x]), r.loss_mask) for r, x in zip(rt, lu)})
+            for w in RT_ADAPTERS:
+                sw = states(theta0, delta, nm, KS.BLOCKS, (w,))[w]
+                tr.set_masters([{k: sw[L * len(keys) + j] for j, k in enumerate(keys)} for L in range(n_layers)])
+                del sw
+                lu = tr.logprobs(rt)
+                np.savez(os.path.join(a.run_dir, "roundtrip", f"trainer_{w}.npz"),
+                         **{f"lp_{r.notes['plan_row']}": lp_at_mask(np.concatenate([[0.0], x]), r.loss_mask) for r, x in zip(rt, lu)})
             rep["round_trip_rows"] = [r.notes["plan_row"] for r in rt]
             rank = tr.B.RANK
+            files = list(out.metrics.get("sketch_files", []))
             tr.close()                                        # the workers' host memory is free before the exports
+            tr.opt = tr.work = tr.work_flat = tr.flats = tr.work_layers = None
+            del res, out, theta1
+            import gc
+
+            gc.collect()
             # the adapters, one state at a time, exported from the parameter states directly (no worker state is involved)
             rep["adapters"] = {}
-            for w in ROUND1[1:] + ROUND2 + ROUND3:
+            for w in [x for x in ROUND1 + ROUND2 + ROUND3 if x != "base"]:
                 st = states(theta0, delta, nm, KS.BLOCKS, (w,))[w]
-                rep["adapters"][w] = TA.export_combined(layers_of(st, n_layers, keys), os.path.join(a.work, "adapters", w), 64, 32.0, rank,
-                                                        "BF16", metadata={"step": f"t8-micro-{w}"})
+                dst = os.path.join(a.work, "adapters", w)
+                sha = TA.export_combined(layers_of(st, n_layers, keys), dst, 64, 32.0, rank, "BF16", metadata={"step": f"t8-micro-{w}"})
                 del st
+                ac = json.load(open(os.path.join(dst, "adapter_config.json")))
+                ex = [int(v) for v in (ac.get("rank_pattern") or {}).values()]
+                rep["adapters"][w] = {"sha256": sha, "r": ac["r"], "lora_alpha": ac["lora_alpha"], "rank_pattern": ac.get("rank_pattern"),
+                                      "alpha_pattern": ac.get("alpha_pattern"), "scale_attention": float(ac["lora_alpha"]) / float(ac["r"]),
+                                      "scale_experts": [float(ac["lora_alpha"]) / e for e in ex]}
             json.dump(rep["adapters"], open(os.path.join(a.run_dir, "adapters.json"), "w"), indent=1)
         rep["min_mem_available_gb"] = mw.low
+        if a.deadline_min > 0:
+            import signal
+
+            signal.alarm(0)
     finally:
         tr.close()
-    files = out.metrics.get("sketch_files", [])
     sketched, zero_counted = set(), 0
     for f in files:
         d_ = torch.load(f, map_location="cpu", weights_only=False)
@@ -399,13 +435,24 @@ def phase_compare(a):
             R.setdefault(name, {}).update(part)
     ad = json.load(open(os.path.join(a.run_dir, "adapters.json")))
     eng = open(a.engine_sha_file).read().strip() if a.engine_sha_file else ""
-    for name, v in R.items():                                 # one file per adapter for the follow read, and its JSON
+    full_rows = set(masks)
+    rep["reads_incomplete"] = {}
+    for name, v in list(R.items()):                           # one file per adapter for the follow read, and its JSON: only when complete
+        if set(v) != full_rows:                               # a partial read stays as its parts (the follow read would refuse it)
+            rep["reads_incomplete"][name] = len(v)
+            del R[name]
+            continue
         if not os.path.exists(os.path.join(rd, name + ".npz")):
             np.savez(os.path.join(rd, name + ".npz"), **{f"lp_{n}": x for n, x in sorted(v.items())})
-        json.dump({"adapter_sha256": ad.get(name), "head": "plain", "engine_sha": eng, "source": "engine"},
+        json.dump({"adapter_sha256": (ad.get(name) or {}).get("sha256"), "head": "plain", "engine_sha": eng, "source": "engine"},
                   open(os.path.join(rd, name + ".json"), "w"), indent=1)
-    R["trainer_U12"] = load_reads(os.path.join(a.run_dir, "roundtrip", "trainer_U12.npz"))
+    for w in RT_ADAPTERS:
+        R[f"trainer_{w}"] = load_reads(os.path.join(a.run_dir, "roundtrip", f"trainer_{w}.npz"))
     rep["reads"] = {k: len(v) for k, v in R.items()}
+    rep["plan_rows_sha256"] = info["rows_sha256"]
+    rep["engine_sha"] = eng
+    ro = os.path.join(a.run_dir, "reads_order.txt")
+    rep["reads_order"] = [x.strip() for x in open(ro) if x.strip()] if os.path.exists(ro) else None
     u = np.load(os.path.join(a.run_dir, "rows_used.npz"))
     old = {}
     for r in rows:
@@ -419,11 +466,27 @@ def phase_compare(a):
     out["M1_engine_Z_vs_base"] = cmp_reads(R["Z"], R["base"], masks)
     out["M2_old_vs_recorded"] = cmp_reads(old, rec, masks)
     out["M2_old_vs_engine_base"] = cmp_reads(old, R["base"], masks)
-    out["M5_trainer_vs_engine_U12"] = cmp_reads(R["trainer_U12"], R["U12"], masks)
+    for w in RT_ADAPTERS:
+        out[f"M5_trainer_vs_engine_{w}"] = cmp_reads(R[f"trainer_{w}"], R.get(w, {}), masks)
     rep["compare"] = {k: {"rows": v[0], "equal": v[1], "differ": v[2]} for k, v in out.items()}
-    rep["M1"] = bool(out["M1_engine_Z_vs_base"][2] == 0 and out["M1_engine_Z_vs_base"][1] > 0)
+    rep["M1"] = bool(out["M1_engine_Z_vs_base"][2] == 0 and out["M1_engine_Z_vs_base"][0] == full and rep.get("zero_adapter", {}).get("all_bitwise"))
     rep["M2"] = bool(rep.get("M2_trainer") and all(out[k][2] == 0 and out[k][0] == full for k in ("M2_old_vs_recorded", "M2_old_vs_engine_base")))
-    rep["M5"] = bool(out["M5_trainer_vs_engine_U12"][2] == 0 and out["M5_trainer_vs_engine_U12"][0] == len(rep["round_trip_rows"]))
+    rep["M5"] = bool(all(out[f"M5_trainer_vs_engine_{w}"][2] == 0 and out[f"M5_trainer_vs_engine_{w}"][0] == len(rep["round_trip_rows"])
+                         for w in RT_ADAPTERS))
+    s_ = rep.get("step", {})
+    gates = {"replay": {"rows": full, "rows_checked": out["M2_old_vs_recorded"][0], "mismatch_tokens": out["M2_old_vs_recorded"][2],
+                        "tokens_compared": out["M2_old_vs_recorded"][1] + out["M2_old_vs_recorded"][2]},
+             "ratio_first_update": {"loss_tokens": int(s_.get("N", 0)),
+                                    # the stale gate compares the update's forward with the old log-probs bit for bit on every row and raises
+                                    # on one differing token: so all rows checked == every ratio exactly exp(0) = 1
+                                    "tokens_not_exactly_1": 0 if s_.get("stale_checked_rows") == full else None,
+                                    "stale_checked_rows": s_.get("stale_checked_rows"), "ratio_max": s_.get("ratio_max"), "clip_share": s_.get("clip_ratio")},
+             "zero_adapter": {"bitwise": bool(rep.get("zero_adapter", {}).get("all_bitwise") and rep["M1"]),
+                              "trainer_checks": rep.get("zero_adapter", {}).get("checks"), "engine_Z_vs_base": rep["compare"]["M1_engine_Z_vs_base"]},
+             "finite": s_.get("finite"), "rows_refused": s_.get("rows_refused"), "A_delta_max_abs": rep.get("A_delta_max_abs"),
+             "A_delta_exactly_zero": rep.get("A_delta_max_abs") == 0.0, "plan_rows_sha256": info["rows_sha256"], "engine_sha": eng,
+             "source": "micro.json (measured values)"}
+    json.dump(gates, open(os.path.join(a.run_dir, "gates.json"), "w"), indent=1, default=float)
     need = ("first_order.json", "gates.json", "masters/theta0.pt", "masters/theta1.pt", "rows_used.npz", "adapters.json")
     rep["M6"] = bool(rep.get("M6_trainer") and all(os.path.exists(os.path.join(a.run_dir, f)) for f in need)
                      and all(len(R.get(w, {})) == full for w in ROUND1))
@@ -454,6 +517,7 @@ def main():
     ap.add_argument("--run-dir", default="")
     ap.add_argument("--rt-groups", type=int, default=1, help="round trip on the rows of the first n groups")
     ap.add_argument("--engine-sha-file", default="")
+    ap.add_argument("--deadline-min", type=float, default=0.0, help="trainer phase: stop (no outputs) after this many minutes")
     ap.add_argument("--out", default="")
     a = ap.parse_args()
     return {"check": phase_check, "pre": phase_pre, "pre_compare": phase_pre_compare, "trainer": phase_trainer, "compare": phase_compare}[a.phase](a)

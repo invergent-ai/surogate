@@ -41,6 +41,13 @@ def score(url, model, ids):
     d = post(url, "/v1/completions", {"model": model, "prompt": "", "tokens": [int(x) for x in ids], "max_tokens": 1, "temperature": 0.0,
                                       "prompt_logprobs": 1, "logprobs": 1, "return_token_ids": True})
     plp = d["prompt_logprobs"]
+    echo = d.get("prompt_token_ids")
+    if echo is None:
+        echo = (d.get("choices") or [{}])[0].get("prompt_token_ids")
+    if echo is None or [int(x) for x in echo] != [int(x) for x in ids]:
+        raise SystemExit(f"the engine's prompt ids differ from the row's ({len(echo) if echo is not None else 'none'} vs {len(ids)})")
+    if len(plp) != len(ids):
+        raise SystemExit(f"{len(plp)} prompt log-probs for {len(ids)} ids")
     return np.array([0.0] + [float(plp[t][str(int(ids[t]))]["logprob"]) for t in range(1, len(ids))], dtype=np.float32)
 
 
