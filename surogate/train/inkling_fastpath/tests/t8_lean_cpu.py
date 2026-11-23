@@ -140,7 +140,7 @@ def main():
             L = VL[v]
             for j, k in enumerate(keys):
                 x = torch.randn(sh2[L][k], generator=g)
-                rec[(v, L, j)] = x
+                rec[(v, L, j)] = x.clone()
                 on_grad(v, L, j, x)
         return rec
     recs = {}

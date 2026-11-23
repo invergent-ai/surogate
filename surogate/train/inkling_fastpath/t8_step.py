@@ -267,7 +267,7 @@ def accumulate_row(w, run, T: int, part: str, qb: int, visit_layers: list, empty
                 return
             if lean and not bool(torch.isfinite(gj).all()):
                 raise T8GateError(f"FINITE GATE: T {T}: layer {layer} {w.layout.keys[j]} (visit {v}) holds non-finite values")
-            c = gj.float().cpu()
+            c = gj.detach().to("cpu", torch.float32, copy=True)  # always a new tensor (a CPU gj would otherwise be added into in place)
             if sk_try is not None:
                 key = w.layout.keys[j]
                 if j >= 4 and v in sk_v:                     # an attention key of a named visit (layer run)
