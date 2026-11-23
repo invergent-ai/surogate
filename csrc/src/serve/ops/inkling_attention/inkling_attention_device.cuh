@@ -103,7 +103,13 @@ __device__ __forceinline__ void mma_bf16_nv(float& c0, float& c1, float& c2, flo
 
 /// Ask L2 to fetch [ptr, ptr + bytes) (bytes a multiple of 16; no registers, no shared memory, no completion to wait for).
 __device__ __forceinline__ void prefetch_l2_bulk(const void* ptr, unsigned bytes) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
     asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(ptr), "r"(bytes) : "memory");
+#else
+    // cp.async.bulk is sm_90+; below it the hint is dropped (the sm_89 cubin of the serve build must compile).
+    (void)ptr;
+    (void)bytes;
+#endif
 }
 
 /// Non-coherent global loads the compiler may not move (a register ring's distance stays as written).

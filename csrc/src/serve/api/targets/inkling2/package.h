@@ -48,6 +48,13 @@ enum class WeightsProfile : std::uint8_t {
     Fp8Attention,
 };
 
+/// Do these weights need an sm_120 / sm_121 GPU? Always, for this target. Its NVFP4 expert GEMM uses the
+/// block-scaled FP4 MMA (sm_120+) and its mix kernels use thread-block clusters (sm_90+). The serve build
+/// compiles them at its whole architecture set so that every cubin builds, with bodies that only `__trap()`
+/// below those architectures; this refusal (make_sequence_planner_impl) keeps an older device, or a build
+/// without an sm_12x cubin, from loading the model and reaching them mid-request.
+[[nodiscard]] constexpr bool weights_profile_needs_sm120(WeightsProfile) noexcept { return true; }
+
 using Frontend       = family::Frontend;
 using PreparedPrompt = family::PreparedPrompt;
 using OutputSession  = family::OutputSession;

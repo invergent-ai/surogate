@@ -420,6 +420,10 @@ struct TailArgs {
 /// layout from the cluster's x through distributed shared memory): bit-identical to the three launches.
 __global__ void __cluster_dims__(kTailCtas, 1, 1) __launch_bounds__(kThreads)
     controller_tail_kernel(const __grid_constant__ TailArgs a) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+    // Thread-block clusters are sm_90+; below it the kernel only traps (the sm_89 cubin of the serve build must compile).
+    __trap();
+#else
     pdl::wait_for_dependencies();
     pdl::trigger_dependents(); // PDL: the next kernel may launch now (it waits for this grid before any read)
     extern __shared__ __align__(16) unsigned char tail_smem[];
@@ -525,6 +529,7 @@ __global__ void __cluster_dims__(kTailCtas, 1, 1) __launch_bounds__(kThreads)
         }
     }
     cluster.sync(); // the other CTAs may still read this CTA's x
+#endif
 }
 
 // ------------------------------------------------------------------------------------- short conv
@@ -761,8 +766,14 @@ __device__ __forceinline__ unsigned short ld_bits(const void* base, std::int64_t
 /// the line (the post-wait load reads whatever L2 holds then). Used for AttnRes stack / bank sources, which completed
 /// visits wrote long ago and the step's weight stream has usually evicted from L2.
 __device__ __forceinline__ void prefetch_column_l2(const PlaneDev& p, std::int64_t t) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
     const auto* row = static_cast<const unsigned short*>(p.data) + t * p.stride;
     asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(row), "r"(static_cast<unsigned>(kD * 2)));
+#else
+    // cp.async.bulk is sm_90+; below it the hint is dropped (the sm_89 cubin of the serve build must compile).
+    (void)p;
+    (void)t;
+#endif
 }
 
 /// block_sum's arithmetic for M values, with ONE barrier: `half` (16-byte aligned, kMxWarps * M floats) must differ
@@ -992,6 +1003,10 @@ __global__ void __launch_bounds__(kThreads) blend_inputs_kernel(const __grid_con
 /// below (the reference walks the columns one by one: a DSMEM round trip, two barriers and a weight load each).
 __global__ void __cluster_dims__(kTailCtas, 1, 1) __launch_bounds__(kThreads)
     controller_tail_kernel(const __grid_constant__ TailArgs a) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+    // Thread-block clusters are sm_90+; below it the kernel only traps (the sm_89 cubin of the serve build must compile).
+    __trap();
+#else
     extern __shared__ __align__(16) unsigned char tail_smem[];
     auto* As = reinterpret_cast<bf16*>(tail_smem);                      // [576][64] swizzled (then G: fp32 [576][8])
     auto* Bs = As + kTailRows * kRank;                                 // [8][64] swizzled
@@ -1198,6 +1213,7 @@ __global__ void __cluster_dims__(kTailCtas, 1, 1) __launch_bounds__(kThreads)
         }
     }
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory"); // the other CTAs may still read this CTA's x
+#endif
 }
 
 /// short_conv_kernel's decode / verify form (W <= kConvFastWidth, one CTA column tile, window update fused, no
