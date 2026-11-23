@@ -76,7 +76,8 @@ void bind_lora(const detail::LoadedModelData& data, const EngineOptions& options
         if (L.router.qdata == nullptr) { continue; } // not resident on this device
         ops::InklingMoeWeights key;
         key.router = L.router.qdata;
-        family::bind_lora_inkling_moe(store, static_cast<int>(index), key);
+        family::bind_lora_inkling_moe(store, static_cast<int>(index), key,
+                                      static_cast<std::int32_t>(options.lora_max_expert_rank));
         // Attention (vLLM parity): the six qkvr slices under their checkpoint names, the fused `attn.qkvr` twin, wo_ud.
         using Binding = ops::LoraStore::ModuleBinding;
         using C       = detail::TextConfig;

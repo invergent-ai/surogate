@@ -68,6 +68,10 @@ public:
         std::int32_t row_offset = 0;
         std::int32_t row_group = 0;
         std::int32_t row_stride = 0;
+        // This bank's rank: 0 = the store's max_rank (every target but Inkling's experts). A smaller
+        // rank gives the bank (slots, rank) instead of (slots, max_rank), and an adapter module of a
+        // larger rank is refused for it. The kernels read the rank from the bank (LoraBank::rank).
+        std::int32_t rank = 0;
         [[nodiscard]] std::int32_t checkpoint_out() const noexcept { return source_out ? source_out : out; }
         [[nodiscard]] std::int32_t source_row(std::int32_t i) const noexcept {
             return row_group ? row_offset + (i / row_group) * row_stride + i % row_group
@@ -299,6 +303,10 @@ public:
     void set_active(bool active) noexcept { active_.store(active, std::memory_order_relaxed); }
     [[nodiscard]] std::int32_t slots() const noexcept { return slots_; }
     [[nodiscard]] std::int32_t max_rank() const noexcept { return max_rank_; }
+    /// The rank a binding's bank is built at (ModuleBinding::rank, or max_rank when it names none).
+    [[nodiscard]] std::int32_t binding_rank(const ModuleBinding& binding) const noexcept {
+        return binding.rank > 0 ? binding.rank : max_rank_;
+    }
     /// The device this store's memory lives on, or -1 before anything is built.
     [[nodiscard]] int device() const noexcept { return device_; }
     /// Device bytes ensure_banks has allocated so far: every bank at every slot and the

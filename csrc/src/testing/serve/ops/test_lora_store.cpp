@@ -17,7 +17,9 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <iostream>
 #include <thread>
@@ -330,6 +332,109 @@ void speculative_columns() {
     sinfer::ops::bind_ops_context(nullptr);
 }
 
+/// Per-bank rank (ModuleBinding::rank, lane ELORA): a store at max_rank 8 holds a module at the default rank
+/// (8) and an Inkling-expert-like fused pair at rank 2 (gate / up interleaved in one checkpoint B, one A).
+/// The small banks are (slots, 2) wide; an adapter of rank 2 lands in them bit for bit through every write
+/// path (host upload, in-place staging, device publication); rank 3 is refused for them only.
+void mixed_ranks() {
+    using Binding = sinfer::ops::LoraStore::ModuleBinding;
+    sinfer::ops::LoraStoreSet set;
+    int device = 0;
+    check(cudaGetDevice(&device) == cudaSuccess, "cudaGetDevice");
+    sinfer::ops::LoraStore& store = set.for_device(device);
+    const auto key = reinterpret_cast<const void*>(0x3000);
+    store.configure(/*slots=*/2, /*max_rank=*/8, /*max_tokens=*/16);
+    store.register_module(0, "attn.big", Binding{key, 1, 6, 5});
+    Binding gate{key, 2, 6, 3};
+    gate.source_out = 6; gate.row_offset = 0; gate.row_group = 1; gate.row_stride = 2; gate.rank = 2;
+    Binding up = gate;
+    up.port = 3; up.row_offset = 1;
+    store.register_module(0, "mlp.experts.0.gate_up_proj", gate);
+    store.register_module(0, "mlp.experts.0.gate_up_proj", up);
+    Binding gate_bank{key, 2, 6, 3};
+    gate_bank.rank = 2;
+    Binding up_bank{key, 3, 6, 3};
+    up_bank.rank = 2;
+    store.register_bank_table(key, {Binding{}, gate_bank, up_bank});
+    store.ensure_banks();
+
+    const sinfer::ops::LoraBank* big   = store.find(key, 1);
+    const sinfer::ops::LoraBank* small = store.find(key, 2);
+    check(big != nullptr && small != nullptr && store.find(key, 3) != nullptr, "mixed: all three banks exist");
+    if (big == nullptr || small == nullptr) { return; }
+    check(big->rank == 8 && big->a_stride == 8 * 6 && big->b_stride == 5 * 8, "mixed: default bank at max_rank");
+    check(small->rank == 2 && small->a_stride == 2 * 6 && small->b_stride == 3 * 2, "mixed: small bank at its rank");
+    const sinfer::ops::LoraBank* host = store.host_bank_table(key);
+    check(host != nullptr && host[1].rank == 2 && host[2].rank == 2, "mixed: the host table carries the bank rank");
+
+    // A [2, 6] and B [6, 2] with distinct bf16 values (1.0 + i / 128, exact), scale 1: the bank holds them as is.
+    std::vector<std::uint16_t> a(12), b(12);
+    for (int i = 0; i < 12; ++i) {
+        a[i] = static_cast<std::uint16_t>(0x3F80 + i);
+        b[i] = static_cast<std::uint16_t>(0x4000 + i);
+    }
+    const auto expect_small = [&](std::int32_t slot, const char* what) {
+        const sinfer::ScopedDevice on(device);
+        for (std::int32_t port = 2; port <= 3; ++port) {
+            const sinfer::ops::LoraBank* bank = store.find(key, port);
+            std::vector<std::uint16_t> got_a(bank->a_stride), got_b(bank->b_stride);
+            CUDA_CHECK(cudaMemcpy(got_a.data(), static_cast<const std::uint16_t*>(bank->a) + slot * bank->a_stride,
+                                  got_a.size() * 2, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(got_b.data(), static_cast<const std::uint16_t*>(bank->b) + slot * bank->b_stride,
+                                  got_b.size() * 2, cudaMemcpyDeviceToHost));
+            bool ok = got_a == a;
+            for (int row = 0; row < 3; ++row) {
+                for (int r = 0; r < 2; ++r) { ok &= got_b[row * 2 + r] == b[(2 * row + (port - 2)) * 2 + r]; }
+            }
+            check(ok, what);
+            const sinfer::ops::LoraBank& mirror = store.host_bank_table(key)[port - 1];
+            const auto* ha = static_cast<const std::uint16_t*>(mirror.a) + slot * mirror.a_stride;
+            const auto* hb = static_cast<const std::uint16_t*>(mirror.b) + slot * mirror.b_stride;
+            check(std::equal(got_a.begin(), got_a.end(), ha) && std::equal(got_b.begin(), got_b.end(), hb),
+                  "mixed: the host mirror equals the device bank");
+        }
+    };
+    store.set_module_slot(0, "mlp.experts.0.gate_up_proj", 0, a, b, 2, 6, 6, 1.0F);
+    expect_small(0, "mixed: host upload lands bitwise in the rank-2 banks (gate even rows, up odd rows)");
+
+    const std::string name = "mlp.experts.0.gate_up_proj";
+    const auto staged = store.stage_modules(1, {sinfer::ops::LoraStore::StagedModule{0, &name, &a, &b, 2, 6, 6, 1.0F}});
+    store.commit_staged(*staged);
+    expect_small(1, "mixed: an in-place staged swap writes the same bits as the upload");
+
+    sinfer::DeviceBuffer da(a.size() * 2), db(b.size() * 2);
+    da.copy_from_host(a.data(), da.bytes);
+    db.copy_from_host(b.data(), db.bytes);
+    store.clear_slot(0);
+    store.set_device_module(0, sinfer::DeviceAdapterModule{0, name, da.p, db.p, 2, 6, 6, 1.0F});
+    expect_small(0, "mixed: a device publication writes the same bits");
+
+    std::vector<std::uint16_t> a3(18, 0x3F80), b3(18, 0x3F80), bbig(15, 0x3F80);
+    bool refused = false;
+    try {
+        store.set_module_slot(0, name, 0, a3, b3, 3, 6, 6, 1.0F);
+    } catch (const std::invalid_argument&) { refused = true; }
+    check(refused, "mixed: rank 3 is refused for a rank-2 bank");
+    expect_small(0, "mixed: a refused load leaves the slot as it was");
+    bool loaded = true;
+    try {
+        store.set_module_slot(0, "attn.big", 0, a3, bbig, 3, 6, 5, 1.0F);
+    } catch (const std::exception&) { loaded = false; }
+    check(loaded, "mixed: rank 3 loads into the default bank");
+
+    // Two aliases of one bank must agree on its rank.
+    sinfer::ops::LoraStoreSet other;
+    sinfer::ops::LoraStore& clash = other.for_device(device);
+    clash.configure(1, 8, 4);
+    Binding r2{key, 9, 4, 4};
+    r2.rank = 2;
+    clash.register_module(0, "x", r2);
+    clash.register_module(0, "y", Binding{key, 9, 4, 4});
+    bool clashed = false;
+    try { clash.ensure_banks(); } catch (const std::logic_error&) { clashed = true; }
+    check(clashed, "mixed: aliases that disagree on the rank are refused");
+}
+
 } // namespace
 
 int main() {
@@ -341,6 +446,7 @@ int main() {
     one_device();
     kv_generations();
     speculative_columns();
+    mixed_ranks();
     if (count >= 2) {
         write_from_another_device(1);
         two_devices(1);
