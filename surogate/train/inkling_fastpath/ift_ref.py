@@ -1,4 +1,4 @@
-# VENDORED UNCHANGED from the autograd copy of the Inkling-2-Mini reference, inkling_ref_ad.py (sha256 cc78cb8b9bb51998..., 2026-11-21):
+# VENDORED from the autograd copy of the Inkling-2-Mini reference, inkling_ref_ad.py (sha256 cc78cb8b9bb51998..., 2026-11-21; comments and the EXPERT_CACHE_DIR default changed since, math unchanged):
 # the semantic op definitions (the CPU reference + the autograd STE changes) the LEVEL-0 backward recomputes.
 """AUTOGRAD COPY (2026-11-21) of ref/inkling_ref.py (sha256 16d8dba0...). Forward arithmetic unchanged;
 changes, all inert unless used (checked bit for bit against the original):

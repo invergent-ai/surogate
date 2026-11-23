@@ -1,4 +1,4 @@
-// Lane mx: critical-path cost of the inkling2 mix ops inside a decode-like PDL chain (CUDA graph), reference kernels
+// Critical-path cost of the inkling2 mix ops inside a decode-like PDL chain (CUDA graph), reference kernels
 // vs the latency-cut ones (inkling_mix_use_reference_kernels). One "step" = 48 visits; per visit, as the engine runs it:
 //   non-looped (even visits): attn_res (attention input, norm) -> A (attention stand-in) -> short_conv (attention
 //     output: residual + addend) -> attn_res (MLP input, + addend, norm) -> M (MoE stand-in) -> short_conv (MLP output)

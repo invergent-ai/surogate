@@ -61,7 +61,7 @@ struct PersistentLayout {
     /// Bytes of the Main pool's planes living outside the arena (elastic pools), counted in the
     /// device reservation as their worst case; zero otherwise.
     std::size_t elastic_plane_bytes = 0;
-    /// Lane f1 M3-C: the main-ledger pages every text allocation is charged for an elastic window
+    /// M3-C: the main-ledger pages every text allocation is charged for an elastic window
     /// class (PagedKVPool::window_lane_charge_pages), so the capacity curve can count them; zero
     /// without an elastic window class (every model but a windowed one sized automatically).
     std::uint32_t kv_window_lane_charge_pages = 0;
@@ -98,7 +98,7 @@ struct SequencePlanningInputs {
     std::vector<std::uint32_t> kv_skip_layers;
     bool elastic_kv                        = false;
     bool elastic_kv_overcommit             = false;
-    /// Lane f1 M3-C: a model with windowed layers keeps them in a demand-mapped window class
+    /// M3-C: a model with windowed layers keeps them in a demand-mapped window class
     /// whose pages are charged to the main KV ledger (on with --kv-capacity auto and elastic KV;
     /// SUROGATE_SERVE_KV_WINDOW_ELASTIC=0 / 1 overrides). Inert without windowed layers.
     bool kv_window_elastic                 = false;
@@ -115,7 +115,7 @@ struct SequencePlanningInputs {
     /// Which weights these are (artifact path, size and modification time): part of the host KV
     /// tier's key namespace, the same for every replica of one artifact.
     std::uint64_t weights_identity = 0;
-    /// Lane f1 M3-C: the Main pool's laid-out (virtual) span is at least this many pages -- the
+    /// M3-C: the Main pool's laid-out (virtual) span is at least this many pages -- the
     /// capacity curve's maximum when an elastic window class widened it -- so every candidate
     /// between the curve's minimum and maximum lays out the same span and the reservation stays
     /// affine in the page count (finalize_sequence_plan_impl). 0 = the span as before.

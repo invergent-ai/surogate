@@ -2,7 +2,7 @@
 
 Forward = the engine's (ift_forward.forward: bitwise the engine's prefill, routing included). Backward, visits last to
 first: visit v is RECOMPUTED in torch from the engine's own visit inputs (the AttnRes stack slots it read, saved as the
-outputs of earlier visits) with the validated reference math (ift_ref = inkling_ref_ad.py, vendored unchanged):
+outputs of earlier visits) with the validated reference math (ift_ref = inkling_ref_ad.py, vendored; math unchanged):
 W4A16 / W8A16 straight-through the activation and KV quantisers (rb / r8 are STE), routing REPLAYED from the engine's
 own ids, the expert LoRA from the fp32 masters; its vjp gives the gradient of the visit inputs and of the layer's LoRA.
 The weights are the ENGINE's (views of the loaded artifact, no copy); expert units come from the engine's exact decode.

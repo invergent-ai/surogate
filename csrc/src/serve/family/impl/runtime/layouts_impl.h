@@ -1601,7 +1601,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         // Every candidate lays out the curve's whole span: with the span following the page count
         // past lanes x logical_pages, a plane's granule rounding made bytes per page differ between
         // the minimum, minimum + 1 and the resolved count, and small auto shapes (16,384 x 4,
-        // 32,768 x 4) refused to start: "physical sequence layout is not affine" (M5, lanes h / f2b).
+        // 32,768 x 4) refused to start: "physical sequence layout is not affine" (M5).
         inputs.main_page_virtual_floor = static_cast<std::uint32_t>(maximum_pages64);
         planner->inputs  = inputs;
         planner->minimum = build_sequence_candidate(inputs, minimum_pages);

@@ -11,7 +11,7 @@ target_include_directories(sinfer_engine PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/impl
   ${SERVE_ROOT})
 
-# NAIVE device kernels (replaced by lanes c / d): compiled with the ops, -fmad=false as inkling_mix.
+# NAIVE device kernels (replaced by the attention / MoE ops): compiled with the ops, -fmad=false as inkling_mix.
 target_sources(sinfer_ops PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/naive/naive_attention.cu
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/naive/naive_moe.cu)

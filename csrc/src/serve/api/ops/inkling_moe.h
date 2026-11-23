@@ -194,7 +194,7 @@ void inkling_moe(const Tensor& x, const InklingMoeWeights& weights, Tensor& out,
                  const InklingMoeOptions& options = {});
 
 // ---- Sub-ops (OPS.md names). Each is the exact stage `inkling_moe` runs, exposed for the op
-// ---- tests against the golden vectors and for the trainer lanes' cross-checks.
+// ---- tests against the golden vectors and for the trainer's cross-checks.
 
 /// Router: x BF16 [2304, T] -> logits FP32 [128, T], ids I32 [8, T] (selection order),
 /// weights FP32 [8, T] (x 8.0).

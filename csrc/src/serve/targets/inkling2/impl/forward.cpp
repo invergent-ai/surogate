@@ -51,7 +51,7 @@ ops::InklingPlane packed(const Tensor& t, int column = 0, std::int64_t width = D
             t.dtype, width};
 }
 
-/// SUROGATE_SERVE_INKLING_NAIVE=1: the naive attention / MoE kernels instead of lanes c / d's ops (A/B checks only).
+/// SUROGATE_SERVE_INKLING_NAIVE=1: the naive attention / MoE kernels instead of the attention / MoE ops (A/B checks only).
 bool use_naive() {
     static const bool naive = std::getenv("SUROGATE_SERVE_INKLING_NAIVE") != nullptr;
     return naive;
@@ -966,7 +966,7 @@ std::size_t Variant::visit_workspace_capacity_bytes(const family::TextGeometry&,
              up(tile * 2 * D * 3 * 4) + up(tile * D * 3 * 2);
     // the invariant GEMM's split partials: the controller `down` of a blend tile (the taps run unsplit in the group)
     bytes += up(ops::inkling_gemm_inv_workspace_bytes(C::gate_rank, 2 * D, static_cast<std::int32_t>(tile), 3));
-    // lanes c / d's ops (and the naive kernels behind SUROGATE_SERVE_INKLING_NAIVE); attention and MoE both counted
+    // the attention / MoE ops (and the naive kernels behind SUROGATE_SERVE_INKLING_NAIVE); attention and MoE both counted
     ops::GqaExecutionEnvelope envelope;
     envelope.max_visible_keys = max_visible_keys;
     std::size_t attention     = 0;

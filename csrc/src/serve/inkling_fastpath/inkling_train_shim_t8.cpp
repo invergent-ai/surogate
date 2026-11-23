@@ -3,7 +3,7 @@
 // EXPLICITLY (forward.cpp reads them from the engine's LoRA store). Same op, same slices, same order as forward.cpp 2b and step 4.
 // Built as libsinfer_inkling_train_t8.so; the base shim is unchanged. ABI 3 (ift_run_visit takes one more pointer).
 //
-// Lane T: the engine-op trainer's FAST route.
+// The engine-op trainer's FAST route.
 //
 // libsinfer_inkling_train.so: an extern "C" shim over the SAME libsinfer.so the rollout engine runs, so a torch
 // training loop (surogate/train/inkling_fastpath/) can drive the engine's own Inkling forward and get the engine's
