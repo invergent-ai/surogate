@@ -15,6 +15,9 @@ PASS LINES, written before any run:
      runs if the card-hour cap leaves room, round 3 (block random controls) likewise; both reported, no line.
   Pre-check (one card, before the session): G18a / G18b of t8_gate_s5 on three of the plan's rows (trainer Z == engine base, trainer with a
      test adapter == engine with its exported file, bitwise at every position) and the replay of those rows (trainer Z == recorded, every loss token).
+Known and accepted limits (written before any run): the trainer round trip (M5) covers group 0's rows only (about 30 % of the loss tokens) and
+the adapters U12, R12 and U4; R12b and the block adapters are not round-tripped; the trainer's zero-adapter check uses one row per worker, the
+engine's Z against base covers every row.
 Phases: check (CPU: the plan file), pre (trainer half of the pre-check), pre_compare, trainer (the session's trainer half), compare (after reads).
 The update's adapters (theta0 = Z): U_k = theta0 + k d; R12 = theta0 + r, r a fixed-seed Gaussian scaled tensor by tensor to the norm of 12 d;
 U12_<block> / R12_<block> = the same restricted to one layer block (before 0-5, inside 6-17, after 18-23).
@@ -207,6 +210,10 @@ def cmp_reads(x: dict, y: dict, masks: dict):
     return len(common), eq, ne
 
 
+def _text(path: str):
+    return open(path).read().strip() if os.path.exists(path) else None
+
+
 def load_reads(path: str) -> dict:
     z = np.load(path)
     return {int(k[3:]): z[k] for k in z.files if k.startswith("lp_")}
@@ -283,6 +290,7 @@ def phase_pre_compare(a):
     e1, n1 = S5.cmp(os.path.join(d, "trainer_adapter.npz"), os.path.join(d, "engine_adapter.json"))
     za, zb = np.load(os.path.join(d, "trainer_zero.npz")), np.load(os.path.join(d, "trainer_adapter.npz"))
     moved = int(sum(int((za[k] != zb[k]).sum()) for k in za.files))
+    rep["engine_cmdline"] = _text(os.path.join(d, "engine_flags.txt"))
     rep["G18a"] = {"equal": e0, "differ": n0, "pass": bool(n0 == 0 and e0 > 0)}
     rep["G18b"] = {"equal": e1, "differ": n1, "adapter_changed_positions": moved, "pass": bool(n1 == 0 and e1 > 0 and moved > 0)}
     rep["pass"] = bool(rep["G18a"]["pass"] and rep["G18b"]["pass"] and rep["replay"]["pass"])
@@ -435,6 +443,15 @@ def phase_compare(a):
             R.setdefault(name, {}).update(part)
     ad = json.load(open(os.path.join(a.run_dir, "adapters.json")))
     eng = open(a.engine_sha_file).read().strip() if a.engine_sha_file else ""
+    sid = _text(os.path.join(a.run_dir, "session_id.txt"))
+    rep["session_id"] = sid
+    rep["engine_cmdline"] = _text(os.path.join(a.run_dir, "engine_flags.txt"))
+    rep["rounds"] = {}
+    rt_ = os.path.join(a.run_dir, "rounds.txt")
+    for line in (open(rt_) if os.path.exists(rt_) else []):
+        if line.strip():
+            k, v = line.split()
+            rep["rounds"][k] = v                              # ran / failed / skipped_for_budget
     full_rows = set(masks)
     rep["reads_incomplete"] = {}
     for name, v in list(R.items()):                           # one file per adapter for the follow read, and its JSON: only when complete
@@ -444,7 +461,7 @@ def phase_compare(a):
             continue
         if not os.path.exists(os.path.join(rd, name + ".npz")):
             np.savez(os.path.join(rd, name + ".npz"), **{f"lp_{n}": x for n, x in sorted(v.items())})
-        json.dump({"adapter_sha256": (ad.get(name) or {}).get("sha256"), "head": "plain", "engine_sha": eng, "source": "engine"},
+        json.dump({"adapter_sha256": (ad.get(name) or {}).get("sha256"), "head": "plain", "engine_sha": eng, "source": "engine", "session_id": sid},
                   open(os.path.join(rd, name + ".json"), "w"), indent=1)
     for w in RT_ADAPTERS:
         R[f"trainer_{w}"] = load_reads(os.path.join(a.run_dir, "roundtrip", f"trainer_{w}.npz"))

@@ -189,7 +189,13 @@ def main():
     for f in ("masters/theta0.pt", "masters/theta1.pt"):
         torch.save({}, os.path.join(run, f))
     rt = [n for n, r in prow.items() if r.group_idx == 0]
-    rep0 = {"M2_trainer": True, "M3": True, "M4": True, "M6_trainer": True, "round_trip_rows": rt, "zero_adapter": {"all_bitwise": True}}
+    rep0 = {"M2_trainer": True, "M3": True, "M4": True, "M6_trainer": True, "round_trip_rows": rt, "zero_adapter": {"checks": 6, "all_bitwise": True},
+            "plan": info, "A_delta_max_abs": 0.0,
+            "step": {"N": float(info["loss_tokens"]), "rows_used": len(prow), "rows_refused": 0, "finite": True, "ratio_max": 1.0, "clip_ratio": 0.0,
+                     "stale_checked_rows": len(prow), "replay_checked_rows": len(prow), "policy_loss": -0.035, "metrics": {}}}
+    open(os.path.join(run, "session_id.txt"), "w").write("micro-test-session\n")
+    open(os.path.join(run, "engine_flags.txt"), "w").write("--served-model-name inkling --prefix-cache-host-gb 2\n")
+    open(os.path.join(run, "rounds.txt"), "w").write("r1 ran\nr2 ran\nr3 skipped_for_budget\n")
     rng = np.random.default_rng(3)
     moved = {n: (MI.lp_at_mask(old[n] - rng.random(len(old[n])).astype(np.float32) * 1e-2, prow[n].loss_mask)) for n in prow}
 
@@ -232,6 +238,10 @@ def main():
 
     rc, rep = scenario("match")
     assert rc == 0 and rep["pass"], rep
+    assert rep["session_id"] == "micro-test-session" and rep["rounds"] == {"r1": "ran", "r2": "ran", "r3": "skipped_for_budget"}
+    assert rep["engine_cmdline"].endswith("--prefix-cache-host-gb 2") and json.load(open(os.path.join(rd, "base.json")))["session_id"] == rep["session_id"]
+    print("MICRO_JSON_SAMPLE " + json.dumps(rep, default=float))
+    print("GATES_JSON_SAMPLE " + json.dumps(json.load(open(os.path.join(run, "gates.json"))), default=float))
     for w in MI.ROUND1:                                       # the follow read's form: every plan row, 0 off the mask, a JSON with head plain
         z = np.load(os.path.join(rd, w + ".npz"))
         assert sorted(int(k[3:]) for k in z.files) == sorted(prow) and all(not z[f"lp_{n}"][~prow[n].loss_mask].any() for n in prow)
