@@ -81,7 +81,7 @@ FP8_BLOCK = "fp8-block"
 #: the same object graph, stored row-scaled and served by the same route.
 FP8_CHANNEL = "fp8-channel"
 #: An unquantised checkpoint served as it is: every projection BF16, as the checkpoint stores
-#: it. Surogate does not quantise the weights a user brings (the owner's rule), so this is what
+#: it. Surogate does not quantise the weights a user brings (a project rule), so this is what
 #: a checkpoint without a quantization_config converts to.
 DENSE_BF16 = "bf16"
 PROFILES = (GROUPWISE_INT, DENSE_BF16, NVFP4_MIXED_BF16, NVFP4_UNIFORM, NVFP4_MLP_ONLY, NVFP4_ALL, FP8_BLOCK,

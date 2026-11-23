@@ -98,7 +98,7 @@ enum class KvAdmission : std::uint8_t {
 struct KvAdmissionOptions {
     KvAdmission mode               = KvAdmission::OnDemand;
     /// Set only by an explicit --kv-admission ondemand. A DSpark engine stays on Reserve without it
-    /// (lane f1): its recompute has not been shown on every route. No other engine reads it.
+    /// (window-bounded KV): its recompute has not been shown on every route. No other engine reads it.
     bool explicit_on_demand        = false;
     /// Decode tokens a request is entitled to beyond its prompt when it is admitted.
     std::uint32_t headroom_tokens  = 256;
@@ -329,7 +329,7 @@ struct EngineOptions {
     // under automatic sizing) and every page past it is admitted through a device-wide gate
     // on free memory, so co-resident engines share the device's idle KV.
     bool elastic_kv_overcommit         = false;
-    // Lane f1: set by the pipeline on each stage when its explicit kv_capacity is the shared
+    // Window KV: set by the pipeline on each stage when its explicit kv_capacity is the shared
     // resolution of `--kv-capacity auto` (construct_pipeline). The stage then plans as under auto
     // where that matters -- an elastic window class (layouts_impl.h kv_window_elastic) -- which is
     // what the preflight that resolved the shared capacity assumed. False everywhere else.
@@ -715,7 +715,7 @@ struct PromptOptions {
 struct PromptInput {
     std::vector<ChatMessage> messages;
     PromptOptions options;
-    /// The images of `options.raw_chat_request` (Inkling-2, ENGINE-INKLING lane V-b): their bytes, acquired by the serving
+    /// The images of `options.raw_chat_request` (Inkling-2 vision): their bytes, acquired by the serving
     /// layer from the body's image_url / input_image parts, in the body's order (message order, part order). Empty for
     /// every other checkpoint, whose media travel inside `messages`.
     std::vector<OwnedMedia> raw_chat_media;

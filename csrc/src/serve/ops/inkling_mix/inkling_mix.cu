@@ -1,7 +1,7 @@
-// Inkling-2-Mini hidden-stream ops (lane e1): api/ops/inkling_mix.h. One translation unit: kernels,
+// Inkling-2-Mini hidden-stream ops: api/ops/inkling_mix.h. One translation unit: kernels,
 // launchers and the host-side validation. Compiled with -fmad=false (CMakeLists.txt): every product /
 // sum the reference does not fuse stays unfused, and the fma the reference does use is an explicit fmaf.
-// Rounding points: rl/engine-inkling-2026-11-21/lanes/e1/DESIGN-target.md section 3.
+// Rounding points: the target design notes, section 3.
 
 #include "api/ops/inkling_mix.h"
 
@@ -411,7 +411,7 @@ struct TailArgs {
     bf16* out                   = nullptr; // [2304, T, S]
     std::int64_t columns        = 0;
     int streams                 = 1;
-    int push_min                = 1;       // lane mx tail: the push scheme from this many columns of a cluster on
+    int push_min                = 1;       // latency-cut tail: the push scheme from this many columns of a cluster on
 };
 
 /// inkling_gemm_inv's split reduce (h = bf16(p0 + p1 + ... + p17)) + inkling_gemm_inv FP32 of the gain/forget weights
@@ -729,7 +729,7 @@ __global__ void softcap_f32_kernel(float* logits, int rows, int tokens, std::int
     x                    = tanhf(__fdiv_rn(x, cap)) * cap;
 }
 
-// =================================================================== lane mx: latency-cut kernels (decode / verify)
+// =================================================================== latency-cut kernels (decode / verify)
 //
 // The same arithmetic as the reference kernels above, in the same per-element order, with the same reduction trees
 // (each value: the xor-shuffle butterfly within a warp, then 0 + warp 0 + ... + warp 7): bit-identical to them

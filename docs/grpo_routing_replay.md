@@ -1,7 +1,7 @@
 # GRPO for Surogate3.7-35B-A3B: CISPO + Rollout Routing Replay (R3)
 
 Status 2026-10-15, branch `claude/grpo-cispo-r3` (worktree `~/surogate-rl` on Spark 1). Step 0 of
-`/mnt/data/work/rl/ultra_pilot/PLAN.md` (Ultramarine recipe: CISPO, group-relative advantages mean-centred without std
+the pilot plan (Ultramarine recipe: CISPO, group-relative advantages mean-centred without std
 normalisation, zero-advantage groups dropped, Rollout Routing Replay).
 
 ## What the recipe needs and where it stands

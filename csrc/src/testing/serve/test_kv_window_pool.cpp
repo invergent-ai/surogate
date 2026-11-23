@@ -1,4 +1,4 @@
-// Window-bounded KV pages (lane f1, rl/engine-inkling-2026-11-21/lanes/f1/DESIGN-window-kv.md): the
+// Window-bounded KV pages (window-KV design): the
 // paged pool's window class on a device -- layout, zeroed sentinel, block-table rows, page
 // recycling, images and forks, window page up/download. Exits 77 without a usable device.
 
@@ -275,9 +275,9 @@ void check_elastic(const sinfer::DeviceContext& device) {
                pool.window_occupancy().lane_in_use == 0, tag + ": everything returned");
 }
 
-/// lanes/OOM F1 (2026-11-23): the window pages charged in the main ledger are mapped by the window
+/// Out-of-memory fix F1 (2026-11-23): the window pages charged in the main ledger are mapped by the window
 /// region, so the main region must not map those bytes too. Before the fix the main region could
-/// map its whole cap while the window region mapped the charged pages beside it: on a W5 card both
+/// map its whole cap while the window region mapped the charged pages beside it: on an Inkling-2-Mini card both
 /// filled together, 4 MiB were left and the engine aborted. At a round boundary the main region's
 /// limit is its cap less the charged window bytes (rounded up to a granule), and what it maps
 /// stays inside that limit.

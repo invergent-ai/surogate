@@ -124,7 +124,7 @@ __launch_bounds__(kSamplerBlock) __global__
     }
 }
 
-// The same draw in two launches (agent-EN GO 15:3x, S1; lane c): sampling_full_vocab_kernel walks a
+// The same draw in two launches (S1): sampling_full_vocab_kernel walks a
 // 201k-token row with one CTA (~230 us a step at any batch). Here each row is cut into
 // kSamplerFullVocabChunkItems-token chunks, one CTA each; the per-token expression is the
 // kernel's above verbatim, and the winner is the argmax under the same strict total order

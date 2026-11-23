@@ -19,7 +19,7 @@ namespace sinfer::runtime {
 /// after the engine's adapter banks were allocated (the same reading when it carries none).
 ///
 /// An automatic capacity without a draft head, or with a DFlash drafter, is sized after the
-/// banks (DFlash since 2026-11-23: its graph allowance does not hold them; lanes/OOM). Sized before them, it
+/// banks (DFlash since 2026-11-23: its graph allowance does not hold them). Sized before them, it
 /// spent them a second time: one rank-16 slot on every expert of a 35B-A3B is 2.7 GiB against
 /// 1 GiB of headroom, and the engine refused to start where the shortfall surfaced (its
 /// conversation checkpoints, 43 lanes, no MTP).

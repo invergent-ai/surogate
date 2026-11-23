@@ -1,4 +1,4 @@
-// ENGINE-INKLING lane V-b: a WebP decoded the way Pillow 13 decodes it (the reference for Inkling-2's vision processor),
+// Inkling-2 vision: a WebP decoded the way Pillow 13 decodes it (the reference for Inkling-2's vision processor),
 // with the same library: libwebp 1.6.0 (csrc/cmake/serve_pil_decoders.cmake). Pillow (WebPImagePlugin.py + _webp.c)
 // opens every WebP through WebPAnimDecoder in colour mode RGBA and loads frame 0 (canvas = the first frame drawn on a
 // transparent canvas); its mode is "RGBA" when the bitstream has alpha, else "RGB" (rawmode "RGBX": alpha dropped).

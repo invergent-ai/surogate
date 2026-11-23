@@ -4,7 +4,7 @@
 // (ref/src/vllm/models/inkling2/nvidia/ops/{moe,nvfp4,mxfp8,activation,moe_sm120}.py), written
 // with explicit round-to-nearest intrinsics so neither nvcc's default FMA contraction nor any
 // target flag can change a bit. The reference kernels run with `enable_fp_fusion=False`.
-// Design: rl/engine-inkling-2026-11-21/lanes/d/DESIGN-moe.md section 1.
+// Design: the MoE design notes, section 1.
 
 #include "ops/linear/nvfp4/nvfp4_codec.cuh"
 #include "ops/sparse_moe/inkling/inkling_moe_internal.h"
@@ -145,7 +145,7 @@ __device__ __forceinline__ std::uint64_t nvfp4_candidate(const float (&x)[16], f
         const std::uint32_t byte =
             e2m1_pair(__fmul_rn(x[2 * k], inverse), __fmul_rn(x[2 * k + 1], inverse), low, high);
         packed |= static_cast<std::uint64_t>(byte & 0xFFU) << (8 * k);
-        // MEASURED (lanes/d/NOTES.md, vLLM eager capture p000): the image's compiled kernels form this error
+        // MEASURED (vLLM eager capture p000): the image's compiled kernels form this error
         // as fma(rec, outer, -x) in a row's power-of-two HEAD segment and unfused, (rec * outer) - x, in its
         // TAIL segment (`_quantize_x` / `_situ_quantize_kernel` quantise head and tail as two inlined
         // `_quantize_block` instances; only the head one was contracted). This rule reproduces every byte of

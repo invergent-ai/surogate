@@ -83,7 +83,7 @@ public:
         }
     }
 
-    /// Lane f1: SUROGATE_SERVE_KV_IDLE_RELEASE=0 turns the two idle-KV releases below off (the
+    /// Window KV: SUROGATE_SERVE_KV_IDLE_RELEASE=0 turns the two idle-KV releases below off (the
     /// behaviour before them: a short head with nothing running is refused, one whose second pass
     /// counted only shared prefixes is retried until it expires). A test / rollback switch.
     static bool idle_kv_release_enabled() noexcept {
@@ -94,7 +94,7 @@ public:
         return enabled;
     }
 
-    /// Lane f1: the shared-prefix cache's entries go (pages a running or retained fork borrows stay
+    /// Window KV: the shared-prefix cache's entries go (pages a running or retained fork borrows stay
     /// with it), and every lane re-plans: a plan that forks a dropped entry would keep its pages.
     /// Returns false when this program has no shared-prefix cache.
     bool drop_shared_prefixes_for_admission() noexcept {
@@ -108,7 +108,7 @@ public:
         }
     }
 
-    /// Lane f1: nothing runs (or nothing is active) and the queue head fits on no lane, not even
+    /// Window KV: nothing runs (or nothing is active) and the queue head fits on no lane, not even
     /// after the other retained lanes go -- the second pass of find_admission_lane keeps the lane
     /// it would take with everything that lane borrows, and only evicting another lane dropped the
     /// shared prefixes. What still holds pages is idle KV: the shared prefixes and the retained
@@ -1534,7 +1534,7 @@ private:
         }
     }
 
-    /// Lane f1 (SUROGATE_SERVE_KV_BLOCK_TRACE=1, diagnostics only): why the queue head is not
+    /// Window KV (SUROGATE_SERVE_KV_BLOCK_TRACE=1, diagnostics only): why the queue head is not
     /// admitted, one line each time the head, the pool's entitled pages or the running count
     /// changes -- the pool, and for each lane its plan's reuse and pages and the two lane tests --
     /// so a head that waits until it expires names what held it.
@@ -1691,10 +1691,10 @@ private:
                 }
             }
             admit_trace_step("evict retained lanes", request->id, evict_started);
-            // Lane f1: the second pass counted the shared prefixes no kept holder borrows as
+            // Window KV: the second pass counted the shared prefixes no kept holder borrows as
             // reclaimable, but only evicting a lane dropped them (evict_retained_lane). With no
             // other lane retained -- every other lane running -- nothing went, and the head was
-            // retried until it expired (lane h, card 3 14:4x: 8 x 64k, one stream never admitted).
+            // retried until it expired (measured: 8 x 64k, one stream never admitted).
             // Once per head, so a second pass that still disagrees cannot spin the admission loop.
             if (!evicted && idle_release_head_ != request->id &&
                 !instance_.program->can_admit_lane(lane, *request->lane_plans[lane])) {
@@ -2130,7 +2130,7 @@ private:
         auto& program = *instance_.program;
         const std::uint32_t groups = program.group_count();
         if (group_meta_.size() != groups) { group_meta_.resize(groups); }
-        // Lane f1 M3-C: an elastic window class compacts between rounds, never under one in flight.
+        // M3-C: an elastic window class compacts between rounds, never under one in flight.
         if constexpr (requires { program.kv_round_boundary(); }) {
             bool idle = true;
             for (std::uint32_t g = 0; g < groups && idle; ++g) { idle = !program.group_in_flight(g); }

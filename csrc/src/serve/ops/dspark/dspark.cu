@@ -1,4 +1,4 @@
-// DSpark drafter ops (ENGINE-INKLING lane e2): api/ops/dspark.h. One translation unit: kernels, launchers and the
+// DSpark drafter ops: api/ops/dspark.h. One translation unit: kernels, launchers and the
 // host-side validation. Compiled with -fmad=false (CMakeLists.txt): every product / sum the reference
 // (ref/dspark_ref.py) does not fuse stays unfused; dot products use explicit fmaf (their order differs from the
 // reference's GEMMs anyway, and the golden-vector tolerances say so).
@@ -108,7 +108,7 @@ head_norm_rope_kernel(const bf16* x, std::int64_t x_stride, const bf16* weight, 
         constexpr int half = G::kHeadDim / 2;
         const int i        = d & (half - 1);
         // positions is a per-round buffer written by an earlier node of the round's graph: read it with ld.cg (the
-        // compiler emitted ld.global.nc here on type-based alias grounds; PDL audit 17:48). inv_freq is a load-time
+        // compiler emitted ld.global.nc here on type-based alias grounds; PDL audit). inv_freq is a load-time
         // constant. Same bits.
         const float angle  = __fmul_rn(static_cast<float>(__ldcg(positions + t)), inv_freq[i]);
         const float c      = cosf(angle);

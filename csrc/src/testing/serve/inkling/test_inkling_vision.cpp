@@ -1,6 +1,6 @@
-// ENGINE-INKLING lane V-b: Inkling-2 image requests -> prompt ids + the vision payload, against vLLM's own code.
+// Inkling-2 image requests -> prompt ids + the vision payload, against vLLM's own code.
 //
-// Vectors (lane V-a, rl/engine-inkling-2026-11-21/vectors/vision, made inside vllm/vllm-openai:inkling-2-mini-x86_64-7cb5dae):
+// Vectors (vectors/vision, not in this repository, made inside vllm/vllm-openai:inkling-2-mini-x86_64-7cb5dae):
 //   cases/cases.jsonl                 chat bodies (images as data: URLs of cases/img/*), expected outcome
 //   processor/<case>.safetensors      prompt_token_ids (renderer + multimodal prompt update), bare_token_ids,
 //                                     *_099 for a body without an effort (the engine's default 0.99),
@@ -9,7 +9,7 @@
 //                                     patches_vllm_raster (vLLM's gather_patches on a card: THE oracle for the payload)
 //   processor/meta.json               per case serve_error (vLLM's exact refusal through a running engine), when recorded
 //   *_served_k                        what vLLM's SERVER fed the encoder where it differs from processing.py's path
-//                                     (lane V-a, gpubox1 card 5: Pillow, EXIF transpose, alpha on white, no EOI fix)
+//                                     (measured on an RTX 5090: Pillow, EXIF transpose, alpha on white, no EOI fix)
 //   meta.json cases.<id>.serve        a running vLLM's outcome (ok / its refusal text)
 // Both decode paths run (inkling_vision.h DecodePath): Served against the server's pixels and refusals, Processor
 // against processing.py's. Checks, per case: refusal text, prompt ids; per image: our decode vs Pillow's (decode +
@@ -336,7 +336,7 @@ PathTotals run_path(ink::DecodePath path, const fs::path& vision, const Json& me
                         const bool own_pixels = served && tensors.count("decoded_rgb_served_" + std::to_string(k)) != 0U;
                         const fs::path pp = vision / "processor" / "patches" / (name + ".safetensors");
                         if (!own_pixels && fs::exists(pp)) {
-                            // processing.py's pixels: V-a's patches_merge and vLLM's gather_patches capture
+                            // processing.py's pixels: the vectors' patches_merge and vLLM's gather_patches capture
                             const auto pt = load_safetensors(pp);
                             const auto merge = pt.at("patches_merge").as<std::uint16_t>();
                             r.payload_ours_vs_merge = differing(ours, merge);
@@ -482,7 +482,7 @@ int main() {
         std::cout << "FAIL: vLLM's ids are IMAGE_MARKER_ID 200005 / IMAGE_PAD_ID 200054\n";
         ++failures;
     }
-    // vision off: f2's behaviour, vLLM at image limit 0
+    // vision off: the text-only behaviour, vLLM at image limit 0
     try {
         (void)ink::parse_chat_request(R"({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]}]})", 0);
         ++failures;
@@ -514,7 +514,7 @@ int main() {
     Json meta = Json::object();
     if (fs::exists(vision / "processor" / "meta.json")) { meta = Json::parse(read_file(vision / "processor" / "meta.json")); }
     // Orientation / alpha vectors made by vLLM's own loader (ImageMediaIO.load_bytes) in the reference image:
-    // lanes/Vb/orient/make_orient.py -- EXIF 1..8 in JPEG, XMP-only orientation, PNG eXIf, WebP EXIF / XMP, RGBA + EXIF.
+    // a vector generator (not in this repository) -- EXIF 1..8 in JPEG, XMP-only orientation, PNG eXIf, WebP EXIF / XMP, RGBA + EXIF.
     if (const char* orient = std::getenv("INKLING_ORIENT_DIR"); orient != nullptr) {
         const fs::path dir(orient);
         const Json index = Json::parse(read_file(dir / "index.json"));

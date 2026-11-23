@@ -102,7 +102,7 @@ struct SamplingWorkspaceLayout {
 };
 
 /// Bytes per row of the speculative split routes' chunk partials ([3][columns][chunks] u64: max bits, sum / z bits,
-/// key / token), carved AFTER the batch's sampling layouts only for a target that opts in (split_routes; lane e2).
+/// key / token), carved AFTER the batch's sampling layouts only for a target that opts in (split_routes; the DSpark drafter).
 inline std::size_t speculative_split_partial_row_bytes(std::int32_t token_domain, std::int32_t columns) {
     if (token_domain <= kSamplerSortTile || columns <= 0) { return 0; }
     const std::size_t bytes = static_cast<std::size_t>(div_up(token_domain, kSamplerFullVocabChunkItems)) *

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ENGINE-INKLING lane h (M4): the performance harness for Inkling-2-Mini serving, for OUR engine and the vLLM image.
+"""The performance harness for Inkling-2-Mini serving, for OUR engine and the vLLM image.
 
 Same requests for both engines over the OpenAI chat API, DISTINCT prompts per stream (each stream starts at its own
 offset of a cyclic text corpus, so no two streams share a prefix or a token sequence). Measures:
@@ -13,13 +13,13 @@ offset of a cyclic text corpus, so no two streams share a prefix or a token sequ
 Every row is printed as one JSON line; with --bounds (perf/results/bounds-*.json from perf/bounds.py) decode rows
 also carry the re-derived bound, target and the measured fraction of the bound.
 
-RULE (DESIGN 4 / LANE-RULES 9): no speed number of OUR engine counts before logit parity holds on the measured path.
+RULE: no speed number of OUR engine counts before logit parity holds on the measured path.
 For --engine ours the harness refuses to run without --parity-record naming the PASS record of that path's gate.
 
 Examples:
   perf_harness.py --engine vllm --base http://127.0.0.1:18471 --model inkling --corpus a.txt b.txt \
       --decode 1x8k,8x8k --prefill 97k --out vllm.jsonl
-  perf_harness.py --engine ours --parity-record rl/engine-inkling-2026-11-21/gate/<path>-PASS.md --base ... \
+  perf_harness.py --engine ours --parity-record gate/<path>-PASS.md --base ... \
       --decode 1x8k,1x64k,1x262k,4x8k,8x8k,8x64k --prefill 8k,32k,97k,262k --cached 64k+256 \
       --request-log /path/requests.jsonl --bounds perf/results/bounds-measured-1121.json --out ours.jsonl
 """

@@ -1,6 +1,6 @@
-// ENGINE-INKLING lane f2: Inkling-2 streaming (stream=true) -- the standing gate check for every Inkling build.
+// Inkling-2 streaming (stream=true) -- the standing gate check for every Inkling build.
 //
-// Over the parser vectors (rl/engine-inkling-2026-11-21/vectors/parser: 554 replies, real ones and edge variants, each
+// Over the parser vectors (vectors/parser, not in this repository: 554 replies, real ones and edge variants, each
 // with vLLM's own non-streamed reading), the generated ids are fed to inkling::StreamParser the way GenerationService
 // feeds it (one engine round at a time: rounds of 1 token, rounds of 1-4 tokens as with MTP, one round), then
 // finish() with the non-streamed reading. Checks:

@@ -1,4 +1,4 @@
-// Inkling-2-Mini's DSpark drafter (lane e2): load-time derivations and the append / propose rounds (dspark.h).
+// Inkling-2-Mini's DSpark drafter: load-time derivations and the append / propose rounds (dspark.h).
 
 #include "targets/inkling2/impl/dspark.h"
 #include "targets/inkling2/impl/variant.h"
@@ -351,8 +351,8 @@ std::size_t dspark_propose_workspace_bytes(std::int32_t batch, std::uint32_t max
     b += align256(static_cast<std::size_t>(G::kRnnRows) * k * 4);
     b += 3 * align256(static_cast<std::size_t>(G::kRank) * batch * 2);
     b += 2 * align256(static_cast<std::size_t>(ops::dspark_vocab_tiles(G::kVocab)) * batch * 4);
-    b += align256(n * 4); // query positions (lane c's draft attention)
-    // lane c's draft attention (its split partials), the larger of the local and the global plan
+    b += align256(n * 4); // query positions (the draft attention)
+    // the draft attention (its split partials), the larger of the local and the global plan
     const ops::GqaExecutionEnvelope envelope{0, std::max<std::uint32_t>(max_visible_keys, G::kBlock)};
     b += align256(std::max(ops::inkling_draft_attention_workspace_bytes(G::kBlockWindow, G::kBlock, batch, envelope),
                            ops::inkling_draft_attention_workspace_bytes(0, G::kBlock, batch, envelope)));
@@ -467,7 +467,7 @@ void dspark_propose(const load::InklingWeights& w, const DSparkDerived& d, const
             ops::dspark_block_attention(q, G::kQRows, p.anchor_positions, p.table_rows, B, window, G::kScale, plane, attn,
                                         s);
         } else {
-            // lane c's draft mode (inkling/c 9fe6290b): all 8 rows of a lane at P + 7, keys from the plane only
+            // the attention's draft mode: all 8 rows of a lane at P + 7, keys from the plane only
             ops::InklingAttentionRows rows;
             rows.positions     = Tensor(qpos, DType::I32, {G::kBlock, B});
             rows.kv_table_rows = Tensor(const_cast<std::int32_t*>(p.table_rows), DType::I32, {B});
@@ -567,7 +567,7 @@ DSparkKv dspark_kv(const family::DSparkRuntime& rt) {
                                   static_cast<std::int32_t>(rt.text_kv->max_context())};
     }
     kv.max_visible_keys = rt.text_kv->max_context();
-    kv.naive_attention  = kv.views[0].dtype != DType::FP8_E4M3FN; // lane c's kernel reads FP8 planes only
+    kv.naive_attention  = kv.views[0].dtype != DType::FP8_E4M3FN; // the draft kernel reads FP8 planes only
     return kv;
 }
 
@@ -642,16 +642,16 @@ std::uint8_t Variant::dspark_content_kind(std::span<const TokenId> ledger) {
 std::uint32_t Variant::dspark_draft_cap(std::span<const TokenId> ledger, const family::DSparkLaneStats* stats) {
     const std::uint8_t kind = dspark_content_kind(ledger);
     if (stats == nullptr) {
-        // static per content kind (lanes/e2/k_policy.py): tool-call JSON 7, structure 7, thinking 3, text 2
+        // static per content kind (a CPU k-policy study): tool-call JSON 7, structure 7, thinking 3, text 2
         constexpr std::uint32_t kStatic[4] = {7, 7, 3, 2};
         return kStatic[kind];
     }
-    // Per lane (agent-EN-e2c): the k of {0, 1, 2, 3, 7} with the most committed tokens per unit of round time,
+    // Per lane: the k of {0, 1, 2, 3, 7} with the most committed tokens per unit of round time,
     //   E_k = 1 + a + ... + a^k (per-position acceptance a, geometric), cost_k = the 1-stream round time of window k,
     // with a = this request's own acceptance on this content kind (accepted drafts / (accepted drafts + rejecting
     // rounds), decayed), shrunk to the kind's prior by kPriorTrials pseudo-trials. Priors: the engine's real rounds
-    // (lane h M6 / e2c, temperature 0) and lanes/e2/k_policy.json (CPU, round dynamics): tool JSON ~0.92, structure
-    // ~0.85, thinking ~0.70, answer text ~0.52. Costs (ms, lane h M6 1 x 3k, graphs, T0; regression of decode seconds
+    // (temperature 0) and a CPU study of the round dynamics: tool JSON ~0.92, structure
+    // ~0.85, thinking ~0.70, answer text ~0.52. Costs (ms, 1 x 3k, graphs, T0; regression of decode seconds
     // on rounds per window): k2 9.68, k3 10.44, k7 13.69; plain decode 6.1 (+0.5 for the context append at k 0); k1
     // interpolated. Break-even vs k 0 near a = 0.42; k 7 overtakes k 3 near a = 0.76.
     constexpr float kPrior[4]    = {0.92f, 0.85f, 0.70f, 0.52f};

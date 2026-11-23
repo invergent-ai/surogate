@@ -11,7 +11,7 @@ namespace sinfer::ops {
 
 // Caller-owned transient capacity for every draft-count and batch-size pair in the inclusive
 // domains. token_domain is the fixed sampling profile; invalid domains throw.
-// split_routes: the target opts in to the split routes of untruncated stochastic rows (exact split + coupled; lane e2):
+// split_routes: the target opts in to the split routes of untruncated stochastic rows (exact split + coupled; DSpark):
 // their chunk partials are added. Every target that passes false gets M7's capacity exactly.
 [[nodiscard]] std::size_t speculative_accept_greedy_drafts_workspace_capacity_bytes(
     std::int32_t token_domain, std::int32_t min_drafts, std::int32_t max_drafts,

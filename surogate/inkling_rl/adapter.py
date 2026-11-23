@@ -1,6 +1,6 @@
 """Inkling expert-LoRA adapters in the serving engine's layout (numpy only, so it runs on every host).
 
-Layout the engine binds (serve-inkling e035ba7b; lanes/e1/card/make_test_adapters.py; lora_registry.cpp:406):
+Layout the engine binds (serve-inkling e035ba7b; lora_registry.cpp:406):
   base_model.model.model.layers.{L}.mlp.experts.{e}.gate_up_proj.lora_A.weight  [r, 2304]
   base_model.model.model.layers.{L}.mlp.experts.{e}.gate_up_proj.lora_B.weight  [2304, r]  rows INTERLEAVED: gate j = 2j,
                                                                                             up j = 2j + 1 (w13's order)
@@ -8,7 +8,7 @@ Layout the engine binds (serve-inkling e035ba7b; lanes/e1/card/make_test_adapter
   base_model.model.model.layers.{L}.mlp.experts.{e}.down_proj.lora_B.weight     [2304, r]
 L = physical layer 0..23 (a core layer's adapter applies on all three passes), e = 0..127; adapter_config.json PEFT LORA.
 
-In-memory layout ("rig layout", lanes/L/rig/rig.py make_lora): one dict per physical layer (None = no adapter there)
+In-memory layout ("rig layout", the learnability rig's rig.make_lora): one dict per physical layer (None = no adapter there)
   {"A13": [E, r, H], "B13": [E, 2I, r], "A2": [E, r, I], "B2": [E, H, r]} float32.
 
 The engine's fold at load (ops/wrapper/lora_store.cpp:197-212): A_bank = bf16(bf16(A) * alpha / r), B_bank = bf16(B), with

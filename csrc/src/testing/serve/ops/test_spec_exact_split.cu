@@ -1,6 +1,6 @@
-// ENGINE-INKLING lane e2 (agent-EN-e2c, 2026-11-21): the split route for untruncated stochastic verify rows
+// The split route for untruncated stochastic verify rows
 // (speculative_exact_max / partial / finalize kernels) through the whole ops::speculative_accept_greedy_drafts op.
-// agent-EN's conditions (17:2x) and what this test checks:
+// The conditions and what this test checks:
 //   1. INVARIANCE: a row's committed tokens, counts, lengths, anchors and token counts do not depend on the batch, the
 //      row's place in it, the draft width K of the call (beyond the row's extent) or the other rows; and a call
 //      repeated gives the same bits (determinism under per-(request, position) seeds).
@@ -9,8 +9,8 @@
 //      Chi-square per column against p_j (alpha 1e-3) on peaked, medium, flat rows, a low-probability draft, T = 0.7,
 //      min_p; a POWER control re-tests every column against p_j with 1 % of the mass moved between two bins (must
 //      fail where the samples allow, to show the test resolves an error of that size).
-//   3. OLD vs NEW: every row's result must equal the one-CTA wide kernel's (any difference FAILS; agent-EN 17:5x), at
-//      Inkling's shape, W4g's real vocabulary (248,077 over 248,320 rows, BF16) and the older Qwen3 shape (151,669 /
+//   3. OLD vs NEW: every row's result must equal the one-CTA wide kernel's (any difference FAILS), at
+//      Inkling's shape, the 35B-A3B target's real vocabulary (248,077 over 248,320 rows, BF16) and the older Qwen3 shape (151,669 /
 //      151,936). The split routes run with split_routes = true (the DSpark opt-in); targets that pass false never
 //      launch them.
 // `bench`: the op's time per call, old vs split, B = 1 / 8, K = 7, every draft accepted (8 columns drawn).
@@ -446,7 +446,7 @@ int test_invariance_and_identity(const Shape& s) {
         }
         std::printf("| %s | %s | %ld | %ld | %ld | %ld / %ld | %ld |\n", s.name, names[kind], rows, rep, alone, k3, k3n, old_same);
         std::fflush(stdout);
-        // agent-EN 17:5x: any difference from the old one-CTA route fails (same draws by construction; the normalizer is
+        // Any difference from the old one-CTA route fails (same draws by construction; the normalizer is
         // the same double sum in another order)
         if (rep != rows || alone != rows || k3 != k3n || old_same != rows) { ++failures; }
     }
@@ -750,7 +750,7 @@ struct ExactCase {
 };
 
 // Column logits of a case: `ids` = the bin tokens (explicit), the tail at -10 (T 1) or -7 (other T).
-// REACH (finding 2026-11-21 18:0x, both routes alike, and ops::sample too): sampling_gumbel draws from a 24-bit uniform,
+// REACH (finding 2026-11-21, both routes alike, and ops::sample too): sampling_gumbel draws from a 24-bit uniform,
 // so a Gumbel is at most ~17.3 and at least ~-2.85: a token whose scaled logit (x - max) / T lies more than ~20 below the
 // column maximum is never drawn by the Gumbel-max (correction / bonus / plain sampling). A T 0.7 case with the tail at
 // -10 (gap 20 scaled) failed on both routes with the tail bin empty (expected 59 of 256k: z 7.7). The tail is kept
@@ -973,8 +973,8 @@ int main(int argc, char** argv) {
         std::printf("no CUDA device: skipped\n");
         return 77;
     }
-    // W4g's real vocabulary is 248,320 (agent-EN 17:5x); 151,669 / 151,936 is the older Qwen3 shape S1 tested.
-    // W4g's engine domain is 248,077 logical tokens over 248,320 physical rows (api/family/frontend.h kTokenDomain; M8b
+    // The 35B-A3B target's real vocabulary is 248,320; 151,669 / 151,936 is the older Qwen3 shape S1 tested.
+    // That target's engine domain is 248,077 logical tokens over 248,320 physical rows (api/family/frontend.h kTokenDomain; M8b
     // review); 151,669 / 151,936 is the older Qwen3 shape S1 tested.
     const Shape shapes[3] = {{"Inkling fp32 201024", true, 201024, 201024},
                              {"W4g bf16 248077/248320", false, 248077, 248320},

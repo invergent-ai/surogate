@@ -1,4 +1,4 @@
-# agent-EN-f2: tokenizer corpus: every distinct text the renderer encodes in a sample of the real bodies (message texts,
+# Tokenizer corpus: every distinct text the renderer encodes in a sample of the real bodies (message texts,
 # reasoning, tool results, tool-call JSON, tool declarations), plus the edge texts. -> {"case","text"} per line.
 import json, sys
 seen, out = set(), []

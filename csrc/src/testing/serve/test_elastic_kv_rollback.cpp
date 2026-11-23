@@ -212,9 +212,9 @@ static void test_mapping_stays_within_the_cap(sinfer::DeviceContext& device) {
     require(live_handles == baseline, "the cap cases leaked an allocation handle");
 }
 
-// lanes/OOM F2 (2026-11-23): the reserve is mapped ahead of demand only while the device keeps the
+// Out-of-memory fix F2 (2026-11-23): the reserve is mapped ahead of demand only while the device keeps the
 // headroom free. Before the fix the worker refilled it until cuMemCreate failed: after an
-// on-demand reclaim on a W5 card it mapped the device down to 4 MiB, and the next
+// on-demand reclaim on an Inkling-2-Mini card it mapped the device down to 4 MiB, and the next
 // cudaMallocAsync aborted the engine. On-demand maps are unchanged (the executor needs them).
 static void test_reserve_keeps_the_headroom(sinfer::DeviceContext& device) {
     constexpr std::size_t quantum = 2ULL << 20;

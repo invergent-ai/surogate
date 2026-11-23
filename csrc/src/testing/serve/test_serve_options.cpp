@@ -44,7 +44,7 @@ int main() {
         failures += check(rejected, "empty provider catalog path accepted");
     }
     {
-        // --max-expert-lora-rank (lane ELORA): 0 by default (= --max-lora-rank), parsed, refused above --max-lora-rank.
+        // --max-expert-lora-rank: 0 by default (= --max-lora-rank), parsed, refused above --max-lora-rank.
         failures += check(defaults.max_expert_lora_rank == 0, "the expert LoRA rank should default to 0");
         const auto mixed = parse({"sinfer-serve", "model.sinfer", "--enable-lora", "--max-lora-rank", "64",
                                   "--max-expert-lora-rank", "16"});
@@ -361,7 +361,7 @@ int main() {
         failures += check(parse({"sinfer-serve", "model.sinfer", "--kv-admission", "ondemand"})
                                   .kv_admission.mode == sinfer::KvAdmission::OnDemand,
                           "--kv-admission ondemand not parsed");
-        // Lane f1: only an explicit ondemand opts a DSpark engine in; the default and reserve do not.
+        // Only an explicit ondemand opts a DSpark engine in; the default and reserve do not.
         failures += check(!defaults.kv_admission.explicit_on_demand && !kv.kv_admission.explicit_on_demand &&
                               parse({"sinfer-serve", "model.sinfer", "--kv-admission", "ondemand"})
                                   .kv_admission.explicit_on_demand &&

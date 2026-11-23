@@ -62,7 +62,7 @@ struct DecoderStateSpec {
     // device's free memory at admission (core/elastic_kv_region.h).
     bool elastic_kv_overcommit              = false;
     std::uint32_t mtp_physical_page_groups  = 0;
-    // Window-bounded KV (DESIGN-window-kv.md, lane f1): the sliding window of each full-attention
+    // Window-bounded KV (window-bounded KV design): the sliding window of each full-attention
     // layer, in the numbering above, 0 for a layer that reads the whole context. A layer with a
     // window keeps its planes in the text pool's window class, sized by `window_class`. Empty
     // (every family without windowed layers, or SUROGATE_SERVE_KV_WINDOW_PAGING=0) leaves the

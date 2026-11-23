@@ -96,7 +96,7 @@ namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS {
 namespace {
 
 /// DSpark under --spec-adaptive: the k policy (SUROGATE_SERVE_DSPARK_K_POLICY). 1 (DEFAULT, "static"): each lane's
-/// cap per content kind (tool JSON / structure 7, thinking 3, text 2; lanes/e2/k_policy.py); 2 ("lane", opt-in): the cap
+/// cap per content kind (tool JSON / structure 7, thinking 3, text 2; a CPU k-policy study); 2 ("lane", opt-in): the cap
 /// from the content kind AND this request's own acceptance on it (family::DSparkLaneStats, the Variant's
 /// dspark_draft_cap; priced with 1-stream round times, so slower at 8 streams -- rows2: -4 % T0, -8 % T1 -- and its
 /// statistics are not yet carried across a KV preemption, so a sampled rollout that is preempted may not reproduce);
@@ -151,7 +151,7 @@ void dspark_note_round_if(Sequence& sequence, std::uint32_t extent) {
 /// the next one; a verify round or a chained ordinary burst stages the barrier once, so it must end at min_tokens and
 /// the next round is staged without it. Verify column j is draw produced + 1 + j: extent <= draws - 1. A burst of n
 /// rounds: n <= draws. MTP on and off then lift the barrier at the same token, at any load. Other targets: no limit,
-/// their rounds keep the per-round barrier (rule 7: W4g stays token-identical; its fix is the owner's call).
+/// their rounds keep the per-round barrier (they stay token-identical; lifting it there is a separate change).
 template <class V, class Request, class Sequence>
 [[nodiscard]] std::uint32_t dspark_barrier_draws_if(const Request& request, const Sequence& sequence) {
     if constexpr (family::dspark_drafter<V>()) {
@@ -398,7 +398,7 @@ void ProgramImplCore::configure_stage(const SequencePlanImpl& plan) {
     if (stage_import.data) { std::memset(stage_import.data, 0, stage_boundary_bytes_); }
     if (stage_export.data) { std::memset(stage_export.data, 0, stage_boundary_bytes_); }
     if (family::dspark_drafter<Variant>() && plan.features.dflash()) {
-        // DSpark on a pipeline (ENGINE-INKLING lane e1): the stage with the head holds the drafter and proposes each
+        // DSpark on a pipeline: the stage with the head holds the drafter and proposes each
         // round's drafts before the first stage launches; the first stage verifies them from its draft import.
         const std::size_t bytes = 2 * schedule::kDSparkDraftImportStride * sizeof(std::int32_t);
         if (stage.last >= layers) {
@@ -498,7 +498,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     };
     decoder = std::make_unique<family::DecoderState>(backing, plan.persistent.decoder, &elastic_kv);
     decoder->configure_checkpoints(plan.persistent.checkpoints, elastic_kv);
-    // Lane f1 M3-C: the capacity curve counted this charge per lane (layouts_impl.h); the pool
+    // M3-C: the capacity curve counted this charge per lane (layouts_impl.h); the pool
     // must book the same, or a context-length request could fit the curve and not the ledger.
     if (plan.persistent.kv_window_lane_charge_pages != decoder->text_kv.pool().window_lane_charge_pages()) {
         throw std::logic_error("planned KV window lane charge " +
@@ -671,7 +671,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         io.visit_records_width  = static_cast<std::int32_t>(width);
         io.visit_records_batch  = static_cast<std::int32_t>(rows);
     }
-    // A visit-schedule target's persistent state for the compute stream (lane d's MoE counters): zeroed once here,
+    // A visit-schedule target's persistent state for the compute stream (the MoE op's counters): zeroed once here,
     // then owned by the target's kernels (they leave it zeroed at the end of every call).
     if (plan.persistent.visit_target_state) {
         const DeviceSpan state = plan.persistent.visit_target_state->bind(backing);
@@ -728,7 +728,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     // batch-invariant cut schedule forbids. An MTP head's KV and the boundary's hidden go with
     // the prefix (PATCHES #150); a DFlash drafter keeps context it does not copy.
     // A visit-schedule target takes the shared prefixes and the host tier like every other target: its per-visit
-    // conv state travels in the prefix images (lane f1's prefix_state_tensors, merge M2).
+    // conv state travels in the prefix images (prefix_state_tensors, merge M2).
     if ((speculative_backend == SpeculativeBackend::None || speculative_backend == SpeculativeBackend::Mtp) &&
         !pipeline_stage() && !ops::batch_invariant()) {
         const char* raw = std::getenv("SUROGATE_SERVE_SHARED_PREFIX_SLOTS");
@@ -787,7 +787,7 @@ bool ProgramImplCore::can_admit_lane(std::uint32_t lane, const RequestPlan& plan
         return pool.can_replace_entitlement(old_pages, new_pages, extra);
     };
     const std::uint32_t old_text = sequence.kv ? sequence.kv->text.owned_entitlement() : 0;
-    // Lane f1 M3-C: a lane without an allocation gets one, and an elastic window class books its
+    // M3-C: a lane without an allocation gets one, and an elastic window class books its
     // window pages with it (0 for every model without one). A lane that has one keeps its charge.
     const std::uint32_t window_charge = sequence.kv ? 0U : decoder->text_kv.pool().window_lane_charge_pages();
     if (!can_replace(decoder->text_kv.pool(), old_text, plan.summary().admission.main_kv_pages, window_charge) ||
@@ -888,7 +888,7 @@ bool ProgramImplCore::can_admit_lane_after_retained_eviction(
 
     const SequenceState& sequence = sequences[lane];
     const std::uint32_t old_text  = sequence.kv ? sequence.kv->text.owned_entitlement() : 0;
-    // Lane f1 M3-C: as in can_admit_lane, a new allocation's window charge (0 without one).
+    // M3-C: as in can_admit_lane, a new allocation's window charge (0 without one).
     const std::uint32_t window_charge = sequence.kv ? 0U : decoder->text_kv.pool().window_lane_charge_pages();
     if (!can_replace(decoder->text_kv.pool(), old_text, reclaimable_text,
                      plan.summary().admission.main_kv_pages, window_charge) ||
@@ -2831,7 +2831,7 @@ void ProgramImplCore::prepare_graphs() {
     }();
     // DFlash engines also serve target-only decision readouts. Capture the ordinary
     // target prefill body for those requests; reasoning prefills keep their feature sink.
-    // A visit-schedule target's prefill / mixed graph bodies are not wired yet (lanes/e1 NOTES).
+    // A visit-schedule target's prefill / mixed graph bodies are not wired yet.
     if (!prefill_graph_vetoed && !family::visit_schedule<Variant>() &&
         (speculative_backend == SpeculativeBackend::None ||
                                  speculative_backend == SpeculativeBackend::DFlash)) {
@@ -2985,7 +2985,7 @@ void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& 
     CUDA_CHECK(cudaMemsetAsync(counts.data, 0, counts.bytes(), device.stream));
     request.sampling_host     = config;
     if constexpr (family::dspark_drafter<Variant>()) {
-        // DSpark (lane e2): coupled verification of untruncated sampled rows (ops/kernel/speculative_round.cuh) --
+        // DSpark: coupled verification of untruncated sampled rows (ops/kernel/speculative_round.cuh) --
         // MTP on commits the tokens MTP-off decoding samples. SUROGATE_SPEC_COUPLED=0: the one-hot rejection rule.
         // SUROGATE_SPEC_EXACT_SPLIT=0 has the same effect whatever this flag says (the coupled verify is a split route;
         // the engine warns at startup).
@@ -5389,7 +5389,7 @@ bool ProgramImplCore::pipeline_drafts_on_head() const noexcept {
 std::span<const std::byte> ProgramImplCore::prepare_pipeline_drafts(std::span<const std::uint32_t> lanes,
                                                                     std::span<const runtime::RoundBudget> budgets,
                                                                     std::uint32_t window) {
-    // DSpark on a pipeline (ENGINE-INKLING lane e1): the first half of launch_dflash_round's round on the drafter stage
+    // DSpark on a pipeline: the first half of launch_dflash_round's round on the drafter stage
     // -- the same ingress for the same lanes / budgets / window, the context append and the proposal -- ahead of the
     // first stage's launch. The round's own launch here later stages the same ingress again and verifies only.
     if (!pipeline_drafts_on_head() || !io.dflash_decode || !dflash) {
@@ -5759,7 +5759,7 @@ bool ProgramImplCore::kv_service_pressure() noexcept {
     if (ElasticKvRegion* region = decoder->text_kv.pool().elastic_region()) {
         region->flush_reserve_release();
     }
-    // Lane f1 M3-C: an elastic window class flushes too, and compacts at this round boundary.
+    // M3-C: an elastic window class flushes too, and compacts at this round boundary.
     if (ElasticKvRegion* region = decoder->text_kv.pool().window_elastic_region()) {
         region->flush_reserve_release();
         compact_window_kv();
@@ -5769,7 +5769,7 @@ bool ProgramImplCore::kv_service_pressure() noexcept {
 
 void ProgramImplCore::kv_round_boundary() noexcept {
     // The pipelined executor has no kv_service_pressure: the main region's releases (a limit lowered
-    // by window charges, set_foreign_bytes; a reserve given back) happen here (lanes/OOM review).
+    // by window charges, set_foreign_bytes; a reserve given back) happen here (out-of-memory review).
     if (ElasticKvRegion* region = decoder->text_kv.pool().elastic_region()) { region->flush_reserve_release(); }
     if (ElasticKvRegion* region = decoder->text_kv.pool().window_elastic_region()) {
         region->flush_reserve_release();
@@ -5798,7 +5798,7 @@ void ProgramImplCore::kv_settle() noexcept {
 
 void ProgramImplCore::configure_kv_admission(const runtime::KvAdmissionOptions& options) noexcept {
     kv_admission  = options;
-    // DFlash keeps the reservation. A DSpark drafter (lane f1, review R6 finding 1) keeps its draft KV in the text pool's own
+    // DFlash keeps the reservation. A DSpark drafter (review R6 finding 1) keeps its draft KV in the text pool's own
     // pages, so a lane's whole state can grow and be recomputed with its text allocation: opt-in, explicit flag only.
     kv_on_demand_ = runtime::kv_engine_on_demand(options.mode == KvAdmission::OnDemand, pipeline_stage(),
                                                  speculative_backend == SpeculativeBackend::DFlash,

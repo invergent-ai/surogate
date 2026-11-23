@@ -1,7 +1,7 @@
 #pragma once
 
-// DSpark (Inkling-2-Mini's MTP drafter, ENGINE-INKLING lane e2) through the family's DFlash runtime
-// (rl/engine-inkling-2026-11-21/lanes/e2/DESIGN-dspark.md 12). A target that declares `dspark_drafter` keeps the DFlash
+// DSpark (Inkling-2-Mini's MTP drafter) through the family's DFlash runtime
+// (DSpark design notes, section 12). A target that declares `dspark_drafter` keeps the DFlash
 // round structure -- feature sink, pending features, context append, one parallel proposal, the shared verify / accept,
 // graphs, adaptive k -- but runs its own drafter: the runtime hands the context append and the proposal to the
 // Variant's `dspark_append` / `dspark_propose` leaves instead of the DFlash bodies. Its draft KV lives in extra planes
@@ -46,7 +46,7 @@ template <class Variant>
 }
 
 /// A lane's draft acceptance by content kind, for the opt-in DSpark k policy "lane" (SUROGATE_SERVE_DSPARK_K_POLICY=lane;
-/// the default is "static"; not carried across a KV preemption yet -- KvResumeState) (agent-EN-e2c): decayed
+/// the default is "static"; not carried across a KV preemption yet -- KvResumeState): decayed
 /// counts of accepted drafts and of rounds stopped by a rejection, per kind, from this request's own rounds only (reset
 /// at every request start), so a lane's k depends on nothing but its own tokens -- batch- and timing-independent, and a
 /// sampled rollout stays reproducible under its per-(request, position) seeds. Read by the Variant's
@@ -103,7 +103,7 @@ struct DSparkProposeArgs {
     std::int32_t batch = 0;
     std::int32_t k     = 0;
     /// The round's device SamplingConfig [B] (the verify's): a coupled sampled lane may draw sampled drafts with the
-    /// coupled verify's own noise (lane e2). Null: greedy drafts.
+    /// coupled verify's own noise (DSpark). Null: greedy drafts.
     const ops::SamplingConfig* sampling = nullptr;
 };
 

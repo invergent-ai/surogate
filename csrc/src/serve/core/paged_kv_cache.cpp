@@ -446,7 +446,7 @@ void PagedKVPool::charge_window_pages(std::int64_t delta) noexcept {
         if (delta < 0) { window_elastic_->release_above_limit(); }
         // The charged window pages are paid out of the main pages (the ledger above), but the
         // window region maps them: the main region's physical limit leaves their bytes out, or
-        // both regions fill the same planned bytes (lanes/OOM/DIAGNOSIS.md, F1).
+        // both regions fill the same planned bytes (out-of-memory diagnosis, F1).
         if (elastic_) {
             elastic_->set_foreign_bytes(static_cast<std::size_t>(window_charged_pages_) * window_page_bytes_);
         }
@@ -574,7 +574,7 @@ PagedKVOccupancy PagedKVPool::occupancy(std::size_t granule_bytes) const noexcep
                                                elastic_->mapped_granules() * elastic_->granule_pages())
                                     : spec_.page_group_count;
     // M3-C: the elastic window class's physical side, for /kv_stats (main + window mapped bytes
-    // must stay within the main cap's bytes + the window floor; lanes/OOM/DIAGNOSIS.md).
+    // must stay within the main cap's bytes + the window floor; out-of-memory diagnosis).
     if (window_elastic_) {
         out.window_page_bytes    = window_page_bytes_;
         out.window_floor_pages   = window_floor_pages_;
@@ -1485,7 +1485,7 @@ std::uint32_t PagedKVPool::compact_window_class(std::span<const PagedKVAllocatio
     }
     used.push_back(window_sentinel_);
     std::sort(used.begin(), used.end());
-    // SUROGATE_SERVE_KV_WINDOW_SHUFFLE=1 (tests only: lane f1's path-invariance "relocate" path):
+    // SUROGATE_SERVE_KV_WINDOW_SHUFFLE=1 (tests only: the path-invariance "relocate" path):
     // every movable page moves at every boundary, to the next free page above it (or the lowest),
     // so a sequence reads its window from pages that were relocated between all of its rounds.
     static const bool shuffle = [] {

@@ -1,6 +1,7 @@
 """CPU tests of the Inkling RL glue (surogate/inkling_rl). Plain asserts; run: python tests/inkling_rl/test_glue.py
 (pytest also collects the test_* functions). Needs numpy, torch, msgspec, pyyaml; the kit worktree READ ONLY for its
-loop module (eff_samples.to_training_sample) and its TRL reference fixture.
+loop module (eff_samples.to_training_sample) and its TRL reference fixture: env KIT_RECIPE = the kit's recipe directory
+(the tests that need it are skipped when it is not set).
 
  1 pins          the vendored kit loss / config / types match their sha256 pins and load
  2 trl           the deployed loss through step's API == TRL 1.17.1 GRPO / DAPO gradients (the kit's own fixture)
@@ -30,7 +31,7 @@ import torch
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, ROOT)
-KIT = os.environ.get("KIT_RECIPE", "/mnt/data/work/repos/si-wt-resume/recipe")
+KIT = os.environ.get("KIT_RECIPE", "")
 
 from surogate.inkling_rl import adapter as AD  # noqa: E402
 from surogate.inkling_rl import kitsrc, records  # noqa: E402
@@ -39,7 +40,15 @@ from surogate.inkling_rl.shim import Shim, MasterAdamW, masters_layers  # noqa: 
 from surogate.inkling_rl.step import StepConfig  # noqa: E402
 
 
+def _need_kit():
+    if not KIT or not os.path.isdir(KIT):
+        import pytest
+
+        pytest.skip("set KIT_RECIPE to the RL kit's recipe directory")
+
+
 def kit_loop():
+    _need_kit()
     sys.path.insert(0, os.path.join(KIT, "loop"))
     import eff_samples  # noqa: E402  (the kit's own row -> TrainingSample code)
 
@@ -54,6 +63,7 @@ def test_pins():
 
 
 def test_trl():
+    _need_kit()
     fx = np.load(os.path.join(KIT, "trainer-patches/gspo-token-aggregation/trl_reference.npz"))
     _, grads = kitsrc.loss_api()
     rows = [{k: fx[f"r{i}_{k}"] for k in ("new", "old", "beh", "mask", "adv")} for i in range(int(fx["n"]))]

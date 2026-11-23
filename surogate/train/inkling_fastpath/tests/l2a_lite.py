@@ -1,18 +1,18 @@
-"""LEARNABILITY 2a-lite on lane T's engine-op trainer (agent-EN 18:4x; lines pre-registered by lane L in LEARNABILITY.md,
-last section; config agreed with agent-EN-L 18:4x):
+"""LEARNABILITY 2a-lite on the engine-op trainer (pass lines and config pre-registered
+before the run):
 
-  data      lanes/L/rig/data_2a.pt: "train" 256 / "heldout" 64 windows {"ids" [<= 1024], "tgt_pos" [k]}; position p
+  data      the rig's data_2a.pt: "train" 256 / "heldout" 64 windows {"ids" [<= 1024], "tgt_pos" [k]}; position p
             predicts ids[p + 1]
   model     expert LoRA r16 a32 on w13 / w2 of all 24 layers, A = PEFT init (rig.make_lora order, seed 0), B = 0
   train     fp32 AdamW (0.9, 0.999, 1e-8, wd 0) on host masters, batch 32 windows (run_2a's shuffle), token-mean NLL
             over the batch's target positions; forward = the ENGINE's (bank fold of the current tensors), backward =
-            lane T's long-row LEVEL-0 path (S2)
+            the engine-op trainer's long-row LEVEL-0 path (S2)
   evaluate  steps 0 / 5 / ... / 25: the engine's W4A4 free-routing forward + head log-prob with the adapter (ONE
             evaluator throughout), per-window NLL sums / counts of all 256 + 64 windows
-  adapter   (LANE-RULES 22) the masters at every evaluation as the engine's BF16 PEFT adapter, <out>/adapter_latest + its sha in
+  adapter   the masters at every evaluation as the engine's BF16 PEFT adapter, <out>/adapter_latest + its sha in
             the JSON ("adapters"); needs surogate.inkling_rl on PYTHONPATH (checked at the start); --no-save-adapter = off
-  output    run_2a's JSON format (lanes/L/rig/analyze_2a.py) + the step-1 gradient of batch 1 (per-tensor norms per
-            layer, 16-expert slices of layers 0 / 5 / 13 / 20 / 23) for lane L's cosine vs the rig
+  output    run_2a's JSON format (the rig's analyze_2a.py) + the step-1 gradient of batch 1 (per-tensor norms per
+            layer, 16-expert slices of layers 0 / 5 / 13 / 20 / 23) for the cosine vs the rig
 Usage: python l2a_lite.py --bin B --artifact A --data data_2a.pt --lr 5e-5 --out DIR [--steps 25] [--eval-every 5]
 """
 
@@ -84,7 +84,7 @@ def evaluate(eng, banks, data):
 
 
 def save_adapter(lora, out_dir, step, lr):
-    """LANE-RULES 22: the current masters as the engine's PEFT adapter (BF16 = what the engine's bank fold reads), written
+    """The current masters as the engine's PEFT adapter (BF16 = what the engine's bank fold reads), written
     to a temporary directory and renamed, so a stop never leaves a half-written adapter. Returns the safetensors sha256."""
     from surogate.inkling_rl import adapter as AD
 
@@ -108,7 +108,7 @@ def main():
     ap.add_argument("--eval-every", type=int, default=5)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--no-save-adapter", action="store_true", help="LANE-RULES 22: say so in the pre-registration")
+    ap.add_argument("--no-save-adapter", action="store_true", help="say so in the pre-registration")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     if not a.no_save_adapter:
@@ -122,7 +122,7 @@ def main():
     tf = LG.TrainForwardLong(eng, W)
     opt = HostAdamW(params, lr=a.lr, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0)
     out_f = os.path.join(a.out, f"run_2a_lr{a.lr:g}.json")
-    rec = {"args": vars(a) | {"trainer": "lane T engine-op (forward = engine, LEVEL-0 S2 backward)",
+    rec = {"args": vars(a) | {"trainer": "engine-op (forward = engine, LEVEL-0 S2 backward)",
                               "chunk": LG.CHUNK, "moe_gm": LG.MOE_GM, "fast_gemm": LG.FAST_GEMM, "tf32": LG.TF32},
            "evals": {}, "steps": [], "adapters": {}}
     rng = random.Random(a.seed)
@@ -157,7 +157,7 @@ def main():
             loss_sum += float(loss.detach())
             tokens += ids.numel()
             del lp, loss
-        if step == 1:  # the step-1 gradient of batch 1, for lane L's cosine vs the rig
+        if step == 1:  # the step-1 gradient of batch 1, for the cosine vs the rig
             torch.save({"bidx": bidx, "norms": [{k: float(lo[k].grad.norm()) for k in B.LORA_KEYS} for lo in lora],
                         "slices": {i: {k: lora[i][k].grad[:16].detach().cpu() for k in B.LORA_KEYS}
                                    for i in SLICE_LAYERS}}, os.path.join(a.out, "step1_grad.pt"))

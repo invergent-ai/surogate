@@ -101,9 +101,9 @@ public:
     /// class (M3-C) books its holders' window pages in this pool's page ledger, but maps them in
     /// its own region, so automatic sizing planned them once, inside this region's cap. The
     /// granule limit leaves them out, so the two regions together stay inside the plan. Before
-    /// this, both could fill at once: on 2026-11-23 a W5 engine mapped the main pool towards its
+    /// this, both could fill at once: on 2026-11-23 an Inkling-2-Mini engine mapped the main pool towards its
     /// cap while eight lanes held window pages, left 4 MiB free and aborted
-    /// (rl/engine-inkling-2026-11-21/lanes/OOM/DIAGNOSIS.md). When the new limit is below what
+    /// (out-of-memory diagnosis, finding F1). When the new limit is below what
     /// is mapped, the free granules go back at the next round boundary (flush_reserve_release; the
     /// pipelined executor flushes at its idle boundaries, kv_round_boundary).
     void set_foreign_bytes(std::size_t bytes) noexcept;

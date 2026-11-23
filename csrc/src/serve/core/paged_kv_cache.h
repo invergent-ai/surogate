@@ -105,7 +105,7 @@ struct PagedKVPoolSpec {
     std::uint32_t window_lane_pages     = 0;
     std::uint32_t window_image_pages    = 0;
     std::uint32_t window_forward_tokens = 0;
-    // M3-C (lanes/f1/DESIGN-M3-kv-lever.md C; elastic pools only): the window planes are
+    // M3-C (KV-lever design C; elastic pools only): the window planes are
     // demand-mapped in their own region, whose guaranteed size is `window_floor_pages`; every
     // reserved allocation is charged `window_lane_charge` window pages in THIS pool's page ledger
     // (as main-page equivalents), shared-prefix window images their own pages when captured.

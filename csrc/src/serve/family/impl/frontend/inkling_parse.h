@@ -1,6 +1,6 @@
 #pragma once
 
-// Inkling-2 frontend (ENGINE-INKLING lane f2): generated token ids -> (reasoning, content, tool calls, finish reason),
+// Inkling-2 frontend: generated token ids -> (reasoning, content, tool calls, finish reason),
 // parse-exact to vLLM's non-streaming chat response.
 //
 // The reference composes two passes of `vllm/parser/inkling.py::InklingParser` (vLLM's ParserEngine with the Inkling

@@ -373,7 +373,7 @@ BindingPlan bind_artifact(artifact::Binder& binder, const BindOptions& options) 
         const DraftConfig& d = *c.dspark;
         const TensorPlacement dp = options.draft ? options.draft_placement.value_or(hp) : TensorPlacement::ValidateOnly;
         out.draft.placement      = dp;
-        // lane e2: the dense linears may live in a mapped host bank (re-quantised to FP8 on the device at load)
+        // DSpark: the dense linears may live in a mapped host bank (re-quantised to FP8 on the device at load)
         const TensorPlacement lp = options.draft && options.draft_linears_host ? TensorPlacement::HostBank : dp;
         const std::int32_t Dd = d.hidden, q = d.query_heads * d.head_dim, kv = d.kv_heads * d.head_dim;
         DraftPlan& m = out.draft;

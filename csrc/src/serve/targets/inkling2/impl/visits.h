@@ -115,7 +115,7 @@ inline constexpr std::array<VisitInfo, TextConfig::layers> kVisits = visits_deta
 /// 41, feature 3 (the final-norm output) after the last visit, 47. These labels are the DFlash geometry's
 /// `target_feature_layers`: the family's feature sink compares them with a pipeline stage's visit range [first, last),
 /// so a stage captures exactly the features of the visits it runs and imports the earlier ones from the boundary packet
-/// (2-card split; lanes/e1/DESIGN-2card.md). On one card the labels only name the rows (row f = label f, as before).
+/// (2-card split). On one card the labels only name the rows (row f = label f, as before).
 inline constexpr std::array<int, 4> kFeatureLabels{5, 23, 41, TextConfig::layers - 1};
 static_assert(kVisits[5].feature == 0 && kVisits[23].feature == 1 && kVisits[41].feature == 2);
 

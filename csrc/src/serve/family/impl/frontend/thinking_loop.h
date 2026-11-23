@@ -5,7 +5,7 @@
 // A thought position repeats when the 32 tokens ending there have already appeared at least twice
 // earlier in the same thought, so its third showing on. The detector fires once at least 90% of
 // the last 2,048 positions repeat. Calibrated offline on the release model's own replies
-// (rl/answer-guard-2026-10-28/loopstat.py in the 35B-A3B work tree): it ends each of four looping
+// (an offline loop-statistics script, not in this repository): it ends each of four looping
 // thoughts 5,500 to 11,000 tokens in, and fires on none of 346 chat replies or 6,900 long
 // SWE-agent turns, whose highest window shares are 0.31 and 0.55.
 //

@@ -1,4 +1,4 @@
-// Window-bounded KV pages (lane f1, rl/engine-inkling-2026-11-21/lanes/f1/DESIGN-window-kv.md):
+// Window-bounded KV pages (window-KV design):
 // the host-only page manager KvWindowPages, driven the way the runtime drives it, against a
 // simulated page store. No device: every check runs on the CPU.
 //

@@ -147,7 +147,7 @@ def run_step(backend, rows: list[Row], version: int | None, cfg: StepConfig, log
             refused_r3 += 1
             live.remove(i)
             continue
-        # THE RULE for uncovered positions (NOTES "R3 COVERAGE RULE", agent-EN 18:2x): the trainer's own routing there equals
+        # THE RULE for uncovered positions ("R3 COVERAGE RULE"): the trainer's own routing there equals
         # the engine's only when the row was sampled by the adapter version the trainer's forward runs (the step's version;
         # the engine never reuses a prefix across an adapter swap). A lagged row (an older version inside max_policy_lag)
         # with uncovered interior positions would mix two versions' routing: refused and counted until the kit's join
@@ -197,7 +197,7 @@ def run_step(backend, rows: list[Row], version: int | None, cfg: StepConfig, log
     # update pass (pass 2)
     agg = {"policy_loss": 0.0, "mismatch_kl": [], "is_masked": [], "seq_log_ratio": [], "total_tokens": 0}
     # P4 AMENDMENT 3 (memory only): the row gradients accumulate on the HOST between rows. On the card, the accumulated p.grad (fp32, 1.48 GiB for
-    # Inkling's LoRA) sat under every later row's backward, which T's one-row memory proof does not have; P4 ran out of memory on it. Same additions
+    # Inkling's LoRA) sat under every later row's backward, which the engine-op trainer's one-row memory proof does not have; P4 ran out of memory on it. Same additions
     # in the same order, in the parameters' own dtype; the sum goes back into p.grad after the last row, so the caller's contract is unchanged.
     params = list(backend.parameters())
     host_grads = [None] * len(params)
@@ -231,7 +231,7 @@ def run_step(backend, rows: list[Row], version: int | None, cfg: StepConfig, log
         if on_card:
             peak = torch.cuda.max_memory_allocated() / 2 ** 30
             torch.cuda.synchronize()
-            torch.cuda.empty_cache()                      # as T's memory proof does before each row
+            torch.cuda.empty_cache()                      # as the engine-op trainer's memory proof does before each row
             log(f"update row {k_row + 1} / {len(live)}: batch index {i}, T {r.T}, loss tokens {n}, peak torch memory {peak:.2f} GiB")
     for p, g in zip(params, host_grads):
         if g is not None:

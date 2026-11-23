@@ -1,5 +1,5 @@
 // Inkling MoE: router, activation quantisers, standalone SiTU, combine and the LoRA shrink.
-// Numerics: inkling_numerics.cuh; design: rl/engine-inkling-2026-11-21/lanes/d/DESIGN-moe.md.
+// Numerics: inkling_numerics.cuh; design: the MoE design notes.
 
 #include "core/pdl.cuh"
 #include "ops/common/memory.cuh"
@@ -42,7 +42,7 @@ __device__ __forceinline__ int live_count(LiveTokens live) {
     return live.device != nullptr ? min(*live.device, live.tokens) : live.tokens;
 }
 
-/// PDL audit (agent-EN 17:48, lane c's FP8 finding): per-step activations (x, y, logits, ids, gammas, down rows)
+/// PDL audit (after the FP8 attention decode finding): per-step activations (x, y, logits, ids, gammas, down rows)
 /// are written by a kernel that may still be in flight when this grid is launched (PDL) and live at arena addresses
 /// reused every visit, so they are NEVER read through the non-coherent read-only path (ld.global.nc / __ldg / a
 /// `const __restrict__` pointer the compiler turns into LDG.CONSTANT): explicit ld.global.cg (L2) loads instead.
