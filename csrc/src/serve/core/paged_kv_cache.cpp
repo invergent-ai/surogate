@@ -441,6 +441,9 @@ void PagedKVPool::charge_window_pages(std::int64_t delta) noexcept {
     window_charged_pages_ = static_cast<std::uint32_t>(static_cast<std::int64_t>(window_charged_pages_) + delta);
     if (window_elastic_) {
         window_elastic_->set_entitled_pages(window_floor_pages_ + window_charged_pages_);
+        // Holders left: the window region gives its emptied granules back down to the lower limit,
+        // since the main region's limit rises at once (review of 75204b7d, MEDIUM 1).
+        if (delta < 0) { window_elastic_->release_above_limit(); }
         // The charged window pages are paid out of the main pages (the ledger above), but the
         // window region maps them: the main region's physical limit leaves their bytes out, or
         // both regions fill the same planned bytes (lanes/OOM/DIAGNOSIS.md, F1).

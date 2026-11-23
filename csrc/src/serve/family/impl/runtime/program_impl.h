@@ -5810,6 +5810,9 @@ bool ProgramImplCore::kv_service_pressure() noexcept {
 }
 
 void ProgramImplCore::kv_round_boundary() noexcept {
+    // The pipelined executor has no kv_service_pressure: the main region's releases (a limit lowered
+    // by window charges, set_foreign_bytes; a reserve given back) happen here (lanes/OOM review).
+    if (ElasticKvRegion* region = decoder->text_kv.pool().elastic_region()) { region->flush_reserve_release(); }
     if (ElasticKvRegion* region = decoder->text_kv.pool().window_elastic_region()) {
         region->flush_reserve_release();
         compact_window_kv();

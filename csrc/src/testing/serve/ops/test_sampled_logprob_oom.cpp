@@ -51,9 +51,9 @@ int main() {
     ok &= check(before.size() == tokens.size() && std::isfinite(before[0].selected.logprob), "scoring works with memory free");
 
     // Nothing kept in the stream-ordered pool, then nothing left on the device.
+    (void)cudaDeviceSynchronize(); // the first call's cudaFreeAsync has completed before the trim
     cudaMemPool_t pool = nullptr;
     if (cudaDeviceGetDefaultMemPool(&pool, 0) == cudaSuccess) { (void)cudaMemPoolTrimTo(pool, 0); }
-    (void)cudaDeviceSynchronize();
     std::vector<void*> hog;
     for (std::size_t chunk = std::size_t{1} << 30; chunk >= 4096; chunk >>= 1) {
         for (;;) {

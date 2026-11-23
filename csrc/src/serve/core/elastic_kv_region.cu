@@ -561,6 +561,12 @@ void ElasticKvRegion::set_foreign_bytes(std::size_t bytes) noexcept {
     if (impl.mapped_granule_count() > impl.mapped_granule_limit()) { impl.release_requested = true; }
 }
 
+void ElasticKvRegion::release_above_limit() noexcept {
+    Impl& impl = *impl_;
+    const std::lock_guard<std::mutex> lock(impl.mutex);
+    if (impl.mapped_granule_count() > impl.mapped_granule_limit()) { impl.release_requested = true; }
+}
+
 std::vector<std::uint8_t> ElasticKvRegion::mapped_granule_mask() const {
     const std::lock_guard<std::mutex> lock(impl_->mutex);
     std::vector<std::uint8_t> mask(impl_->granules, 0);

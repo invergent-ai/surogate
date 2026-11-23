@@ -175,12 +175,13 @@ def kv_model(base):
 
 def physical_bytes(model):
     """Main + window bytes the engine has mapped, and the bytes automatic sizing planned for them:
-    the main cap in whole granules plus the window floor and one window granule of rounding."""
+    the main cap in whole granules plus the window floor, and one granule of each class of rounding."""
     window = model["window"]
     granule = model["granule_pages"]
     main_cap = math.ceil(model["capacity_pages"] / granule) * granule * model["page_bytes"]
     mapped = model["pages_mapped"] * model["page_bytes"] + window["pages_mapped"] * window["page_bytes"]
-    plan = main_cap + (window["floor_pages"] + window["granule_pages"]) * window["page_bytes"]
+    # Rounding: the main limit and the window entitlement each round up to a whole granule.
+    plan = main_cap + granule * model["page_bytes"] + (window["floor_pages"] + window["granule_pages"]) * window["page_bytes"]
     return mapped, plan
 
 

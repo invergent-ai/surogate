@@ -104,8 +104,13 @@ public:
     /// this, both could fill at once: on 2026-11-23 a W5 engine mapped the main pool towards its
     /// cap while eight lanes held window pages, left 4 MiB free and aborted
     /// (rl/engine-inkling-2026-11-21/lanes/OOM/DIAGNOSIS.md). When the new limit is below what
-    /// is mapped, the free granules go back at the next round boundary (flush_reserve_release).
+    /// is mapped, the free granules go back at the next round boundary (flush_reserve_release; the
+    /// pipelined executor flushes at its idle boundaries, kv_round_boundary).
     void set_foreign_bytes(std::size_t bytes) noexcept;
+    /// Mapped past the granule limit (its entitlement fell, e.g. a window class whose holders left):
+    /// the free granules go back at the next round boundary. A worker unmap otherwise keeps up to
+    /// the trim threshold of emptied granules, past the entitlement the plan counted.
+    void release_above_limit() noexcept;
     /// Which granules are mapped right now (one entry per granule, nonzero when mapped). A
     /// snapshot: the worker may map or unmap a free granule a moment later.
     [[nodiscard]] std::vector<std::uint8_t> mapped_granule_mask() const;

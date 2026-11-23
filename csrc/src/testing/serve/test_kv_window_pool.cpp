@@ -351,8 +351,16 @@ void check_elastic_physical_bound(const sinfer::DeviceContext& device) {
     const std::size_t window_granule = std::size_t{layout.window_granule_pages} * charged.page_bytes;
     expect(main_mapped + window_mapped <= cap_bytes + floor_bytes + window_granule,
            tag + ": main + window mapped " + std::to_string((main_mapped + window_mapped) >> 20) + " MiB within the plan");
+    // Two holders leave: the main limit rises at once, so the window region must give its emptied
+    // granules back down to its own (lower) limit at the next boundary (review of 75204b7d, MEDIUM 1).
     a.release();
     b.release();
+    window_region->flush_reserve_release();
+    window_region->wait_idle();
+    main_region->wait_idle();
+    expect(window_region->mapped_granules() <= window_region->granule_limit(),
+           tag + ": after holders leave the window region maps " + std::to_string(window_region->mapped_granules()) +
+               " granules, its limit is " + std::to_string(window_region->granule_limit()));
     c.release();
 }
 
