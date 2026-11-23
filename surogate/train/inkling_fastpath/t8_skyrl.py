@@ -99,3 +99,26 @@ def dual_clip_seeds(lp: np.ndarray, old: np.ndarray, adv_tok: np.ndarray, mask: 
     met = {"loss": float(loss), "clipped_tokens": clipped, "loss_tokens": float(m.sum()),
            "ratio_max": float((ratio * m).max()) if bool(m.any()) else 1.0}
     return lp_t.grad.numpy().copy(), float(loss), met
+
+
+BLOCKS = {"before": range(0, 6), "inside": range(6, 18), "after": range(18, 24)}  # physical layers: prelude, looped core, coda
+
+
+def first_order_by_block(grad_ascent: list, delta: list, keys: tuple, blocks: dict = BLOCKS) -> dict:
+    """RX's follow read (LOOP-W5.md 4.2): the predicted first-order change <g, dθ> per layer block and in all.
+    grad_ascent: per (layer, key) in the trainer's gradient order (layer-major, `keys` per layer), the gradient of the quantity whose change is
+    predicted (e.g. sum over the trained rows of A x sum_t log pi: StepOut.grads of seeds="weights" with weight = the advantage, sense "ascent";
+    or -N x StepOut.grads of the FIRST ppo mini-batch, where the ratio is exactly 1 and nothing is clipped). delta: the update, same order
+    (e.g. masters after - masters before, scaled as the read needs). Returns {"before", "inside", "after", "all"}: float64 sums."""
+    nk = len(keys)
+    if len(grad_ascent) != len(delta) or len(delta) % nk:
+        raise ValueError("gradient and update lists differ")
+    out = {b: 0.0 for b in blocks}
+    for i, (g, d) in enumerate(zip(grad_ascent, delta)):
+        L = i // nk
+        v = float((torch.as_tensor(g).double() * torch.as_tensor(d).double()).sum())
+        for b, rng in blocks.items():
+            if L in rng:
+                out[b] += v
+    out["all"] = sum(out[b] for b in blocks)
+    return out

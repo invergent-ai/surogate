@@ -127,6 +127,38 @@ def main():
     assert all(torch.equal(a, b) for a, b in zip(tr.opt.masters, m0)) and not tr.opt.opt.state, "masters / optimizer not restored"
     assert os.path.exists(os.path.join(tmp, "STOP")), "no STOP file"
     print("end to end: the step fails loudly, STOP written, masters and optimizer restored: PASS")
+    # RX's per-attempt sketches (accumulate_row + WorkerCore._sketch_row)
+    keys = TS.param_keys(64)
+    sh2 = [{k: (3, 5) for k in keys} for _ in range(24)]
+    w = fake_worker(True, 0, sh2, keys)
+    w.sk_visits, w.sk_stride, w._row_sketch = {45, 20}, 4, None
+
+    def run_all(on_grad, qb, seed=9):
+        g = torch.Generator().manual_seed(seed)
+        rec = {}
+        for v in range(47, -1, -1):
+            L = VL[v]
+            for j, k in enumerate(keys):
+                x = torch.randn(sh2[L][k], generator=g)
+                rec[(v, L, j)] = x
+                on_grad(v, L, j, x)
+        return rec
+    recs = {}
+    TS.accumulate_row(w, lambda og, qb: recs.update(run_all(og, qb)), 1000, "main", 128, VL, lambda: None)
+    rs = w._row_sketch
+    assert torch.equal(rs[("visit", 45, "qA")], recs[(45, VL[45], keys.index("qA"))]) and ("visit", 44, "qA") not in rs
+    assert ("visit", 20, "A13") not in rs, "expert keys are sampled per layer, not per visit"
+    L = VL[20]
+    tot = sum(recs[(v, L2, 1)] for (v, L2, j) in recs if L2 == L and j == 1)
+    assert torch.allclose(rs[("layer", L, "B13")], tot.reshape(-1)[::4], rtol=0, atol=1e-6)
+    w2 = SimpleNamespace(sketch={}, sketch_meta={})
+    row = SimpleNamespace(trial_idx=7, group_idx=1, advantage=-0.5, notes={})
+    TS.WorkerCore._sketch_row(w2, row, {k: v.clone() for k, v in rs.items()}, "ppo", 200.0)
+    assert torch.allclose(w2.sketch[7][("visit", 45, "qA")], rs[("visit", 45, "qA")] / (0.5 / 200.0))
+    row0 = SimpleNamespace(trial_idx=8, group_idx=1, advantage=0.0, notes={})
+    TS.WorkerCore._sketch_row(w2, row0, rs, "ppo", 200.0)
+    assert w2.sketch_meta[8]["rows_skipped_zero_factor"] == 1 and 8 not in w2.sketch
+    print("sketches: named visits' attention keys, expert samples of layer totals, divided by -A / N, A = 0 counted: PASS")
     print("T8 LEAN CPU TEST: PASS")
     return 0
 

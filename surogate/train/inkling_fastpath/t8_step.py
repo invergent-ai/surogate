@@ -86,6 +86,13 @@ class T8Config:
     lean_host: bool = False         # S4 (a): no per-row copy of a visited-once layer's gradient (added straight into the worker's sum; looped
                                     # layers keep their per-row sum until their last visit: same additions in the same order, bitwise).
                                     # A row that runs out of card memory after its first add is NOT retried: the step fails (STOP, masters restored).
+    # RX's per-attempt gradient sketches (LOOP-W5.md 4.3): for every attempt (row.trial_idx), the gradient of its summed loss-token log-prob term
+    # BEFORE the advantage, on the attention keys of the named VISITS and on every sketch_expert_stride-th coordinate of each expert key (physical
+    # layer totals), written to sketch_dir per worker at the end of the step. In "ppo" mode the row's gradient is divided by its seed factor -A / N
+    # (exact at ratio 1, i.e. the first mini-batch; later: the sum of r_t x grad log pi over the unclipped tokens). Rows with A = 0 are counted, not sketched.
+    sketch_visits: tuple = ()
+    sketch_expert_stride: int = 0
+    sketch_dir: str = ""
     empty_pinned_each_visit: bool = False  # S4 (b): torch's pinned pool emptied after every visit. G17 (g17-2): (a) + (b) together saved 1.1 GiB host
                                     # per worker at 57k but cost 15 % tok/s (171 -> 146); off by default
 
@@ -98,6 +105,12 @@ def validate_config(cfg: T8Config) -> None:
         raise ValueError(f"attn_rank {cfg.attn_rank}: the engine's S10 kernels take ranks 1..64")
     if cfg.attn_rank and cfg.attn_alpha / cfg.attn_rank not in (0.125, 0.25, 0.5, 1.0, 2.0, 4.0):
         raise ValueError("attn_alpha / attn_rank must be a power of two (the store's bf16 fold is then exact)")
+    if (cfg.sketch_visits or cfg.sketch_expert_stride) and not cfg.sketch_dir:
+        raise ValueError("sketches need sketch_dir")
+    if cfg.sketch_visits and not cfg.attn_rank:
+        raise ValueError("sketch_visits name attention keys: attn_rank must be > 0")
+    if any(not 0 <= int(v) < int(cfg.visits) for v in cfg.sketch_visits):
+        raise ValueError(f"sketch_visits {cfg.sketch_visits}")
     if cfg.lean_host and cfg.split_final:
         raise ValueError("lean_host adds straight into the step's sum: with split_final the two parts would be added in another order")
     if cfg.attn_rank and not set(cfg.train_keys) & set(ATTN_KEYS):
@@ -224,6 +237,14 @@ class ParamLayout:
 # worker side: the arithmetic of one row
 # ---------------------------------------------------------------------------------------------------------------------
 def accumulate_row(w, run, T: int, part: str, qb: int, visit_layers: list, empty_cache):
+    sk_v = getattr(w, "sk_visits", set())
+    sk_s = getattr(w, "sk_stride", 0)
+    if sk_v or sk_s:
+        if getattr(w, "_row_sketch", None) is None:
+            w._row_sketch = {}
+        row_sk = w._row_sketch                               # several parts of one row add into the same sketch
+    else:
+        row_sk = None
     """One row's backward and where its gradient goes (worker w: layout, flat, seg_keys, cfg, v_first, _segment_name).
     run(on_grad, q_block) runs the backward; it may raise torch.OutOfMemoryError.
     Default: the row's sums are collected per (layer, key) and returned (the caller checks them and adds them); an out-of-memory row is retried
@@ -239,6 +260,7 @@ def accumulate_row(w, run, T: int, part: str, qb: int, visit_layers: list, empty
     while True:
         pg, ps = {}, {}
         added = [False]
+        sk_try = {} if row_sk is not None else None          # this attempt's contributions; merged only if the backward completes
 
         def on_grad(v, layer, j, gj):
             if (layer, j) not in w.layout.index:
@@ -246,6 +268,15 @@ def accumulate_row(w, run, T: int, part: str, qb: int, visit_layers: list, empty
             if lean and not bool(torch.isfinite(gj).all()):
                 raise T8GateError(f"FINITE GATE: T {T}: layer {layer} {w.layout.keys[j]} (visit {v}) holds non-finite values")
             c = gj.float().cpu()
+            if sk_try is not None:
+                key = w.layout.keys[j]
+                if j >= 4 and v in sk_v:                     # an attention key of a named visit (layer run)
+                    kk = ("visit", v, key)
+                    sk_try[kk] = c.clone() if kk not in sk_try else sk_try[kk].add_(c)
+                if j < 4 and sk_s:                           # every sk_s-th coordinate of the expert key, physical-layer total
+                    kk = ("layer", layer, key)
+                    smp = c.reshape(-1)[::sk_s].clone()
+                    sk_try[kk] = smp if kk not in sk_try else sk_try[kk].add_(smp)
             if j in w.seg_keys:
                 k = (part, w._segment_name(v), layer, w.layout.keys[j])
                 ps[k] = c.clone() if k not in ps else ps[k].add_(c)
@@ -260,6 +291,9 @@ def accumulate_row(w, run, T: int, part: str, qb: int, visit_layers: list, empty
         except torch.OutOfMemoryError:
             oom = True
         if not oom:
+            if sk_try is not None:
+                for k, x in sk_try.items():
+                    row_sk[k] = x if k not in row_sk else row_sk[k].add_(x)
             return pg, ps, retries, qb
         pg, ps = None, None                                   # outside the except block: the traceback's frames no longer hold tensors
         empty_cache()
@@ -281,10 +315,14 @@ class WorkerCore:
         self.layout, self.flat, self.cfg = layout, flat, cfg
         self.seg_keys = {layout.keys.index(k) for k in cfg.segment_keys}
         self.seg_acc = {}
+        self.sketch, self.sketch_meta = {}, {}
+        self.sk_visits = set(int(v) for v in getattr(cfg, "sketch_visits", ()))
+        self.sk_stride = int(getattr(cfg, "sketch_expert_stride", 0))
 
     def begin_step(self):
         self.flat.zero_()
         self.seg_acc = {}
+        self.sketch, self.sketch_meta = {}, {}
 
     def _segment_name(self, v: int) -> str:
         import t8_lean
@@ -395,6 +433,10 @@ class WorkerCore:
                 row_grad[k] = t if k not in row_grad else row_grad[k].add_(t)
             for k, t in part_seg.items():
                 row_seg[k] = t if k not in row_seg else row_seg[k].add_(t)
+        rs = getattr(self, "_row_sketch", None)
+        if rs is not None:
+            self._sketch_row(row, rs, mode, scale)
+            self._row_sketch = None
         for (L, j), t in row_grad.items():
             if not bool(torch.isfinite(t).all()):
                 raise T8GateError(f"FINITE GATE: row {i} (T {T}): layer {L} {self.layout.keys[j]} holds non-finite values")
@@ -425,7 +467,42 @@ class WorkerCore:
     def _release(self, ctx):
         pass
 
+    def _sketch_row(self, row, rs: dict, mode: str, scale: float) -> None:
+        if mode == "ppo":
+            factor = -float(row.advantage) / float(scale)
+        elif mode == "weights":
+            factor = float(row.notes["weight"])
+        else:
+            raise ValueError(f"sketches are defined for seeds 'ppo' and 'weights', not {mode!r}")
+        t = row.trial_idx
+        meta = self.sketch_meta.setdefault(t, {"rows": 0, "rows_skipped_zero_factor": 0, "advantage": float(row.advantage), "group": row.group_idx})
+        if factor == 0.0:
+            meta["rows_skipped_zero_factor"] += 1
+            return
+        meta["rows"] += 1
+        d = self.sketch.setdefault(t, {})
+        for k, x in rs.items():
+            y = x / factor
+            d[k] = y if k not in d else d[k].add_(y)
+
     def finish_step(self) -> dict:
+        written = []
+        sdir = getattr(self.cfg, "sketch_dir", "")
+        if sdir and self.sketch_meta:
+            os.makedirs(sdir, exist_ok=True)
+            tag = getattr(self, "card", os.getpid())
+            for t, meta in self.sketch_meta.items():
+                path = os.path.join(sdir, f"sketch_trial{t}_w{tag}.pt")
+                torch.save({"trial": t, **meta, "tensors": self.sketch.get(t, {}), "visits": sorted(self.sk_visits),
+                            "expert_stride": self.sk_stride}, path + ".tmp")
+                os.replace(path + ".tmp", path)
+                written.append(path)
+        self.sketch, self.sketch_meta = {}, {}
+        out = self._finish_segments()
+        out["sketch_files"] = written
+        return out
+
+    def _finish_segments(self) -> dict:
         """The segment sums as ONE tensor + an index (one file descriptor per worker over the pipe, whatever K and the keys)."""
         keys = sorted(self.seg_acc, key=str)
         index = [(k, tuple(self.seg_acc[k].shape)) for k in keys]
@@ -641,6 +718,7 @@ def compute_step(handles: list, layout: ParamLayout, flats: list, shapes: list, 
     m["wall_s"] = wall
     m["tok_per_s_per_card"] = tokens / max(wall, 1e-9) / len(handles)
     m["workers"] = [f["stats"] for f in fin]
+    m["sketch_files"] = [p for f in fin for p in f.get("sketch_files", [])]
     return StepOut(grads=grads, segments=segments, metrics=m, rows=sorted(results, key=lambda r: r["i"]),
                    sense="ascent" if seeds == "weights" else "descent")
 
