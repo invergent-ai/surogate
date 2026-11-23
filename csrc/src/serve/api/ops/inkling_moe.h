@@ -114,7 +114,7 @@ struct InklingMoeAdapters {
     const LoraBank* table          = nullptr; ///< device; null = no adapter in this round
     const std::int32_t* token_slot = nullptr; ///< device I32 [T]; null with uniform_slot
     const std::int32_t* uniform_slot = nullptr; ///< device I32 [1]: one slot for the whole round
-    std::int32_t max_rank          = 0;       ///< the store's padded rank (<= kMaxAdapterRank)
+    std::int32_t max_rank          = 0;       ///< the expert banks' rank (store max_rank unless --max-expert-lora-rank; <= kMaxAdapterRank)
 };
 
 /// Test / debug taps: device buffers the call copies its intermediates into, by SLOT row

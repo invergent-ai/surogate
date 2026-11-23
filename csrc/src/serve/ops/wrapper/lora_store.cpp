@@ -160,8 +160,6 @@ void LoraStore::set_slot(const void* base_key, std::int32_t port, std::int32_t s
         b.size() != static_cast<std::size_t>(out_dim) * rank) {
         throw std::invalid_argument("lora_store: A must be [rank,in] and B [out,rank]");
     }
-    advance_kv_generation(slot);
-
     const Key key{base_key, port};
     auto found = banks_.find(key);
     if (found == banks_.end()) {
@@ -198,6 +196,7 @@ void LoraStore::set_slot(const void* base_key, std::int32_t port, std::int32_t s
         throw std::invalid_argument("lora_store: adapter rank " + std::to_string(rank) +
                                     " exceeds this bank's rank " + std::to_string(bank_rank));
     }
+    advance_kv_generation(slot); // after every refusal: a refused write leaves the slot's prefix state alone
 
     // A padded to the bank's rank rows, with alpha/r folded in; rows past `rank` stay
     // zero so a short adapter contributes nothing through them.
@@ -457,7 +456,14 @@ void LoraStore::ensure_banks() {
     for (const auto& [where, parts] : directory_) {
       for (const auto& binding : parts) {
         const Key key{binding.key, binding.port};
-        if (banks_.find(key) != banks_.end()) { continue; }
+        if (const auto built = banks_.find(key); built != banks_.end()) {
+            // A binding registered after its bank was built (a later ensure_banks) must agree with it.
+            if (built->second.view.k != binding.in || built->second.view.n != binding.out ||
+                built->second.view.rank != binding_rank(binding)) {
+                throw std::logic_error("LoRA alias disagrees with its existing bank's shape or rank");
+            }
+            continue;
+        }
         const auto [existing, inserted] = queued.emplace(key, &binding);
         if (!inserted) {
             if (existing->second->in != binding.in || existing->second->out != binding.out ||
