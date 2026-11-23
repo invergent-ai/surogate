@@ -15,8 +15,8 @@ namespace {
 constexpr std::pair<std::string_view, double> kNamedEffort[] = {
     {"none", 0.0}, {"minimal", 0.1}, {"low", 0.2}, {"medium", 0.7}, {"high", 0.9}, {"xhigh", 0.99}, {"max", 0.99}};
 // The effort a request that sets none is rendered with. vLLM's renderer default (inkling_encoding.DEFAULT_REASONING_EFFORT)
-// is 0.9; OWNER RULE 2026-11-21 17:40 (rl/engine-inkling-2026-11-21/LANE-RULES.md 20): "always use inkling at 0.99
-// reasoning effort" -- our default is 0.99 (= 'xhigh' / 'max'). A request that names an effort (top-level
+// is 0.9; deployment rule since 2026-11-21: Inkling is always served at reasoning effort 0.99
+// -- our default is 0.99 (= 'xhigh' / 'max'). A request that names an effort (top-level
 // reasoning_effort, chat_template_kwargs.reasoning_effort: a level, a number, a numeric string) keeps it; absent, null and
 // "auto" (dropped by the kwargs merge) take this default. Test: sinfer_inkling_frontend_test over vectors/renderer-099
 // (the default-effort requests expect vLLM's ids for the same body with chat_template_kwargs.reasoning_effort = 0.99).
@@ -55,9 +55,111 @@ bool is_image_part(std::string_view type) {
     return type == "image" || type == "input_image" || type == "image_url";
 }
 
+// vLLM's parse_chat_message_content_part for a part type outside its parser map (renderers/chat_utils/chat_message.py):
+// sorted(MM_PARSER_MAP.keys() | {"text", "refusal"}).
+constexpr std::string_view kSupportedPartTypes =
+    "audio_embeds, audio_url, image_embeds, image_pil, image_url, input_audio, input_image, input_text, output_text, "
+    "prompt_embeds, refusal, text, thinking, tool_reference, video_embeds, video_url";
+
+// Python's repr() of a JSON value (str quoting as CPython: single quotes unless the text has ' and no ").
+void python_repr(std::string& out, const PyValue& v) {
+    switch (v.kind) {
+    case PyValue::Kind::Null: out += "None"; return;
+    case PyValue::Kind::Bool: out += v.boolean ? "True" : "False"; return;
+    case PyValue::Kind::Int: out += v.text; return;
+    case PyValue::Kind::Float: out += py_float_repr(v.number); return;
+    case PyValue::Kind::String: {
+        const bool has_single = v.text.find('\'') != std::string::npos;
+        const char quote = has_single && v.text.find('"') == std::string::npos ? '"' : '\'';
+        out += quote;
+        for (const char ch : v.text) {
+            const auto c = static_cast<unsigned char>(ch);
+            if (ch == '\\' || ch == quote) { out += '\\'; out += ch; }
+            else if (ch == '\n') { out += "\\n"; }
+            else if (ch == '\r') { out += "\\r"; }
+            else if (ch == '\t') { out += "\\t"; }
+            else if (c < 0x20 || c == 0x7f) {
+                char buf[8];
+                std::snprintf(buf, sizeof(buf), "\\x%02x", c);
+                out += buf;
+            } else { out += ch; }
+        }
+        out += quote;
+        return;
+    }
+    case PyValue::Kind::Array:
+        out += '[';
+        for (std::size_t i = 0; i < v.items.size(); ++i) {
+            if (i != 0) { out += ", "; }
+            python_repr(out, v.items[i]);
+        }
+        out += ']';
+        return;
+    case PyValue::Kind::Object:
+        out += '{';
+        for (std::size_t i = 0; i < v.keys.size(); ++i) {
+            if (i != 0) { out += ", "; }
+            python_repr(out, PyValue::from_string(v.keys[i]));
+            out += ": ";
+            python_repr(out, v.items[i]);
+        }
+        out += '}';
+        return;
+    }
+}
+
+// vLLM parses an input_image part with TypeAdapter(ResponseInputImageParam), whose `detail` is required: without it
+// pydantic refuses the request with this text (pydantic 2.14 in the reference image; input_value is the part's repr,
+// cut to its first 25 and last 24 characters when longer than 50).
+[[noreturn]] void refuse_input_image_without_detail(const PyValue& part) {
+    std::string repr;
+    python_repr(repr, part);
+    if (repr.size() > 50) {
+        // pydantic-core cuts the repr by bytes (first 25, last 24); the cut points move to UTF-8 character boundaries
+        // so a non-ASCII value can never make the error body invalid UTF-8.
+        const auto continuation = [&](std::size_t i) { return (static_cast<unsigned char>(repr[i]) & 0xC0U) == 0x80U; };
+        std::size_t head = 25, tail = repr.size() - 24;
+        while (head > 0 && continuation(head)) { --head; }
+        while (tail < repr.size() && continuation(tail)) { ++tail; }
+        repr = repr.substr(0, head) + "..." + repr.substr(tail);
+    }
+    throw RequestError("1 validation error for ResponseInputImageParam\ndetail\n  Field required [type=missing, input_value=" +
+                       repr + ", input_type=dict]\n    For further information visit https://errors.pydantic.dev/2.14/v/missing");
+}
+
+// The image source of an image_url / input_image part, as vLLM's parser map reads it: image_url.url (the OpenAI form)
+// or a plain URL string (the simple form vLLM also accepts); input_image's image_url string (Responses spelling).
+std::string image_source(const PyValue& part, std::string_view type) {
+    const PyValue* value = part.find("image_url");
+    if (value != nullptr && type == "image_url" && value->is_object()) { value = value->find("url"); }
+    if (value == nullptr || !value->is_string() || value->text.empty()) {
+        throw RequestError("image part has no image URL: expected " +
+                           std::string(type == "image_url" ? "image_url.url" : "image_url") + " to be a URL string");
+    }
+    return value->text;
+}
+
+// Images in the request (vision on): vLLM's MultiModalItemTracker counts the image items in message order and refuses
+// the first one over the limit; the sources are what the serving layer fetches.
+struct ImageScan {
+    std::uint64_t limit = 0;
+    std::vector<std::string>* urls = nullptr;
+};
+
+void take_image_part(const PyValue& part, std::string_view type, ImageScan& scan) {
+    if (scan.limit == 0) { throw RequestError(image_count_message(0)); }
+    if (type == "image") {
+        throw RequestError("Unsupported chat content part type: 'image'. Supported types: " +
+                           std::string(kSupportedPartTypes) + ".");
+    }
+    if (type == "input_image" && part.find("detail") == nullptr) { refuse_input_image_without_detail(part); }
+    if (scan.urls->size() >= scan.limit) { throw RequestError(image_count_message(scan.limit)); }
+    scan.urls->push_back(image_source(part, type));
+}
+
 // What the request model leaves of a message's content: the shapes that reach the renderer as a lazy iterator instead
 // of a list are refused there ("message content must be a string or a sequence of parts").
-void check_content_shape(const PyValue& message) {
+void check_content_shape(const PyValue& message, ImageScan& images) {
     const PyValue* content = message.find("content");
     if (content == nullptr || content->is_null() || content->is_string()) { return; }
     if (!content->is_array()) { throw RequestError("message content must be a string or a sequence of parts"); }
@@ -70,14 +172,17 @@ void check_content_shape(const PyValue& message) {
         if (!type->is_string()) { throw RequestError("message content must be a string or a sequence of parts"); }
         const std::string& t = type->text;
         if (t == "text" || t == "input_text" || t == "thinking") { continue; }
-        if (is_image_part(t)) { throw RequestError("At most 0 image(s) may be provided in one prompt."); }
+        if (is_image_part(t)) {
+            take_image_part(part, t, images);
+            continue;
+        }
         if (t == "tool_error") { throw RequestError("message content must be a string or a sequence of parts"); }
         throw RequestError("unsupported Inkling2 content part type: '" + t + "'");
     }
 }
 
 struct Part {
-    std::string kind;  // text | thinking | tool_error
+    std::string kind;  // text | thinking | tool_error | image
     std::string text;
 };
 
@@ -110,7 +215,8 @@ std::vector<Part> iter_parts(const PyValue* content) {
         } else if (type->is_string() && type->text == "tool_error") {
             parts.push_back({"tool_error", text_of("text")});
         } else if (type->is_string() && is_image_part(type->text)) {
-            throw RequestError("At most 0 image(s) may be provided in one prompt.");
+            // Accepted by parse_chat_request only with vision on; the marker and its pads are written by Writer.
+            parts.push_back({"image", ""});
         } else {
             throw RequestError("unsupported Inkling2 content part type: " + py_repr(*type));
         }
@@ -120,7 +226,8 @@ std::vector<Part> iter_parts(const PyValue* content) {
 
 class Writer {
 public:
-    Writer(const TextEncoder& encode, const SpecialTokens& sp) : encode_(encode), sp_(sp) {}
+    Writer(const TextEncoder& encode, const SpecialTokens& sp, std::span<const std::uint64_t> image_tokens)
+        : encode_(encode), sp_(sp), image_tokens_(image_tokens) {}
 
     void text(std::string_view s) {
         if (s.empty()) { return; }
@@ -141,6 +248,17 @@ public:
     void message(std::string_view role, std::string_view kind, std::string_view payload, std::string_view author) {
         token(role_token(role));
         if (!author.empty()) { text(author); }
+        if (kind == "image") {
+            // vLLM: the renderer's bare <|content_image|>, which the multimodal processor replaces with itself + N pads.
+            if (next_image_ >= image_tokens_.size()) {
+                throw std::logic_error("Inkling image part without a prepared image");
+            }
+            if (sp_.image_pad < 0) { throw std::invalid_argument("Inkling tokenizer has no <|unused_200054|> image pad"); }
+            token(sp_.content_image);
+            ids_.insert(ids_.end(), static_cast<std::size_t>(image_tokens_[next_image_++]), sp_.image_pad);
+            token(sp_.end_message);
+            return;
+        }
         int kind_token = -1;
         if (kind == "text") { kind_token = sp_.content_text; }
         else if (kind == "thinking") { kind_token = sp_.content_thinking; }
@@ -153,11 +271,18 @@ public:
         token(sp_.end_message);
     }
 
-    std::vector<int> take() { return std::move(ids_); }
+    std::vector<int> take() {
+        if (next_image_ != image_tokens_.size()) {
+            throw std::logic_error("Inkling render met fewer image parts than prepared images");
+        }
+        return std::move(ids_);
+    }
 
 private:
     const TextEncoder& encode_;
     const SpecialTokens& sp_;
+    std::span<const std::uint64_t> image_tokens_;
+    std::size_t next_image_ = 0;
     std::vector<int> ids_;
 };
 
@@ -240,6 +365,10 @@ std::string ascii_json_string(const std::string& s) {
 
 } // namespace
 
+std::string image_count_message(std::uint64_t limit) {
+    return "At most " + std::to_string(limit) + " image(s) may be provided in one prompt.";
+}
+
 SpecialTokens SpecialTokens::resolve(const std::function<std::optional<int>(std::string_view)>& token_id) {
     SpecialTokens t;
     std::string missing;
@@ -268,12 +397,14 @@ SpecialTokens SpecialTokens::resolve(const std::function<std::optional<int>(std:
     need(t.content_invoke_tool_json, {"<|content_invoke_tool_json|>"}, false);
     need(t.content_invoke_tool_text, {"<|content_invoke_tool_text|>"}, true);
     need(t.end_message, {"<|end_message|>"}, false);
+    need(t.image_pad, {"<|unused_200054|>"}, true);
     if (!missing.empty()) { throw std::invalid_argument("Inkling tokenizer is missing special tokens: " + missing); }
     return t;
 }
 
-ChatRequest parse_chat_request(std::string_view body_json) {
+ChatRequest parse_chat_request(std::string_view body_json, std::uint64_t image_limit) {
     ChatRequest r;
+    ImageScan images{.limit = image_limit, .urls = &r.image_urls};
     PyValue body = py_json_loads(body_json);
     if (!body.is_object()) { throw RequestError("request body must be a JSON object"); }
 
@@ -299,7 +430,7 @@ ChatRequest parse_chat_request(std::string_view body_json) {
         if (had && !reasoning_content.is_null() && is_none(m.find("reasoning"))) {
             m.set("reasoning", std::move(reasoning_content));
         }
-        check_content_shape(m);
+        check_content_shape(m, images);
     }
 
     // tools (check_tool_usage: [] means none) and their model dump
@@ -460,7 +591,11 @@ std::string effort_text(double effort) {
     return std::string("Thinking effort level: ") + buf;
 }
 
-std::vector<int> render_chat(const ChatRequest& request, const TextEncoder& encode_text, const SpecialTokens& sp) {
+std::vector<int> render_chat(const ChatRequest& request, const TextEncoder& encode_text, const SpecialTokens& sp,
+                             std::span<const std::uint64_t> image_tokens) {
+    if (image_tokens.size() != request.image_urls.size()) {
+        throw std::logic_error("Inkling render needs one token count per image part");
+    }
     const PyValue& kw = request.template_kwargs;
     const PyValue* kw_tools = kw.find("tools");
     const PyValue* cfm = kw.find("continue_final_message");
@@ -511,7 +646,7 @@ std::vector<int> render_chat(const ChatRequest& request, const TextEncoder& enco
         declared = std::move(kept);
     }
 
-    Writer w(encode_text, sp);
+    Writer w(encode_text, sp, image_tokens);
     if (!declared.empty()) { w.message("system", "xml", tool_declare_json(declared), "tool_declare"); }
 
     std::optional<std::string> pending_effort = effort_text(effort);

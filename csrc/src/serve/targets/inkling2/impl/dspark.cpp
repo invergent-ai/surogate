@@ -1,4 +1,4 @@
-// Inkling-2-Mini's DSpark drafter (lane e2): load-time derivations and the append / propose rounds (dspark.h).
+// Inkling-2-Mini's DSpark drafter: load-time derivations and the append / propose rounds (dspark.h).
 
 #include "targets/inkling2/impl/dspark.h"
 #include "targets/inkling2/impl/variant.h"
@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -111,9 +112,15 @@ bool dspark_bf16_weights_forced() {
 }
 
 bool dspark_fp8_weights_requested() {
-    // DEFAULT since fp8ab2 (card 7 16:34): identity 16 / 16, tokens / round 3.59 vs 3.56 (BF16), -0.29 GiB device
-    // with the FP8 fold. SUROGATE_SERVE_DSPARK_BF16_WEIGHTS=1 keeps the BF16 drafter weights.
-    return !dspark_bf16_weights_forced();
+    // OPT-IN (SUROGATE_SERVE_DSPARK_FP8_WEIGHTS=1) since M10: the BF16 drafter is the default again -- h2's drafter A/B on
+    // M7 (perf/h2/m7-55c27326-1121-1757/dab): the FP8 route (W8A16 dspark_gemm_w8 + the FP8 fold) costs ~9.5 % per
+    // stream at 8 streams (T0 105.9 vs 117.1, T1 78.5 vs 86.7 tok/s), equal at 1 stream, same tokens / round.
+    // SUROGATE_SERVE_DSPARK_BF16_WEIGHTS=1 still forces BF16.
+    static const bool fp8 = [] {
+        const char* raw = std::getenv("SUROGATE_SERVE_DSPARK_FP8_WEIGHTS");
+        return raw != nullptr && raw[0] == '1';
+    }();
+    return fp8 && !dspark_bf16_weights_forced();
 }
 
 namespace {
@@ -133,13 +140,20 @@ void dense(WorkspaceArena& work, const DSparkDerived& d, const Weight& w, const 
 } // namespace
 
 bool dspark_fp8_fold_requested() {
-    // DEFAULT since fp8ab2 (with the FP8 weights; CPU r1+r2: no acceptance loss). SUROGATE_SERVE_DSPARK_BF16_FOLD=1
-    // keeps the BF16 fold.
-    static const bool bf16 = [] {
-        const char* raw = std::getenv("SUROGATE_SERVE_DSPARK_BF16_FOLD");
-        return raw != nullptr && raw[0] == '1';
+    // OPT-IN (SUROGATE_SERVE_DSPARK_FP8_FOLD=1) since M10, only with the FP8 weights (dspark_fp8_weights_requested); CPU
+    // r1+r2: no acceptance loss. An FP8 fold over BF16 weights has no proof (review R5 minor 7): the flag alone is ignored,
+    // with one line on stderr. SUROGATE_SERVE_DSPARK_BF16_FOLD=1 still forces the BF16 fold.
+    static const bool fp8 = [] {
+        const char* fp8_raw  = std::getenv("SUROGATE_SERVE_DSPARK_FP8_FOLD");
+        const char* bf16_raw = std::getenv("SUROGATE_SERVE_DSPARK_BF16_FOLD");
+        const bool asked = fp8_raw != nullptr && fp8_raw[0] == '1' && !(bf16_raw != nullptr && bf16_raw[0] == '1');
+        if (asked && !dspark_fp8_weights_requested()) {
+            std::fprintf(stderr, "dspark: SUROGATE_SERVE_DSPARK_FP8_FOLD=1 ignored: it needs SUROGATE_SERVE_DSPARK_FP8_WEIGHTS=1\n");
+            return false;
+        }
+        return asked;
     }();
-    return !bf16;
+    return fp8;
 }
 
 namespace {
@@ -337,8 +351,8 @@ std::size_t dspark_propose_workspace_bytes(std::int32_t batch, std::uint32_t max
     b += align256(static_cast<std::size_t>(G::kRnnRows) * k * 4);
     b += 3 * align256(static_cast<std::size_t>(G::kRank) * batch * 2);
     b += 2 * align256(static_cast<std::size_t>(ops::dspark_vocab_tiles(G::kVocab)) * batch * 4);
-    b += align256(n * 4); // query positions (lane c's draft attention)
-    // lane c's draft attention (its split partials), the larger of the local and the global plan
+    b += align256(n * 4); // query positions (the draft attention)
+    // the draft attention (its split partials), the larger of the local and the global plan
     const ops::GqaExecutionEnvelope envelope{0, std::max<std::uint32_t>(max_visible_keys, G::kBlock)};
     b += align256(std::max(ops::inkling_draft_attention_workspace_bytes(G::kBlockWindow, G::kBlock, batch, envelope),
                            ops::inkling_draft_attention_workspace_bytes(0, G::kBlock, batch, envelope)));
@@ -453,7 +467,7 @@ void dspark_propose(const load::InklingWeights& w, const DSparkDerived& d, const
             ops::dspark_block_attention(q, G::kQRows, p.anchor_positions, p.table_rows, B, window, G::kScale, plane, attn,
                                         s);
         } else {
-            // lane c's draft mode (inkling/c 9fe6290b): all 8 rows of a lane at P + 7, keys from the plane only
+            // the attention's draft mode: all 8 rows of a lane at P + 7, keys from the plane only
             ops::InklingAttentionRows rows;
             rows.positions     = Tensor(qpos, DType::I32, {G::kBlock, B});
             rows.kv_table_rows = Tensor(const_cast<std::int32_t*>(p.table_rows), DType::I32, {B});
@@ -509,7 +523,8 @@ void dspark_propose(const load::InklingWeights& w, const DSparkDerived& d, const
                                 j == 0 ? nullptr : state[(j + 1) & 1], state[j & 1], latent, s);
         ops::dspark_markov_vocab(base, G::kVocabPadded, 1 + j, B, d.fp8_fold ? nullptr : d.fold_w, d.fold_b, latent,
                                  G::kVocab, nullptr, part_v, part_i, nullptr, nullptr, s,
-                                 d.fp8_fold ? d.fold_codes : nullptr, d.fp8_fold ? d.fold_scales : nullptr);
+                                 d.fp8_fold ? d.fold_codes : nullptr, d.fp8_fold ? d.fold_scales : nullptr,
+                                 p.sampling, p.sampling != nullptr ? p.anchor_positions : nullptr, j);
         ops::dspark_markov_pick(part_v, part_i, tiles, B, j, stride, p.drafts, s);
     }
 }
@@ -552,7 +567,7 @@ DSparkKv dspark_kv(const family::DSparkRuntime& rt) {
                                   static_cast<std::int32_t>(rt.text_kv->max_context())};
     }
     kv.max_visible_keys = rt.text_kv->max_context();
-    kv.naive_attention  = kv.views[0].dtype != DType::FP8_E4M3FN; // lane c's kernel reads FP8 planes only
+    kv.naive_attention  = kv.views[0].dtype != DType::FP8_E4M3FN; // the draft kernel reads FP8 planes only
     return kv;
 }
 
@@ -588,6 +603,12 @@ void Variant::dspark_propose(const ModelView& model, const family::DSparkRuntime
     p.drafts           = static_cast<std::int32_t*>(args.drafts.data);
     p.draft_stride     = args.drafts.ne[0];
     p.k                = args.k;
+    // Coupled sampled drafts (dspark.h) unless SUROGATE_SERVE_DSPARK_SAMPLED_DRAFTS=0 (greedy drafts, A/B).
+    static const bool sampled_drafts = [] {
+        const char* raw = std::getenv("SUROGATE_SERVE_DSPARK_SAMPLED_DRAFTS");
+        return raw == nullptr || raw[0] == '\0' || std::atoi(raw) != 0;
+    }();
+    p.sampling = sampled_drafts ? args.sampling : nullptr;
     // The vocabulary pass keeps 16 lanes' latents in shared memory: wider rounds run in groups of 16.
     for (std::int32_t b0 = 0; b0 < args.batch; b0 += 16) {
         p.batch = std::min<std::int32_t>(16, args.batch - b0);
@@ -597,6 +618,7 @@ void Variant::dspark_propose(const ModelView& model, const family::DSparkRuntime
         if (g.lanes != nullptr) { g.lanes += b0; }
         g.table_rows += b0;
         g.drafts += static_cast<std::int64_t>(b0) * p.draft_stride;
+        if (g.sampling != nullptr) { g.sampling += b0; }
         detail::dspark_propose(*im.weights, *im.dspark, dspark_kv(rt), g, *rt.work, rt.stream);
     }
 }
@@ -620,16 +642,16 @@ std::uint8_t Variant::dspark_content_kind(std::span<const TokenId> ledger) {
 std::uint32_t Variant::dspark_draft_cap(std::span<const TokenId> ledger, const family::DSparkLaneStats* stats) {
     const std::uint8_t kind = dspark_content_kind(ledger);
     if (stats == nullptr) {
-        // static per content kind (lanes/e2/k_policy.py): tool-call JSON 7, structure 7, thinking 3, text 2
+        // static per content kind (a CPU k-policy study): tool-call JSON 7, structure 7, thinking 3, text 2
         constexpr std::uint32_t kStatic[4] = {7, 7, 3, 2};
         return kStatic[kind];
     }
-    // Per lane (agent-EN-e2c): the k of {0, 1, 2, 3, 7} with the most committed tokens per unit of round time,
+    // Per lane: the k of {0, 1, 2, 3, 7} with the most committed tokens per unit of round time,
     //   E_k = 1 + a + ... + a^k (per-position acceptance a, geometric), cost_k = the 1-stream round time of window k,
     // with a = this request's own acceptance on this content kind (accepted drafts / (accepted drafts + rejecting
     // rounds), decayed), shrunk to the kind's prior by kPriorTrials pseudo-trials. Priors: the engine's real rounds
-    // (lane h M6 / e2c, temperature 0) and lanes/e2/k_policy.json (CPU, round dynamics): tool JSON ~0.92, structure
-    // ~0.85, thinking ~0.70, answer text ~0.52. Costs (ms, lane h M6 1 x 3k, graphs, T0; regression of decode seconds
+    // (temperature 0) and a CPU study of the round dynamics: tool JSON ~0.92, structure
+    // ~0.85, thinking ~0.70, answer text ~0.52. Costs (ms, 1 x 3k, graphs, T0; regression of decode seconds
     // on rounds per window): k2 9.68, k3 10.44, k7 13.69; plain decode 6.1 (+0.5 for the context append at k 0); k1
     // interpolated. Break-even vs k 0 near a = 0.42; k 7 overtakes k 3 near a = 0.76.
     constexpr float kPrior[4]    = {0.92f, 0.85f, 0.70f, 0.52f};

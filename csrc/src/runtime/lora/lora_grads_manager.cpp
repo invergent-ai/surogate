@@ -144,6 +144,7 @@ void ModularLoRAGradsManager::allocate_gradients() {
     };
 
     for (int l = 0; l < mConfig.num_layers; ++l) {
+        if (!mConfig.layer_local.empty() && !mConfig.layer_local[static_cast<std::size_t>(l)]) continue;
         std::string prefix = fmt::format("lora_grad_layer_{}", l);
         auto& full = mFullGrads.blocks[l];
         auto& shard = mShardedGrads.blocks[l];
@@ -399,6 +400,8 @@ void ModularLoRAGradsManager::set_schema_hook_registry(const dsl::HookRegistry* 
 
 void ModularLoRAGradsManager::reduce_gradients(cudaStream_t stream, NCCLCommunicator& comm) {
     if (comm.world_size() == 1) return;
+    // Stage-local: each layer's gradient exists on the one GPU that runs it, and the arenas differ per rank.
+    if (!mConfig.layer_local.empty()) return;
 
     // One collective per arena rather than one per adapter tensor (two per
     // target per layer before). Expert adapters are EP-sharded: under EP they
@@ -421,6 +424,7 @@ void ModularLoRAGradsManager::reduce_layer_gradients(int layer_idx, cudaStream_t
     if (layer_idx < 0 || layer_idx >= static_cast<int>(mFullGrads.blocks.size())) {
         return;
     }
+    if (!mConfig.layer_local.empty()) return;  // stage-local: nothing to reduce (see reduce_gradients)
     const bool ep_active = comm.ep_enabled();
     auto all_reduce_layer = [&](LoRATargetId id, auto& layer) {
         // Expert adapters are EP-sharded; reducing them over the full world would mix experts.

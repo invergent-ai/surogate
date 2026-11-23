@@ -142,8 +142,9 @@ CUDA_VISIBLE_DEVICES=0 surogate grpo-colocate \
 To use another supported model, replace the model in all three files with its
 checkpoint and select the LoRA targets from that model's training example.
 `lora_target_modules: [all]` selects the targets supported by its training definition.
-For MoE models, also set `lora_dtype: bf16`; expert LoRA training currently requires
-BF16 adapters. Official quantized GPT-OSS and FP8 Laguna checkpoints must first be
+For MoE models either `lora_dtype` works: with `fp32` the expert LoRA gradients are
+accumulated and stored in FP32 (BF16 activations, FP32 masters); `bf16` halves the
+adapter's memory. Official quantized GPT-OSS and FP8 Laguna checkpoints must first be
 exported as BF16; their quantized formats cannot be used in this mode.
 
 Use the same model in all three files, matching `max_steps` in training and

@@ -29,11 +29,13 @@
 #include "family/impl/runtime/text_context.h"
 #include "family/impl/runtime/vision_context.h"
 #include "family/impl/runtime/vision_prefill.h"
+#include "family/vision_fp8.h"
 
 #include <cstddef>
 #include <cstdlib>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <string>
 #include <array>
 #include <atomic>
@@ -625,7 +627,7 @@ public:
     [[nodiscard]] bool kv_under_pressure() const noexcept;
     /// Round boundary: perform a reserve release another engine asked for, report pressure.
     bool kv_service_pressure() noexcept;
-    void kv_round_boundary() noexcept; ///< lane f1 M3-C: window-class compaction (pipelined executor)
+    void kv_round_boundary() noexcept; ///< M3-C: window-class compaction (pipelined executor)
 
     /// --kv-admission (DESIGN-kv-admission.md), set once by the executor before any request is
     /// planned. On demand only where a recompute reproduces a sequence: not on a pipeline stage
@@ -664,7 +666,7 @@ public:
         void* data = nullptr;
         ~PinnedBoundary() { if (data != nullptr) { cudaFreeHost(data); } }
     } stage_export, stage_import;
-    // DSpark on a pipeline (ENGINE-INKLING lane e1): the drafter stage's verify ids / positions for the round
+    // DSpark on a pipeline: the drafter stage's verify ids / positions for the round
     // (export, on the stage with the head) and their copy on the first stage (import). Empty for every other target.
     PinnedBoundary dspark_draft_export, dspark_draft_import;
     std::size_t stage_boundary_bytes_ = 0;
@@ -982,6 +984,9 @@ public:
     /// And not with in-place Marlin residency opted into (SUROGATE_SERVE_MARLIN_FP8): a base
     /// round's fused MLP would adopt a weight the adapter route then could not read.
     bool base_rounds_ = false;
+    /// --vision-fp8: the MXFP8 copies of the vision tower's block projections, held for the
+    /// program's life (VisionContext finds them through family::find_vision_fp8).
+    std::shared_ptr<const family::VisionFp8Weights> vision_fp8_;
     /// Whether a round over these lanes is a base round: none of their requests selects an
     /// adapter. `more` is a mixed round's other half (its staged prompts beside its decoders).
     [[nodiscard]] bool base_round_for(std::span<const std::uint32_t> lanes,
@@ -1069,6 +1074,10 @@ private:
     launch_dflash_round(std::span<const std::uint32_t> lanes,
                          std::span<const runtime::RoundBudget> budgets,
                          std::span<const std::uint32_t> prefill_lanes = {});
+    /// The decode-readiness check of row `row` of a DFlash round (launch_dflash_round and the DSpark pipeline
+    /// proposal share it): a valid, unique lane, active with budget, KV bound, frontier below capacity, ledgers aligned.
+    void check_dflash_row(std::span<const std::uint32_t> lanes, std::size_t row,
+                          const runtime::RoundBudget& budget, const char* what) const;
     [[nodiscard]] runtime::BatchedGeneratedRound consume_dflash_round(runtime::RoundHandle handle);
     void reserve_sequence_kv(SequenceState& sequence, std::uint32_t text_pages,
                              std::uint32_t backend_pages);
@@ -1087,7 +1096,7 @@ private:
                                         std::uint32_t nominal);
     void trim_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
                           std::uint32_t backend_tokens = 0);
-    // Window-bounded KV pages (lane f1, prefix_cache_impl.h; DESIGN-window-kv.md). All of them do
+    // Window-bounded KV pages (prefix_cache_impl.h). All of them do
     // nothing unless the text pool has a window class, which only a model with windowed layers has.
     [[nodiscard]] bool window_paging() const noexcept;
     /// Frontiers whose window the sequence must keep: its rewrite checkpoint, and the one its

@@ -1,11 +1,11 @@
 #pragma once
 
-// Inkling-2-Mini (inkling2_loop) routed mixture: the five lane-d ops of OPS.md section 3
+// Inkling-2-Mini (inkling2_loop) routed mixture: the five MoE ops of the op catalogue
 // (`inkling_route`, `inkling_quant_nvfp4_4o6`, `inkling_quant_mxfp8`, `inkling_softcap_swiglu`,
-// `inkling_moe`) in one header. Design and numerics: rl/engine-inkling-2026-11-21/lanes/d/DESIGN-moe.md.
+// `inkling_moe`) in one header. Design and numerics: the MoE design notes.
 // The semantic definition of every op is the python function of the same name in
-// rl/engine-inkling-2026-11-21/ref/inkling_ref.py, which follows the vLLM image's sm_120 kernels
-// (ref/src/vllm/models/inkling2/nvidia/ops/{moe,nvfp4,mxfp8,activation,moe_sm120}.py).
+// the Python reference inkling_ref.py (not in this repository), which follows the vLLM image's sm_120 kernels
+// (vllm/models/inkling2/nvidia/ops/{moe,nvfp4,mxfp8,activation,moe_sm120}.py).
 //
 // This op is deliberately NOT a `sparse_moe` geometry. The registered `sparse_moe` mixtures share a
 // codec-generic kernel family whose arithmetic follows the round's width (static activation scales,
@@ -83,7 +83,7 @@ struct InklingMoeWeights {
     InklingExpertBank w2;
 };
 
-/// The per-layer MoE payload lane e1's ModelView carries (`InklingMoePayload`, DESIGN-target 4).
+/// The per-layer MoE payload the target's ModelView carries (`InklingMoePayload`, DESIGN-target 4).
 using InklingMoePayload = InklingMoeWeights;
 
 /// Routed-expert capture for routing replay (R3): one row per VISIT. With the runtime's capture
@@ -114,7 +114,7 @@ struct InklingMoeAdapters {
     const LoraBank* table          = nullptr; ///< device; null = no adapter in this round
     const std::int32_t* token_slot = nullptr; ///< device I32 [T]; null with uniform_slot
     const std::int32_t* uniform_slot = nullptr; ///< device I32 [1]: one slot for the whole round
-    std::int32_t max_rank          = 0;       ///< the store's padded rank (<= kMaxAdapterRank)
+    std::int32_t max_rank          = 0;       ///< the expert banks' rank (store max_rank unless --max-expert-lora-rank; <= kMaxAdapterRank)
 };
 
 /// Test / debug taps: device buffers the call copies its intermediates into, by SLOT row
@@ -194,7 +194,7 @@ void inkling_moe(const Tensor& x, const InklingMoeWeights& weights, Tensor& out,
                  const InklingMoeOptions& options = {});
 
 // ---- Sub-ops (OPS.md names). Each is the exact stage `inkling_moe` runs, exposed for the op
-// ---- tests against the golden vectors and for the trainer lanes' cross-checks.
+// ---- tests against the golden vectors and for the trainer's cross-checks.
 
 /// Router: x BF16 [2304, T] -> logits FP32 [128, T], ids I32 [8, T] (selection order),
 /// weights FP32 [8, T] (x 8.0).
@@ -234,5 +234,19 @@ void inkling_decode_expert_units(const InklingExpertBank& bank, InklingExpertFor
 /// dependents at entry -- as the engine's inkling_mix / gemm_inv kernels do since e1 f9ebe0eb -- and then
 /// spins `nanoseconds` of wall time, so the next kernel (the MoE's route) launches early as in serving.
 void inkling_bench_predecessor(std::int32_t nanoseconds, cudaStream_t stream);
+
+/// TEST ONLY (pdl-chain regression, PDL audit 2026-11-21): how the bf16 activation rows (x, y) are read by the row
+/// quantisers and the fused-y down: 0 = plain ld.global (the serving form), 1 = ld.global.nc (the form the audit
+/// removed: negative control, the regression must see stale rows), 2 = ld.global.cg (reported). Never set in serving.
+void inkling_test_read_only_loads(int mode);
+/// TEST ONLY: copy `bytes` (multiple of 16) with a PDL-launched kernel that waits for its predecessor and lets its
+/// dependents launch at once (the engine's kernel pattern): the pdl-chain regression's writer of the reused x buffer.
+/// `hostile`: after its trigger, every CTA (2 per SM) first reads all of the OLD destination through ld.global.nc
+/// (planting stale lines next to the dependent's CTAs), then writes; `sink`: 1 int (required when hostile).
+void inkling_test_copy_rows(const void* source, void* destination, std::int64_t bytes, cudaStream_t stream,
+                            bool hostile = false, int* sink = nullptr);
+/// TEST ONLY: a PDL-launched kernel whose CTAs (2 per SM) read all of `buffer` through ld.global.nc, planting its
+/// current lines in every SM's non-coherent cache (the pdl-chain negative control's hostile step). `sink`: 1 int.
+void inkling_test_plant_reads(const void* buffer, std::int64_t bytes, int* sink, cudaStream_t stream);
 
 } // namespace sinfer::ops

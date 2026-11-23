@@ -1,4 +1,4 @@
-"""the gate's comparison functions on synthetic tensors: a true match passes, and every vacuous or wrong comparison fails."""
+"""The gate's comparison functions on synthetic tensors: a true match passes, and every vacuous or wrong comparison fails."""
 import os
 import sys
 

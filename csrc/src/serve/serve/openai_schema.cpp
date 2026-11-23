@@ -265,6 +265,34 @@ void parse_content_parts(const OJson& content, ChatTurn& turn, std::size_t index
     }
 }
 
+/// The image parts of a body the model's own renderer reads (RequestLimits::raw_chat; Inkling-2): their sources, in
+/// message order and part order (vLLM's parse_chat_messages order), for the serving layer to acquire. Whether images
+/// are allowed at all, and how many, is the renderer's call (vLLM's wording); everything else in the messages is left
+/// to it too, so parts this does not recognise are skipped here.
+void collect_raw_chat_images(const OJson& body, GenerationRequest& out) {
+    if (!body.contains("messages") || !body.at("messages").is_array()) { return; }
+    for (const OJson& message : body.at("messages")) {
+        if (!message.is_object() || !message.contains("content") || !message.at("content").is_array()) { continue; }
+        for (const OJson& part : message.at("content")) {
+            if (!part.is_object() || !part.contains("type") || !part.at("type").is_string()) { continue; }
+            const std::string& type = part.at("type").get_ref<const std::string&>();
+            if (type != "image_url" && type != "input_image") { continue; }
+            ContentPart image;
+            image.kind     = ContentKind::Image;
+            image.type_raw = type;
+            try {
+                image.source = parse_media_url(part, "image_url");
+            } catch (const ApiException& error) {
+                // Refused when its bytes are acquired (translate), after the renderer's own checks: vLLM refuses a
+                // request with images at image limit 0 for the count, whatever the URL.
+                image.kind = ContentKind::Unsupported;
+                image.text = error.error().message;
+            }
+            out.raw_chat_images.push_back(std::move(image));
+        }
+    }
+}
+
 /// A tool result's text. Clients that speak in content parts (Claude Code, Cursor, agent SDKs)
 /// send it as a list of text parts; vLLM joins those with newlines, so this does too.
 std::string tool_message_text(const OJson& item, std::size_t index) {
@@ -818,6 +846,8 @@ GenerationRequest parse_chat_completion_request(const OJson& body, const Request
         parse_tool_choice(body, out);
         out.parallel_tool_calls = get_bool(body, "parallel_tool_calls", true);
         parse_messages(body, out);
+    } else {
+        collect_raw_chat_images(body, out);
     }
     parse_stop(body, out, limits);
     parse_sampling(body, out);

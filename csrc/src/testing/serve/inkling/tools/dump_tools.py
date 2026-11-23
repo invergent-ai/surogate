@@ -1,6 +1,9 @@
-# agent-EN-f2: dump the surogates harness's builtin tool schemas (OpenAI format, as ToolRegistry.get_schemas exports them).
-import json, sys, importlib, pkgutil, asyncio
-sys.path.insert(0, "/mnt/data/work/repos/surogates")
+# Dump the surogates harness's builtin tool schemas (OpenAI format, as ToolRegistry.get_schemas exports them).
+import json, sys, importlib, pkgutil, asyncio, os
+# SUROGATES_REPO: a checkout of the surogates harness (required).
+if not os.environ.get("SUROGATES_REPO"):
+    sys.exit("dump_tools.py: set SUROGATES_REPO to a checkout of the surogates harness")
+sys.path.insert(0, os.environ["SUROGATES_REPO"])
 from surogates.tools.registry import ToolRegistry
 import surogates.tools.builtin as B
 reg = ToolRegistry()

@@ -1,8 +1,8 @@
-// Inkling-2-Mini: the visit schedule (lane e1, DESIGN-target.md 1.2 / 1.4). `Variant::run_visits` walks the
+// Inkling-2-Mini: the visit schedule (target design notes, 1.2 / 1.4). `Variant::run_visits` walks the
 // visits of `visits.h` over the AttnRes stack the residual holds (7 slots x 2304 per column). Per visit:
 // attention inputs (AttnRes mix, or for a looped visit the mix blended with the cross-pass message), the
-// projections, attention (prologue with the K / V convs, rel-bias attention, gate / sink; NAIVE until lane
-// c lands), wo_ud, the attention-output conv, the MLP input mix (+ blend), the MoE (NAIVE until lane d
+// projections, attention (prologue with the K / V convs, rel-bias attention, gate / sink; NAIVE until the
+// kernels land), wo_ud, the attention-output conv, the MLP input mix (+ blend), the MoE (NAIVE until its op
 // lands) and the MLP-output conv, which writes the next partial block in place.
 
 #include "targets/inkling2/impl/variant.h"
@@ -51,7 +51,7 @@ ops::InklingPlane packed(const Tensor& t, int column = 0, std::int64_t width = D
             t.dtype, width};
 }
 
-/// SUROGATE_SERVE_INKLING_NAIVE=1: the naive attention / MoE kernels instead of lanes c / d's ops (A/B checks only).
+/// SUROGATE_SERVE_INKLING_NAIVE=1: the naive attention / MoE kernels instead of the attention / MoE ops (A/B checks only).
 bool use_naive() {
     static const bool naive = std::getenv("SUROGATE_SERVE_INKLING_NAIVE") != nullptr;
     return naive;
@@ -87,7 +87,7 @@ void* gemm_scratch(WorkspaceArena& work, std::size_t bytes) {
     return work.alloc(DType::FP32, {static_cast<std::int32_t>((bytes + 3) / 4)}).data;
 }
 
-/// Every projection runs the batch- and path-invariant GEMM (agent-EN 10:2x): a column's bits depend on the weights
+/// Every projection runs the batch- and path-invariant GEMM: a column's bits depend on the weights
 /// and that column only, never on the round's width or on the other columns.
 void gemm_bf16(WorkspaceArena& work, const Weight& w, std::int32_t row_begin, std::int32_t rows, const void* x,
                std::int32_t tokens, void* out, std::int32_t ldc, cudaStream_t s) {
@@ -165,7 +165,7 @@ void apply_attn_lora(WorkspaceArena& work, const AttnLoraSelection& sel, const o
     ops::inkling_lora_delta(sel.table, slices, count, sel.rank, tokens, sel.token_slot, sel.uniform, low.data, bytes, s);
 }
 
-/// Lane d's InklingMoeOptions::workspace_tokens: the widest call the arena's free bytes still book (the visit
+/// The MoE op's InklingMoeOptions::workspace_tokens: the widest call the arena's free bytes still book (the visit
 /// workspace was planned for the phase's widest round, so the free space at the MoE step is at least that call's
 /// layout), so a narrower prefill call may take fewer down column passes. Speed only: the bits are the same.
 std::int32_t moe_workspace_tokens(const WorkspaceArena& work, ops::InklingExpertFormat format, bool adapters,
@@ -187,10 +187,10 @@ std::int32_t moe_workspace_tokens(const WorkspaceArena& work, ops::InklingExpert
     return lo;
 }
 
-/// The compute stream's persistent state: lane d's MoE counters, then (256-aligned) lane c's attention fold counters.
+/// The compute stream's persistent state: the MoE op's counters, then (256-aligned) the attention fold counters.
 std::size_t moe_state_span() { return (ops::inkling_moe_state_bytes() + 255U) & ~std::size_t{255}; }
 
-/// Lane c's key-group cut, passed explicitly (engine and trainer must pass the same value; lane h froze P3).
+/// The attention key-group cut, passed explicitly (engine and trainer must pass the same value; P3 is frozen).
 constexpr ops::InklingKeyGroups kKeyGroups = ops::InklingKeyGroups::P3;
 
 ops::InklingConvStateView state_view(const Round& rd, int visit) {
@@ -353,7 +353,7 @@ PlaneView plane_view(const Round& rd, int visit) {
 /// SUROGATE_SERVE_INKLING_DUMP=<dir> (parity work only; synchronises the stream): the first eager forward of the
 /// process writes, per visit, its attention inputs, qkvr, gated attention, attn_out, mlp_in, moe_out and the
 /// partial it wrote, as `<dir>/v<visit>_<name>.bin` = header {u32 'INK1', u32 dtype (0 bf16, 1 fp32), i32 rows,
-/// i32 columns, i32 planes} + the values, column-major [rows, columns, planes] (lane a's `record_visits`, T7).
+/// i32 columns, i32 planes} + the values, column-major [rows, columns, planes] (the reference's `record_visits`, T7).
 struct Dump {
     const char* dir = nullptr;
     bool active     = false;
@@ -443,7 +443,7 @@ ops::InklingAttentionWeights attention_weights(const Round& rd, const load::Inkl
     return w;
 }
 
-/// The visit's KV plane as lane c's batch view (a single-sequence prefill's one block table as a 1-row matrix).
+/// The visit's KV plane as the attention's batch view (a single-sequence prefill's one block table as a 1-row matrix).
 PagedKVBatchLayerView kv_batch_view(const Round& rd, int visit) {
     if (!rd.r.sequence_kv.valid()) { return rd.r.text_kv->batch_layer_view(static_cast<std::uint32_t>(visit)); }
     const PagedKVLayerView v = rd.r.sequence_kv.layer_view(static_cast<std::uint32_t>(visit));
@@ -498,7 +498,7 @@ void run_visit(Round& rd, int v) {
     cudaStream_t s                      = rd.s;
     auto scope                          = rd.work.scope();
     if (vi.feature >= 0 && rd.r.features.active()) {
-        // DSpark (lane e2): a contiguous [2304, T] copy -- the sink's verify path views the value it is given.
+        // DSpark: a contiguous [2304, T] copy -- the sink's verify path views the value it is given.
         Tensor feature   = rd.work.alloc(DType::BF16, {D, T});
         const Tensor src = slot_tensor(rd.r.x, vi.partial, T);
         CUDA_CHECK(cudaMemcpy2DAsync(feature.data, static_cast<std::size_t>(D) * 2, src.data,
@@ -519,7 +519,7 @@ void run_visit(Round& rd, int v) {
     Tensor k_dyn, v_dyn;
     if (L.fp8_attention) {
         // FP8 attention weights (the artifact's per-channel / 1x128 objects, SUROGATE_SERVE_INKLING_ATTENTION=fp8-*):
-        // lane c's inkling_attn_linear, every row range of the visit in ONE launch; the dynamic taps (BF16) ride the
+        // inkling_attn_linear, every row range of the visit in ONE launch; the dynamic taps (BF16) ride the
         // grouped invariant GEMM.
         Tensor x0(in(0), DType::BF16, {D, T});
         Tensor x1(in(Q == 3 ? 1 : 0), DType::BF16, {D, T});
@@ -597,7 +597,7 @@ void run_visit(Round& rd, int v) {
         }
         apply_attn_lora(rd.work, sel, slices, 6, T, s);
     }
-    // 3. attention per group: lane c's invariant op (prologue: K / V conv + cache write; relative attention; gate and
+    // 3. attention per group: the invariant attention op (prologue: K / V conv + cache write; relative attention; gate and
     //    sink). The K / V conv state is its: in place, recorded (verify), or captured at a rewrite checkpoint.
     Tensor gated = rd.work.alloc(DType::BF16, {C::attn_width, T});
     const ops::InklingConvStateView state = state_view(rd, v);
@@ -685,11 +685,11 @@ void run_visit(Round& rd, int v) {
             rows.valid_columns = g.valid;
             rows.kv_table_rows = g.table_rows;
             rows.key_groups    = kKeyGroups;
-            // Lane c's persistent fold counters (zeroed once by the program; the last CTA returns them to zero).
+            // The attention's persistent fold counters (zeroed once by the program; the last CTA returns them to zero).
             if (rd.r.target_state != nullptr) {
                 rows.state = reinterpret_cast<std::int32_t*>(static_cast<std::byte*>(rd.r.target_state) + moe_state_span());
             }
-            // Lane c's early metadata read (c2's metadata_static, e1's Q3 answer 12:41): segments when their ints went
+            // The attention's early metadata read (metadata_static): segments when their ints went
             // in the round's host copy (a full barrier after everything the step wrote before); the ordinary decode
             // block (ingress copy, the step's first node) or any non-verify block behind that barrier; never verify.
             rows.metadata_static = seg != nullptr ? rd.seg_barrier
@@ -751,11 +751,11 @@ void run_visit(Round& rd, int v) {
     Tensor mlp_in = rd.work.alloc(DType::BF16, {D, T, 1});
     mlp_input(rd, vi, L, attn_out, mlp_in);
     dump("mlp_in", v, mlp_in.data, DType::BF16, D, D, T, 1, s);
-    // 7. MoE: lane d's op (routing, NVFP4 four-over-six / MXFP8 activations, experts, combine); routed experts
+    // 7. MoE: the Inkling MoE op (routing, NVFP4 four-over-six / MXFP8 activations, experts, combine); routed experts
     //    captured per VISIT
     Tensor moe_out = rd.work.alloc(DType::BF16, {D, T});
     // S10: the round's adapter selection (published by the family schedule; none in a base round) on this
-    // physical layer's bank table (lane d's family/impl/lora_bind_inkling.h) -- every pass of a core layer shares it.
+    // physical layer's bank table (family/impl/lora_bind_inkling.h) -- every pass of a core layer shares it.
     ops::InklingMoeAdapters adapter_storage;
     ops::InklingMoeWeights moe_key;
     moe_key.router = L.router.qdata;
@@ -788,7 +788,7 @@ void run_visit(Round& rd, int v) {
             options.capture         = &capture;
         }
         options.adapters = adapters;
-        // Lane d's narrow-round router + select fold: the stream's persistent counters (zeroed once at startup).
+        // The MoE op's narrow-round router + select fold: the stream's persistent counters (zeroed once at startup).
         options.state = static_cast<std::int32_t*>(rd.r.target_state);
         options.workspace_tokens = moe_workspace_tokens(rd.work, moe_weights(L).format, adapters != nullptr, T);
         const Tensor x(mlp_in.data, DType::BF16, {D, T});
@@ -837,13 +837,13 @@ void Variant::run_visits(const ModelView& model, family::VisitRound& r) {
     auto round_scope = rd.work.scope();
     // Groups: every segment (B = 1) and the decode / verify block. The segments' KV rows and state slots are staged
     // with ONE host copy before the round's first visit kernel (so they are complete before any attention kernel:
-    // lane c's metadata_static); under a stream capture (never for a visit target's prompt rounds today) the copy
+    // the attention's metadata_static); under a stream capture (never for a visit target's prompt rounds today) the copy
     // from pageable memory is not allowed and they are written by kernels instead.
     cudaStreamCaptureStatus seg_capture = cudaStreamCaptureStatusNone;
     CUDA_CHECK(cudaStreamIsCapturing(rd.s, &seg_capture));
     std::vector<std::int32_t> seg_ints;
     Tensor seg_dev;
-    // 8 ints per segment: the KV row at [8 i], the state slot at [8 i + 4] -- each 16-byte aligned (lane c's ops
+    // 8 ints per segment: the KV row at [8 i], the state slot at [8 i + 4] -- each 16-byte aligned (the attention ops
     // require aligned I32 metadata).
     constexpr int kSegInts = 8;
     if (!r.segments.empty()) {
@@ -931,7 +931,7 @@ void Variant::run_visits(const ModelView& model, family::VisitRound& r) {
     d.active = d.dir != nullptr && !dumped && capturing == cudaStreamCaptureStatusNone && !r.segments.empty() &&
                rd.T >= min_columns;
     for (int v = r.first_visit; v < r.last_visit; ++v) { run_visit(rd, v); }
-    // DSpark's fourth feature (lane e2): the final-norm output, the BF16 hidden the LM head reads, captured before the
+    // DSpark's fourth feature: the final-norm output, the BF16 hidden the LM head reads, captured before the
     // runtime checks the round's features are complete; the same invariant mix finish() runs.
     if (r.features.active() && r.last_visit == C::layers) {
         auto scope    = rd.work.scope();
@@ -960,13 +960,13 @@ std::size_t Variant::visit_workspace_capacity_bytes(const family::TextGeometry&,
     bytes += 2 * up(T * 32 * 2);                             // dynamic taps
     bytes += up(T * C::attn_width * 2) * 2 + up(T * 384 * 2); // q_out, gated, r_out
     bytes += up(T * D * 2) * 4;                              // attn_partial, attn_out, mlp_in, moe_out
-    bytes += up(T * D * 2);                                  // a DSpark feature copy (lane e2)
+    bytes += up(T * D * 2);                                  // a DSpark feature copy
     // the looped blend tile: dest + msg fp32, pair, h, gf fp32, blended
     bytes += up(tile * D * 3 * 4) + up(tile * D * 3 * 4) + up(tile * 2 * D * 3 * 2) + up(tile * C::gate_rank * 3 * 2) +
              up(tile * 2 * D * 3 * 4) + up(tile * D * 3 * 2);
     // the invariant GEMM's split partials: the controller `down` of a blend tile (the taps run unsplit in the group)
     bytes += up(ops::inkling_gemm_inv_workspace_bytes(C::gate_rank, 2 * D, static_cast<std::int32_t>(tile), 3));
-    // lanes c / d's ops (and the naive kernels behind SUROGATE_SERVE_INKLING_NAIVE); attention and MoE both counted
+    // the attention / MoE ops (and the naive kernels behind SUROGATE_SERVE_INKLING_NAIVE); attention and MoE both counted
     ops::GqaExecutionEnvelope envelope;
     envelope.max_visible_keys = max_visible_keys;
     std::size_t attention     = 0;

@@ -1,17 +1,19 @@
 #pragma once
-// DSpark drafter ops (ENGINE-INKLING lane e2): Inkling-2-Mini's MTP drafter -- 3 dense block layers over the
-// target's features plus the recurrent Markov head (rl/engine-inkling-2026-11-21/lanes/e2/DESIGN-dspark.md).
+// DSpark drafter ops: Inkling-2-Mini's MTP drafter -- 3 dense block layers over the
+// target's features plus the recurrent Markov head (DSpark design notes, not in this repository).
 //
-// Semantics: the functions of rl/engine-inkling-2026-11-21/ref/dspark_ref.py (rounding points marked `# R:`
-// there), which port vLLM's Inkling2 DSpark (ref/src/vllm/models/inkling2/nvidia/dspark.py, ops/dspark.py,
-// speculator.py). Golden vectors: rl/engine-inkling-2026-11-21/vectors/dspark_*/ (dspark_ref.py make_vectors).
-// The GEMMs of the drafter are not here: they run on lane e1's invariant GEMM (inkling_gemm_inv).
+// Semantics: the functions of the DSpark Python reference dspark_ref.py (not in this repository; rounding points marked `# R:`
+// there), which port vLLM's Inkling2 DSpark (vllm/models/inkling2/nvidia/dspark.py, ops/dspark.py,
+// speculator.py). Golden vectors: dspark_* vector directories (dspark_ref.py make_vectors).
+// The GEMMs of the drafter are not here: they run on the target's invariant GEMM (inkling_gemm_inv).
 //
 // Layout convention (this engine's): the FIRST dimension is the fastest. "[2304, T]" is T columns of 2304
 // contiguous values; a draft block of B lanes is [.., 8, B] (column j + 8 * b). All entry points take raw device
 // pointers; BF16 means __nv_bfloat16 storage. Every kernel computes a column's output with one arithmetic,
 // independent of the batch (DESIGN.md 11): no atomics, fixed reduction orders.
 #include <cuda_runtime.h>
+
+#include "api/ops/sampling.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -106,7 +108,7 @@ void dspark_embed_block(const std::int32_t* anchors, std::int32_t batch, const v
 void dspark_block_positions(const std::int32_t* anchor_positions, std::int32_t batch, std::int32_t* positions,
                             cudaStream_t stream);
 
-/// positions[j + 8 * b] = anchor_positions[b] + 7, j < 8: the block's query positions for lane c's draft attention
+/// positions[j + 8 * b] = anchor_positions[b] + 7, j < 8: the block's query positions for the Inkling draft attention
 /// (every row of a lane sits at the block's last position, so all see one key set).
 void dspark_block_query_positions(const std::int32_t* anchor_positions, std::int32_t batch, std::int32_t* positions,
                                   cudaStream_t stream);
@@ -140,7 +142,7 @@ void dspark_kv_write(const void* k, const void* v, std::int64_t stride, const st
  * [anchor_b, anchor_b + 8). Query head h reads KV head h / 3. Scores fp32, softmax with an online max, P
  * rounded to bf16 for P.V, the sum taken over the unrounded P; out = bf16(acc / sum).
  * q BF16 [128, 24, 8, B] with `q_stride` elements per column; out BF16 [128, 24, 8, B] contiguous.
- * NAIVE (correctness): one CTA per (kv head, lane); lane c's draft mode replaces it (BOARD 13:35 / c2 13:4x).
+ * NAIVE (correctness): one CTA per (kv head, lane); the Inkling attention's draft mode replaces it.
  */
 void dspark_block_attention(const void* q, std::int64_t q_stride, const std::int32_t* anchor_positions,
                             const std::int32_t* table_rows, std::int32_t batch, std::int32_t window, float scale,
@@ -191,11 +193,18 @@ void dspark_markov_gate(const float* ctx, std::int32_t j, std::int32_t k, std::i
  */
 /// FP8 fold (fold_codes / fold_scales non-null: per-row e4m3 [domain rows, 256] + fp32 row scales; fold_w ignored):
 /// bias_v = bf16(scale_v * (codes[v] . latent_b) + fold_b[v]) -- the M1 lever `fp8fold`, no acceptance loss.
+/// COUPLED SAMPLED DRAFTS (`sampling` non-null): a lane whose config is a coupled untruncated sampled row
+/// (SamplingConfig::speculative_coupled, temperature > 0, top_k 0, top_p 1) ranks by z = logit / T + Gumbel keyed by
+/// sample_key(cfg, anchor_positions[b] + draft_index, kSamplePurposeDecode) -- the noise the coupled verify draws that
+/// token with -- instead of the logit: a sampled draft d ~ softmax(logits / T) that equals the target's token whenever
+/// the two Gumbel-max draws agree. Any draft is exact under coupled verification; only acceptance changes. Other lanes
+/// (greedy, top-k / top-p, one-hot verification) keep the greedy draft.
 void dspark_markov_vocab(const void* base, std::int32_t base_rows, std::int32_t row, std::int32_t batch,
                          const void* fold_w, const void* fold_b, const void* latent, std::int32_t domain,
                          const std::int32_t* ids, float* part_val, std::int32_t* part_id, void* bias_out,
                          void* logits_out, cudaStream_t stream, const void* fold_codes = nullptr,
-                         const float* fold_scales = nullptr);
+                         const float* fold_scales = nullptr, const SamplingConfig* sampling = nullptr,
+                         const std::int32_t* anchor_positions = nullptr, std::int32_t draft_index = 0);
 
 /// drafts[j + stride * b] = the id of the largest partial (lowest id on ties) over the `tiles` partials of lane b
 /// (stride = the drafts tensor's first extent, >= k).

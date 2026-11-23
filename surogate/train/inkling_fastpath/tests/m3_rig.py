@@ -1,7 +1,7 @@
-"""Lane T M3, phase B: lane L's validated rig (lanes/L/rig/rig.py, W4A16 trainer mode) computes the LoRA gradient of
+"""M3, phase B: the validated learnability rig (rig.py, W4A16 trainer mode) computes the LoRA gradient of
 the same sequence with the same masters (rig.make_lora seed 7, b_std 1e-3) and the ENGINE's routing replayed (from
 phase A's m3_fast.pt); compared with the fast route's LEVEL-0 gradient.
-PASS iff every slice tensor's cosine >= 0.99 (agent-EN's M3 line), the gradients are finite and the losses agree
+PASS iff every slice tensor's cosine >= 0.99 (the M3 pass line), the gradients are finite and the losses agree
 within 2 % (the fast route's loss is the engine's W4A4 one, the rig's is W4A16).
 Usage: RIG_DEVICE=cuda python m3_rig.py <rig dir> <model dir> <m3_fast.pt> <out.json>
 """

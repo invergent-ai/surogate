@@ -39,7 +39,8 @@ namespace dsl {
 
 void DslModel::export_adapter(const std::string& directory,
                               NCCLCommunicator& comm,
-                              const std::string& base_model_path) {
+                              const std::string& base_model_path,
+                              std::optional<ETensorDType> dtype) {
     if (!lora_enabled()) return;
     namespace fs = std::filesystem;
     fs::path dir(directory);
@@ -47,7 +48,7 @@ void DslModel::export_adapter(const std::string& directory,
         fs::create_directories(dir);
     }
     comm.barrier();
-    mLoRAWeights->export_to_file((dir / "adapter_model.safetensors").string(), comm);
+    mLoRAWeights->export_to_file((dir / "adapter_model.safetensors").string(), comm, dtype);
     if (comm.rank() == 0) {
         nlohmann::json adapter_config;
         adapter_config["base_model_name_or_path"] = base_model_path;
@@ -83,41 +84,60 @@ void DslModel::import_adapter(const std::string& file_name, NCCLCommunicator& co
 
 // LoRA checkpoint save/load
 
+namespace {
+/// The optimizer state file of a LoRA checkpoint, without extension: one shared file, or one per rank when the
+/// adapters are dispatch-PP stage-local (each rank's state covers only its own stages' layers).
+std::string lora_optimizer_file_stem(bool per_rank, int rank) {
+    return per_rank ? fmt::format("lora_optimizer.rank{}", rank) : std::string("lora_optimizer");
+}
+}  // namespace
+
 void DslModel::save_lora_checkpoint(const std::string& checkpoint_dir, NCCLCommunicator& comm) {
     if (!lora_enabled()) return;
     namespace fs = std::filesystem;
 
     export_adapter(checkpoint_dir, comm);
 
+    // dispatch-PP stage-local adapters: each rank's optimizer state covers its own stages' layers, one file per rank.
+    const bool per_rank = mLoRAWeights && mLoRAWeights->stage_local();
+    const std::string opt_stem = lora_optimizer_file_stem(per_rank, comm.rank());
+    const bool write_meta = per_rank || comm.rank() == 0;
+    auto write_state = [&](ITensorContainer& container) {
+        const std::string file = (fs::path(checkpoint_dir) / (opt_stem + ".safetensors")).string();
+        if (per_rank) {
+            write_safetensors(file, container);
+        } else {
+            write_safetensors(file, container, comm);
+        }
+    };
+
     if (mLoRAAdamWState && (mLoRAAdamWState->initialized || mLoRAAdamWState->values_restored)) {
         internal::LoRAAdamWStateContainer container(mLoRAAdamWState.get());
-        write_safetensors((fs::path(checkpoint_dir) / "lora_optimizer.safetensors").string(), container, comm);
-        if (comm.rank() == 0) {
+        write_state(container);
+        if (write_meta) {
             nlohmann::json meta = {{"optimizer_type", "adamw"},
                                    {"total_params", mLoRAAdamWState->total_params},
                                    {"num_tensors", mLoRAAdamWState->num_tensors}};
-            std::ofstream(fs::path(checkpoint_dir) / "lora_optimizer.json") << meta.dump(2);
+            std::ofstream(fs::path(checkpoint_dir) / (opt_stem + ".json")) << meta.dump(2);
         }
     } else if (mLoRAAdamW8BitState && (mLoRAAdamW8BitState->initialized || mLoRAAdamW8BitState->values_restored)) {
         internal::LoRAAdamW8BitStateContainer container(mLoRAAdamW8BitState.get());
-        fs::path opt_file = fs::path(checkpoint_dir) / "lora_optimizer.safetensors";
-        write_safetensors(opt_file.string(), container, comm);
+        write_state(container);
 
-        if (comm.rank() == 0) {
+        if (write_meta) {
             nlohmann::json opt_meta;
             opt_meta["optimizer_type"] = "adamw_8bit";
             opt_meta["total_params"] = mLoRAAdamW8BitState->total_params;
             opt_meta["num_groups"] = mLoRAAdamW8BitState->num_groups;
             opt_meta["num_tensors"] = mLoRAAdamW8BitState->num_tensors;
-            std::ofstream meta_file(fs::path(checkpoint_dir) / "lora_optimizer.json");
+            std::ofstream meta_file(fs::path(checkpoint_dir) / (opt_stem + ".json"));
             meta_file << opt_meta.dump(2);
         }
     } else if (mLoRANorMuonState && (mLoRANorMuonState->initialized || mLoRANorMuonState->values_restored)) {
         internal::LoRANorMuonStateContainer container(mLoRANorMuonState.get());
-        fs::path opt_file = fs::path(checkpoint_dir) / "lora_optimizer.safetensors";
-        write_safetensors(opt_file.string(), container, comm);
+        write_state(container);
 
-        if (comm.rank() == 0) {
+        if (write_meta) {
             nlohmann::json opt_meta;
             opt_meta["optimizer_type"] = "normuon";
             opt_meta["total_params"] = mLoRANorMuonState->total_params;
@@ -128,7 +148,7 @@ void DslModel::save_lora_checkpoint(const std::string& checkpoint_dir, NCCLCommu
                 shapes.push_back({shape.first, shape.second});
             }
             opt_meta["variance_shapes"] = shapes;
-            std::ofstream meta_file(fs::path(checkpoint_dir) / "lora_optimizer.json");
+            std::ofstream meta_file(fs::path(checkpoint_dir) / (opt_stem + ".json"));
             meta_file << opt_meta.dump(2);
         }
     }
@@ -187,8 +207,10 @@ void DslModel::load_lora_checkpoint(const std::string& checkpoint_dir, NCCLCommu
         return;
     }
 
-    fs::path opt_file = fs::path(checkpoint_dir) / "lora_optimizer.safetensors";
-    fs::path opt_meta_file = fs::path(checkpoint_dir) / "lora_optimizer.json";
+    const std::string opt_stem =
+        lora_optimizer_file_stem(mLoRAWeights && mLoRAWeights->stage_local(), comm.rank());
+    fs::path opt_file = fs::path(checkpoint_dir) / (opt_stem + ".safetensors");
+    fs::path opt_meta_file = fs::path(checkpoint_dir) / (opt_stem + ".json");
     if (!fs::exists(opt_file) || !fs::exists(opt_meta_file)) {
         return;
     }
@@ -236,17 +258,33 @@ void DslModel::load_lora_checkpoint(const std::string& checkpoint_dir, NCCLCommu
             state.state2 = mAllocator->allocate(ETensorDType::BYTE,
                                                 "lora_adamw8bit_state2",
                                                 {static_cast<long>(state.total_params)});
-            state.scales1 = mAllocator->allocate(ETensorDType::FP16,
+            state.scales1 = mAllocator->allocate(ETensorDType::FP32,
                                                  "lora_adamw8bit_scales1",
                                                  {static_cast<long>(state.num_groups)});
-            state.scales2 = mAllocator->allocate(ETensorDType::FP16,
+            state.scales2 = mAllocator->allocate(ETensorDType::FP32,
                                                  "lora_adamw8bit_scales2",
                                                  {static_cast<long>(state.num_groups)});
         }
 
         internal::LoRAAdamW8BitStateContainer container(&state);
-        load_safetensors(opt_file.string(), container, /*allow_cast=*/false);
+        // Checkpoints from before the FP32 scales hold them in FP16; the cast widens those exactly. The moments are
+        // bytes in both, so nothing else is cast.
+        load_safetensors(opt_file.string(), container, /*allow_cast=*/true);
         state.values_restored = true;
+
+        // Those FP16 scales rounded to 0 below 2.98e-8, which lost the group's moments, and they stay lost: until the group's
+        // second moment has built up again (Adam's step count goes on from the checkpoint) its updates are too large.
+        std::vector<float> host_scales(state.num_groups);
+        CUDA_CHECK(cudaMemcpy(host_scales.data(), state.scales2.Data, state.num_groups * sizeof(float), cudaMemcpyDefault));
+        const auto lost = std::count(host_scales.begin(), host_scales.end(), 0.f);
+        if (lost > 0) {
+            fprintf(stderr,
+                    "[lora] rank %d: %zd of %zu optimizer groups have no second moment (a checkpoint from before the FP32 "
+                    "scales); to restart Adam cleanly, load the adapter alone\n",
+                    comm.rank(),
+                    static_cast<std::ptrdiff_t>(lost),
+                    state.num_groups);
+        }
 
     } else if (optimizer_type == "normuon") {
         // NorMuon keeps one variance buffer per tensor, so their count is the tensor count.
@@ -502,6 +540,20 @@ void DslModel::calculate_lora_gradient_norm(NCCLCommunicator& comm, float grad_c
     // Reduce partial block sums
     deterministic_sum(buf.template get<float>(), buf.template get<float>(), num_block_sums, stream);
 
+    if (mLoRAWeights && mLoRAWeights->stage_local()) {
+        // dispatch-PP stage-local adapters: this rank's gradients are its own stages' layers only, and every GPU runs
+        // the step at once. Sum the squared norms over the ranks: buf[0] = amax^2 * prescaled sum, amax = 1.
+        float sum_amax[2] = {0.0f, 0.0f};
+        CUDA_CHECK(cudaMemcpyAsync(&sum_amax[0], buf.template get<float>(), sizeof(float), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(&sum_amax[1], amax_ptr, sizeof(float), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        const float local_sq[2] = {sum_amax[1] * sum_amax[1] * sum_amax[0], 1.0f};
+        CUDA_CHECK(cudaMemcpyAsync(buf.template get<float>(), &local_sq[0], sizeof(float), cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(amax_ptr, &local_sq[1], sizeof(float), cudaMemcpyHostToDevice, stream));
+        comm.reduce_norm(buf.template get<float>(), stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+
     float total_tokens = static_cast<float>(rs.B) * static_cast<float>(rs.T) *
                          static_cast<float>(std::max(1, rs.GradAccumSteps)) *
                          static_cast<float>(std::max(1, comm.world_size()));
@@ -513,7 +565,9 @@ void DslModel::calculate_lora_gradient_norm(NCCLCommunicator& comm, float grad_c
     // globally summed. Undo that averaging before the global token denominator.
     // The same scale feeds both reported norm and optimizer gradient scaling.
     // EP has distinct dense/expert reduction groups; leave that path unchanged.
-    const float reduction_scale = mUseTokenScale && !comm.ep_enabled()
+    // dispatch-PP gradients are whole sums over every microbatch, never averaged: no
+    // scale (it multiplied the norm the clip sees, and the reported one, by world_size).
+    const float reduction_scale = mUseTokenScale && !comm.ep_enabled() && !mDispatchPpLocalGrads
         ? static_cast<float>(std::max(1, comm.world_size())) : 1.0f;
     global_norm_sqrt_prescaled(buf.template get<float>(),
                                capturing ? nullptr : rs.NormHost,
@@ -605,11 +659,11 @@ void DslModel::initialize_lora_multi_tensor_state(NCCLCommunicator& comm, cudaSt
                                             "lora_adamw8bit_state2",
                                             EAllocationType::ON_DEVICE,
                                             {(long)total_params});
-        state.scales1 = mAllocator->allocate(ETensorDType::FP16,
+        state.scales1 = mAllocator->allocate(ETensorDType::FP32,
                                              "lora_adamw8bit_scales1",
                                              EAllocationType::ON_DEVICE,
                                              {(long)state.num_groups});
-        state.scales2 = mAllocator->allocate(ETensorDType::FP16,
+        state.scales2 = mAllocator->allocate(ETensorDType::FP32,
                                              "lora_adamw8bit_scales2",
                                              EAllocationType::ON_DEVICE,
                                              {(long)state.num_groups});
@@ -618,17 +672,17 @@ void DslModel::initialize_lora_multi_tensor_state(NCCLCommunicator& comm, cudaSt
     if (!state.values_restored) {
         optimizers::init_flash_adamw8bit_state(reinterpret_cast<signed char*>(state.state1.Data),
                                                reinterpret_cast<unsigned char*>(state.state2.Data),
-                                               state.scales1.template get<half>(),
-                                               state.scales2.template get<half>(),
+                                               state.scales1.template get<float>(),
+                                               state.scales2.template get<float>(),
                                                total_params,
                                                stream);
     }
 
     fprintf(stderr,
-            "[LoRA] Flash AdamW 8-bit optimizer: %d tensors, %zu params, %.1f MB state (int8 m+v + FP16 scales)\n",
+            "[LoRA] Flash AdamW 8-bit optimizer: %d tensors, %zu params, %.1f MB state (int8 m+v + FP32 scales)\n",
             state.num_tensors,
             total_params,
-            (total_params * 2 + state.num_groups * 2 * sizeof(half)) / 1e6);
+            (total_params * 2 + state.num_groups * 2 * sizeof(float)) / 1e6);
 
     state.initialized = true;
 }
@@ -1006,8 +1060,8 @@ void DslModel::update_lora_adamw_8bit(NCCLCommunicator& comm,
             mLoRAAdamW8BitState->num_tensors,
             reinterpret_cast<signed char*>(mLoRAAdamW8BitState->state1.Data),
             reinterpret_cast<unsigned char*>(mLoRAAdamW8BitState->state2.Data),
-            mLoRAAdamW8BitState->scales1.template get<half>(),
-            mLoRAAdamW8BitState->scales2.template get<half>(),
+            mLoRAAdamW8BitState->scales1.template get<float>(),
+            mLoRAAdamW8BitState->scales2.template get<float>(),
             mLoRAAdamW8BitState->state_offsets.template get<int>(),
             mLoRAAdamW8BitState->total_params,
             learning_rate,
@@ -1028,8 +1082,8 @@ void DslModel::update_lora_adamw_8bit(NCCLCommunicator& comm,
             mLoRAAdamW8BitState->num_tensors,
             reinterpret_cast<signed char*>(mLoRAAdamW8BitState->state1.Data),
             reinterpret_cast<unsigned char*>(mLoRAAdamW8BitState->state2.Data),
-            mLoRAAdamW8BitState->scales1.template get<half>(),
-            mLoRAAdamW8BitState->scales2.template get<half>(),
+            mLoRAAdamW8BitState->scales1.template get<float>(),
+            mLoRAAdamW8BitState->scales2.template get<float>(),
             mLoRAAdamW8BitState->state_offsets.template get<int>(),
             mLoRAAdamW8BitState->total_params,
             learning_rate,
@@ -1101,8 +1155,8 @@ void DslModel::update_lora_adamw_8bit_graph(NCCLCommunicator& comm,
                                                          state.num_tensors,
                                                          reinterpret_cast<signed char*>(state.state1.Data),
                                                          reinterpret_cast<unsigned char*>(state.state2.Data),
-                                                         state.scales1.template get<half>(),
-                                                         state.scales2.template get<half>(),
+                                                         state.scales1.template get<float>(),
+                                                         state.scales2.template get<float>(),
                                                          state.state_offsets.template get<int>(),
                                                          state.total_params,
                                                          /*lr=*/0.f,
@@ -1122,8 +1176,8 @@ void DslModel::update_lora_adamw_8bit_graph(NCCLCommunicator& comm,
                                                          state.num_tensors,
                                                          reinterpret_cast<signed char*>(state.state1.Data),
                                                          reinterpret_cast<unsigned char*>(state.state2.Data),
-                                                         state.scales1.template get<half>(),
-                                                         state.scales2.template get<half>(),
+                                                         state.scales1.template get<float>(),
+                                                         state.scales2.template get<float>(),
                                                          state.state_offsets.template get<int>(),
                                                          state.total_params,
                                                          /*lr=*/0.f,

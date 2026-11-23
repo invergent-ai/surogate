@@ -552,14 +552,41 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op) {
                 }
                 return v;
             };
+            // SUROGATE_LORA_FP32_FORWARD: the products from the fp32 masters themselves (not with LLEP-merged
+            // weights or EP-global tensors), so the forward moves smoothly with every update.
+            const modules::LoRAGroupedLayerWeights<TensorShard>* master_gate_up = nullptr;
+            if (lora_fp32_forward_enabled() && lora_grouped_ptr == &lora_block.moe.grouped) {
+                auto& master_block = mLoRAWeights->get_master_block(layer_idx_any, mRunState.MainStream);
+                if (master_block.moe.grouped.gate_up.has_value() && master_block.moe.grouped.gate_up->has_value())
+                    master_gate_up = &*master_block.moe.grouped.gate_up;
+            }
             auto fused_lora_forward = [&](Tensor& out_t,
                                           const Tensor& in_t,
                                           const modules::LoRAGroupedLayerWeights<Tensor>& w,
                                           int in_features,
-                                          int out_features) -> bool {
+                                          int out_features,
+                                          const modules::LoRAGroupedLayerWeights<TensorShard>* master = nullptr) -> bool {
                 if (!moe_lora_grouped_enabled() || (training && dropout > 0.0f) || mOptions.rollout_parity())
                     return false;
                 if (out_t.DType != ETensorDType::BF16 || in_t.DType != ETensorDType::BF16) return false;
+                if (master && master->A.DType == ETensorDType::FP32 && master->B.DType == ETensorDType::FP32 &&
+                    master->A.Rank == 3 && master->A.Sizes[0] == num_experts &&
+                    moe_lora_grouped_forward_f32w(out_t.get<nv_bfloat16>(),
+                                                  in_t.get<nv_bfloat16>(),
+                                                  master->A.get<float>(),
+                                                  master->B.get<float>(),
+                                                  expert_offsets.get<int>(),
+                                                  host_offsets_ptr,
+                                                  num_experts,
+                                                  total_tokens_i,
+                                                  in_features,
+                                                  out_features,
+                                                  rank,
+                                                  scaling,
+                                                  /*accumulate=*/true,
+                                                  mRunState.MainStream)) {
+                    return true;
+                }
                 const Tensor A = native_expert_view(w.A);
                 const Tensor B = native_expert_view(w.B);
                 if (!A.Data || !B.Data) return false;
@@ -583,8 +610,8 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op) {
                 Tensor lora_intermediate = view_or_temp(mLoRARunState->moe_lora_intermediate1, total_tokens_l, rank);
                 const bool has_gate_up = grouped.gate_up.has_value() && grouped.gate_up->has_value();
 
-                if (has_gate_up &&
-                    fused_lora_forward(out, inp, *grouped.gate_up, hidden_size, static_cast<int>(gate_up_dim))) {
+                if (has_gate_up && fused_lora_forward(out, inp, *grouped.gate_up, hidden_size,
+                                                      static_cast<int>(gate_up_dim), master_gate_up)) {
                     lora_applied = true;
                 } else if (has_gate_up) {
                     Tensor lora_gate_up = view_or_temp(mLoRARunState->moe_lora_gate_up, total_tokens_l, gate_up_dim);
@@ -1265,11 +1292,27 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up_backward(const Compiled
                         lora_active_ptr = fallback_active.empty() ? nullptr : fallback_active.data();
                         lora_num_active = fallback_count;
                     }
-                    if (grad_output.DType == ETensorDType::BF16) {
+                    if (grad_output.DType == ETensorDType::BF16 && d_weight_view.DType == ETensorDType::FP32) {
+                        // FP32 LoRA masters: bf16 operands, the gradient accumulated and stored in fp32, so a step's
+                        // windows add up without a rounding to bf16 after each.
+                        moe_grouped_gemm_weight_grad(d_weight_view.get<float>(),
+                                                     grad_output.get<nv_bfloat16>(),
+                                                     in.get<nv_bfloat16>(),
+                                                     expert_offsets_ptr->get<int>(),
+                                                     num_experts,
+                                                     M,
+                                                     N,
+                                                     mRunState.cublas_handle(),
+                                                     mRunState.MainStream,
+                                                     host_offsets_ptr,
+                                                     /*alpha=*/1.0f,
+                                                     beta,
+                                                     lora_active_ptr,
+                                                     lora_weight_is_compact,
+                                                     lora_num_active);
+                    } else if (grad_output.DType == ETensorDType::BF16) {
                         if (d_weight_view.DType != ETensorDType::BF16) {
-                            throw std::runtime_error(
-                                "MoE LoRA backward: lora_dtype=fp32 with bf16 activations not supported. "
-                                "Set lora_dtype='bf16' in your config.");
+                            throw std::runtime_error("MoE LoRA backward: dtype mismatch in weight gradients.");
                         }
                         moe_grouped_gemm_weight_grad(d_weight_view.get<nv_bfloat16>(),
                                                      grad_output.get<nv_bfloat16>(),
@@ -1363,6 +1406,10 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up_backward(const Compiled
             // every rank, so the pairwise WT-comm schedule matches.
             auto scatter_exchange = [&](Tensor& mgA, Tensor& mgB,
                                         modules::LoRAGroupedLayerWeights<Tensor>& local) {
+                if (local.A.DType != mgA.DType || local.B.DType != mgB.DType) {
+                    throw std::runtime_error("MoE LoRA backward: FP32 expert LoRA gradients are not supported with LLEP "
+                                             "(its merged weight gradients are in the activation dtype); use lora_dtype bf16");
+                }
                 const auto& meta = *wg_meta;
                 const int nl = std::max(meta.num_local, 1);
                 const int my_ep = meta.native_start / nl;
@@ -1423,12 +1470,14 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up_backward(const Compiled
             // rounds them to bf16 before and after vector_add(t, t, t, 0.5 * s)). Falls
             // back to cuBLAS for dropout, rollout parity, non-bf16 tensors, compact LoRA
             // weights and LLEP merged weight gradients (which need scatter_exchange).
-            auto native_expert_view = [&](const Tensor& w) -> Tensor {
+            auto native_expert_view = [&](const Tensor& w, bool allow_fp32 = false) -> Tensor {
                 // The tensor itself, or the native slice of an EP-global [E_global, ...]
                 // tensor (the rule of dispatch_grouped_gemm); Data == nullptr when unusable.
+                // allow_fp32: the weight gradients of FP32 LoRA masters.
                 Tensor v = w;
                 v.Data = nullptr;
-                if (w.DType != ETensorDType::BF16 || w.Rank != 3 || !w.Data) return v;
+                const bool dtype_ok = w.DType == ETensorDType::BF16 || (allow_fp32 && w.DType == ETensorDType::FP32);
+                if (!dtype_ok || w.Rank != 3 || !w.Data) return v;
                 const long rows = w.Sizes[0];
                 if (rows == num_experts) {
                     v.Data = w.Data;
@@ -1466,9 +1515,10 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up_backward(const Compiled
                 if (!host_offsets_sanitized.empty() || inp.Rank < 2 || inp.Sizes[0] < total_tokens_l) return false;
                 const Tensor A = native_expert_view(w.A);
                 const Tensor B = native_expert_view(w.B);
-                Tensor dA = grads ? native_expert_view(grads->A) : Tensor{};
-                Tensor dB = grads ? native_expert_view(grads->B) : Tensor{};
+                Tensor dA = grads ? native_expert_view(grads->A, /*allow_fp32=*/true) : Tensor{};
+                Tensor dB = grads ? native_expert_view(grads->B, /*allow_fp32=*/true) : Tensor{};
                 if (!A.Data || !B.Data || (grads && (!dA.Data || !dB.Data))) return false;
+                if (grads && dA.DType != dB.DType) return false;
                 std::size_t workspace_floats = 0;
                 Tensor workspace;
                 if (grads) {
@@ -1484,26 +1534,30 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up_backward(const Compiled
                                                      "moe_lora_grouped_partials");
                     mTemps.push_back(workspace);
                 }
-                return moe_lora_grouped_backward_bf16(dx_t.get<nv_bfloat16>(),
-                                                      grads ? dA.get<nv_bfloat16>() : nullptr,
-                                                      grads ? dB.get<nv_bfloat16>() : nullptr,
-                                                      d_out_t.get<nv_bfloat16>(),
-                                                      inp.get<nv_bfloat16>(),
-                                                      A.get<nv_bfloat16>(),
-                                                      B.get<nv_bfloat16>(),
-                                                      expert_offsets_ptr->get<int>(),
-                                                      host_offsets_ptr,
-                                                      num_experts,
-                                                      total_tokens_i,
-                                                      in_features,
-                                                      out_features,
-                                                      rank,
-                                                      scaling,
-                                                      /*dx_accumulate=*/true,
-                                                      /*grad_accumulate=*/lora_accum,
-                                                      grads ? workspace.get<float>() : nullptr,
-                                                      workspace_floats,
-                                                      mRunState.MainStream);
+                auto run = [&](auto* dA_p, auto* dB_p) {
+                    return moe_lora_grouped_backward_bf16(dx_t.get<nv_bfloat16>(),
+                                                          dA_p,
+                                                          dB_p,
+                                                          d_out_t.get<nv_bfloat16>(),
+                                                          inp.get<nv_bfloat16>(),
+                                                          A.get<nv_bfloat16>(),
+                                                          B.get<nv_bfloat16>(),
+                                                          expert_offsets_ptr->get<int>(),
+                                                          host_offsets_ptr,
+                                                          num_experts,
+                                                          total_tokens_i,
+                                                          in_features,
+                                                          out_features,
+                                                          rank,
+                                                          scaling,
+                                                          /*dx_accumulate=*/true,
+                                                          /*grad_accumulate=*/lora_accum,
+                                                          grads ? workspace.get<float>() : nullptr,
+                                                          workspace_floats,
+                                                          mRunState.MainStream);
+                };
+                if (grads && dA.DType == ETensorDType::FP32) return run(dA.get<float>(), dB.get<float>());
+                return run(grads ? dA.get<nv_bfloat16>() : nullptr, grads ? dB.get<nv_bfloat16>() : nullptr);
             };
 
             if (total_tokens_i > 0 && rank > 0) {

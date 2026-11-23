@@ -278,7 +278,7 @@ Options parse_options(int argc, char** argv) {
 
     if (!options.devices.empty()) {
         // SUROGATE_SERVE_TEST_SHARED_DEVICES=1 (tests only): stages may share a GPU -- a pipeline's stage logic proven on
-        // one card (lane e1's inkling2 visit split) before two are free.
+        // one card (the inkling2 visit split) before two are free.
         const char* shared_raw = std::getenv("SUROGATE_SERVE_TEST_SHARED_DEVICES");
         const bool shared      = shared_raw != nullptr && std::string_view(shared_raw) == "1";
         for (std::size_t i = 0; i < options.devices.size() && !shared; ++i) {

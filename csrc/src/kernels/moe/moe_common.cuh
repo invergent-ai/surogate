@@ -57,11 +57,26 @@ bool moe_cutlass_grouped_gemm_bf16(cublasOperation_t transa,
                                    const std::vector<nv_bfloat16*>& C,
                                    const std::vector<int>& ldc,
                                    cudaStream_t stream);
+/// The same with fp32 C (bf16 operands, fp32 accumulate and store): weight gradients that accumulate in fp32.
+bool moe_cutlass_grouped_gemm_bf16_f32out(cublasOperation_t transa,
+                                          cublasOperation_t transb,
+                                          const std::vector<int>& m,
+                                          const std::vector<int>& n,
+                                          const std::vector<int>& k,
+                                          float alpha,
+                                          const std::vector<const nv_bfloat16*>& A,
+                                          const std::vector<int>& lda,
+                                          const std::vector<const nv_bfloat16*>& B,
+                                          const std::vector<int>& ldb,
+                                          float beta,
+                                          const std::vector<float*>& C,
+                                          const std::vector<int>& ldc,
+                                          cudaStream_t stream);
 
 /// One GEMM per expert, in cuBLAS column-major terms:
 ///   C[i] = alpha * op_a(A[i]) * op_b(B[i]) + beta * C[i],  op_a(A[i]) m[i] x k[i], op_b(B[i]) k[i] x n[i].
-/// bf16 runs as one CUTLASS grouped launch; anything else (fp32, unaligned bf16) as a loop of
-/// cublasGemmEx on the handle, whose stream the callers set to `stream`.
+/// bf16 runs as one CUTLASS grouped launch, with bf16 or fp32 C (TOut); anything else (fp32 operands,
+/// unaligned bf16) as a loop of cublasGemmEx on the handle, whose stream the callers set to `stream`.
 ///
 /// Not cublasGemmGroupedBatchedEx: cuBLAS runs bf16, fp16 and fp32 groups on one kernel object shared by
 /// the whole process, locks that object's mutex before the launch and unlocks it only after
@@ -76,7 +91,7 @@ bool moe_cutlass_grouped_gemm_bf16(cublasOperation_t transa,
 /// does not depend on how many tokens its expert received (row packing needs that: a packed row must
 /// equal the row alone bit for bit). The cublasGemmEx loop lets cuBLAS choose an algorithm per shape
 /// and does not have that property. Both are deterministic run to run.
-template <typename T>
+template <typename T, typename TOut = T>
 inline void moe_expert_gemms(cublasHandle_t handle,
                              cudaStream_t stream,
                              cublasOperation_t transa,
@@ -90,10 +105,17 @@ inline void moe_expert_gemms(cublasHandle_t handle,
                              const std::vector<const T*>& B,
                              const std::vector<int>& ldb,
                              float beta,
-                             const std::vector<T*>& C,
+                             const std::vector<TOut*>& C,
                              const std::vector<int>& ldc) {
     if constexpr (std::is_same_v<T, nv_bfloat16>) {
-        if (moe_cutlass_grouped_gemm_bf16(transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc, stream)) {
+        bool done = false;
+        if constexpr (std::is_same_v<TOut, float>) {
+            done = moe_cutlass_grouped_gemm_bf16_f32out(transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc,
+                                                        stream);
+        } else {
+            done = moe_cutlass_grouped_gemm_bf16(transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc, stream);
+        }
+        if (done) {
             return;
         }
         static std::atomic<bool> warned{false};
@@ -127,7 +149,7 @@ inline void moe_expert_gemms(cublasHandle_t handle,
                                   ldb[i],
                                   &beta,
                                   C[i],
-                                  cublas_dtype<T>(),
+                                  cublas_dtype<TOut>(),
                                   ldc[i],
                                   CUBLAS_COMPUTE_32F,
                                   CUBLAS_GEMM_DEFAULT));

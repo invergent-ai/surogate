@@ -911,6 +911,12 @@ void HttpServer::handle_kv_stats(const httplib::Request&, httplib::Response& res
             {"pages_in_use", stats.kv_pages_in_use},
             {"pages_resident_at_granule", stats.kv_pages_resident_at_granule},
             {"pages_mapped", stats.kv_pages_mapped},
+            {"window",
+             nlohmann::json{{"pages_mapped", stats.kv_window_mapped_pages},
+                            {"pages_charged", stats.kv_window_charged_pages},
+                            {"floor_pages", stats.kv_window_floor_pages},
+                            {"granule_pages", stats.kv_window_granule_pages},
+                            {"page_bytes", stats.kv_window_page_bytes}}},
             {"admission_unblocked_heads", stats.admission_unblocked_heads},
             {"kv_admission", stats.kv_on_demand != 0 ? "ondemand" : "reserve"},
             {"capacity_pages", stats.kv_capacity_pages},
@@ -2419,7 +2425,7 @@ void HttpServer::attach(GenerationService& service) {
     device_                            = memory.device;
     attached_memory_.emplace(&service, memory);
     request_jsonl_.write_server_start(options_, service.sampling_defaults(), public_model_id_, load,
-                                      service.memory_summary());
+                                      service.memory_summary(), service.runtime_stats().kv_on_demand != 0);
 }
 
 bool HttpServer::listen() {

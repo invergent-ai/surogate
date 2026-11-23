@@ -1,20 +1,20 @@
-# VENDORED UNCHANGED from rl/engine-inkling-2026-11-21/lanes/L/inkling_ref_ad.py (sha256 cc78cb8b9bb51998..., lane L, 2026-11-21):
-# the semantic op definitions (lane a's CPU reference + lane L's autograd STE changes) the LEVEL-0 backward recomputes.
-"""AUTOGRAD COPY (lane L, 2026-11-21) of ref/inkling_ref.py (sha256 16d8dba0...). Forward arithmetic unchanged;
-changes, all inert unless used (checked bit for bit against the original by lanes/L/learn1.py check):
+# VENDORED from the autograd copy of the Inkling-2-Mini reference, inkling_ref_ad.py (sha256 cc78cb8b9bb51998..., 2026-11-21; comments and the EXPERT_CACHE_DIR default changed since, math unchanged):
+# the semantic op definitions (the CPU reference + the autograd STE changes) the LEVEL-0 backward recomputes.
+"""AUTOGRAD COPY (2026-11-21) of ref/inkling_ref.py (sha256 16d8dba0...). Forward arithmetic unchanged;
+changes, all inert unless used (checked bit for bit against the original):
   (L1) rb() / r8() are straight-through autograd functions (identity backward in fp32); same forward values.
        ROUND["on"] = False turns both into identity (smooth fp32 function: finite-difference gradient checks only).
   (L2) InklingRef.kv_store_f32: keep the KV cache in fp32 storage (values already e4m3 / bf16 exact), so autograd
        never casts gradients to float8.
   (L3) InklingRef.forward(..., ckpt=True): one-chunk forward with activation checkpointing per visit
        (torch.utils.checkpoint, REENTRANT; each visit's VisitState is re-created fresh inside the checkpoint).
-  (L4) ROOT = three levels up (file lives in lanes/L/).
+  (L4) ROOT = three levels up from this file.
   (L5) expert GEMMs with grad: _WeightMM (same forward mm; the backward rebuilds the frozen fp32 expert weight
        instead of saving it).
 
-Inkling-2-Mini (inkling2_loop) CPU reference -- lane a of ENGINE-INKLING.
+Inkling-2-Mini (inkling2_loop) CPU reference.
 
-Pure PyTorch, CPU, batch 1. THE semantic definition of every Inkling op for the engine and trainer lanes (OPS.md
+Pure PyTorch, CPU, batch 1. THE semantic definition of every Inkling op for the engine and the trainer (OPS.md
 section 3 names). Written by reading the vLLM implementation in vllm/vllm-openai:inkling-2-mini-x86_64-7cb5dae
 (ref/src/vllm/models/inkling2/nvidia/**), the only implementation that runs this checkpoint, following the sm_120
 code paths (the RTX 5090 runs: `ops/attention_sm90.py`, `ops/moe_sm120.py`, `ops/conv_mix.py` sm_120 branch).
@@ -33,7 +33,7 @@ Conventions
 - Visit numbering (OPS.md 1): v < 6 -> (layer v, pass 0); 6 <= v < 42 -> (6 + (v-6) % 12, (v-6) // 12);
   v >= 42 -> (v - 24, pass 0). Visit 48 = final-norm output.
 
-Checked facts (see lanes/a/NOTES.md): NVFP4 outer_scale_denominator = 2688 = 6 * 448 and max|w| == amax (layer 0
+Checked facts: NVFP4 outer_scale_denominator = 2688 = 6 * 448 and max|w| == amax (layer 0
 expert 0); w13 rows interleave (gate j = row 2j, up j = row 2j + 1) as `ops/activation.py` `_situ` reads the bf16
 gate_up pairs (sm_120 keeps the checkpoint row order: no shuffle); low nibble = even element.
 """
@@ -49,11 +49,11 @@ from dataclasses import dataclass, field
 import torch
 from safetensors import safe_open
 
-ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # (L4) rl/engine-inkling-2026-11-21 (NFS; /mnt/data on node-3, /data/surogate on the CPU boxes)
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # (L4)
 MODEL_DIR = os.path.join(ROOT, "model")
 # Prebuilt exact bf16 expert values (raw files, mmapped read-only, page cache shared by all processes on a host);
 # built by `python ref/inkling_ref.py build-expert-cache`. Optional: without it the experts are dequantised at load.
-EXPERT_CACHE_DIR = os.path.join(ROOT, "lanes/a/cache/experts_bf16")
+EXPERT_CACHE_DIR = os.environ.get("INKLING_EXPERT_CACHE_DIR", os.path.join(ROOT, "cache", "experts_bf16"))
 FP32_MAX = 3.4028234663852886e38
 D = 2304
 LOOP_STREAMS = ("attn", "k", "v", "mlp")
@@ -75,7 +75,7 @@ def is_exact() -> bool:
 
 
 # vLLM-artifact emulation (OFF by default; the reference semantics are the ideal fp32-accumulation ones). Measured on
-# the vLLM image's own kernels (lanes/a/capture_compare.py, splitk_search*.py; RTX 5090, prefill chunk M = 256):
+# the vLLM image's own kernels (capture_compare.py, splitk_search*.py; RTX 5090, prefill chunk M = 256):
 #  - cuBLAS bf16 GEMMs with small N use split-K with bf16-ROUNDED partials summed in fp32: the separate K / V
 #    projections (N 1024, K 2304: 5 parts of 512) of global layers and of looped local visits, and the dynamic-conv
 #    tap projection (N 32: 8 parts of 320). The q-side GEMM, the fused local qkvr, wo_ud: plain fp32 accumulation.
@@ -311,7 +311,7 @@ def inkling_quant_nvfp4_4o6(x: torch.Tensor) -> QuantNVFP4:
     inv4 = torch.clamp(1.0 / (s4 * dec[:, None]), max=FP32_MAX)
     c6, v6 = e2m1_rne(xb * inv6[..., None])
     c4, v4 = e2m1_rne(xb * inv4[..., None])
-    # block error |fma(v * s, outer, -x)| (the compiled kernel FUSES the multiply-subtract: measured by lane d on the
+    # block error |fma(v * s, outer, -x)| (the compiled kernel FUSES the multiply-subtract: measured on the
     # capture of vLLM's kernels, 0 of 36,864 blocks differ with the fused form, 3 with the unfused one), pairwise sum
     o = outer[:, None, None]
     err6 = _pairwise16((v6 * s6[..., None]).double().mul(o.double()).sub(xb.double()).float().abs())
@@ -363,7 +363,7 @@ def quant_fp8_per_token(x: torch.Tensor) -> torch.Tensor:
 
 
 def fp8_quant_weight(w: torch.Tensor, scheme: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """FP8 e4m3 weight quantisation candidates for the attention projections (owner ruling 06:58; DESIGN 10.1).
+    """FP8 e4m3 weight quantisation candidates for the attention projections (DESIGN 10.1).
 
     scheme: 'tensor' (one scale), 'channel' (per output row), 'block1x128' (per output row x 128 input columns),
     'block128x128'. Scale = amax / 448 of the group (fp32; 1 for an all-zero group). Returns (e4m3 values [N, K],
@@ -802,7 +802,7 @@ class MoEWeights:
 
 def make_lora(num_experts: int = 128, hidden: int = D, inter: int = 1152, rank: int = 16, alpha: float = 32.0,
               seed: int = 0, std: float = 0.02) -> dict:
-    """Random expert LoRA (fixed seed; bf16-representable values) for the lane-d LoRA vectors."""
+    """Random expert LoRA (fixed seed; bf16-representable values) for the MoE LoRA vectors."""
     g = torch.Generator().manual_seed(seed)
     f = lambda *sh: rb(torch.randn(*sh, generator=g) * std)
     return {"w13": (f(num_experts, rank, hidden), f(num_experts, 2 * inter, rank)),

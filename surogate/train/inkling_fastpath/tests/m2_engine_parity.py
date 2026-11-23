@@ -1,6 +1,6 @@
-"""Lane T M1 / M2: the trainer's forward through the shim == the engine's own forward, BIT FOR BIT.
+"""M1 / M2: the trainer's forward through the shim == the engine's own forward, BIT FOR BIT.
 
-Inputs (made by lanes/T/card/m2_remote.sh on the same card, same libsinfer.so, just before):
+Inputs (made by the card-side preparation script on the same card, same libsinfer.so, just before):
   --dump DIR     SUROGATE_SERVE_INKLING_DUMP of surogate-engine's first prompt forward (o00): per visit attn_in, qkvr,
                  gated, attn_out, mlp_in, moe_out, partial (forward.cpp `dump`)
   --resp DIR     /v1/completions responses with prompt_logprobs (<name>.json), token ids in --prompts DIR/<name>.json

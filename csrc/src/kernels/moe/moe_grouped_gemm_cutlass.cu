@@ -3,7 +3,8 @@
 
 // bf16 grouped GEMM for the MoE experts on CUTLASS's grouped kernel: one launch for all experts, no
 // library lock (moe_expert_gemms in moe_common.cuh says why not cuBLAS grouped GEMM), and one tile
-// configuration for every expert. The last point keeps a token's result independent of how many
+// configuration for every expert. The output is bf16, or fp32 for weight gradients that accumulate
+// in fp32 across a step's windows (FP32 LoRA masters). The last point keeps a token's result independent of how many
 // other tokens its expert received: each output element sums over K in the same order whatever the
 // problem's N, which row packing relies on (a packed row must match the row alone bit for bit).
 // There is no split-K, so the result is also the same run to run.
@@ -18,6 +19,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 #include <cublas_v2.h>
@@ -42,7 +44,7 @@ using cutlass::layout::RowMajor;
 
 // cuBLAS column-major convention throughout: C (m x n, column-major) = op(A) (m x k) * op(B) (k x n).
 // op = N on a column-major operand is a ColumnMajor layout; op = T is the same bytes as RowMajor.
-template <typename LayoutA, typename LayoutB>
+template <typename LayoutA, typename LayoutB, typename ElementC>
 using GroupedGemm = cutlass::gemm::device::GemmGrouped<typename cutlass::gemm::kernel::DefaultGemmGrouped<
     cutlass::bfloat16_t,
     LayoutA,
@@ -52,7 +54,7 @@ using GroupedGemm = cutlass::gemm::device::GemmGrouped<typename cutlass::gemm::k
     LayoutB,
     cutlass::ComplexTransform::kNone,
     8,
-    cutlass::bfloat16_t,
+    ElementC,
     ColumnMajor,
     float,
     cutlass::arch::OpClassTensorOp,
@@ -60,7 +62,8 @@ using GroupedGemm = cutlass::gemm::device::GemmGrouped<typename cutlass::gemm::k
     cutlass::gemm::GemmShape<128, 128, 32>,
     cutlass::gemm::GemmShape<64, 64, 32>,
     cutlass::gemm::GemmShape<16, 8, 16>,
-    cutlass::epilogue::thread::LinearCombination<cutlass::bfloat16_t, 8, float, float>,
+    // 16-byte stores: 8 bf16 or 4 fp32 outputs per access.
+    cutlass::epilogue::thread::LinearCombination<ElementC, 128 / cutlass::sizeof_bits<ElementC>::value, float, float>,
     // Unused by the grouped kernels (CUTLASS example 24); required by the template.
     cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle,
     4,
@@ -169,7 +172,7 @@ inline std::size_t align16(std::size_t x) {
     return (x + 15) / 16 * 16;
 }
 
-template <typename LayoutA, typename LayoutB>
+template <typename LayoutA, typename LayoutB, typename OutT>
 void run_grouped(const std::vector<int>& m,
                  const std::vector<int>& n,
                  const std::vector<int>& k,
@@ -179,10 +182,11 @@ void run_grouped(const std::vector<int>& m,
                  const std::vector<const nv_bfloat16*>& B,
                  const std::vector<int>& ldb,
                  float beta,
-                 const std::vector<nv_bfloat16*>& C,
+                 const std::vector<OutT*>& C,
                  const std::vector<int>& ldc,
                  cudaStream_t stream) {
-    using Gemm = GroupedGemm<LayoutA, LayoutB>;
+    using ElementC = std::conditional_t<std::is_same_v<OutT, float>, float, cutlass::bfloat16_t>;
+    using Gemm = GroupedGemm<LayoutA, LayoutB, ElementC>;
     using Element = cutlass::bfloat16_t;
     const std::size_t count = m.size();
 
@@ -223,8 +227,8 @@ void run_grouped(const std::vector<int>& m,
                                   epilogue,
                                   reinterpret_cast<Element**>(dev + off_ptr_a),
                                   reinterpret_cast<Element**>(dev + off_ptr_b),
-                                  reinterpret_cast<Element**>(dev + off_ptr_c),
-                                  reinterpret_cast<Element**>(dev + off_ptr_c),
+                                  reinterpret_cast<ElementC**>(dev + off_ptr_c),
+                                  reinterpret_cast<ElementC**>(dev + off_ptr_c),
                                   reinterpret_cast<int64_t*>(dev + off_lda),
                                   reinterpret_cast<int64_t*>(dev + off_ldb),
                                   reinterpret_cast<int64_t*>(dev + off_ldc),
@@ -247,22 +251,21 @@ bool aligned16(const void* p) {
     return reinterpret_cast<std::uintptr_t>(p) % 16 == 0;
 }
 
-}  // namespace
-
-bool moe_cutlass_grouped_gemm_bf16(cublasOperation_t transa,
-                                   cublasOperation_t transb,
-                                   const std::vector<int>& m,
-                                   const std::vector<int>& n,
-                                   const std::vector<int>& k,
-                                   float alpha,
-                                   const std::vector<const nv_bfloat16*>& A,
-                                   const std::vector<int>& lda,
-                                   const std::vector<const nv_bfloat16*>& B,
-                                   const std::vector<int>& ldb,
-                                   float beta,
-                                   const std::vector<nv_bfloat16*>& C,
-                                   const std::vector<int>& ldc,
-                                   cudaStream_t stream) {
+template <typename OutT>
+bool cutlass_grouped(cublasOperation_t transa,
+                     cublasOperation_t transb,
+                     const std::vector<int>& m,
+                     const std::vector<int>& n,
+                     const std::vector<int>& k,
+                     float alpha,
+                     const std::vector<const nv_bfloat16*>& A,
+                     const std::vector<int>& lda,
+                     const std::vector<const nv_bfloat16*>& B,
+                     const std::vector<int>& ldb,
+                     float beta,
+                     const std::vector<OutT*>& C,
+                     const std::vector<int>& ldc,
+                     cudaStream_t stream) {
     const bool ta = transa != CUBLAS_OP_N, tb = transb != CUBLAS_OP_N;
     if (ta && tb) return false;  // not instantiated (no MoE caller uses TT)
     for (std::size_t i = 0; i < m.size(); ++i) {
@@ -283,4 +286,40 @@ bool moe_cutlass_grouped_gemm_bf16(cublasOperation_t transa,
         run_grouped<ColumnMajor, ColumnMajor>(m, n, k, alpha, A, lda, B, ldb, beta, C, ldc, stream);
     }
     return true;
+}
+
+}  // namespace
+
+bool moe_cutlass_grouped_gemm_bf16(cublasOperation_t transa,
+                                   cublasOperation_t transb,
+                                   const std::vector<int>& m,
+                                   const std::vector<int>& n,
+                                   const std::vector<int>& k,
+                                   float alpha,
+                                   const std::vector<const nv_bfloat16*>& A,
+                                   const std::vector<int>& lda,
+                                   const std::vector<const nv_bfloat16*>& B,
+                                   const std::vector<int>& ldb,
+                                   float beta,
+                                   const std::vector<nv_bfloat16*>& C,
+                                   const std::vector<int>& ldc,
+                                   cudaStream_t stream) {
+    return cutlass_grouped(transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc, stream);
+}
+
+bool moe_cutlass_grouped_gemm_bf16_f32out(cublasOperation_t transa,
+                                          cublasOperation_t transb,
+                                          const std::vector<int>& m,
+                                          const std::vector<int>& n,
+                                          const std::vector<int>& k,
+                                          float alpha,
+                                          const std::vector<const nv_bfloat16*>& A,
+                                          const std::vector<int>& lda,
+                                          const std::vector<const nv_bfloat16*>& B,
+                                          const std::vector<int>& ldb,
+                                          float beta,
+                                          const std::vector<float*>& C,
+                                          const std::vector<int>& ldc,
+                                          cudaStream_t stream) {
+    return cutlass_grouped(transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc, stream);
 }

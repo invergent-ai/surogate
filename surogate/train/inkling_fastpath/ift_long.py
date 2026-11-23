@@ -1,6 +1,6 @@
-"""ENGINE-INKLING lane T: the LEVEL-0 backward for LONG rows on one card (lanes/T/NOTES.md, long-row path).
+"""The LEVEL-0 backward for LONG rows on one card (the long-row path).
 
-Same gradient as ift_backward (S2: lane L's W4A16 / STE math per visit, evaluated at the ENGINE's visit inputs,
+Same gradient as ift_backward (S2: the reference's W4A16 / STE math per visit, evaluated at the ENGINE's visit inputs,
 routing replayed from the engine), restructured so memory no longer grows like (visits x tokens x graph):
 - the engine forward keeps every visit output in PINNED HOST memory (bf16, exact), not on the card; the autograd graph
   over the 48 visits carries zero-byte placeholders (the values live on the host and in the engine's head output);
@@ -10,7 +10,7 @@ routing replayed from the engine), restructured so memory no longer grows like (
   output convs) run with full-T autograd (small graphs); attention is flash-style (RelAttentionR: the relative bias is
   formed per query block from r and rel_proj, never as a dense [T, 24, 1,024] tensor);
 - the final mix is TokenChunked too.
-Validation: the same gradient as ift_backward on short rows (tests/long_check.py), lane L's rig via D1 as before.
+Validation: the same gradient as ift_backward on short rows (tests/long_check.py), the learnability rig via D1 as before.
 """
 
 from __future__ import annotations
@@ -200,7 +200,7 @@ def sink_add(dst, g):
 # flash attention with the relative bias formed from r per query block
 # ---------------------------------------------------------------------------------------------------------------
 def _rel_block(r_out, rel_proj, b0, b1):
-    """rel [nq, 24, 1024] = bf16(r_out[b0:b1] . rel_proj) (lane L's prologue: rb(einsum('thj,jd->thd')))."""
+    """rel [nq, 24, 1024] = bf16(r_out[b0:b1] . rel_proj) (the reference's prologue: rb(einsum('thj,jd->thd')))."""
     return RA.rb(torch.einsum("thj,jd->thd", r_out[b0:b1], rel_proj.float()))
 
 
@@ -448,7 +448,7 @@ def _moe_rows(xr, gr, eg, pg, cap, ng, u13, f13, u2, f2, lo, scale):
 
 # ---------------------------------------------------------------------------------------------------------------
 # LEVEL-1 lever 1b (MOE_FAST, default OFF until its card check): the same S2 vjp as _moe_rows, without the id-major
-# padding and without autograd over the GEMMs. Real routing (lanes/T/tools/moe_bucket_census.py, P3' rows, 48 windows of
+# padding and without autograd over the GEMMs. Real routing (a MoE bucket census, P3' rows, 48 windows of
 # 8k): the padded bmm of a 16-expert group carries 3.96x the real rows (one expert holds most of them); with the group's
 # experts sorted by row count and cut optimally into <= 3 batches it carries 1.34x. The down projection's forward
 # value is never computed: its output is rounded straight-through and only its cotangent is used.

@@ -228,12 +228,12 @@ std::string serve_usage_text(const char* argv0) {
            "[--kv-cache-dtype auto|bf16|fp8|fp8_e4m3|int8] [--kv-cache-dtype-skip-layers L,...] "
            "[--spec mtp|dflash --draft-tokens N] [--spec-max-lanes N|all] [--spec-adaptive] "
            "[--default-max-tokens N] [--overlong-max-tokens reject|cap] "
-           "[--vision] [--gemma-image-tokens 280|560|1120] [--offload-vision] [--offload-embeddings] [--offload-output-head] "
+           "[--vision] [--vision-fp8] [--gemma-image-tokens 280|560|1120] [--offload-vision] [--offload-embeddings] [--offload-output-head] "
            "[--enforce-eager] [--no-prefix-reuse] [--batch-invariant] "
            "[--enable-sleep-mode] [--elastic-kv|--no-elastic-kv] [--elastic-kv-overcommit] "
            "[--gpu-memory-limit-mib N] [--prefix-cache-host-gb N] "
            "[--model name=path[,key=value...]] [--model-priority high|normal|low] "
-           "[--enable-lora] [--lora-modules name=path,...] [--max-loras N] [--max-lora-rank N] "
+           "[--enable-lora] [--lora-modules name=path,...] [--max-loras N] [--max-lora-rank N] [--max-expert-lora-rank N] "
            "[--capture-routing] "
            "[--lm-head-draft|--full-head-draft] [--thinking|--no-thinking] [--preserve-thinking] "
            "[--thinking-retention off|loop|all] [--thinking-retention-mb N] [--thinking-retention-ttl T] "
@@ -258,6 +258,10 @@ std::string serve_usage_text(const char* argv0) {
            "server\n"
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
            "       --vision enables image/video input for a supported model\n"
+           "       --vision-fp8 runs the vision tower's block projections in MXFP8 on a Blackwell\n"
+           "         device (block-scaled FP8 at twice the BF16 rate; outputs change by FP8\n"
+           "         rounding). The weights are quantized once at startup, beside the BF16 ones;\n"
+           "         on a 12.x device an image of 3072+ patches also takes FP8 attention\n"
            "       --rope-scaling takes Hugging Face's rope_scaling object, e.g.\n"
            "         '{\"rope_type\":\"yarn\",\"factor\":4,\"original_max_position_embeddings\":262144}':\n"
            "         YaRN over the Qwen3.5/3.6 MoE rotation, extending the context to\n"
@@ -270,6 +274,7 @@ std::string serve_usage_text(const char* argv0) {
            "         the pool (0.01) free while others run, grows sequences a round at a time and,\n"
            "         when the pool runs short, preempts the running request that arrived last and\n"
            "         recomputes it later; reserve commits prompt + max_tokens at admission.\n"
+           "         A DSpark engine (Inkling, --spec dflash) reserves unless ondemand is given explicitly.\n"
            "       --kv-cache-dtype defaults to auto: BF16 for attention-only models and on "
            "Hopper, FP8 for hybrids elsewhere.\n"
            "         fp8 and fp8_e4m3 select the same format. Skip-layer indices keep BF16.\n"
@@ -336,6 +341,8 @@ std::string serve_usage_text(const char* argv0) {
            "       --enable-lora enables adapters; --lora-modules loads named adapters at "
            "startup.\n"
            "         --max-loras defaults to 1 and --max-lora-rank to 32 per model.\n"
+           "         --max-expert-lora-rank N sizes the routed-expert banks apart from --max-lora-rank\n"
+           "         (Inkling-2-Mini; 0 = --max-lora-rank).\n"
            "       --lora-swap in-place makes POST /v1/load_lora_adapter of a loaded name swap the\n"
            "         bytes at a round boundary: running requests continue on the new adapter and\n"
            "         none are held (the body's \"in_place\" overrides; drain is the default). Each\n"
@@ -477,8 +484,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             const std::string mode = require_value("--kv-admission");
             if (mode == "reserve") {
                 options.kv_admission.mode = KvAdmission::Reserve;
+                options.kv_admission.explicit_on_demand = false;
             } else if (mode == "ondemand" || mode == "on-demand") {
                 options.kv_admission.mode = KvAdmission::OnDemand;
+                options.kv_admission.explicit_on_demand = true;
             } else {
                 throw std::invalid_argument("--kv-admission must be reserve or ondemand");
             }
@@ -609,6 +618,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             default_max_tokens_explicit = true;
         } else if (arg == "--offload-vision") {
             options.offload_vision = true;
+        } else if (arg == "--vision-fp8") {
+            options.vision_fp8 = true;
         } else if (arg == "--offload-embeddings") {
             options.offload_embeddings = true;
         } else if (arg == "--offload-output-head") {
@@ -821,6 +832,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--max-lora-rank") {
             options.max_lora_rank = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-lora-rank"), "max-lora-rank"));
+        } else if (arg == "--max-expert-lora-rank") {
+            options.max_expert_lora_rank = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--max-expert-lora-rank"), "max-expert-lora-rank"));
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head          = ProposalHead::Optimized;
             options.speculative.proposal_head_explicit = true;
@@ -932,6 +946,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.port <= 0 || options.port > 65535) {
         throw std::invalid_argument("--port must be in [1,65535]");
     }
+    if (options.vision_fp8 && !options.enable_vision) {
+        throw std::invalid_argument("--vision-fp8 needs --vision");
+    }
     if (options.elastic_kv_overcommit && !options.elastic_kv) {
         throw std::invalid_argument("--elastic-kv-overcommit needs the elastic pool; drop --no-elastic-kv");
     }
@@ -1029,6 +1046,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         if (options.max_loras == 0) { throw std::invalid_argument("--max-loras must be positive"); }
         if (options.max_lora_rank == 0) {
             throw std::invalid_argument("--max-lora-rank must be positive");
+        }
+        if (options.max_expert_lora_rank > options.max_lora_rank) {
+            throw std::invalid_argument("--max-expert-lora-rank must not exceed --max-lora-rank");
         }
         if (options.lora_modules.size() > options.max_loras) {
             throw std::invalid_argument("--lora-modules names " +

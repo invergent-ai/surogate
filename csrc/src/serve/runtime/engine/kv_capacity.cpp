@@ -154,7 +154,11 @@ KvCapacityResolution resolve_kv_capacity(const KvCapacityPolicy& policy,
 std::size_t kv_sizing_free_bytes(const KvCapacityPolicy& policy, SpeculativeBackend speculative,
                                  std::size_t free_before_adapter_banks,
                                  std::size_t free_after_adapter_banks) noexcept {
-    return policy.mode == KvCapacityMode::Automatic && speculative == SpeculativeBackend::None
+    // MTP alone keeps the old sizing: its graph allowance (82 MiB a lane per topology class) was
+    // measured to hold the banks. DFlash's does not: on Inkling-2-Mini it is 320 MiB at 8 lanes against about
+    // 1.1 GiB of rank-16 banks, which then took the whole 1 GiB of headroom
+    // (out-of-memory diagnosis, F4).
+    return policy.mode == KvCapacityMode::Automatic && speculative != SpeculativeBackend::Mtp
                ? free_after_adapter_banks
                : free_before_adapter_banks;
 }

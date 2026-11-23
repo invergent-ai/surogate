@@ -622,3 +622,57 @@ void dequantize_per_block(Tensor& out,
                          dp,
                          stream);
 }
+
+// =============================================================================
+// Row-wise (per-channel) FP8 dequantization
+// =============================================================================
+
+namespace {
+
+// out[r, c] = code[r, c] * scale[r]: an FP8 E4M3 weight with one scale per output row, as compressed-tensors
+// exports its per-channel FP8 Linears (weight_scale [rows, 1], BF16 or FP32). Two elements per thread.
+template <typename ScaleT>
+__global__ void dequantize_fp8_rowwise_kernel(nv_bfloat16* __restrict__ out,
+                                              const __nv_fp8_e4m3* __restrict__ in,
+                                              const ScaleT* __restrict__ row_scales,
+                                              int M,
+                                              int K) {
+    const long half_k = K / 2;
+    const long total = static_cast<long>(M) * half_k;
+    for (long i = blockIdx.x * static_cast<long>(blockDim.x) + threadIdx.x; i < total;
+         i += static_cast<long>(gridDim.x) * blockDim.x) {
+        const long r = i / half_k;
+        const long c = (i % half_k) * 2;
+        const float s = static_cast<float>(row_scales[r]);
+        const long o = r * K + c;
+        out[o] = __float2bfloat16(static_cast<float>(in[o]) * s);
+        out[o + 1] = __float2bfloat16(static_cast<float>(in[o + 1]) * s);
+    }
+}
+
+}  // namespace
+
+void dequantize_fp8_rowwise(nv_bfloat16* out,
+                            const __nv_fp8_e4m3* in,
+                            const void* row_scales,
+                            ETensorDType scale_dtype,
+                            int M,
+                            int K,
+                            const cudaDeviceProp& dp,
+                            cudaStream_t stream) {
+    if (K % 2 != 0) {
+        throw std::runtime_error("dequantize_fp8_rowwise: K must be even");
+    }
+    const int threads = 256;
+    const long work = static_cast<long>(M) * (K / 2);
+    const int blocks = static_cast<int>(std::min<long>((work + threads - 1) / threads, 32L * dp.multiProcessorCount));
+    if (scale_dtype == ETensorDType::BF16) {
+        dequantize_fp8_rowwise_kernel<<<blocks, threads, 0, stream>>>(
+            out, in, static_cast<const nv_bfloat16*>(row_scales), M, K);
+    } else if (scale_dtype == ETensorDType::FP32) {
+        dequantize_fp8_rowwise_kernel<<<blocks, threads, 0, stream>>>(out, in, static_cast<const float*>(row_scales), M, K);
+    } else {
+        throw std::runtime_error("dequantize_fp8_rowwise: row scales must be BF16 or FP32");
+    }
+    CUDA_CHECK(cudaGetLastError());
+}

@@ -69,9 +69,6 @@ struct SamplingWorkspace {
     unsigned long long* sort_keys_a = nullptr;
     unsigned long long* sort_keys_b = nullptr;
     float2* full_vocab_partials     = nullptr; // [columns][chunks] (z or max, id bits); null: one-CTA route
-    // [3][columns][chunks] u64 (max bits, double-sum bits, Gumbel key): the split route of untruncated speculative
-    // rows (speculative_exact_*_kernel); null: the one-CTA wide kernel.
-    unsigned long long* spec_exact_partials = nullptr;
 };
 
 struct SamplingWorkspaceLayout {
@@ -84,7 +81,6 @@ struct SamplingWorkspaceLayout {
     TensorRegion group_done;
     TensorRegion speculative_finalize_count;
     TensorRegion full_vocab_partials;
-    TensorRegion spec_exact_partials;
     std::size_t bytes           = 0;
     std::int32_t partial_stride = 0;
     bool multiblock             = false;
@@ -101,10 +97,18 @@ struct SamplingWorkspaceLayout {
             sort_keys_a.region.bytes ? static_cast<unsigned long long*>(sort_keys_a.bind(backing).data) : nullptr,
             sort_keys_b.region.bytes ? static_cast<unsigned long long*>(sort_keys_b.bind(backing).data) : nullptr,
             full_vocab_partials.region.bytes ? static_cast<float2*>(full_vocab_partials.bind(backing).data) : nullptr,
-            spec_exact_partials.region.bytes ? static_cast<unsigned long long*>(spec_exact_partials.bind(backing).data) : nullptr,
         };
     }
 };
+
+/// Bytes per row of the speculative split routes' chunk partials ([3][columns][chunks] u64: max bits, sum / z bits,
+/// key / token), carved AFTER the batch's sampling layouts only for a target that opts in (split_routes; the DSpark drafter).
+inline std::size_t speculative_split_partial_row_bytes(std::int32_t token_domain, std::int32_t columns) {
+    if (token_domain <= kSamplerSortTile || columns <= 0) { return 0; }
+    const std::size_t bytes = static_cast<std::size_t>(div_up(token_domain, kSamplerFullVocabChunkItems)) *
+                              static_cast<std::size_t>(columns) * 3 * sizeof(unsigned long long);
+    return (bytes + 255) / 256 * 256;
+}
 
 inline SamplingWorkspaceLayout make_sampling_workspace_layout(std::int32_t token_domain,
                                                               std::int32_t columns) {
@@ -124,9 +128,6 @@ inline SamplingWorkspaceLayout make_sampling_workspace_layout(std::int32_t token
         out.full_vocab_partials = layout.add_tensor(
             DType::I64, {div_up(token_domain, kSamplerFullVocabChunkItems), columns}, 256,
             "sampling full-vocabulary chunk partials");
-        out.spec_exact_partials = layout.add_tensor(
-            DType::I64, {div_up(token_domain, kSamplerFullVocabChunkItems), columns, 3}, 256,
-            "speculative exact-route chunk partials");
     }
     if (out.multiblock) {
         out.partial_keys =

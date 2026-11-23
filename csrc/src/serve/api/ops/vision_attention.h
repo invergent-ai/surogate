@@ -47,4 +47,36 @@ void vision_attention(const Tensor& q, const Tensor& k, const Tensor& v, const T
 void vision_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                       std::int32_t segment_length, Tensor& out, cudaStream_t stream, float scale = 0.0F);
 
+/**
+ * The same packed, non-causal attention with S = Q K^T and O += P V on the e4m3 tensor cores
+ * (--vision-fp8): Q and K rounded to e4m3 with one scale per (token, head), V with one per
+ * (head, channel), P scaled by 448 before its rounding (ops/kernel/vision_attention_fp8.cuh).
+ * `scratch` holds the prepared operands, vision_attention_fp8_scratch_bytes(D, H, P) bytes,
+ * 16-byte aligned, and must not overlap the inputs or out. Returns false, having enqueued
+ * nothing, where the route does not run: a device other than compute capability 12.x, D other
+ * than 64 or 72, misaligned operands, or too small a scratch. Throws as the BF16 overload does
+ * on an invalid call.
+ */
+[[nodiscard]] bool vision_attention_fp8(const Tensor& q, const Tensor& k, const Tensor& v,
+                                        const Tensor& cu_seqlens, WorkspaceArena& workspace,
+                                        DeviceSpan scratch, Tensor& out, cudaStream_t stream,
+                                        float scale = 0.0F);
+/**
+ * vision_attention_fp8 with the tower's rotary embedding folded in: q and k are the unrotated
+ * projections, `positions` the [P, 2] I32 rotary positions ops::rope takes, and the rotation is
+ * applied on the way into e4m3 -- the same rotation, rounded to BF16 as ops::rope rounds it, so
+ * the result is bit for bit ops::rope followed by vision_attention_fp8. q and k are only read.
+ * Returns false, having enqueued nothing (q and k unrotated), wherever vision_attention_fp8 would
+ * or ops::rope would not take its fixed vision kernel (16 heads, two axes, rotary_dim == D, theta
+ * 10000), where bit-for-bit agreement is not on offer.
+ */
+[[nodiscard]] bool vision_attention_fp8_rope(const Tensor& q, const Tensor& k, const Tensor& v,
+                                             const Tensor& positions, std::int32_t rotary_dim,
+                                             float theta, const Tensor& cu_seqlens,
+                                             WorkspaceArena& workspace, DeviceSpan scratch,
+                                             Tensor& out, cudaStream_t stream, float scale = 0.0F);
+/// Scratch bytes vision_attention_fp8 needs for D x H x P; 0 for an unsupported D.
+[[nodiscard]] std::size_t vision_attention_fp8_scratch_bytes(std::int32_t head_dim,
+                                                             std::int32_t heads,
+                                                             std::int32_t patches);
 } // namespace sinfer::ops

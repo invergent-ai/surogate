@@ -1,4 +1,4 @@
-// DSpark drafter ops (ENGINE-INKLING lane e2): api/ops/dspark.h. One translation unit: kernels, launchers and the
+// DSpark drafter ops: api/ops/dspark.h. One translation unit: kernels, launchers and the
 // host-side validation. Compiled with -fmad=false (CMakeLists.txt): every product / sum the reference
 // (ref/dspark_ref.py) does not fuse stays unfused; dot products use explicit fmaf (their order differs from the
 // reference's GEMMs anyway, and the golden-vector tolerances say so).
@@ -7,6 +7,7 @@
 
 #include "core/device.h" // CUDA_CHECK
 #include "ops/kernel/paged_kv_address.cuh"
+#include "ops/kernel/sampling_device.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -107,7 +108,7 @@ head_norm_rope_kernel(const bf16* x, std::int64_t x_stride, const bf16* weight, 
         constexpr int half = G::kHeadDim / 2;
         const int i        = d & (half - 1);
         // positions is a per-round buffer written by an earlier node of the round's graph: read it with ld.cg (the
-        // compiler emitted ld.global.nc here on type-based alias grounds; PDL audit 17:48). inv_freq is a load-time
+        // compiler emitted ld.global.nc here on type-based alias grounds; PDL audit). inv_freq is a load-time
         // constant. Same bits.
         const float angle  = __fmul_rn(static_cast<float>(__ldcg(positions + t)), inv_freq[i]);
         const float c      = cosf(angle);
@@ -410,12 +411,34 @@ __global__ void __launch_bounds__(kThreads)
 markov_vocab_kernel(const bf16* base, std::int64_t base_rows, int row, int batch, const bf16* fold_w,
                     const std::uint8_t* fold_codes, const float* fold_scales, const bf16* fold_b, const bf16* latent,
                     int domain, const std::int32_t* ids, float* part_val, std::int32_t* part_id, bf16* bias_out,
-                    bf16* logits_out) {
+                    bf16* logits_out, const SamplingConfig* sampling, const std::int32_t* anchor_positions,
+                    int draft_index) {
     __shared__ float lat_s[kMaxLanes][G::kRank];
     __shared__ float wv_s[kThreads / 32][kMaxLanes];
     __shared__ int wi_s[kThreads / 32][kMaxLanes];
+    // coupled sampled drafts: per lane, whether to sample, 1 / T and the Gumbel key (dspark.h)
+    __shared__ int cp_s[kMaxLanes];
+    __shared__ float it_s[kMaxLanes];
+    __shared__ unsigned long long seed_s[kMaxLanes];
+    __shared__ int kpos_s[kMaxLanes], kpur_s[kMaxLanes];
     for (int idx = threadIdx.x; idx < batch * G::kRank; idx += kThreads) {
         lat_s[idx / G::kRank][idx % G::kRank] = f(latent[idx]);
+    }
+    if (threadIdx.x < batch) {
+        const int b = threadIdx.x;
+        int cp      = 0;
+        if (sampling != nullptr) {
+            const SamplingConfig cfg = sampling[b];
+            cp = cfg.speculative_coupled != 0 && sampling_untruncated(cfg) ? 1 : 0;
+            if (cp) {
+                const SampleKey key = sample_key(cfg, anchor_positions[b] + draft_index, kSamplePurposeDecode);
+                it_s[b]   = 1.0F / cfg.temperature;
+                seed_s[b] = cfg.seed;
+                kpos_s[b] = key.position;
+                kpur_s[b] = key.purpose;
+            }
+        }
+        cp_s[b] = cp;
     }
     __syncthreads();
     const int warp = threadIdx.x >> 5;
@@ -446,6 +469,12 @@ markov_vocab_kernel(const bf16* base, std::int64_t base_rows, int row, int batch
             for (int e = 0; e < 8; ++e) { wf[e] = f(w8[e]); }
         }
         const float fb     = f(fold_b[v]);
+        // lane b of the warp draws lane b's Gumbel for this token once; the b loop takes it with a shuffle
+        float g_mine = 0.0F;
+        if (lane < batch && cp_s[lane]) {
+            g_mine = sampling_gumbel(seed_s[lane], kpos_s[lane], kpur_s[lane],
+                                     static_cast<unsigned>(ids != nullptr ? ids[v] : v));
+        }
         for (int b = 0; b < batch; ++b) {
             float p = 0.0F;
 #pragma unroll
@@ -457,8 +486,10 @@ markov_vocab_kernel(const bf16* base, std::int64_t base_rows, int row, int batch
             const float s     = rbf(__fadd_rn(f(base[(static_cast<std::int64_t>(row) + G::kBlock * b) * base_rows + v]),
                                               bias));
             const float logit = rbf(__fmul_rn(G::kSoftcap, tanhf(__fdiv_rn(s, G::kSoftcap))));
-            if (logit > best_v[b]) { // rows ascend: the first maximum is the lowest id
-                best_v[b] = logit;
+            const float g     = __shfl_sync(0xffffffffU, g_mine, b);
+            const float z     = cp_s[b] ? __fadd_rn(__fmul_rn(logit, it_s[b]), g) : logit;
+            if (z > best_v[b]) { // rows ascend: the first maximum is the lowest id
+                best_v[b] = z;
                 best_i[b] = v;
             }
             if (lane == 0) {
@@ -801,7 +832,9 @@ void dspark_markov_gate(const float* ctx, std::int32_t j, std::int32_t k, std::i
 void dspark_markov_vocab(const void* base, std::int32_t base_rows, std::int32_t row, std::int32_t batch,
                          const void* fold_w, const void* fold_b, const void* latent, std::int32_t domain,
                          const std::int32_t* ids, float* part_val, std::int32_t* part_id, void* bias_out,
-                         void* logits_out, cudaStream_t stream, const void* fold_codes, const float* fold_scales) {
+                         void* logits_out, cudaStream_t stream, const void* fold_codes, const float* fold_scales,
+                         const SamplingConfig* sampling, const std::int32_t* anchor_positions,
+                         std::int32_t draft_index) {
     constexpr const char* op = "dspark_markov_vocab";
     require((fold_codes == nullptr) == (fold_scales == nullptr), op, "FP8 fold needs codes and scales");
     require(base != nullptr && (fold_w != nullptr || fold_codes != nullptr) && fold_b != nullptr && latent != nullptr && part_val != nullptr &&
@@ -809,11 +842,12 @@ void dspark_markov_vocab(const void* base, std::int32_t base_rows, std::int32_t 
             op, "null pointer");
     require(batch > 0 && batch <= kMaxLanes && domain > 0 && base_rows >= domain && row >= 1 && row < G::kBlock, op,
             "bad shape (batch <= 16)");
+    require(sampling == nullptr || anchor_positions != nullptr, op, "sampled drafts need the anchor positions");
     markov_vocab_kernel<<<static_cast<unsigned>(dspark_vocab_tiles(domain)), kThreads, 0, stream>>>(
         static_cast<const bf16*>(base), base_rows, row, batch, static_cast<const bf16*>(fold_w),
         static_cast<const std::uint8_t*>(fold_codes), fold_scales, static_cast<const bf16*>(fold_b),
         static_cast<const bf16*>(latent), domain, ids, part_val, part_id,
-        static_cast<bf16*>(bias_out), static_cast<bf16*>(logits_out));
+        static_cast<bf16*>(bias_out), static_cast<bf16*>(logits_out), sampling, anchor_positions, draft_index);
     CUDA_CHECK(cudaGetLastError());
 }
 

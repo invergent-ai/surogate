@@ -1,5 +1,5 @@
-// Inkling-2-Mini loaded model (lane e1): the 48-visit served geometry, the ModelView whose 48 FullLayer entries
-// alias the 24 physical layers lane b binds, and the load-time query arithmetic (ARTIFACT.md 5).
+// Inkling-2-Mini loaded model: the 48-visit served geometry, the ModelView whose 48 FullLayer entries
+// alias the 24 physical layers the loader binds, and the load-time query arithmetic (ARTIFACT.md 5).
 
 #include "targets/inkling2/impl/model.h"
 #include "targets/inkling2/impl/visits.h"
@@ -12,6 +12,7 @@
 
 #include <map>
 #include <stdexcept>
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -109,7 +110,7 @@ family::TextGeometry visit_geometry(const artifact::Reader& reader) {
     std::vector<std::string> types(C::layers);
     for (int v = 0; v < C::layers; ++v) { types[v] = kVisits[v].global ? "full_attention" : "sliding_attention"; }
     family::TextGeometry g = family::TextGeometry::resolved_moe(values, types);
-    // The DSpark drafter's geometry for the DFlash runtime (lane e2), whenever the artifact carries the drafter; it
+    // The DSpark drafter's geometry for the DFlash runtime (DSpark), whenever the artifact carries the drafter; it
     // is used only under `--speculative dflash`.
     const load::ArtifactConfig config = load::parse_artifact_config(reader.payload("inkling2/config.json").data);
     if (config.dspark) { g.dflash = dspark_dflash_geometry(config); }
@@ -126,10 +127,10 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
       host_bank(plan.host_bank.objects.empty() ? nullptr : family::HostBank::shared(plan.host_bank)) {
     // HostBank objects (the FP8 drafter's BF16 sources) resolve to their pinned host bytes from here on.
     if (host_bank) { host_bank->attach(backing); }
-    // Lane b binds the text-only set (no pixel configs): take exactly that set.
+    // The loader binds the text-only set (no pixel configs): take exactly that set.
     frontend = family::take_text_only_frontend_resources(backing, plan.plan.frontend);
     // The release's chat_template.jinja is for HF tooling: vLLM renders Inkling prompts natively from the request
-    // (renderers/inkling_encoding.py), and so does lane f2's frontend, which takes that path only when the artifact
+    // (renderers/inkling_encoding.py), and so does the Inkling frontend, which takes that path only when the artifact
     // states no template. The engine's Jinja reader also cannot parse this one. `--chat-template` still overrides.
     frontend.chat_template_jinja.clear();
     weights  = load::load_weights(plan.plan, backing);
@@ -138,13 +139,33 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     model.weights = &weights;
     model.queries = &queries;
     if (weights.has_draft) {
-        // DSpark (lane e2): the fold and the drafter's derived weights; the runtime's DFlash guards need a payload.
+        // DSpark: the fold and the drafter's derived weights; the runtime's DFlash guards need a payload.
         derive_dspark(weights, dspark, plan.plan.options.draft_linears_host, dspark_fp8_fold_requested());
         model.dspark = &dspark;
-        if (host_bank && dspark.fp8) {
-            // The host bank holds only the drafter's BF16 dense linears (~0.49 GiB pinned), read once above to quantise
-            // them; the FP8 drafter never reads them again (dspark.cpp dense()). Release it (M7 review): detach the
-            // objects from the artifact and null their views first, so nothing can dereference freed memory.
+        // The host bank holds the drafter's BF16 dense linears (~0.49 GiB pinned), read once above to quantise them;
+        // the FP8 drafter never reads them again (dspark.cpp dense()). Release it (M7 review) -- only if EVERY banked
+        // object is one of the 27 draft linears (mtp/layers/<l>/{attn/q,k,v,o,k_ctx,v_ctx; mlp/gate,up,down}; M8b
+        // review): a bank holding anything else (e.g. host experts, later) is kept. Detach the objects from the artifact
+        // and null their views first, so nothing can dereference freed memory.
+        const auto only_draft_linears = [&] {
+            static constexpr const char* kSuffix[9] = {"attn/q", "attn/k", "attn/v", "attn/o", "attn/k_ctx",
+                                                       "attn/v_ctx", "mlp/gate", "mlp/up", "mlp/down"};
+            if (plan.host_bank.objects.size() != weights.draft.layers.size() * 9) { return false; }
+            for (const auto& object : plan.host_bank.objects) {
+                bool known = false;
+                for (std::size_t l = 0; l < weights.draft.layers.size() && !known; ++l) {
+                    for (const char* suffix : kSuffix) {
+                        if (object.name == "mtp/layers/" + std::to_string(l) + "/" + suffix) {
+                            known = true;
+                            break;
+                        }
+                    }
+                }
+                if (!known) { return false; }
+            }
+            return true;
+        };
+        if (host_bank && dspark.fp8 && only_draft_linears()) {
             host_bank->detach(backing);
             for (auto& L : weights.draft.layers) {
                 for (Weight* wt : {&L.q, &L.k, &L.v, &L.o, &L.k_ctx, &L.v_ctx, &L.gate, &L.up, &L.down}) {
@@ -153,6 +174,11 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
                 }
             }
             host_bank.reset();
+            std::fprintf(stderr, "inkling2: DSpark FP8 drafter: released the host bank of %zu BF16 draft linears\n",
+                         plan.host_bank.objects.size());
+        } else if (host_bank && dspark.fp8) {
+            std::fprintf(stderr, "inkling2: DSpark FP8 drafter: host bank KEPT (it holds objects other than the 27 draft "
+                                 "linears)\n");
         }
     }
 

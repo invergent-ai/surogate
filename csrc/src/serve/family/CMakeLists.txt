@@ -10,6 +10,7 @@ target_sources(sinfer_engine PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/inkling_json.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/inkling_parse.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/inkling_render.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/inkling_vision.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/media_cache.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/processor.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/lfm2_processor.cpp
@@ -30,6 +31,7 @@ target_sources(sinfer_engine PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/gemma_vision.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/gemma_vision_ops.cu
   ${CMAKE_CURRENT_SOURCE_DIR}/vision_tower.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/vision_fp8.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/vision_standalone.cpp)
 
 target_include_directories(sinfer_engine PRIVATE

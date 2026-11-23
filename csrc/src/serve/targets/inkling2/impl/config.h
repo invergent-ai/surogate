@@ -57,7 +57,7 @@ struct VisionConfig : family::VisionBackboneConfig {
     static constexpr int output_hidden = TextConfig::hidden;
 };
 
-/// The DSpark drafter rides the DFlash runtime (lane e2, family/impl/runtime/dspark_round.h): `--speculative dflash`
+/// The DSpark drafter rides the DFlash runtime (family/impl/runtime/dspark_round.h): `--speculative dflash`
 /// runs it, k <= 7 drafts per round (block 8).
 struct DFlashConfig {
     static constexpr bool supported = true;

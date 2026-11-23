@@ -1,4 +1,4 @@
-"""ENGINE-INKLING lane T (agent-EN-T): ctypes binding of libsinfer_inkling_train.so, the fast-route shim over the
+"""Ctypes binding of libsinfer_inkling_train.so, the fast-route shim over the
 engine's libsinfer.so (csrc/src/serve/inkling_fastpath/inkling_train_shim.cpp).
 
 The trainer's Inkling forward IS the engine's: every visit runs the engine's own ops with the engine's arguments
@@ -6,7 +6,7 @@ The trainer's Inkling forward IS the engine's: every visit runs the engine's own
 the engine owns the weights (loaded by its own loader). Layout convention: an engine [rows, T] buffer (rows
 contiguous per column) is a row-major torch tensor [T, rows].
 
-Rule (owner 2026-11-21 17:40): the trainer consumes the engine's token ids only and never renders text.
+Rule: the trainer consumes the engine's token ids only and never renders text.
 """
 
 from __future__ import annotations
@@ -163,7 +163,7 @@ class InklingEngine:
             r = list(row)
             self.visits.append(Visit(v, r[0], r[1], tuple(r[3:3 + r[2]]), r[7], r[8], (r[9], r[10]), r[11],
                                      bool(r[12]), bool(r[13]), bool(r[14]), bool(r[15])))
-        # the persistent per-stream state (lanes c / d counters), zeroed once, never touched again
+        # the persistent per-stream state (the attention / MoE ops' counters), zeroed once, never touched again
         self.state = torch.zeros(int(self.lib.shim.ift_state_bytes()) + 256, dtype=torch.uint8, device=self.dev)
         self._ws = None
 
@@ -238,7 +238,7 @@ class InklingEngine:
         return out
 
     def decode_experts(self, layer: int, which: str, first: int, count: int, out: torch.Tensor | None = None):
-        """Lane d's exact unit decode: (unit bf16 [count, 2304, k], factor fp32 [count]); which 'w13' (k 2304) or
+        """The engine's exact unit decode: (unit bf16 [count, 2304, k], factor fp32 [count]); which 'w13' (k 2304) or
         'w2' (k 1152). dX = sum over a token's slots of (dY . unit[e]) * factor[e]."""
         k = 2304 if which == "w13" else 1152
         unit = out if out is not None else torch.empty(count, 2304, k, dtype=torch.bfloat16, device=self.dev)

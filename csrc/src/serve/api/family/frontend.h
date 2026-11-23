@@ -34,6 +34,15 @@ struct FrontendOptions {
     /// domain and has no Vision tokens at all, and asserting the family's would
     /// reject a correct artifact.
     bool registered_tokenizer = true;
+    /// Inkling-2 only, read when vision_enabled: vLLM's per-prompt image count
+    /// (--limit-mm-per-prompt, vLLM's default 999) and the per-image token cap (vLLM's encoder cache size, 4,096 at
+    /// --max-num-batched-tokens 4096). Both refusals carry vLLM's words.
+    std::uint32_t image_limit_per_prompt = 999;
+    std::uint32_t max_image_tokens       = 4'096;
+    /// Inkling-2 pixels: true = what vLLM's server feeds the encoder for a chat request (Pillow, EXIF transpose,
+    /// alpha on white, a JPEG lacking EOI refused), false = vLLM's Inkling processor's own decode_image (no EXIF,
+    /// alpha on a checkerboard, EOI appended), which vLLM's server never reaches for chat (measured on a running vLLM).
+    bool image_decode_as_served = true;
 };
 
 struct FrontendResources;
@@ -188,6 +197,11 @@ public:
     /// answer to a different question.
     void validate_sampling_tokens(const ResolvedSamplingParameters& sampling) const;
     [[nodiscard]] std::shared_ptr<const CompiledTokenConstraint> compile_json_constraint(
+        const std::string& schema) const;
+    /// The schema for the answer that follows a reasoning region a prompt opened: the region is the model's
+    /// own until it writes its close token (JsonConstraintCompiler::compile_after). Null for a model that has
+    /// no single close token, or whose reasoning is a message channel rather than a span.
+    [[nodiscard]] std::shared_ptr<const CompiledTokenConstraint> compile_json_constraint_after_reasoning(
         const std::string& schema) const;
     [[nodiscard]] std::shared_ptr<const CompiledTokenConstraint> compile_tool_constraint(
         const std::string& structural_tag) const;

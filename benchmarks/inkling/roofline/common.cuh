@@ -1,4 +1,4 @@
-// ENGINE-INKLING lane h: day-1 roofline kit for one RTX 5090 (sm_120a). Shared helpers.
+// Inkling-2-Mini roofline kit for one RTX 5090 (sm_120a). Shared helpers.
 //
 // Every benchmark prints ONE JSON object per line on stdout (machine-readable; perf/bounds.py reads them) and a
 // human-readable line on stderr. Timings: CUDA events around a calibrated number of repetitions, several trials,

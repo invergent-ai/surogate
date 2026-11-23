@@ -1,4 +1,4 @@
-"""the 8-card gate's row file and its round-trip verdict on synthetic log-probs (no GPU)."""
+"""The 8-card gate's row file and its round-trip verdict on synthetic log-probs (no GPU)."""
 import json
 import os
 import sys

@@ -13,7 +13,7 @@
 namespace sinfer::family {
 
 /// The draft windows the runtime captures and chooses from. `dspark` (a DSpark target, family/impl/runtime/
-/// dspark_round.h): {0, 1, 2, 3, max} -- the arms its acceptance by content kind asks for (lanes/e2/k_policy.py);
+/// dspark_round.h): {0, 1, 2, 3, max} -- the arms its acceptance by content kind asks for (a CPU k-policy study);
 /// every other drafter keeps {0, 1, 3, 7, 15, max}.
 inline std::vector<std::uint32_t> dflash_draft_windows(std::uint32_t maximum, bool adaptive, bool dspark = false) {
     if (!adaptive) { return {maximum}; }

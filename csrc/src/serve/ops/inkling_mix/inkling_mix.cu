@@ -1,7 +1,7 @@
-// Inkling-2-Mini hidden-stream ops (lane e1): api/ops/inkling_mix.h. One translation unit: kernels,
+// Inkling-2-Mini hidden-stream ops: api/ops/inkling_mix.h. One translation unit: kernels,
 // launchers and the host-side validation. Compiled with -fmad=false (CMakeLists.txt): every product /
 // sum the reference does not fuse stays unfused, and the fma the reference does use is an explicit fmaf.
-// Rounding points: rl/engine-inkling-2026-11-21/lanes/e1/DESIGN-target.md section 3.
+// Rounding points: the target design notes, section 3.
 
 #include "api/ops/inkling_mix.h"
 
@@ -15,6 +15,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <stdexcept>
@@ -410,6 +411,7 @@ struct TailArgs {
     bf16* out                   = nullptr; // [2304, T, S]
     std::int64_t columns        = 0;
     int streams                 = 1;
+    int push_min                = 1;       // latency-cut tail: the push scheme from this many columns of a cluster on
 };
 
 /// inkling_gemm_inv's split reduce (h = bf16(p0 + p1 + ... + p17)) + inkling_gemm_inv FP32 of the gain/forget weights
@@ -418,6 +420,10 @@ struct TailArgs {
 /// layout from the cluster's x through distributed shared memory): bit-identical to the three launches.
 __global__ void __cluster_dims__(kTailCtas, 1, 1) __launch_bounds__(kThreads)
     controller_tail_kernel(const __grid_constant__ TailArgs a) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+    // Thread-block clusters are sm_90+; below it the kernel only traps (the sm_89 cubin of the serve build must compile).
+    __trap();
+#else
     pdl::wait_for_dependencies();
     pdl::trigger_dependents(); // PDL: the next kernel may launch now (it waits for this grid before any read)
     extern __shared__ __align__(16) unsigned char tail_smem[];
@@ -523,6 +529,7 @@ __global__ void __cluster_dims__(kTailCtas, 1, 1) __launch_bounds__(kThreads)
         }
     }
     cluster.sync(); // the other CTAs may still read this CTA's x
+#endif
 }
 
 // ------------------------------------------------------------------------------------- short conv
@@ -722,6 +729,606 @@ __global__ void softcap_f32_kernel(float* logits, int rows, int tokens, std::int
     x                    = tanhf(__fdiv_rn(x, cap)) * cap;
 }
 
+// =================================================================== latency-cut kernels (decode / verify)
+//
+// The same arithmetic as the reference kernels above, in the same per-element order, with the same reduction trees
+// (each value: the xor-shuffle butterfly within a warp, then 0 + warp 0 + ... + warp 7): bit-identical to them
+// (invariance test I8 compares the two bit for bit). What changes is WHEN and WHERE things happen:
+//  - weights (AttnRes queries, norm weights, conv taps, the controllers' gain / forget tile) are read BEFORE the PDL
+//    wait: nothing inside a step writes them, so the reads overlap the producer's tail (activations are read only
+//    after the wait, through plain loads -- never ld.global.nc, which can return stale lines under PDL); the AttnRes
+//    stack / bank columns get an L2 bulk prefetch (a hint, no register) there too;
+//  - every activation load of a row is issued before its first use (the reference kernels' per-source dtype branches
+//    made the compiler wait for each source before it issued the next one: ~7 dependent memory round trips);
+//  - attn_res runs one CTA per (column, query) and blend_inputs one per (column, dest query | message stream): the
+//    reference's single CTA per column was issue-bound at T = 1 (four schedulers for every query's work);
+//  - a CTA's independent reductions share one pass (sums of squares + dots), and a pass uses alternating scratch
+//    halves, so it needs one barrier instead of two;
+//  - controller tail: each CTA pushes its x into the CTA that reduces the column (DSMEM stores) instead of every CTA
+//    pulling every column's x (72 DSMEM loads per thread at T = 8 saturated the LSU queue).
+
+// The kernels keep the reference kernels' names inside namespace mx, so the nsys tooling (perf/m4/nsys_kernels.py,
+// perf/h2/op_table.py: base name, batch from short_conv_kernel's grid.z) reads both paths alike.
+namespace mx {
+
+constexpr int kMxWarps = kThreads / 32;
+
+__device__ __forceinline__ float bits_to_f32(unsigned short b) {
+    return __uint_as_float(static_cast<unsigned>(b) << 16U); // == __bfloat162float
+}
+
+__device__ __forceinline__ unsigned short ld_bits(const void* base, std::int64_t i) {
+    return static_cast<const unsigned short*>(base)[i];
+}
+
+/// An L2 prefetch of one column of a bf16 plane (4,608 bytes; cp.async.bulk.prefetch, sm_90+). A hint, not a load: it
+/// writes no register and L2 is the coherence point, so it is safe before the PDL wait even if a producer still writes
+/// the line (the post-wait load reads whatever L2 holds then). Used for AttnRes stack / bank sources, which completed
+/// visits wrote long ago and the step's weight stream has usually evicted from L2.
+__device__ __forceinline__ void prefetch_column_l2(const PlaneDev& p, std::int64_t t) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
+    const auto* row = static_cast<const unsigned short*>(p.data) + t * p.stride;
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(row), "r"(static_cast<unsigned>(kD * 2)));
+#else
+    // cp.async.bulk is sm_90+; below it the hint is dropped (the sm_89 cubin of the serve build must compile).
+    (void)p;
+    (void)t;
+#endif
+}
+
+/// block_sum's arithmetic for M values, with ONE barrier: `half` (16-byte aligned, kMxWarps * M floats) must differ
+/// from the half the previous pass of this block used (a thread that writes here has passed the previous pass's
+/// barrier, so every read of the other half is done; the pass before that used this half and all its reads happened
+/// before the previous pass's barrier). Branch-free over the M values (a runtime bound would serialise the shuffle
+/// chains); callers zero the values they do not use. Warp w's sum of value i sits at half[i * kMxWarps + w], read
+/// back as two float4 and added in warp order from 0 -- the same sum as block_sum's.
+template <int M>
+__device__ __forceinline__ void block_sum_pass(float (&v)[M], float* half) {
+    static_assert(kMxWarps == 8, "two float4 per value");
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+#pragma unroll
+        for (int i = 0; i < M; ++i) { v[i] += __shfl_xor_sync(0xffffffffU, v[i], off); }
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int i = 0; i < M; ++i) { half[i * kMxWarps + warp] = v[i]; }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < M; ++i) {
+        const float4 lo = *reinterpret_cast<const float4*>(&half[i * kMxWarps]);
+        const float4 hi = *reinterpret_cast<const float4*>(&half[i * kMxWarps + 4]);
+        float s         = 0.0F;
+        s += lo.x;
+        s += lo.y;
+        s += lo.z;
+        s += lo.w;
+        s += hi.x;
+        s += hi.y;
+        s += hi.z;
+        s += hi.w;
+        v[i] = s;
+    }
+}
+
+/// mix_query after its block sum: `dot` = the reduced dots of the N sources (r[off .. off + N)).
+template <int N, int M>
+__device__ __forceinline__ void softmax_mix(const float (&x)[N][kPer], const float (&rstd)[N], const float (&r)[M],
+                                            int off, float (&mix)[kPer]) {
+    float logit[N];
+    float mx = -INFINITY;
+#pragma unroll
+    for (int n = 0; n < N; ++n) {
+        logit[n] = r[off + n] * rstd[n];
+        mx       = fmaxf(mx, logit[n]);
+    }
+    float p[N];
+    float total = 0.0F;
+#pragma unroll
+    for (int n = 0; n < N; ++n) {
+        p[n]  = expf(logit[n] - mx);
+        total = total + p[n];
+    }
+    const float inv_sum = __fdiv_rn(1.0F, total);
+#pragma unroll
+    for (int n = 0; n < N; ++n) { p[n] = p[n] * rstd[n]; } // normalize_values
+#pragma unroll
+    for (int i = 0; i < kPer; ++i) {
+        float acc = 0.0F;
+#pragma unroll
+        for (int n = 0; n < N; ++n) { acc = fmaf(p[n], x[n][i], acc); }
+        mix[i] = acc * inv_sum;
+    }
+}
+
+/// The N sources of a column, bf16 planes only (stack..., last [+ addend]): all loads first, then the conversions.
+template <int N, bool kAdd>
+__device__ __forceinline__ void load_sources_bf16(const PlaneDev* src, const PlaneDev& addend, std::int64_t t,
+                                                  float (&x)[N][kPer]) {
+    unsigned short raw[N][kPer];
+    unsigned short rad[kPer];
+#pragma unroll
+    for (int n = 0; n < N; ++n) {
+#pragma unroll
+        for (int i = 0; i < kPer; ++i) { raw[n][i] = ld_bits(src[n].data, t * src[n].stride + threadIdx.x + i * kThreads); }
+    }
+    if constexpr (kAdd) {
+#pragma unroll
+        for (int i = 0; i < kPer; ++i) { rad[i] = ld_bits(addend.data, t * addend.stride + threadIdx.x + i * kThreads); }
+    }
+#pragma unroll
+    for (int n = 0; n < N; ++n) {
+#pragma unroll
+        for (int i = 0; i < kPer; ++i) {
+            float v = bits_to_f32(raw[n][i]);
+            if constexpr (kAdd) {
+                if (n == N - 1) { v = v + bits_to_f32(rad[i]); }
+            }
+            x[n][i] = v;
+        }
+    }
+}
+
+/// One query of one column (mix_query's arithmetic): one reduction pass over the sources' sums of squares and the
+/// query's dots (scratch[0]), the softmax mix, and this thread's part of the output norm's sum of squares (returned;
+/// the caller reduces it with scratch[1]).
+template <int N>
+__device__ __forceinline__ float single_query_mix(const float (&x)[N][kPer], const float (&qv)[kPer], float (&mix)[kPer],
+                                                  float (*scratch)[kMxWarps * 2 * N]) {
+    float r[2 * N];
+#pragma unroll
+    for (int n = 0; n < N; ++n) {
+        float s = 0.0F;
+#pragma unroll
+        for (int i = 0; i < kPer; ++i) { s = fmaf(x[n][i], x[n][i], s); }
+        r[n] = s;
+    }
+#pragma unroll
+    for (int n = 0; n < N; ++n) {
+        float s = 0.0F;
+#pragma unroll
+        for (int i = 0; i < kPer; ++i) { s = fmaf(qv[i], x[n][i], s); }
+        r[N + n] = s;
+    }
+    block_sum_pass<2 * N>(r, scratch[0]);
+    float rstd[N];
+#pragma unroll
+    for (int n = 0; n < N; ++n) { rstd[n] = rsqrt_approx(fmaf(r[n], 1.0F / 2304.0F, 1e-6F)); }
+    softmax_mix<N, 2 * N>(x, rstd, r, N, mix);
+    float ss[1] = {0.0F};
+#pragma unroll
+    for (int i = 0; i < kPer; ++i) { ss[0] = ss[0] + mix[i] * mix[i]; }
+    return ss[0]; // the caller reduces it (or not)
+}
+
+/// attn_res_kernel<N> for bf16 sources, one CTA per (column, query): the queries of a column share nothing but their
+/// sources, so each runs as its own CTA (the sources are read once per query; the sums of squares are recomputed
+/// with the same expression). Per CTA: one pass for the sums of squares + the dots, one for the output norm.
+template <int N, bool kAdd>
+__global__ void __launch_bounds__(kThreads) attn_res_kernel(const __grid_constant__ AttnResArgs a) {
+    const int tid   = static_cast<int>(threadIdx.x);
+    const int q     = static_cast<int>(blockIdx.y);
+    const bool norm = a.norm_weight != nullptr;
+    float qv[kPer];
+    unsigned short wb[kPer];
+#pragma unroll
+    for (int i = 0; i < kPer; ++i) { // weights: before the wait
+        qv[i] = a.queries[q * kD + tid + i * kThreads];
+        wb[i] = norm ? ld_bits(a.norm_weight, q * kD + tid + i * kThreads) : static_cast<unsigned short>(0);
+    }
+    if (tid < N - 1) { prefetch_column_l2(a.src[tid], blockIdx.x); } // stack sources (not `last`)
+    pdl::wait_for_dependencies(); // PDL: every activation read / write after the producer grid completes
+    pdl::trigger_dependents();
+    __shared__ __align__(16) float scratch[2][kMxWarps * 2 * N];
+    const std::int64_t t = blockIdx.x;
+    float x[N][kPer];
+    load_sources_bf16<N, kAdd>(a.src, a.addend, t, x);
+    float mix[kPer];
+    float ss[1] = {single_query_mix<N>(x, qv, mix, scratch)};
+    if (norm) {
+        block_sum_pass<1>(ss, scratch[1]);
+        const float out_rstd = rsqrt_approx(__fdiv_rn(ss[0], 2304.0F) + a.norm_eps);
+        bf16* out = static_cast<bf16*>(a.out) + (static_cast<std::int64_t>(q) * a.columns + t) * kD;
+#pragma unroll
+        for (int i = 0; i < kPer; ++i) { out[tid + i * kThreads] = __float2bfloat16_rn((mix[i] * out_rstd) * bits_to_f32(wb[i])); }
+    } else {
+        float* out = static_cast<float*>(a.out) + (static_cast<std::int64_t>(q) * a.columns + t) * kD;
+#pragma unroll
+        for (int i = 0; i < kPer; ++i) { out[tid + i * kThreads] = mix[i]; }
+    }
+}
+
+/// blend_inputs_kernel<N> for bf16 planes, one CTA per (column, role): roles [0, DQ) = the dest mix of query q (and the
+/// dest half of the pair norm of every stream that uses it), roles [DQ, DQ + S) = the message mix of stream s (and the
+/// message half of its pair norm). The pair norm's two halves depend only on their own mix (rd on dest, rm on msg),
+/// so the roles share nothing: no exchange between CTAs. Each role = one query's mix, as attn_res_kernel.
+template <int N, bool kAdd>
+__global__ void __launch_bounds__(kThreads) blend_inputs_kernel(const __grid_constant__ BlendInputsArgs a) {
+    const int tid       = static_cast<int>(threadIdx.x);
+    const int role      = static_cast<int>(blockIdx.y);
+    const bool dest     = role < a.dest_q;
+    const int q         = dest ? role : role - a.dest_q; // dest query, or message stream
+    const float* query  = dest ? a.dest_queries + static_cast<std::int64_t>(q) * kD
+                               : a.msg_queries + static_cast<std::int64_t>(q) * kD;
+    float qv[kPer];
+#pragma unroll
+    for (int i = 0; i < kPer; ++i) { qv[i] = query[tid + i * kThreads]; } // weights: before the wait
+    if (dest) {
+        if (tid < N - 1) { prefetch_column_l2(a.src[tid], blockIdx.x); } // stack sources (not `last`)
+    } else if (tid < 2) {
+        prefetch_column_l2(a.bank[tid], blockIdx.x); // the previous pass's bank
+    }
+    pdl::wait_for_dependencies(); // PDL: every activation read / write after the producer grid completes
+    pdl::trigger_dependents();
+    const std::int64_t t = blockIdx.x;
+    float mix[kPer];
+    float ss[1];
+    if (dest) {
+        __shared__ __align__(16) float scratch[2][kMxWarps * 2 * N];
+        float x[N][kPer];
+        load_sources_bf16<N, kAdd>(a.src, a.addend, t, x);
+        ss[0] = single_query_mix<N>(x, qv, mix, scratch);
+        float* out = a.dest + (static_cast<std::int64_t>(q) * a.columns + t) * kD;
+#pragma unroll
+        for (int i = 0; i < kPer; ++i) { out[tid + i * kThreads] = mix[i]; }
+        block_sum_pass<1>(ss, scratch[1]);
+        const float rd = rsqrt_approx(__fdiv_rn(ss[0], 2304.0F) + 1e-6F);
+        for (int s = 0; s < a.streams; ++s) { // dest broadcast (DQ = 1): every stream; DQ = S: stream q
+            if (a.dest_q > 1 && s != q) { continue; }
+            bf16* o = a.pair + (static_cast<std::int64_t>(s) * a.columns + t) * (2 * kD);
+#pragma unroll
+            for (int i = 0; i < kPer; ++i) { o[tid + i * kThreads] = __float2bfloat16_rn(mix[i] * rd); }
+        }
+    } else {
+        __shared__ __align__(16) float mscratch[2][kMxWarps * 4];
+        float y[2][kPer];
+        load_sources_bf16<2, false>(a.bank, a.addend, t, y);
+        ss[0] = single_query_mix<2>(y, qv, mix, mscratch);
+        float* mo = a.msg + (static_cast<std::int64_t>(q) * a.columns + t) * kD;
+#pragma unroll
+        for (int i = 0; i < kPer; ++i) { mo[tid + i * kThreads] = mix[i]; }
+        block_sum_pass<1>(ss, mscratch[1]);
+        const float rm = rsqrt_approx(__fdiv_rn(ss[0], 2304.0F) + 1e-6F);
+        bf16* o        = a.pair + (static_cast<std::int64_t>(q) * a.columns + t) * (2 * kD);
+#pragma unroll
+        for (int i = 0; i < kPer; ++i) { o[kD + tid + i * kThreads] = __float2bfloat16_rn(mix[i] * rm); }
+    }
+}
+
+/// controller_tail_kernel with: the gain / forget tile and the norm weights requested before the PDL wait; dest /
+/// msg loaded right after the wait (they do not depend on the GEMM); the norm's sums of squares by the push scheme
+/// below (the reference walks the columns one by one: a DSMEM round trip, two barriers and a weight load each).
+__global__ void __cluster_dims__(kTailCtas, 1, 1) __launch_bounds__(kThreads)
+    controller_tail_kernel(const __grid_constant__ TailArgs a) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+    // Thread-block clusters are sm_90+; below it the kernel only traps (the sm_89 cubin of the serve build must compile).
+    __trap();
+#else
+    extern __shared__ __align__(16) unsigned char tail_smem[];
+    auto* As = reinterpret_cast<bf16*>(tail_smem);                      // [576][64] swizzled (then G: fp32 [576][8])
+    auto* Bs = As + kTailRows * kRank;                                 // [8][64] swizzled
+    auto* X  = reinterpret_cast<float*>(Bs + kTailTokens * kRank);     // [8][288]
+    auto* G  = reinterpret_cast<float*>(tail_smem);                    // fp32 [576][kGStride]
+    auto* XF = X + kTailTokens * kTailChannels; // push scheme: [2304] the column this CTA reduces
+    auto* RS = XF + kD;                         // push scheme: [8] every column's rstd
+    constexpr int kGStride = kTailTokens + 1; // odd: step 4's reads of one column over consecutive rows hit 32 banks
+    static_assert(kTailRows * kGStride * 4 <= kTailRows * kRank * 2, "G aliases the A tile");
+    __shared__ __align__(16) float scratch[kMxWarps * kTailTokens];
+    cg::cluster_group cluster = cg::this_cluster();
+    const int rank = static_cast<int>(cluster.block_rank());
+    const int s    = static_cast<int>(blockIdx.y);
+    const int t0   = (static_cast<int>(blockIdx.x) / kTailCtas) * kTailTokens;
+    const int nt   = min(kTailTokens, static_cast<int>(a.columns) - t0);
+    const int c0   = rank * kTailChannels;
+    const int tid  = static_cast<int>(threadIdx.x);
+    // Two ways to give every thread of a reducing CTA the 9 x values of its sum-of-squares chain (d = tid + 256 i, x
+    // of channel d lives in CTA d / 288); same chains, same tree, same bits:
+    //  pull (only with SUROGATE_SERVE_INKLING_TAIL_PUSH_MIN > 1, below that many columns): after the cluster barrier
+    //  every CTA reads the column's x from the other CTAs (DSMEM loads);
+    //  push (default, every column count): each CTA stores its x of column j straight into CTA j's column buffer,
+    //  CTA j reduces it from its own shared memory and stores rstd into every CTA. At 8 columns the pull form makes
+    //  each thread issue 72 DSMEM loads, which saturate the LSU queue (ncu 18:3x: stall_lg 42 %, the T = 8 tail
+    //  ~11-15 us); push also wins at 1 column (bench 18:4x).
+    const bool push = nt >= a.push_min;
+    if (push) { asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory"); } // this CTA has started
+    // 1. A (weights, before the wait): gain rows c0 .. c0 + 287 and forget rows 2304 + c0 .. of stream s
+    const bf16* W = a.gf_weight + static_cast<std::int64_t>(s) * (2 * kD) * kRank;
+    for (int item = tid; item < kTailRows * (kRank / 8); item += kThreads) {
+        const int row = item / (kRank / 8), kk = (item - row * (kRank / 8)) * 8;
+        const int src = row < kTailChannels ? c0 + row : kD + c0 + (row - kTailChannels);
+        cp_async_zfill<16, Cache::cg>(&As[row * kRank + tail_swizzle(row, kk)],
+                                      &W[static_cast<std::int64_t>(src) * kRank + kk], 16);
+    }
+    cp_commit();
+    constexpr int kOut = (kTailChannels + kThreads - 1) / kThreads; // 2 output channels per thread at most
+    unsigned short wn[kOut];
+#pragma unroll
+    for (int k = 0; k < kOut; ++k) {
+        const int c = tid + k * kThreads;
+        wn[k] = c < kTailChannels ? ld_bits(a.norm_weight, static_cast<std::int64_t>(s) * a.w_stream + c0 + c)
+                                  : static_cast<unsigned short>(0);
+    }
+    pdl::wait_for_dependencies(); // PDL: every activation read / write after the producer grid completes
+    pdl::trigger_dependents();
+    // 4a. dest / msg of this CTA's channels (blend_inputs' outputs), issued first
+    constexpr int kItems = (kTailTokens * kTailChannels + kThreads - 1) / kThreads; // 9
+    float dv[kItems], mv[kItems];
+#pragma unroll
+    for (int k = 0; k < kItems; ++k) {
+        const int item = tid + k * kThreads;
+        dv[k] = mv[k] = 0.0F;
+        if (item < nt * kTailChannels) {
+            const int j = item / kTailChannels, c = item - j * kTailChannels;
+            const std::int64_t t = t0 + j;
+            dv[k] = a.dest[s * a.dest_stream + t * kD + c0 + c];
+            mv[k] = a.msg[(s * a.columns + t) * kD + c0 + c];
+        }
+    }
+    // 2. B: h = bf16(the partials added in chunk order), zero past the last column (the GEMM's zero fill)
+    const std::int64_t plane = static_cast<std::int64_t>(a.streams) * a.columns * kRank;
+    static_assert(kTailTokens * kRank == 2 * kThreads, "two B items per thread");
+    float p[2][kTailSplits];
+#pragma unroll
+    for (int u = 0; u < 2; ++u) {
+        const int item = tid + u * kThreads;
+        const int j = item / kRank, r = item - j * kRank;
+        const std::int64_t i = (static_cast<std::int64_t>(s) * a.columns + t0 + j) * kRank + r;
+#pragma unroll
+        for (int c = 0; c < kTailSplits; ++c) { p[u][c] = j < nt ? a.partials[c * plane + i] : 0.0F; }
+    }
+#pragma unroll
+    for (int u = 0; u < 2; ++u) {
+        const int item = tid + u * kThreads;
+        const int j = item / kRank, r = item - j * kRank;
+        float h     = 0.0F;
+        if (j < nt) {
+            h = p[u][0];
+#pragma unroll
+            for (int c = 1; c < kTailSplits; ++c) { h += p[u][c]; }
+        }
+        Bs[j * kRank + tail_swizzle(j, r)] = __float2bfloat16_rn(h);
+    }
+    cp_wait<0>();
+    __syncthreads();
+    // 3. the gain/forget GEMM of the 36 m16 tiles: warp w takes w, w + 8, ... (controller_tail_kernel's fragments)
+    const int warp = tid >> 5, lane = tid & 31, gid = lane >> 2, lid = lane & 3;
+    const int a_matrix = lane >> 3, a_inner = lane & 7;
+    const int a_row_off = a_inner + ((a_matrix & 1) << 3), a_col_off = (a_matrix >> 1) << 3;
+    const int b_inner = lane & 7, b_k_off = ((lane >> 3) & 1) << 3;
+    constexpr int kTiles = kTailRows / 16, kPerWarp = (kTiles + kMxWarps - 1) / kMxWarps;
+    float acc[kPerWarp][4];
+#pragma unroll
+    for (int u = 0; u < kPerWarp; ++u) {
+        acc[u][0] = acc[u][1] = acc[u][2] = acc[u][3] = 0.0F;
+        const int mt = warp + u * kMxWarps;
+        if (mt >= kTiles) { continue; }
+#pragma unroll
+        for (int k_step = 0; k_step < kRank / 16; ++k_step) {
+            unsigned af[4], bfr[2];
+            const int row = mt * 16 + a_row_off, col = k_step * 16 + a_col_off;
+            ldmatrix_x4(af[0], af[1], af[2], af[3], smem_addr(&As[row * kRank + tail_swizzle(row, col)]));
+            const int bcol = k_step * 16 + b_k_off;
+            ldmatrix_x2(bfr[0], bfr[1], smem_addr(&Bs[b_inner * kRank + tail_swizzle(b_inner, bcol)]));
+            mma_bf16(acc[u][0], acc[u][1], acc[u][2], acc[u][3], af[0], af[1], af[2], af[3], bfr[0], bfr[1]);
+        }
+    }
+    __syncthreads(); // G overwrites A
+#pragma unroll
+    for (int u = 0; u < kPerWarp; ++u) {
+        const int mt = warp + u * kMxWarps;
+        if (mt >= kTiles) { continue; }
+        const int r0 = mt * 16 + gid;
+        G[r0 * kGStride + 2 * lid]           = acc[u][0];
+        G[r0 * kGStride + 2 * lid + 1]       = acc[u][1];
+        G[(r0 + 8) * kGStride + 2 * lid]     = acc[u][2];
+        G[(r0 + 8) * kGStride + 2 * lid + 1] = acc[u][3];
+    }
+    __syncthreads();
+    // 4b. x of this CTA's channels (blend_rms_norm_kernel's expression); push: also into CTA j's column buffer
+    if (push) { asm volatile("barrier.cluster.wait.aligned;" ::: "memory"); } // every CTA of the cluster has started
+#pragma unroll
+    for (int k = 0; k < kItems; ++k) {
+        const int item = tid + k * kThreads;
+        if (item < nt * kTailChannels) {
+            const int j = item / kTailChannels, c = item - j * kTailChannels;
+            const float gain   = tanhf(G[c * kGStride + j]);
+            const float forget = tanhf(G[(kTailChannels + c) * kGStride + j]);
+            const float x      = (1.0F - forget) * dv[k] + gain * mv[k];
+            X[j * kTailChannels + c] = x;
+            if (push) { cluster.map_shared_rank(XF, j)[c0 + c] = x; }
+        }
+    }
+    cluster.sync();
+    if (push) {
+        if (rank < nt) { // column j = rank: blend_rms_norm_kernel's chain and block sum, from this CTA's buffer
+            float ss[1] = {0.0F};
+#pragma unroll
+            for (int i = 0; i < kPer; ++i) {
+                const float x = XF[tid + i * kThreads];
+                ss[0]         = ss[0] + x * x;
+            }
+            block_sum_pass<1>(ss, scratch);
+            if (tid < kTailCtas) {
+                cluster.map_shared_rank(RS, tid)[rank] = rsqrt_approx(__fdiv_rn(ss[0], 2304.0F) + a.eps);
+            }
+        }
+        cluster.sync(); // RS complete; no remote access after this barrier
+#pragma unroll
+        for (int j = 0; j < kTailTokens; ++j) {
+            if (j >= nt) { break; }
+            const float rstd = RS[j];
+            bf16* o          = a.out + (static_cast<std::int64_t>(s) * a.columns + t0 + j) * kD;
+#pragma unroll
+            for (int k = 0; k < kOut; ++k) {
+                const int c = tid + k * kThreads;
+                if (c < kTailChannels) {
+                    o[c0 + c] = __float2bfloat16_rn((X[j * kTailChannels + c] * rstd) * bits_to_f32(wn[k]));
+                }
+            }
+        }
+        return;
+    }
+    // 5. every column's sum of squares in blend_rms_norm_kernel's layout (thread tid sums d = tid + 256 i), one pass
+    const float* rx[kPer];
+#pragma unroll
+    for (int i = 0; i < kPer; ++i) {
+        const int d = tid + i * kThreads;
+        rx[i]       = cluster.map_shared_rank(X, d / kTailChannels) + d % kTailChannels;
+    }
+    float xs[kTailTokens][kPer];
+#pragma unroll
+    for (int j = 0; j < kTailTokens; ++j) {
+        if (j < nt) {
+#pragma unroll
+            for (int i = 0; i < kPer; ++i) { xs[j][i] = rx[i][j * kTailChannels]; }
+        }
+    }
+    float ss[kTailTokens];
+#pragma unroll
+    for (int j = 0; j < kTailTokens; ++j) {
+        float acc_ss = 0.0F;
+        if (j < nt) {
+#pragma unroll
+            for (int i = 0; i < kPer; ++i) { acc_ss = acc_ss + xs[j][i] * xs[j][i]; }
+        }
+        ss[j] = acc_ss;
+    }
+    // this CTA's reads of the other CTAs' x are complete (their values are in ss): arrive now, wait before exit
+    asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+    block_sum_pass<kTailTokens>(ss, scratch);
+#pragma unroll
+    for (int j = 0; j < kTailTokens; ++j) {
+        if (j >= nt) { break; }
+        const float rstd = rsqrt_approx(__fdiv_rn(ss[j], 2304.0F) + a.eps);
+        bf16* o          = a.out + (static_cast<std::int64_t>(s) * a.columns + t0 + j) * kD;
+#pragma unroll
+        for (int k = 0; k < kOut; ++k) {
+            const int c = tid + k * kThreads;
+            if (c < kTailChannels) {
+                o[c0 + c] = __float2bfloat16_rn((X[j * kTailChannels + c] * rstd) * bits_to_f32(wn[k]));
+            }
+        }
+    }
+    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory"); // the other CTAs may still read this CTA's x
+#endif
+}
+
+/// short_conv_kernel's decode / verify form (W <= kConvFastWidth, one CTA column tile, window update fused, no
+/// capture): the taps before the PDL wait, then every load of the row (positions, x, residual, addend; the slot's
+/// window once the slot index is known) before the first use.
+constexpr int kConvFastWidth = 8;
+
+__global__ void __launch_bounds__(kConvChannelTile) short_conv_kernel(const __grid_constant__ ConvArgs a) {
+    const int c     = blockIdx.x * kConvChannelTile + threadIdx.x;
+    const int b     = blockIdx.z;
+    const bool live = c < a.channels;
+    float w[4] = {0.0F, 0.0F, 0.0F, 0.0F};
+    if (live) { // weights: before the wait
+#pragma unroll
+        for (int k = 0; k < 4; ++k) { w[k] = bits_to_f32(ld_bits(a.weight, static_cast<std::int64_t>(c) * 4 + k)); }
+    }
+    pdl::wait_for_dependencies(); // PDL: every activation read / write after the producer grid completes
+    pdl::trigger_dependents();
+    if (!live) { return; }
+    const std::int64_t slot = a.slots[b];
+    const int valid         = a.valid != nullptr ? a.valid[b] : a.width;
+    int pos[kConvFastWidth];
+    unsigned short xr[kConvFastWidth], ar[kConvFastWidth], rr[kConvFastWidth];
+#pragma unroll
+    for (int j = 0; j < kConvFastWidth; ++j) {
+        pos[j] = 0;
+        xr[j] = ar[j] = rr[j] = 0;
+        if (j < a.width) {
+            const std::int64_t n = static_cast<std::int64_t>(j) + static_cast<std::int64_t>(a.width) * b;
+            pos[j]               = a.positions[n];
+            xr[j]                = ld_bits(a.x, n * a.x_stride + c);
+            if (a.addend != nullptr) { ar[j] = ld_bits(a.addend, n * a.addend_stride + c); }
+            if (a.residual != nullptr) { rr[j] = ld_bits(a.residual, n * a.residual_stride + c); }
+        }
+    }
+    // S = [state tap 0, 1, 2, x column 0, 1, ...] (conv_seq); the slot is read only for a row with valid columns
+    // (the reference reads or writes it exactly then)
+    float seq[3 + kConvFastWidth];
+#pragma unroll
+    for (int i = 0; i < 3; ++i) {
+        seq[i] = valid > 0 ? bits_to_f32(ld_bits(a.state, slot * a.slot_stride + i * a.tap_stride + c)) : 0.0F;
+    }
+#pragma unroll
+    for (int j = 0; j < kConvFastWidth; ++j) { seq[3 + j] = bits_to_f32(xr[j]); }
+    const float scale = 0.44721359549995793F; // fp32(5 ** -0.5)
+#pragma unroll
+    for (int j = 0; j < kConvFastWidth; ++j) {
+        if (j < a.width && j < valid) {
+            const std::int64_t n = static_cast<std::int64_t>(j) + static_cast<std::int64_t>(a.width) * b;
+            float acc            = 0.0F;
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const int lag = 3 - k;
+                const float v = (pos[j] - lag >= 0) ? seq[j + k] : 0.0F;
+                acc           = fmaf(v, w[k], acc);
+            }
+            const float cur = seq[3 + j];
+            bf16 y          = __float2bfloat16_rn((acc + cur) * scale);
+            if (a.addend != nullptr) {
+                float base = bits_to_f32(ar[j]);
+                if (a.residual != nullptr) { base = bits_to_f32(rr[j]) + base; }
+                y = __float2bfloat16_rn(base + __bfloat162float(y));
+            }
+            a.out[n * a.out_stride + c] = y;
+        }
+    }
+    if (valid > 0) { // conv_window_kernel's update: S[valid + i] (a state tap from registers, or the x column again,
+                     // as conv_seq reads it; no dynamic register index, which the compiler turns into local memory)
+#pragma unroll
+        for (int i = 0; i < 3; ++i) {
+            const int idx = valid + i;
+            float u;
+            if (idx < 3) {
+                u = idx == 0 ? seq[0] : (idx == 1 ? seq[1] : seq[2]);
+            } else {
+                const std::int64_t n = static_cast<std::int64_t>(idx - 3) + static_cast<std::int64_t>(a.width) * b;
+                u                    = bits_to_f32(ld_bits(a.x, n * a.x_stride + c));
+            }
+            a.state[slot * a.slot_stride + i * a.tap_stride + c] = __float2bfloat16_rn(u);
+        }
+    }
+}
+
+} // namespace mx
+
+// Reference-kernel switch (tests and A/B): SUROGATE_SERVE_INKLING_MIX_REFERENCE=1 or inkling_mix_use_reference_kernels.
+std::atomic<int> g_mix_reference{-1};
+
+bool use_reference_kernels() {
+    int v = g_mix_reference.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* raw = std::getenv("SUROGATE_SERVE_INKLING_MIX_REFERENCE");
+        v               = raw != nullptr && raw[0] != '\0' && std::atoi(raw) != 0 ? 1 : 0;
+        g_mix_reference.store(v, std::memory_order_relaxed);
+    }
+    return v != 0;
+}
+
+/// The latency-cut kernels serve decode / verify widths; prefill keeps the reference kernels (same bits either way).
+constexpr std::int32_t kFastColumns = 64;
+
+template <int N>
+void attn_res_fast_n(bool add, const dim3& grid, cudaStream_t stream, const AttnResArgs& a) {
+    const pdl::LaunchConfig cfg{grid, dim3(kThreads), 0, stream};
+    CUDA_CHECK(add ? pdl::launch_dependent(cfg, mx::attn_res_kernel<N, true>, a)
+                   : pdl::launch_dependent(cfg, mx::attn_res_kernel<N, false>, a));
+}
+
+template <int N>
+void blend_inputs_fast_n(bool add, const dim3& grid, cudaStream_t stream, const BlendInputsArgs& a) {
+    const pdl::LaunchConfig cfg{grid, dim3(kThreads), 0, stream};
+    CUDA_CHECK(add ? pdl::launch_dependent(cfg, mx::blend_inputs_kernel<N, true>, a)
+                   : pdl::launch_dependent(cfg, mx::blend_inputs_kernel<N, false>, a));
+}
+
 // ------------------------------------------------------------------------------------- validation
 
 [[noreturn]] void fail(const char* op, const std::string& what) {
@@ -827,6 +1434,21 @@ void inkling_attn_res(const InklingAttnResSources& sources, std::int32_t columns
     a.out     = out.data;
     a.columns = columns;
     const dim3 grid(static_cast<unsigned>(columns));
+    if (!use_reference_kernels() && columns <= kFastColumns && sources.last.dtype == DType::BF16) {
+        const bool add = a.has_addend != 0;
+        const dim3 g2(static_cast<unsigned>(columns), static_cast<unsigned>(q)); // one CTA per (column, query)
+        switch (sources.stack_count + 1) {
+        case 1: attn_res_fast_n<1>(add, g2, stream, a); break;
+        case 2: attn_res_fast_n<2>(add, g2, stream, a); break;
+        case 3: attn_res_fast_n<3>(add, g2, stream, a); break;
+        case 4: attn_res_fast_n<4>(add, g2, stream, a); break;
+        case 5: attn_res_fast_n<5>(add, g2, stream, a); break;
+        case 6: attn_res_fast_n<6>(add, g2, stream, a); break;
+        default: fail(op, "unsupported source count");
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     switch (sources.stack_count + 1) {
     case 1: CUDA_CHECK(pdl::launch_dependent({grid, dim3(kThreads), 0, stream}, attn_res_kernel<1>, a)); break;
     case 2: CUDA_CHECK(pdl::launch_dependent({grid, dim3(kThreads), 0, stream}, attn_res_kernel<2>, a)); break;
@@ -925,6 +1547,22 @@ void inkling_blend_inputs(const InklingAttnResSources& dest_sources, const Tenso
     a.pair         = static_cast<bf16*>(pair.data);
     a.columns      = columns;
     const dim3 grid(static_cast<unsigned>(columns));
+    if (!use_reference_kernels() && columns <= kFastColumns && dest_sources.last.dtype == DType::BF16 &&
+        bank.stack[0].dtype == DType::BF16 && bank.last.dtype == DType::BF16) {
+        const bool add = a.has_addend != 0;
+        const dim3 g2(static_cast<unsigned>(columns), static_cast<unsigned>(dq + streams)); // (column, role)
+        switch (dest_sources.stack_count + 1) {
+        case 1: blend_inputs_fast_n<1>(add, g2, stream, a); break;
+        case 2: blend_inputs_fast_n<2>(add, g2, stream, a); break;
+        case 3: blend_inputs_fast_n<3>(add, g2, stream, a); break;
+        case 4: blend_inputs_fast_n<4>(add, g2, stream, a); break;
+        case 5: blend_inputs_fast_n<5>(add, g2, stream, a); break;
+        case 6: blend_inputs_fast_n<6>(add, g2, stream, a); break;
+        default: fail(op, "unsupported source count");
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     switch (dest_sources.stack_count + 1) {
     case 1: CUDA_CHECK(pdl::launch_dependent({grid, dim3(kThreads), 0, stream}, blend_inputs_kernel<1>, a)); break;
     case 2: CUDA_CHECK(pdl::launch_dependent({grid, dim3(kThreads), 0, stream}, blend_inputs_kernel<2>, a)); break;
@@ -976,9 +1614,25 @@ void inkling_controller_tail(const float* down_partials, const void* gain_forget
     a.out         = static_cast<bf16*>(out.data);
     a.columns     = t;
     a.streams     = s;
+    const dim3 grid(static_cast<unsigned>(kTailCtas * ((t + kTailTokens - 1) / kTailTokens)), static_cast<unsigned>(s));
+    if (!use_reference_kernels()) {
+        // SUROGATE_SERVE_INKLING_TAIL_PUSH_MIN (A/B knob): the push scheme from this many columns of a cluster on.
+        // Default 1 = always (bench 18:4x, L2-cold T = 1: push 2.15 us vs pull 2.74 us per call; same bits).
+        static const int push_min = [] {
+            const char* e = std::getenv("SUROGATE_SERVE_INKLING_TAIL_PUSH_MIN");
+            return e != nullptr ? std::max(1, std::atoi(e)) : 1;
+        }();
+        a.push_min = push_min;
+        constexpr int kSmem = kTailSmem + kD * 4 + kTailTokens * 4; // + the push scheme's column buffer and rstd
+        CUDA_CHECK(set_func_attribute_per_device(mx::controller_tail_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                 kSmem));
+        CUDA_CHECK(pdl::launch_dependent({grid, dim3(kThreads), static_cast<std::size_t>(kSmem), stream},
+                                         mx::controller_tail_kernel, a));
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     CUDA_CHECK(set_func_attribute_per_device(controller_tail_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                              kTailSmem));
-    const dim3 grid(static_cast<unsigned>(kTailCtas * ((t + kTailTokens - 1) / kTailTokens)), static_cast<unsigned>(s));
     CUDA_CHECK(pdl::launch_dependent({grid, dim3(kThreads), static_cast<std::size_t>(kTailSmem), stream},
                                      controller_tail_kernel, a));
     CUDA_CHECK(cudaGetLastError());
@@ -1037,6 +1691,11 @@ void inkling_short_conv(const InklingPlane& x, std::int32_t channels, const Tens
     const dim3 grid(grid_count(channels, kConvChannelTile), grid_count(rows.width, kConvColumnTile),
                     static_cast<unsigned>(rows.batch));
     a.fuse_window = capture_slot < 0 && rows.width <= kConvColumnTile ? 1 : 0;
+    if (a.fuse_window && rows.width <= mx::kConvFastWidth && !use_reference_kernels()) {
+        CUDA_CHECK(pdl::launch_dependent({grid, dim3(kConvChannelTile), 0, stream}, mx::short_conv_kernel, a));
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     CUDA_CHECK(pdl::launch_dependent({grid, dim3(kConvChannelTile), 0, stream}, short_conv_kernel, a));
     CUDA_CHECK(cudaGetLastError());
     if (!a.fuse_window) {
@@ -1143,6 +1802,10 @@ void inkling_conv_fold(const InklingConvPool& pool, std::span<const InklingConvF
                                          static_cast<const bf16*>(records.inputs), records.visits,
                                          records.width_max);
     CUDA_CHECK(cudaGetLastError());
+}
+
+void inkling_mix_use_reference_kernels(bool on) noexcept {
+    g_mix_reference.store(on ? 1 : 0, std::memory_order_relaxed);
 }
 
 void inkling_softcap_f32(float* logits, std::int32_t rows, std::int32_t tokens, std::int32_t ldc,

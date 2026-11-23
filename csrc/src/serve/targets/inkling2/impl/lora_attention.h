@@ -1,6 +1,6 @@
 #pragma once
 
-// Inkling-2-Mini attention LoRA (lane e1, S10, vLLM parity): the six qkvr slices and wo_ud under the checkpoint's
+// Inkling-2-Mini attention LoRA (S10, vLLM parity): the six qkvr slices and wo_ud under the checkpoint's
 // module names (vLLM's inkling2 PACKED_MODULES_MAPPING "qkvr" = wq_du, wr_du, gate_attn, attn_sink_proj, wk_dv,
 // wv_dv; plus wo_ud), one bank table per physical layer keyed on the qkvr / wo weight (every pass of a core layer
 // shares it). Applied after the projections by ops::inkling_lora_delta (one arithmetic at every width).

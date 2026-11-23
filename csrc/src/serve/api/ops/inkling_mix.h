@@ -1,12 +1,12 @@
 #pragma once
 
-// Inkling-2-Mini hidden-stream ops (ENGINE-INKLING lane e1): the block attention-residual mix, the loop
+// Inkling-2-Mini hidden-stream ops: the block attention-residual mix, the loop
 // message controller's two norms, the hidden-stream short convolution with its per-visit state, the
 // embedding with its norm, and the softcapped fp32 LM head.
 //
-// Semantics: the python functions of the same names in rl/engine-inkling-2026-11-21/ref/inkling_ref.py,
-// which follow vLLM's Inkling2 sm_120 path (ref/src/vllm/models/inkling2/nvidia/ops/{attn_res,loop,sconv,
-// norm}.py). Rounding points: lanes/e1/DESIGN-target.md section 3. Every rsqrt is the non-FTZ
+// Semantics: the python functions of the same names in the Python reference inkling_ref.py (not in this repository),
+// which follow vLLM's Inkling2 sm_120 path (vllm/models/inkling2/nvidia/ops/{attn_res,loop,sconv,
+// norm}.py). Rounding points: the target design notes, section 3. Every rsqrt is the non-FTZ
 // `rsqrt.approx.f32` of `ops/norm.py`; tanh / exp are the accurate libm functions; products and sums the
 // reference does not fuse are not fused.
 //
@@ -70,6 +70,15 @@ struct InklingAttnResSources {
 void inkling_attn_res(const InklingAttnResSources& sources, std::int32_t columns,
                       const Tensor& queries, const Tensor* norm_weight, float norm_eps, Tensor& out,
                       cudaStream_t stream);
+
+/**
+ * Latency-cut kernels: at decode / verify widths inkling_attn_res, inkling_blend_inputs, inkling_controller_tail and
+ * inkling_short_conv run latency-cut kernels that compute the same bits as the reference kernels (invariance test
+ * I8). They read their WEIGHTS (queries, norm weights, conv taps, gain / forget) before the PDL wait, so those must
+ * not be written inside a step (they are written at load only). `on` = the reference kernels everywhere (tests and
+ * A/B; also SUROGATE_SERVE_INKLING_MIX_REFERENCE=1 at start). Takes effect at the next launch / graph capture.
+ */
+void inkling_mix_use_reference_kernels(bool on) noexcept;
 
 /**
  * Op inkling_embed (ref `inkling_embed`): out column t = bf16(rmsnorm_w(table row ids[t])), the
@@ -176,7 +185,7 @@ void inkling_short_conv(const InklingPlane& x, std::int32_t channels, const Tens
 /**
  * The window preceding column `column` of a one-row segment (B == 1) -- state + x as inkling_short_conv
  * reads them -- written to slot `dst_slot` for channels [channel_offset, + channels). Used for the K / V
- * streams, whose convolution lane c's prologue runs, at a rewrite checkpoint inside a segment.
+ * streams, whose convolution the attention prologue runs, at a rewrite checkpoint inside a segment.
  * Must run before the conv of that segment updates its slot.
  */
 void inkling_conv_capture_window(const InklingPlane& x, std::int32_t channels,
@@ -186,7 +195,7 @@ void inkling_conv_capture_window(const InklingPlane& x, std::int32_t channels,
 
 /// The in-place window update alone (no conv): every row's slot := the last 3 inputs of [state | x columns]
 /// after its last valid column, for channels [channel_offset, + channels). For the K / V streams, whose
-/// convolution lane c's prologue (or the naive one) computes from the old window first.
+/// convolution the attention prologue (or the naive one) computes from the old window first.
 void inkling_conv_update_window(const InklingPlane& x, std::int32_t channels, const InklingConvRows& rows,
                                 const InklingConvStateView& state, std::int32_t channel_offset,
                                 cudaStream_t stream);
@@ -196,7 +205,7 @@ void inkling_conv_copy_slot(const InklingConvStateView& state, std::int32_t chan
                             std::int32_t channels, std::int32_t src, std::int32_t dst,
                             cudaStream_t stream);
 
-/// Speculative-verify records (lanes/e1/DESIGN-target.md 2): per row b and visit v, the state before
+/// Speculative-verify records (target design notes, section 2): per row b and visit v, the state before
 /// the round (`old`: BF16 [6656, 3]) and the round's conv inputs (`inputs`: BF16 [6656, width_max]).
 /// old at `old + ((b * visits + v) * 3) * 6656`, inputs at `inputs + ((b * visits + v) * width_max) *
 /// 6656`.
@@ -247,7 +256,7 @@ void inkling_gemm_bf16_f32(const void* weight, std::int32_t n, std::int32_t k, c
                            std::int32_t tokens, float* out, std::int32_t ldc, cudaStream_t stream);
 void inkling_gemm_f32_prepare(std::int32_t n, std::int32_t k, std::int32_t tokens, std::int32_t ldc);
 
-/// ---- Batch- and path-invariant GEMM (agent-EN 10:2x: one invariant forward for engine and trainer) ----
+/// ---- Batch- and path-invariant GEMM (one invariant forward for engine and trainer) ----
 ///
 /// out[0:n, t] = W[n, k] . x[:, t] for t < tokens, BF16 operands, FP32 accumulation, stored as `out_dtype`
 /// (BF16: one rounding at the end; FP32: the accumulator). W is [n, k] with k contiguous, x is [k, tokens] with k
@@ -279,6 +288,9 @@ struct InklingGemmBatch {
 void inkling_gemm_inv(const void* weight, std::int32_t n, std::int32_t k, const void* x, std::int32_t tokens,
                       void* out, DType out_dtype, std::int32_t ldc, const InklingGemmBatch& batch, void* workspace,
                       std::size_t workspace_bytes, cudaStream_t stream);
+/// Selects the narrow wo kernel (T <= 8, one problem, n % 16 == 0, k % 64 == 0; same bits as the generic kernel) for tests
+/// and A/Bs. Default: off; SUROGATE_SERVE_INKLING_WO_NARROW=1 = the narrow kernel.
+void inkling_gemm_inv_use_narrow(bool on) noexcept;
 
 /// The first phase of a split shape alone: the chunks' FP32 partials, [splits][batch][tokens][n] (chunk-major), the
 /// operand of inkling_controller_tail (which adds them in chunk order exactly as inkling_gemm_inv's reduce does).
@@ -300,7 +312,7 @@ struct InklingGemmProblem {
 void inkling_gemm_inv_group(std::span<const InklingGemmProblem> problems, std::int32_t k, std::int32_t tokens,
                             DType out_dtype, cudaStream_t stream);
 
-/// ---- The trainer's log-prob (agent-EN 11:3x; g1b's ENGINE-OP IR) ----
+/// ---- The trainer's log-prob (the engine-op IR) ----
 ///
 /// out[t] = log softmax(softcap(W_head . hidden[:, t]))[token_ids[t]] over the first `token_domain` rows, bit for bit
 /// the value every log-prob the engine returns carries (completion token_logprobs and prompt_logprobs are
@@ -331,7 +343,7 @@ inline constexpr int kInklingLoraMaxSlices = 6;
                                                              std::int32_t tokens) noexcept;
 
 /**
- * Attention LoRA (S10; lanes/e1/NOTES.md), ONE arithmetic at every width / batch: for every token t whose slot
+ * Attention LoRA (S10), ONE arithmetic at every width / batch: for every token t whose slot
  * s = token_slot[t] (or *uniform_slot) is >= 0 and every slice:
  *   low[r] = fma chain over k = 0..K-1 of A_s[r, k] * x[k, t] (fp32, from 0; 32 lane chains with a fixed xor-tree),
  *   delta[j] = fma chain over r = 0..R-1 of B_s[j, r] * low[r] (fp32, from 0),

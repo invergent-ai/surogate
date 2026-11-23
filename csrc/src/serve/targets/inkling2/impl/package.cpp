@@ -1,5 +1,5 @@
-// Inkling-2-Mini package (lane e1): the registry's questions for the `inkling2` artifact. Bindings are lane
-// b's (`impl/load/`); the served geometry, the model view and the visit schedule are this target's.
+// Inkling-2-Mini package: the registry's questions for the `inkling2` artifact. Bindings are the
+// loader's (`impl/load/`); the served geometry, the model view and the visit schedule are this target's.
 
 #include <api/targets/inkling2/package.h>
 #include <api/family/frontend_resources.h>
@@ -64,19 +64,25 @@ load::AttentionChoice attention_choice() {
     return choice;
 }
 
-/// S10, experts first (the kit's recipe trains expert w13 / w2): lane d's binding (family/impl/lora_bind_inkling.h)
+/// S10, experts first (the kit's recipe trains expert w13 / w2): the MoE binding (family/impl/lora_bind_inkling.h)
 /// per PHYSICAL layer, keyed on its router weight. Every pass of a core layer reads the same bank table, so one
 /// adapter serves all its visits; adapters name physical layers (the trainer exports them that way).
 void bind_lora(const detail::LoadedModelData& data, const EngineOptions& options) {
     if (!options.lora_enable && options.lora_payloads.empty()) { return; }
     ops::LoraStore& store = ops::lora_store_for_current_device();
     family::configure_lora_store(store, options);
+    // The attention delta kernel (ops::inkling_lora_delta) serves ranks 1..64 and reads the store's max_rank as its rank:
+    // refuse a larger --max-lora-rank here, at startup, rather than at the first adapter round.
+    if (store.max_rank() > 64) {
+        throw std::invalid_argument("inkling2 attention LoRA supports --max-lora-rank up to 64");
+    }
     for (std::size_t index = 0; index < data.weights.layers.size(); ++index) {
         const load::InklingLayerWeights& L = data.weights.layers[index];
         if (L.router.qdata == nullptr) { continue; } // not resident on this device
         ops::InklingMoeWeights key;
         key.router = L.router.qdata;
-        family::bind_lora_inkling_moe(store, static_cast<int>(index), key);
+        family::bind_lora_inkling_moe(store, static_cast<int>(index), key,
+                                      static_cast<std::int32_t>(options.lora_max_expert_rank));
         // Attention (vLLM parity): the six qkvr slices under their checkpoint names, the fused `attn.qkvr` twin, wo_ud.
         using Binding = ops::LoraStore::ModuleBinding;
         using C       = detail::TextConfig;
@@ -122,13 +128,15 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
 
 std::size_t Package::extra_derived_residency_bytes(const EngineOptions& options) {
     if (options.speculative.backend != SpeculativeBackend::DFlash) { return 0; }
+    // the drafter lives on the stage holding the last visit only (plan_load's draft_placement; M8b review)
+    if (options.pipeline_stage_last != 0 && options.pipeline_stage_last < detail::TextConfig::layers) { return 0; }
     return detail::dspark_derived_device_bytes(detail::dspark_fp8_weights_requested(), detail::dspark_fp8_fold_requested());
 }
 
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
                                      WeightsProfile weights_profile) {
     load::BindOptions bind;
-    // The 2-card visit split (lanes/e1/DESIGN-2card.md): a pipeline stage runs visits [first, last) of the 48 and
+    // The 2-card visit split (2-card design): a pipeline stage runs visits [first, last) of the 48 and
     // keeps on its device the physical layers those visits use (a core layer is on every stage that runs one of its
     // passes); the other layers are validated only. The family hands the residual (the whole AttnRes stack, 7 x 2304
     // per column) across the boundary and keeps each stage's KV planes and conv states.
@@ -151,11 +159,11 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
     if (bind.attention.fp8 != (weights_profile == WeightsProfile::Fp8Attention)) {
         throw std::logic_error("inkling2: the weights profile and the attention choice disagree");
     }
-    // DSpark (lane e2): `--speculative dflash` binds the artifact's drafter and runs it through the DFlash runtime.
+    // DSpark: `--speculative dflash` binds the artifact's drafter and runs it through the DFlash runtime.
     bind.draft = options.speculative.backend == SpeculativeBackend::DFlash;
-    // FP8 drafter weights by default (fp8ab2 16:34: identity, tokens / round within noise, -0.29 GiB with the FP8
-    // fold): the BF16 dense linears sit in the host bank (attached in LoadedModelData) and are re-quantised at load;
-    // SUROGATE_SERVE_DSPARK_BF16_WEIGHTS=1 keeps them BF16 on the device. Not on a drafter-less pipeline stage.
+    // BF16 drafter weights by default since M9 (h2's A/B: the FP8 route is ~9.5 % slower at 8 streams); with
+    // SUROGATE_SERVE_DSPARK_FP8_WEIGHTS=1 the BF16 dense linears sit in the host bank (attached in LoadedModelData,
+    // released after derive) and are re-quantised at load. Not on a drafter-less pipeline stage.
     bind.draft_linears_host = bind.draft && detail::dspark_fp8_weights_requested() &&
                               bind.draft_placement != artifact::TensorPlacement::ValidateOnly;
     detail::ArtifactLoadPlan plan;
@@ -172,7 +180,7 @@ SINFER_TARGET_CONSTRUCT_LOADED_MODEL();
 Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineOptions& options) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
     bind_lora(model.impl_->data, options);
-    // The generic tokenizer frontend: token-id prompts and plain text until lane f2's native renderer is wired.
+    // The generic tokenizer frontend: token-id prompts and plain text until the native Inkling renderer is wired.
     return family::make_frontend(model.impl_->data.frontend,
                                  family::FrontendOptions{
                                      .vision_enabled           = false,
@@ -193,9 +201,9 @@ Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device, c
 }
 
 std::vector<int> Package::pipeline_stage_bounds(int stage_count) {
-    // 2 stages: cut after visit 30 (the end of core pass 1; f1c's DESIGN-2card-1M.md 3, counting KV, not only weights).
+    // 2 stages: cut after visit 30 (the end of core pass 1; 2-card 1M design, 3, counting KV, not only weights).
     // Card 0 = prelude + core passes 0-1 (layers 0-17, 5 global visits, embedding); card 1 = core pass 2 + coda + head
-    // (+ DSpark's planes / drafter): layers 6-23, 3 global visits. At 1M both cards land near 22 GiB (f1c's estimate).
+    // (+ DSpark's planes / drafter): layers 6-23, 3 global visits. At 1M both cards land near 22 GiB (design estimate).
     // SUROGATE_SERVE_INKLING_STAGE_CUT=<visit> overrides the cut (measurement only).
     if (stage_count != 2) { throw std::invalid_argument("inkling2: the visit split is defined for 2 stages"); }
     int cut = 30;

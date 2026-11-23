@@ -1,0 +1,276 @@
+"""GRPO training configuration.
+
+GRPOTrainConfig extends SFTConfig with GRPO-specific fields (loss config,
+prime-rl transport settings). All model, training, LoRA, QLoRA, precision,
+and runtime fields are inherited from SFTConfig.
+"""
+
+from dataclasses import dataclass
+from typing import Literal
+
+from surogate.core.config.sft_config import SFTConfig
+from surogate.utils.dict import DictDefault
+from surogate.utils.logger import get_logger
+
+logger = get_logger()
+
+
+@dataclass
+class GRPOLossConfig:
+    """GRPO loss parameters (mirrors prime-rl's LossConfig)."""
+
+    ipo_mask_low: float = 0.2  # The low threshold for masking tokens (probability difference)
+    ipo_mask_high: float = 0.2  # The high threshold for masking tokens (probability difference)
+    adv_tau: float = 1.0
+    teacher_tau: float = 0.0
+    kl_tau: float = 1e-3  # The tau for KL divergence
+    # OPD / replay knobs used by the reference loss (surogate/grpo/loss.py);
+    # off by default. These fields were referenced by loss.py and its tests
+    # but never added here (pre-existing gap, fixed 2026-07-27).
+    opd_tau: float = 0.0
+    opd_beta: float = 1.0
+    replay_tau: float = 0.0
+    # Hard cap on exp(trainer - inference) in the policy-gradient seed. The
+    # IPO probability-difference mask does NOT bound the ratio: a rare token
+    # (both probs tiny, trainer >> inference in ratio terms) passes the mask
+    # with a ratio of 1e3-1e5 and dominates the batch gradient. e^2 keeps
+    # ~all honest off-policy correction (periodic-reload staleness) while
+    # bounding single-token influence. Uncapped values still feed the
+    # mismatch_kl metric so staleness monitoring sees the truth.
+    ratio_clip: float = 7.389056  # e^2
+    # "ipo" (default): prime-rl's IPO loss as above. "cispo": CISPO (MiniMax-M1) - every completion token keeps its
+    # gradient (no probability-difference mask), no KL term, and the stop-gradient importance weight is truncated at
+    # `ratio_clip` (set it to 1 + eps_high). The native seed already computes A * min(ratio, ratio_clip) per kept token,
+    # so CISPO is this parameter setting: masks wider than any probability difference (|p_t - p_i| <= 1), kl_tau = 0.
+    # "gspo": GSPO (Zheng et al. 2025, arXiv 2507.18071) in its GSPO-token form (eqs. 13-14). One importance ratio per
+    # sequence, s_i = exp(mean over its loss tokens of log(pi_theta / pi_old)), clipped with PPO's min to
+    # [1 - seq_clip_low, 1 + seq_clip_high]; every sequence weighs the same (a token's gradient is A * s_i / |y_i| and
+    # the step divides by its trial count). No probability-difference mask, no KL term; ratio_clip is not used.
+    # dispatch-PP only: the ratio needs a whole sequence's log-probs before its backward.
+    variant: Literal["ipo", "cispo", "gspo"] = "ipo"
+    # GSPO's left and right clipping ranges; the defaults are the paper's. pi_old is the rollout engine's log-probs,
+    # so s_i also carries the engine/trainer mismatch: the mean log-ratio is -KL(engine || trainer), and a k3 of 0.005
+    # per token puts s_i near 0.995. Measure s_i (train/seq_log_ratio) before choosing these.
+    seq_clip_low: float = 3e-4
+    seq_clip_high: float = 4e-4
+    # GSPO's pi_old: "inference", the rollout engine's log-probs (section 5.4's possibility); "step_start", the trainer's
+    # own log-probs of the step's rows at the weights the step starts from, scored once before its first update (the
+    # paper's recomputation: with on-policy batches, max_policy_lag 0, those weights sampled the rows); or "trainer",
+    # the trainer's log-probs at the current parameters (stop-gradient), so s_i = 1 and nothing is clipped.
+    # seq_log_ratio reports the engine-based value for "trainer" and the pi_old-based one otherwise.
+    seq_ratio_old: Literal["inference", "step_start", "trainer"] = "inference"
+    # Async rows (max_policy_lag >= 1) under step_start: decoupled PPO (AReaL, Fu et al. 2025, arXiv 2505.24298). pi_old
+    # stays the step's starting weights (the proximal policy, the clip's reference) and each sample's gradient is scaled
+    # by a stop-gradient behavior weight, GSPO's sequence form: w_i = min(cap, exp(mean over its loss tokens of
+    # log pi_prox - log pi_behavior)), pi_behavior the rollout engine's log-probs of a row an older version sampled
+    # (on-policy rows get the engine/trainer mismatch only, w ~ 0.99). None: lagged rows refused under step_start.
+    behavior_is_cap: float | None = None
+    # GSPO's aggregation over the step's tokens (trainer check 2026-11-06). "sequence" (the default, the paper's form = TRL
+    # loss_type "grpo"): every sequence weighs the same, a token's gradient is A * s_i / |y_i| and the step divides by its
+    # trial count, so a short row's tokens weigh |y_long| / |y_short| times a long row's. "token" (DAPO = TRL's default
+    # loss_type "dapo" with importance_sampling_level "sequence"): every loss token weighs the same, a token's gradient is
+    # A * s_i and the step divides by its loss tokens (a row then weighs by its length); s_i and its clip stay per row.
+    # With "token" every row of a split trial must carry the trial's FULL advantage (the loop's row_adv_split off), so
+    # the trial's tokens count once each. ipo / cispo already aggregate per token: "token" is refused there.
+    aggregation: Literal["sequence", "token"] = "sequence"
+
+    def __post_init__(self):
+        if self.variant not in ("ipo", "cispo", "gspo"):
+            raise ValueError(f"loss.variant must be 'ipo', 'cispo' or 'gspo', got {self.variant!r}")
+        if self.variant in ("cispo", "gspo"):
+            if self.kl_tau not in (0.0, 1e-3):
+                logger.warning(f"loss.variant={self.variant} ignores kl_tau={self.kl_tau} (it has no KL term)")
+            self.ipo_mask_low = 2.0
+            self.ipo_mask_high = 2.0
+            self.kl_tau = 0.0
+        if self.variant == "gspo":
+            if not 0.0 < self.seq_clip_low < 1.0 or not self.seq_clip_high > 0.0:
+                raise ValueError(
+                    f"loss.seq_clip_low must be in (0, 1) and loss.seq_clip_high positive, got "
+                    f"{self.seq_clip_low} and {self.seq_clip_high}")
+            if self.opd_tau or self.replay_tau:
+                raise ValueError("loss.variant=gspo does not combine with opd_tau or replay_tau (per-token terms)")
+            if self.seq_ratio_old not in ("inference", "step_start", "trainer"):
+                raise ValueError(
+                    f"loss.seq_ratio_old must be 'inference', 'step_start' or 'trainer', got {self.seq_ratio_old!r}")
+        if not self.ratio_clip > 0.0:
+            raise ValueError(f"loss.ratio_clip must be positive, got {self.ratio_clip}")
+        if self.behavior_is_cap is not None:
+            if self.variant != "gspo" or self.seq_ratio_old != "step_start":
+                raise ValueError("loss.behavior_is_cap is decoupled PPO's behavior weight: only with variant gspo and "
+                                 "seq_ratio_old step_start")
+            if not float(self.behavior_is_cap) >= 1.0:
+                raise ValueError(f"loss.behavior_is_cap must be at least 1, got {self.behavior_is_cap}")
+            self.behavior_is_cap = float(self.behavior_is_cap)
+        if self.aggregation not in ("sequence", "token"):
+            raise ValueError(f"loss.aggregation must be 'sequence' or 'token', got {self.aggregation!r}")
+        if self.aggregation == "token" and self.variant != "gspo":
+            raise ValueError("loss.aggregation 'token' is GSPO's DAPO-style aggregation; ipo and cispo already "
+                             "aggregate per token (leave aggregation at 'sequence')")
+
+
+@dataclass
+class NoiseSchedulerConfig:
+    """QeRL Adaptive Quantization Noise (AQN) parameters.
+
+    Adds Gaussian noise to RMSNorm weights in the inference model before
+    rollout generation.  The noise standard deviation decays geometrically
+    from sigma_start to sigma_end over num_stages intervals.
+
+    Reference: https://arxiv.org/abs/2510.11696
+    """
+
+    enabled: bool = False
+    sigma_start: float = 5e-2
+    sigma_end: float = 5e-4
+    num_stages: int = 10
+
+
+@dataclass
+class GRPOTrainConfig(SFTConfig):
+    """Configuration for GRPO RL training with Surogate.
+
+    Extends SFTConfig with GRPO-specific fields. Data comes from prime-rl's
+    transport layer (not from tokenized files), so the `datasets` field is
+    typically left empty.
+    """
+
+    # GRPO loss
+    loss: GRPOLossConfig | None = None
+
+    # QeRL noise scheduler (Adaptive Quantization Noise)
+    noise_scheduler: NoiseSchedulerConfig | None = None
+
+    # Prime-RL integration
+    transport_type: Literal["filesystem", "zmq"] = "filesystem"
+    max_async_level: int = 1
+    # Padding multiple for packed micro-batches.
+    pad_to_multiple_of: int = 1
+    # One sample per micro-batch (disables FFD packing). REQUIRED with
+    # sequence_chunks > 1: chunked training attention has no packed-doc
+    # isolation. Pair with pad_to_multiple_of = chunk size; all-padding
+    # tail chunks are skipped natively.
+    single_sample_bins: bool = False
+    # Document-level attention masking for packed sequences.
+    doc_masking: bool = True
+    # Turn-resolved supervision diagnostics (TurnOPD arXiv:2607.05804 §4).
+    # Routes the micro-step through forward_for_grpo + Python loss +
+    # backward_grpo instead of the fused native step, so per-token logprobs are
+    # visible to Python. Same math, same gradients (covered by
+    # tests/grpo/test_native_formula.py), but slower — measurement only.
+    turn_diagnostics: bool = False
+    # dispatch-PP only: score every row with the trainer's own base model (the
+    # LoRA delta off, the policy pass's kernels) and use those log-probs as the
+    # rows' teacher_logprobs -- a KL anchor to the base weights, weighted by
+    # loss.teacher_tau, with no teacher server. Costs one more log-prob pass per
+    # dispatch call; the rows' own teacher_logprobs are replaced.
+    # "missing" (on-policy distillation with several teachers, 2026-11-03): only
+    # the rows that arrive without teacher_logprobs are scored by the base; rows
+    # that carry them (an engine teacher's) keep them. The base pass then runs
+    # over those rows alone.
+    teacher_from_base: bool | Literal["missing"] = False
+    # dtype of the LoRA adapter in weight broadcasts: "bf16" rounds FP32 masters
+    # (lora_dtype: fp32) to BF16, the copy a BF16 serving engine loads, at half
+    # the bytes; "master" writes them as stored. Checkpoints keep full precision.
+    broadcast_dtype: Literal["bf16", "master"] = "bf16"
+    # dispatch-PP only: optimizer updates per rollout batch. The step's rows are partitioned into this many mini-batches
+    # of whole GRPO groups (TrainingSample.group_idx), or whole trials without one, seeded per step; each gets its own
+    # log-prob pass, backward and update, normalized by its own trial count (gspo) or loss tokens. The Adam step index
+    # of update k is minibatches * step + k. Mini-batch sizes follow the batch.
+    minibatches: int = 1
+    # Drop the samples whose trained tokens were sampled by a policy version older than the step's by more than this,
+    # or by several versions (TrainingSample.completion_versions); 0 = on-policy batches only. None = no check.
+    max_policy_lag: int | None = None
+
+    def __init__(self, cfg: DictDefault):
+        # Each token's gradient is advantage * importance_ratio_clip * (softmax - 1{target}) / N_valid.
+        # The advantage is often < 0.1, the clipped ratio is near 1.0 ± epsilon, and the loss mask removes prompt tokens.
+        # The effective gradient per parameter ends up 10-100x smaller than SFT, so the *gradients* stay fp32.
+        #
+        # The master weights do not: measured GRPO runs show a BF16 master is enough.
+        # Masters are allocated for every param, frozen ones included, and a master
+        # dtype that differs from the param dtype also forces a separate work copy
+        # (dsl_weight_manager.cpp) — so fp32 cost 6 bytes/param (fp32 master + bf16
+        # work) against 2 when they alias, e.g. 12 GB vs 4 GB of arena on a 2B, most
+        # of it for a frozen base a LoRA run never trains. Precision where it matters
+        # comes from the adapter instead: lora_dtype defaults to "fp32", so the
+        # trainable LoRA weights and their optimizer state stay full precision.
+        #
+        # Leaving master_dtype unset falls back to the model dtype (BF16). A full
+        # fine-tune that wants fp32 must set BOTH master_dtype and gradient_dtype, as
+        # `examples/training/full-finetune.yaml` does -- since the gate below stops
+        # forcing fp32 gradients, setting master_dtype alone now pairs an fp32 master
+        # with BF16 gradients, which nothing exercises.
+        #
+        # All of that reasoning is about an adapter, so only apply it when there is
+        # one. The block above deliberately leaves `master_dtype` at the model dtype;
+        # pairing that BF16 master with fp32 gradients is what the backward rejects:
+        #   matmul_backward: weight-grad output tensor shape/dtype mismatch
+        # For a LoRA run the pair never arises, because the adapter carries its own
+        # dtype. For a full fine-tune it would, so leave `gradient_dtype` alone and
+        # let it follow the model dtype, exactly as SFT already does. fp32 gradients
+        # are not the problem in themselves -- `examples/training/full-finetune.yaml`
+        # runs them on a full fine-tune by asking for an fp32 master to match.
+        if "gradient_dtype" not in cfg and cfg.get("lora", True):
+            cfg["gradient_dtype"] = "fp32"
+
+        cfg["sample_packing"] = "false"
+        cfg["datasets"] = []
+
+        # GRPO packed batches are heavily masked (prompt + padding tokens are -100,
+        # only the response gets loss). The compact lm_head path skips work on those
+        # rows for a meaningful step-time win — measured ~13% on Qwen3-0.6B BF16
+        # LoRA, ~14-21% on fp8-hybrid (the helpers route the gathered slices
+        # through the FP8 cache lookup + on-the-fly quantization).
+        if "lmhead_drop_ignored_rows" not in cfg:
+            cfg["lmhead_drop_ignored_rows"] = True
+
+        super().__init__(cfg)
+
+        # Parse nested loss config
+        loss_dict = cfg.get("loss", {})
+        if isinstance(loss_dict, dict) and loss_dict:
+            self.loss = GRPOLossConfig(**loss_dict)
+        elif isinstance(loss_dict, GRPOLossConfig):
+            self.loss = loss_dict
+        else:
+            self.loss = GRPOLossConfig()
+
+        # Parse nested noise scheduler config
+        ns_dict = cfg.get("noise_scheduler", {})
+        if isinstance(ns_dict, dict) and ns_dict:
+            self.noise_scheduler = NoiseSchedulerConfig(**ns_dict)
+        elif isinstance(ns_dict, NoiseSchedulerConfig):
+            self.noise_scheduler = ns_dict
+        else:
+            self.noise_scheduler = NoiseSchedulerConfig()
+
+        self.transport_type = cfg.get("transport_type", self.transport_type)
+        self.single_sample_bins = bool(cfg.get("single_sample_bins", self.single_sample_bins))
+        self.max_async_level = cfg.get("max_async_level", self.max_async_level)
+        self.pad_to_multiple_of = cfg.get("pad_to_multiple_of", self.pad_to_multiple_of)
+        self.doc_masking = cfg.get("doc_masking", self.doc_masking)
+        self.turn_diagnostics = cfg.get("turn_diagnostics", self.turn_diagnostics)
+        tfb = cfg.get("teacher_from_base", self.teacher_from_base)
+        self.teacher_from_base = "missing" if tfb == "missing" else bool(tfb)
+        self.broadcast_dtype = cfg.get("broadcast_dtype", self.broadcast_dtype)
+        self.minibatches = int(cfg.get("minibatches", self.minibatches))
+        lag = cfg.get("max_policy_lag", self.max_policy_lag)
+        self.max_policy_lag = None if lag is None else int(lag)
+        if self.minibatches < 1:
+            raise ValueError(f"minibatches must be at least 1, got {self.minibatches}")
+
+        # Initialize inherited config: model_dir, runtime_config, lora_config, etc.
+        # In the SFT path this is called by TokenizeDatasets.__init__(), but GRPO
+        # bypasses tokenization so we call it here directly.
+        self.__post_init__()
+        # Propagate GRPO-specific doc masking to runtime options.
+        # This controls document-level attention masking in the C++ engine
+        # while still allowing position_ids (RoPE resets) to be passed.
+        self.runtime_config.doc_masking = self.doc_masking
+
+        # Disable CUDA graphs for GRPO for now. The native GRPO step removes the
+        # Python logprob round trip, but graph capture needs separate wiring.
+        if self.use_cuda_graphs:
+            self.use_cuda_graphs = False
+            self.runtime_config.use_cuda_graphs = False

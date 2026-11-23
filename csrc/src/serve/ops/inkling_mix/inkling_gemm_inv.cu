@@ -1,4 +1,4 @@
-// Batch- and path-invariant BF16 GEMM for the inkling2 target (api/ops/inkling_mix.h, agent-EN 10:2x decision).
+// Batch- and path-invariant BF16 GEMM for the inkling2 target (api/ops/inkling_mix.h).
 //
 // The per-element chain is the one of ops/linear/bf16/bf16_invariant_gemm.cu (k16 MMA steps in increasing k from a
 // zero accumulator, k tiles of 64 zero-padded, no split-K by width, no cross-warp reduction); this copy adds what the
@@ -17,7 +17,9 @@
 #include <cuda_bf16.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -48,8 +50,8 @@ struct Schedule {
 
 // The shared kernel's three tiles (measured there on an RTX 5090); the choice follows speed only.
 using Tile16x8  = Schedule<16, 8, 16, 8, 6>;
-// Decode widths with few row tiles (wo_ud: 144 one-warp CTAs on 170 SMs walked k = 3072 at ~0.84 TB/s, lane h's nsys
-// 14:49): the same tile with 7 stages in flight instead of 5. The pipeline depth moves no product: same bits.
+// Decode widths with few row tiles (wo_ud: 144 one-warp CTAs on 170 SMs walked k = 3072 at ~0.84 TB/s, per an nsys
+// profile): the same tile with 7 stages in flight instead of 5. The pipeline depth moves no product: same bits.
 using Tile16x8Deep = Schedule<16, 8, 16, 8, 8>; // the loop waits for STAGES - 1 groups; PTX takes at most 7
 using Tile32x32 = Schedule<32, 32, 16, 16, 4>;
 using Tile64x64 = Schedule<64, 64, 32, 32, 3>;
@@ -209,7 +211,7 @@ __global__ __launch_bounds__(S::kThreads) void gemm_inv_kernel(const __grid_cons
 /// out = p[0] + p[1] + ... + p[splits - 1], added in that order, one thread per output element. The partials are read
 /// through L2 (ld.global.cg), never the non-coherent read-only path: they are written by the split GEMM just before this
 /// kernel in the PDL chain (this grid may be resident while it runs) and the visit arena reuses their address every
-/// visit, which breaks ld.global.nc's read-only-for-the-kernel's-lifetime contract (lane c's FP8 decode finding 17:47).
+/// visit, which breaks ld.global.nc's read-only-for-the-kernel's-lifetime contract (the FP8 attention decode finding).
 template <typename OutT>
 __global__ void __launch_bounds__(256) reduce_kernel(const float* partial, OutT* __restrict__ out,
                                                      std::int32_t rows, std::int32_t tokens, std::int32_t batch,
@@ -232,6 +234,135 @@ __global__ void __launch_bounds__(256) reduce_kernel(const float* partial, OutT*
     } else {
         out[at] = __float2bfloat16_rn(sum);
     }
+}
+
+// ---- wo at decode widths (default OFF, SUROGATE_SERVE_INKLING_WO_NARROW=1 = on) -----
+// gemm_inv_kernel<Tile16x8Deep, Bf16> for T <= 8, one problem, n % 16 == 0, k % 64 == 0: the same one-warp 16 x 8 tile, the
+// same copy pipeline, the same smem placement, the same m16n8k16 chain and the same store, so the same bits. What differs
+// is when the addresses are computed: each thread's 4 weight + 2 activation pieces and its 8 fragment offsets once, before
+// the loop (the generic loop spends 178 of its 241 instructions per 64-k tile on them), and __syncwarp in place of a CTA
+// barrier, the CTA being one warp.
+struct NarrowArgs {
+    const __nv_bfloat16* weight; // [n][k]
+    const __nv_bfloat16* x;      // [tokens][k]
+    __nv_bfloat16* out;          // [tokens][ldc]
+    std::int32_t k, tokens, ldc;
+};
+
+template <int STAGES>
+__global__ __launch_bounds__(32) void gemm_inv_narrow_kernel(const __grid_constant__ NarrowArgs a) {
+    pdl::wait_for_dependencies(); // PDL: every read / write after the producer grid completes
+    pdl::trigger_dependents(); // PDL: the next kernel may launch now (it waits for this grid before any read)
+    constexpr int BM = 16, BN = 8, BK = kBlockK;
+    __shared__ __align__(16) __nv_bfloat16 As[STAGES * BM * BK];
+    __shared__ __align__(16) __nv_bfloat16 Bs[STAGES * BN * BK];
+
+    const int lane = static_cast<int>(threadIdx.x), gid = lane >> 2, lid = lane & 3;
+    const int m0      = static_cast<int>(blockIdx.x) * BM;
+    const int k_tiles = a.k / BK;
+    const int piece   = (lane & 7) * 8; // this thread's 16-byte piece of a row's 64-k tile
+
+    const __nv_bfloat16* a_src[4];
+    int a_dst[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int row = (lane >> 3) + 4 * j;
+        a_src[j]      = a.weight + static_cast<std::int64_t>(m0 + row) * a.k + piece;
+        a_dst[j]      = row * BK + swizzled_col(row, piece);
+    }
+    const __nv_bfloat16* b_src[2];
+    int b_dst[2], b_bytes[2];
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        const int col    = (lane >> 3) + 4 * j;
+        const bool valid = col < a.tokens;
+        // A column past T zero-fills: no byte is read (the address stays inside x's first token).
+        b_src[j]   = a.x + static_cast<std::int64_t>(valid ? col : 0) * a.k + piece;
+        b_dst[j]   = col * BK + swizzled_col(col, piece);
+        b_bytes[j] = valid ? 16 : 0;
+    }
+    const int a_matrix = lane >> 3, a_row = (lane & 7) + ((a_matrix & 1) << 3), a_col = (a_matrix >> 1) << 3;
+    const int b_row = lane & 7, b_col = ((lane >> 3) & 1) << 3;
+    int a_frag[4], b_frag[4];
+#pragma unroll
+    for (int step = 0; step < 4; ++step) {
+        a_frag[step] = a_row * BK + swizzled_col(a_row, step * 16 + a_col);
+        b_frag[step] = b_row * BK + swizzled_col(b_row, step * 16 + b_col);
+    }
+
+    const auto stage_inputs = [&](int stage, int k_tile) {
+        const int k0 = k_tile * BK;
+        auto* as     = As + stage * BM * BK;
+        auto* bs     = Bs + stage * BN * BK;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) { cp_async<16, Cache::cg>(as + a_dst[j], a_src[j] + k0); }
+#pragma unroll
+        for (int j = 0; j < 2; ++j) { cp_async_zfill<16, Cache::cg>(bs + b_dst[j], b_src[j] + k0, b_bytes[j]); }
+    };
+#pragma unroll
+    for (int stage = 0; stage < STAGES - 1; ++stage) {
+        if (stage < k_tiles) { stage_inputs(stage, stage); }
+        cp_commit();
+    }
+    float c0 = 0.0F, c1 = 0.0F, c2 = 0.0F, c3 = 0.0F;
+#pragma unroll 1
+    for (int k_tile = 0; k_tile < k_tiles; ++k_tile) {
+        const int stage = k_tile % STAGES;
+        const int next  = k_tile + STAGES - 1;
+        if (next < k_tiles) { stage_inputs(next % STAGES, next); }
+        cp_commit();
+        cp_wait<STAGES - 1>();
+        __syncwarp();
+        const auto* as = As + stage * BM * BK;
+        const auto* bs = Bs + stage * BN * BK;
+#pragma unroll
+        for (int step = 0; step < 4; ++step) {
+            unsigned f0, f1, f2, f3, g0, g1;
+            ldmatrix_x4(f0, f1, f2, f3, smem_addr(as + a_frag[step]));
+            ldmatrix_x2(g0, g1, smem_addr(bs + b_frag[step]));
+            mma_bf16(c0, c1, c2, c3, f0, f1, f2, f3, g0, g1);
+        }
+        __syncwarp();
+    }
+    cp_wait<0>();
+
+    const int row0 = m0 + gid, token0 = 2 * lid;
+    const auto store = [&](int row, int token, float value) {
+        if (token >= a.tokens) { return; }
+        a.out[static_cast<std::int64_t>(token) * a.ldc + row] = __float2bfloat16_rn(value);
+    };
+    store(row0, token0, c0);
+    store(row0, token0 + 1, c1);
+    store(row0 + 8, token0, c2);
+    store(row0 + 8, token0 + 1, c3);
+}
+
+// The switch: default OFF; SUROGATE_SERVE_INKLING_WO_NARROW=1 or inkling_gemm_inv_use_narrow(true) = the narrow kernel (same bits).
+// MTP off on M11: 1x8k +3.57 %, 8x8k +2.89 %. MTP on at 8x8k on M13 (the served shape): gain -0.13 %, 95 % CI [-0.73, +0.48] %, which
+// the registered line reads as not passed.
+std::atomic<int> g_wo_narrow{-1};
+
+bool use_wo_narrow() {
+    int v = g_wo_narrow.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = std::getenv("SUROGATE_SERVE_INKLING_WO_NARROW");
+        v             = e != nullptr && e[0] == '1' && e[1] == '\0' ? 1 : 0;
+        g_wo_narrow.store(v, std::memory_order_relaxed);
+    }
+    return v != 0;
+}
+
+/// The shapes whose generic launch is gemm_inv_kernel<Tile16x8Deep, Bf16> with full row tiles and whole k tiles.
+bool wo_narrow_shape(std::int32_t n, std::int32_t k, std::int32_t tokens, std::int32_t batch) {
+    static const int sms = [] {
+        int device = 0, count = 0;
+        if (cudaGetDevice(&device) != cudaSuccess ||
+            cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) {
+            return 0;
+        }
+        return count;
+    }();
+    return batch == 1 && tokens <= 8 && n % 16 == 0 && k % kBlockK == 0 && n / 16 < 2 * sms;
 }
 
 template <class S, Store kStore>
@@ -313,6 +444,12 @@ void inkling_gemm_inv(const void* weight, std::int32_t n, std::int32_t k, const 
         a.chunk = ((k + kBlockK - 1) / kBlockK) * kBlockK; // one chunk: the whole (padded) k
         if (out_dtype == DType::FP32) {
             dispatch<Store::Fp32>(a, 1, stream);
+        } else if (use_wo_narrow() && wo_narrow_shape(n, k, tokens, batch.count)) {
+            const NarrowArgs na{static_cast<const __nv_bfloat16*>(weight), static_cast<const __nv_bfloat16*>(x),
+                                static_cast<__nv_bfloat16*>(out), k, tokens, ldc};
+            CUDA_CHECK(pdl::launch_dependent({dim3(static_cast<unsigned>(n / 16)), dim3(32), 0, stream},
+                                             gemm_inv_narrow_kernel<Tile16x8Deep::kStages>, na));
+            CUDA_CHECK(cudaGetLastError());
         } else {
             dispatch<Store::Bf16>(a, 1, stream);
         }
@@ -355,6 +492,8 @@ void inkling_gemm_inv_partials(const void* weight, std::int32_t n, std::int32_t 
            kSplitChunk, batch.count, batch.weight_stride, batch.x_stride, 0};
     dispatch<Store::Partial>(a, splits, stream);
 }
+
+void inkling_gemm_inv_use_narrow(bool on) noexcept { g_wo_narrow.store(on ? 1 : 0, std::memory_order_relaxed); }
 
 void inkling_gemm_inv_group(std::span<const InklingGemmProblem> problems, std::int32_t k, std::int32_t tokens,
                             DType out_dtype, cudaStream_t stream) {

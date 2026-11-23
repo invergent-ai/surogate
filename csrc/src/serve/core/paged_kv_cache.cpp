@@ -282,6 +282,9 @@ PagedKVPool::PagedKVPool(DeviceSpan backing, const PagedKVPoolLayout& layout,
         }
         window_elastic_ = std::make_unique<ElasticKvRegion>(std::move(region));
         window_backing  = DeviceSpan{window_elastic_->base(), window_elastic_->bytes()};
+        // The main region's limit leaves out what this region maps past its own (holders left,
+        // their granules not yet given back): set_foreign_bytes alone rose at once.
+        if (elastic_) { elastic_->set_foreign_region(*window_elastic_); }
     }
     planes_.reserve(layout.planes.size());
     for (std::size_t index = 0; index < layout.planes.size(); ++index) {
@@ -439,7 +442,18 @@ std::uint32_t PagedKVPool::window_charge_for(std::uint32_t window_pages) const n
 
 void PagedKVPool::charge_window_pages(std::int64_t delta) noexcept {
     window_charged_pages_ = static_cast<std::uint32_t>(static_cast<std::int64_t>(window_charged_pages_) + delta);
-    if (window_elastic_) { window_elastic_->set_entitled_pages(window_floor_pages_ + window_charged_pages_); }
+    if (window_elastic_) {
+        window_elastic_->set_entitled_pages(window_floor_pages_ + window_charged_pages_);
+        // Holders left: the window region gives its emptied granules back down to the lower limit,
+        // since the main region's limit rises at once (review of 75204b7d, MEDIUM 1).
+        if (delta < 0) { window_elastic_->release_above_limit(); }
+        // The charged window pages are paid out of the main pages (the ledger above), but the
+        // window region maps them: the main region's physical limit leaves their bytes out, or
+        // both regions fill the same planned bytes (out-of-memory diagnosis, F1).
+        if (elastic_) {
+            elastic_->set_foreign_bytes(static_cast<std::size_t>(window_charged_pages_) * window_page_bytes_);
+        }
+    }
 }
 
 void PagedKVPool::replace_window_holder(PagedKVAllocation* from, PagedKVAllocation* to) noexcept {
@@ -562,6 +576,16 @@ PagedKVOccupancy PagedKVPool::occupancy(std::size_t granule_bytes) const noexcep
     out.mapped_pages     = elastic_ ? std::min(spec_.page_group_count,
                                                elastic_->mapped_granules() * elastic_->granule_pages())
                                     : spec_.page_group_count;
+    // M3-C: the elastic window class's physical side, for /kv_stats (main + window mapped bytes
+    // must stay within the main cap's bytes + the window floor; out-of-memory diagnosis).
+    if (window_elastic_) {
+        out.window_page_bytes    = window_page_bytes_;
+        out.window_floor_pages   = window_floor_pages_;
+        out.window_granule_pages = window_elastic_->granule_pages();
+        out.window_charged_pages = window_charged_pages_;
+        out.window_mapped_pages  = std::min(window_page_count_,
+                                            window_elastic_->mapped_granules() * window_elastic_->granule_pages());
+    }
 
     // A page's bytes are contiguous per plane only under PageMajor; a HeadMajor plane scatters
     // one page across its heads, so no page-granular mapping scheme applies to it.
@@ -1464,7 +1488,7 @@ std::uint32_t PagedKVPool::compact_window_class(std::span<const PagedKVAllocatio
     }
     used.push_back(window_sentinel_);
     std::sort(used.begin(), used.end());
-    // SUROGATE_SERVE_KV_WINDOW_SHUFFLE=1 (tests only: lane f1's path-invariance "relocate" path):
+    // SUROGATE_SERVE_KV_WINDOW_SHUFFLE=1 (tests only: the path-invariance "relocate" path):
     // every movable page moves at every boundary, to the next free page above it (or the lowest),
     // so a sequence reads its window from pages that were relocated between all of its rounds.
     static const bool shuffle = [] {
@@ -1553,6 +1577,9 @@ std::uint32_t PagedKVPool::compact_window_class(std::span<const PagedKVAllocatio
         ++moved;
     }
     window_moved_pages_ += moved;
+    // Granules the moves emptied go back at the next round boundary while the region maps past its
+    // limit; the worker's unmap job alone keeps them up to the trim threshold.
+    if (moved != 0) { window_elastic_->release_above_limit(); }
     static const bool trace = std::getenv("SUROGATE_SERVE_KV_WINDOW_TRACE") != nullptr;
     if (trace && moved != 0) {
         std::fprintf(stderr, "kv-window: compaction moved %u pages (%u in use, %u granules before)\n", moved, in_use,

@@ -3,7 +3,7 @@
 QLoRA enables memory-efficient fine-tuning by quantizing the frozen base model weights while training LoRA adapters in higher precision. Surogate supports two modes:
 
 - **Online QLoRA**: Weights are quantized on-the-fly at startup from a standard BF16/FP16 checkpoint.
-- **Pre-quantized models**: Load a model that is already quantized (e.g., from HuggingFace Hub). Supported formats are **Fine-Grained FP8** (compatible with NVIDIA ModelOpt FP8 exports), **ModelOpt NVFP4** (two-level FP8+FP32 block scaling), and **MXFP4** (microscaling FP4, GPT-OSS models). Pre-quantized models skip the quantization step at startup and load directly into the quantized format.
+- **Pre-quantized models**: Load a model that is already quantized (e.g., from HuggingFace Hub). Supported formats are **Fine-Grained FP8** (compatible with NVIDIA ModelOpt FP8 exports), **ModelOpt NVFP4** (two-level FP8+FP32 block scaling), **compressed-tensors NVFP4** (llm-compressor exports, e.g. NVFP4 experts beside per-channel FP8 projections), and **MXFP4** (microscaling FP4, GPT-OSS models). Pre-quantized models skip the quantization step at startup and load directly into the quantized format.
 
 Surogate supports three online QLoRA quantization formats:
 
@@ -24,6 +24,7 @@ When a HuggingFace model already ships with pre-quantized weights (e.g., a Model
 | ------------------------------------------------------------------------------------------------ | ------------------ | ---------- | ----------------------- | ----------------------------------------------------------- |
 | [**Fine-Grained FP8**](https://huggingface.co/docs/transformers/en/quantization/finegrained_fp8) | `fp8`              | FP8 E4M3   | FP32 (inverse scale)    | Per-block 2D tile scaling                                   |
 | [**ModelOpt NVFP4**](https://huggingface.co/docs/transformers/en/quantization/mxfp4)             | `modelopt` / NVFP4 | FP4 E2M1   | FP8 block + FP32 global | Two-level scaling (FP8 + FP32)                              |
+| **compressed-tensors NVFP4**                                                                     | `compressed-tensors` (`nvfp4-pack-quantized` group) | FP4 E2M1 | FP8 block + FP32 global per expert | llm-compressor exports; other modules load as stored (see below) |
 | [**MXFP4**](https://huggingface.co/docs/transformers/en/quantization/mxfp4)                      | `mxfp4`            | FP4 E2M1   | FP8 per-block           | GPT-OSS models only; uses `_blocks`/`_scales` tensor naming |
 
 ### How It Works
@@ -36,6 +37,7 @@ Surogate inspects the model's `quantization_config` in its HuggingFace `config.j
 | ---------------- | --------------- | ------------------------- | ----------------------- |
 | Fine-Grained FP8 | `{name}.weight` | `{name}.weight_scale_inv` | —                       |
 | ModelOpt NVFP4   | `{name}.weight` | `{name}.weight_scale`     | `{name}.weight_scale_2` |
+| compressed-tensors NVFP4 | `{name}.weight_packed` | `{name}.weight_scale` | `{name}.weight_global_scale` |
 | MXFP4            | `{base}_blocks` | `{base}_scales`           | —                       |
 
 MXFP4 uses a different base name convention — there is no `.weight` suffix; instead, the packed FP4 data is stored as `{base}_blocks` and the FP8 scales as `{base}_scales`.
@@ -69,6 +71,44 @@ lora: true
 lora_rank: 16
 recipe: nvfp4
 ```
+
+### compressed-tensors NVFP4 (llm-compressor exports)
+
+A checkpoint whose `quantization_config` has `quant_method: compressed-tensors` and a `config_groups`
+entry of format `nvfp4-pack-quantized` loads as a pre-quantized NVFP4 base. The NVFP4 modules arrive as
+E2M1 codes (`weight_packed`), E4M3 block scales (`weight_scale`) and a global scale
+(`weight_global_scale`, the encode scale, inverted on load). The trainer quantizes weights only:
+`input_global_scale` is not used, and NVFP4 weights are dequantized to BF16 where they are used.
+
+- **MoE experts stored one by one** (`experts.{e}.{gate,up,down}_proj`, as llm-compressor writes them) are
+  stacked for Qwen3.5 / Qwen3.6 MoE models. Each expert keeps its own global scale: the dequant kernel
+  applies one decode scale per expert instead of folding them into one, which would re-round the E4M3
+  block scales (up to ~6 % error).
+- **Every other module loads as the checkpoint stores it.** Per-channel FP8 Linears (in a Qwen3.5-35B-A3B
+  export: the attention and Gated DeltaNet projections and the lm-head) stay FP8 (codes + row scales)
+  and stream with their stage under `parallelism: dispatch_pp`, instead of becoming a BF16 copy on every
+  GPU. BF16 modules load at full precision.
+- **Recipe:** `bf16`.
+
+```yaml
+model: /path/to/nvfp4-checkpoint   # NVFP4 in compressed-tensors format
+lora: true
+lora_rank: 16
+lora_target_modules: [gate_proj, up_proj, down_proj]
+recipe: bf16
+```
+
+Checked on an NVFP4 export of a Qwen3.5-35B-A3B model (8× RTX 5090, `parallelism: dispatch_pp`, zero LoRA delta),
+against our serving engine's rollouts of the same checkpoint, as k3 KL per token:
+
+| Comparison | k3 |
+| --- | --- |
+| vs the engine's decode, 6 rollouts of at most 8k | 0.0050 |
+| vs the engine's prefill, 21 rollouts of at most 32k (chunked) | 0.0056 |
+| vs the engine with its MoE pinned to W4A16 | 0.0036-0.0047 |
+| FP8 base against the FP8 engine, for comparison | 0.0087 |
+
+At 131k with replicated LoRA r8, the peak per card is 27.3 GB, against 29.7 GB with the FP8 export.
 
 ### Example — MXFP4 (GPT-OSS)
 

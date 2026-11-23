@@ -181,7 +181,7 @@ lora_target_modules:
 ### Commands used:
 
 ```shell
-VLLM_ALLOW_RUNTIME_LORA_UPDATING=True vllm serve Qwen/Qwen3-0.6B --max-model-len 2048 --max-lora-rank 64 --enable-lora --lora-modules adapter=/home/densemax2/work/flavius/surogate/output/benchmark_sft_bf16/adapter/ --port 8001
+VLLM_ALLOW_RUNTIME_LORA_UPDATING=True vllm serve Qwen/Qwen3-0.6B --max-model-len 2048 --max-lora-rank 64 --enable-lora --lora-modules adapter=/path/to/surogate/output/benchmark_sft_bf16/adapter/ --port 8001
 ```
 
 ```shell
@@ -189,7 +189,7 @@ lm-eval --model local-completions --model_args model=adapter,base_url=http://loc
 ```
 
 ```shell
-curl -X POST http://localhost:8001/v1/load_lora_adapter -H "Content-Type: application/json" -d '{"lora_name": "adapter", "lora_path": "/home/densemax2/work/flavius/surogate/output/benchmark_sft_qfp8/adapter"}'
+curl -X POST http://localhost:8001/v1/load_lora_adapter -H "Content-Type: application/json" -d '{"lora_name": "adapter", "lora_path": "/path/to/surogate/output/benchmark_sft_qfp8/adapter"}'
 ```
 
 ```shell

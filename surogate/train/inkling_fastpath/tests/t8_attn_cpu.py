@@ -1,5 +1,5 @@
 """S3 CPU checks of the attention-LoRA pieces (no engine): (1) lora_add's forward == the S10 arithmetic written out in fp64
-(bf16(bf16(base) + (x . bf16(bf16(A) s)^T) . bf16(B)^T)) up to fp32 summation; (2) its A / B / x gradients through the base trainer's TokenChunked in chunks ==
+(bf16(bf16(base) + (x . bf16(bf16(A) s)^T) . bf16(B)^T)) up to fp32 summation; (2) its A / B / x gradients through the engine-op trainer's TokenChunked in chunks ==
 plain autograd over all tokens (rel <= 1e-5); (3) the key layout: param_shapes / work_views / ParamLayout agree, expert keys first; (4) config refusals."""
 import os
 import sys

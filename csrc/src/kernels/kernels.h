@@ -2274,6 +2274,7 @@ void zero_matrix_columns(Tensor& dest, long col_start, long col_end, cudaStream_
 void convert_dtype(float* target, const nv_bfloat16* source, std::size_t size);
 void convert_dtype(nv_bfloat16* target, const float* source, std::size_t size);
 void convert_dtype(nv_bfloat16* target, const half* source, std::size_t size);
+void convert_dtype(float* target, const half* source, std::size_t size);
 void convert_dtype(float* target, const nv_bfloat16* source, std::size_t size, cudaStream_t stream);
 void convert_dtype(nv_bfloat16* target, const float* source, std::size_t size, cudaStream_t stream);
 void convert_dtype(nv_bfloat16* target, const half* source, std::size_t size, cudaStream_t stream);
@@ -2321,6 +2322,17 @@ void dequantize_per_block(nv_bfloat16* out,
                           int block_size,
                           const cudaDeviceProp& dp,
                           cudaStream_t stream);
+
+// Row-wise (per-channel) FP8 dequantization: out[r, c] = in[r, c] * row_scales[r], row_scales BF16 or FP32
+// (compressed-tensors' per-channel FP8 Linears: weight_scale [M, 1]).
+void dequantize_fp8_rowwise(nv_bfloat16* out,
+                            const __nv_fp8_e4m3* in,
+                            const void* row_scales,
+                            ETensorDType scale_dtype,
+                            int M,
+                            int K,
+                            const cudaDeviceProp& dp,
+                            cudaStream_t stream);
 void dequantize_per_block(Tensor& out,
                           const Tensor& in,
                           const Tensor& block_scales,
@@ -2426,6 +2438,18 @@ void dequantize_fp4_block(nv_bfloat16* out,
                           int K,
                           const cudaDeviceProp& dp,
                           cudaStream_t stream);
+
+/// @brief FP4 block dequantization with a global decode scale per group of rows_per_group rows
+/// (row_group_scales: device FP32, M / rows_per_group entries), e.g. one per stacked expert.
+void dequantize_fp4_block_grouped(nv_bfloat16* out,
+                                  const uint8_t* in_fp4,
+                                  const __nv_fp8_e4m3* block_scales,
+                                  const float* row_group_scales,
+                                  int rows_per_group,
+                                  int M,
+                                  int K,
+                                  const cudaDeviceProp& dp,
+                                  cudaStream_t stream);
 
 /// @brief Swizzle FP8 block scales from row-major to F8_128x4 layout (in-place).
 ///
@@ -4186,6 +4210,22 @@ void moe_grouped_gemm_weight_grad(nv_bfloat16* d_weight,
                                   const int* active_expert_indices = nullptr,
                                   bool weight_is_compact = true,
                                   int num_active_experts = -1);
+/// bf16 operands, fp32 gradient (accumulated and stored in fp32): FP32 LoRA masters with bf16 activations.
+void moe_grouped_gemm_weight_grad(float* d_weight,
+                                  const nv_bfloat16* grad_output,
+                                  const nv_bfloat16* input,
+                                  const int* expert_offsets,
+                                  int num_experts,
+                                  int M,
+                                  int N,
+                                  cublasHandle_t cublas_handle,
+                                  cudaStream_t stream,
+                                  const int* host_offsets = nullptr,
+                                  float alpha = 1.0f,
+                                  float beta = 0.0f,
+                                  const int* active_expert_indices = nullptr,
+                                  bool weight_is_compact = true,
+                                  int num_active_experts = -1);
 
 /// @brief Grouped GEMM for MoE gate+up projection across all experts.
 /// Runs all expert GEMMs in parallel instead of sequentially.
@@ -4786,6 +4826,47 @@ bool moe_lora_grouped_forward_bf16(nv_bfloat16* out,
                                    cudaStream_t stream,
                                    int tile_tokens = 0);
 
+/// @brief FP32-weight LoRA forward switch: true when SUROGATE_LORA_FP32_FORWARD is set and not "0" (read once).
+/// The expert and dense LoRA forwards then read the fp32 masters instead of their bf16 work copies, so the
+/// function moves smoothly with every update; the backward keeps the bf16 copies.
+bool lora_fp32_forward_enabled();
+
+/// @brief moe_lora_grouped_forward_bf16 with fp32 A and B (the LoRA masters): the same semantics, the products
+/// taken from fp32 weights. Same shape and alignment rules.
+bool moe_lora_grouped_forward_f32w(nv_bfloat16* out,
+                                   const nv_bfloat16* x,
+                                   const float* A,
+                                   const float* B,
+                                   const int* expert_offsets,
+                                   const int* host_offsets,
+                                   int num_experts,
+                                   int total_tokens,
+                                   int in_features,
+                                   int out_features,
+                                   int rank,
+                                   float scaling,
+                                   bool accumulate,
+                                   cudaStream_t stream,
+                                   int tile_tokens = 0);
+
+/// @brief Dense LoRA forward with fp32 weights through the same kernel as a one-expert group:
+///   out[t, :out_features] = (accumulate ? out : 0) + scaling * (x[t, :] . A^T) . B^T
+/// for t < tokens, out rows out_ld elements apart (a column slice of a wider output), x rows in_features apart.
+/// @param A [rank, in_features] fp32. @param B [out_features, rank] fp32.
+/// @return false, launching nothing, for an unsupported shape or alignment (out_ld % 8 != 0 included).
+bool lora_dense_forward_f32w(nv_bfloat16* out,
+                             int out_ld,
+                             const nv_bfloat16* x,
+                             const float* A,
+                             const float* B,
+                             int tokens,
+                             int in_features,
+                             int out_features,
+                             int rank,
+                             float scaling,
+                             bool accumulate,
+                             cudaStream_t stream);
+
 /// @brief Workspace (in floats) that moe_lora_grouped_backward_bf16 needs for the same arguments.
 std::size_t moe_lora_grouped_backward_workspace_floats(const int* host_offsets,
                                                        int num_experts,
@@ -4807,6 +4888,28 @@ std::size_t moe_lora_grouped_backward_workspace_floats(const int* host_offsets,
 bool moe_lora_grouped_backward_bf16(nv_bfloat16* dx,
                                     nv_bfloat16* dA,
                                     nv_bfloat16* dB,
+                                    const nv_bfloat16* d_out,
+                                    const nv_bfloat16* x,
+                                    const nv_bfloat16* A,
+                                    const nv_bfloat16* B,
+                                    const int* expert_offsets,
+                                    const int* host_offsets,
+                                    int num_experts,
+                                    int total_tokens,
+                                    int in_features,
+                                    int out_features,
+                                    int rank,
+                                    float scaling,
+                                    bool dx_accumulate,
+                                    bool grad_accumulate,
+                                    float* workspace,
+                                    std::size_t workspace_floats,
+                                    cudaStream_t stream,
+                                    int tile_tokens = 0);
+/// The same with fp32 dA / dB (FP32 LoRA masters): the reduce adds the fp32 tile sums to fp32 gradients.
+bool moe_lora_grouped_backward_bf16(nv_bfloat16* dx,
+                                    float* dA,
+                                    float* dB,
                                     const nv_bfloat16* d_out,
                                     const nv_bfloat16* x,
                                     const nv_bfloat16* A,
