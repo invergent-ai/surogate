@@ -1,4 +1,4 @@
-"""Lane T8, S0 pass line (PLAN-SKYRL.md): on 200 fixed random inputs (+ edge cases) our port == SkyRL's OWN functions, loaded from its file by AST
+"""S0 pass line: on 200 fixed random inputs (+ edge cases) our port == SkyRL's OWN functions, loaded from its file by AST
 (sha256-pinned copies of SkyRL faae9039's ppo_utils.py / torch_utils.py in $T8_SKYRL_REF, named *_faae9039.py.txt): advantages, per-token loss, reduced loss, and the per-token seed d loss / d logp, to 1e-12 relative (fp64).
 Edge cases: a group of one, a group with std 0, negative advantages hitting the dual clip, ratios beyond the 20 clip, rows with no loss token."""
 import ast

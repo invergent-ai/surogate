@@ -1,5 +1,5 @@
-"""Lane T8, S3: the engine binding for libsinfer_inkling_train_t8.so (ABI 3: ift_run_visit takes the visit's explicit S10 attention adapters).
-Lane T's ift_engine.InklingEngine is reused as it is; only the library and the visit call differ. `attn_layers`: None (no attention adapter) or a
+"""S3: the engine binding for libsinfer_inkling_train_t8.so (ABI 3: ift_run_visit takes the visit's explicit S10 attention adapters).
+The base trainer's ift_engine.InklingEngine is reused as it is; only the library and the visit call differ. `attn_layers`: None (no attention adapter) or a
 list of 24 AttnAdapters (by physical layer; every pass of a core layer reads its layer's tables, as the engine's store does)."""
 from __future__ import annotations
 

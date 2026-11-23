@@ -1,4 +1,4 @@
-"""Lane T8: the gate's comparison functions on synthetic tensors: a true match passes, and every vacuous or wrong comparison fails."""
+"""the gate's comparison functions on synthetic tensors: a true match passes, and every vacuous or wrong comparison fails."""
 import os
 import sys
 

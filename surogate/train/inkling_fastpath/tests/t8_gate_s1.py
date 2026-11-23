@@ -1,4 +1,4 @@
-"""Lane T8, S1 + S2 card gate (SkyRL plan S1 + S2). PASS LINES, written before any run (also in the lane notes). No adapter is kept; nothing is trained beyond
+"""S1 + S2 card gate (SkyRL plan S1 + S2). PASS LINES, written before any run (also in the design notes). No adapter is kept; nothing is trained beyond
 two test optimizer steps on 4 rows whose result is discarded.
 Expert adapters at SkyRL's shape (r16 / alpha 32 per expert, A AND B trained), A = the kaiming-uniform seed-0 masters, B = N(0, 1e-3) (seed 11) so that A has
 a gradient. Real rows of 16,009 / 28,002 / 47,014 / 57,431 tokens (gate_rows.npz), full backward K = 48, plain head.

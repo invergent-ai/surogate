@@ -1,4 +1,4 @@
-"""Lane T8, S0: SkyRL's policy loss, advantage and reduction for the W5 trainer (SkyRL faae9039, preset `lora`).
+"""S0: SkyRL's policy loss, advantage and reduction for the trainer (SkyRL faae9039, preset `lora`).
 
 Written from SkyRL's code, line for line, in fp64 on the host (the per-row seeds of our step):
 - GRPO advantage (`ppo_utils.py:1411-1460`, `compute_grpo_outcome_advantage`): per group, mean of the scores and torch.std (unbiased), both in fp32 as SkyRL's calls give them; a group of

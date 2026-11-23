@@ -1,5 +1,5 @@
-"""Lane T8, S3 card gate (PLAN-SKYRL.md): attention LoRA r64 / alpha 32 (scale 0.5) on the seven S10 slices. PASS LINES, written before any run (also in
-the lane notes; REVISED after a code review, still before any run). Nothing is trained; no adapter is kept. Adapter: attention A = the
+"""S3 card gate: attention LoRA r64 / alpha 32 (scale 0.5) on the seven S10 slices. PASS LINES, written before any run (also in
+the design notes; REVISED after a code review, still before any run). Nothing is trained; no adapter is kept. Adapter: attention A = the
 trainer's kaiming init, B = N(0, 0.2) (seed 13; large, so that each delta is far above one bf16 ulp of the base); experts at the zero adapter.
 Row: the first 4,096 tokens of gate_rows.npz row 1.
   G13 forward wiring, every one of the 48 visits, on the SAME visit inputs: (a) run with no attention adapter, (b) qkvr adapter only, (c) qkvr + wo_ud.
@@ -213,7 +213,7 @@ def main():
             log(f"G13 visit {v}: {row}")
     del x, seg, ws
     eng._ws = None
-    # (a) == the T shim's base forward: compare the base log-probs of the T8 engine (no adapters) with lane T's engine
+    # (a) == the T shim's base forward: compare the base log-probs of the T8 engine (no adapters) with the base trainer's engine
     r0_ = rows[0]                                            # (i) the whole row 0: its loss tokens start at 14,404
     ids0 = torch.as_tensor(np.ascontiguousarray(r0_.ids), dtype=torch.int32, device=dev)
     with torch.no_grad():

@@ -1,4 +1,4 @@
-"""Lane T8, S4 (a) + (b) `lean_host` on CPU: t8_step.accumulate_row, the function the real worker uses.
+"""S4 (a) + (b) `lean_host` on CPU: t8_step.accumulate_row, the function the real worker uses.
  1. lean_host on == off, BITWISE, on Inkling's real visit -> layer table (looped layers visited 3 times), at K = 48 and K = 18;
  2. default path: an out-of-memory row is retried with the query block halved and gives the same sums as a clean run;
  3. lean_host: out of memory BEFORE the first addition -> retried (nothing added yet); AFTER it -> RuntimeError, no retry;

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Lane T8: the engine's prompt log-probs of each row's token ids (stdlib only).   t8_score_client.py <base url> <rows.json> <model> <out.json>
+"""the engine's prompt log-probs of each row's token ids (stdlib only).   t8_score_client.py <base url> <rows.json> <model> <out.json>
 model "inkling" = the base model (no adapter slot); any other name = that LoRA module. Position t holds log p(ids[t] | ids[:t]); position 0 holds 0."""
 import json
 import sys

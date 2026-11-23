@@ -1,10 +1,10 @@
-"""Lane T8: the row-parallel GSPO step for W5 (interface: STEP-API; plan item U1). One coordinator, one worker per card, each row on one card.
+"""the row-parallel GSPO step (plan item U1). One coordinator, one worker per card, each row on one card.
 
 The per-row arithmetic is `inkling_rl.step.run_step`'s, split in two so that it can run on several cards:
  - plan_rows (coordinator): off-policy drop, refusals, R3 counters, the loss scale. Same order and rules as run_step, lines 126-167 and 193-196.
  - WorkerCore.process_row (worker): ONE forward per row (run_step's score pass and update pass run at the same weights, so their log-probs are the
    same bits), mismatch metric, TIS weights, seeds from the deployed loss, backward, row gradient added to the worker's sum.
-Hard gates (STEP-API): replay (bitwise at every loss token of an on-policy row), routing where the rollout captured it, support (centred head),
+Hard gates: replay (bitwise at every loss token of an on-policy row), routing where the rollout captured it, support (centred head),
 finite gradients. A failed gate raises T8GateError in the coordinator and writes <run_dir>/STOP.
 """
 from __future__ import annotations
@@ -32,7 +32,7 @@ def param_keys(attn_rank: int) -> tuple:
     """The per-layer key order of every flat layout, master list and gradient list (experts first, so j < 4 are the expert keys)."""
     return LORA_KEYS + (ATTN_KEYS if attn_rank else ())
 # The code path is part of the gradient's definition: ift_long reads these at import, and its defaults are NOT the path the gates prove (review B1).
-# A0 = lane T's pre-lever stack, the one the census worker runs. The trainer sets them for its workers and every worker checks them after import.
+# A0 = the base trainer's pre-lever stack, the one the reference gradient worker runs. The trainer sets them for its workers and every worker checks them after import.
 STACKS = {"A0": {"IFT_MOE_GM": "0", "IFT_MOE_DET": "0", "IFT_FAST_GEMM": "0", "IFT_ATTN_ADAPT": "0", "IFT_CHUNK": "1024", "IFT_MOE_FAST": "0",
                  "IFT_ATTN_TC": "0", "IFT_TF32": "0", "IFT_MOE_ROWS": "8192", "IFT_MOE_PAD_ROWS": "0", "IFT_MANUAL": "1", "IFT_OFFLOAD_MIN": "8192"}}
 WORKER_ENV = {"SUROGATE_INKLING_ATTN_EARLY_META": "0", "MALLOC_ARENA_MAX": "2", "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
@@ -724,7 +724,7 @@ def compute_step(handles: list, layout: ParamLayout, flats: list, shapes: list, 
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# the trainer object the RL loop holds (STEP-API)
+# the trainer object the RL loop holds
 # ---------------------------------------------------------------------------------------------------------------------
 class T8Trainer:
     """One spawned worker per card. A script using it must guard its entry point with `if __name__ == "__main__"` (spawn re-imports it)."""
@@ -885,7 +885,7 @@ class T8Trainer:
         return compute_step(self.handles, self.layout, self.flats, self.shapes, self.cfg, rows, version, step_cfg, seeds, minibatch_index)
 
     def ppo_batch(self, rows: list, version, lr: float, n_minibatches: int = 1, step_cfg: StepConfig | None = None) -> list:
-        """SkyRL's update on one batch (PLAN-SKYRL.md S2): old log-probs recomputed by the trainer at the start weights, then n_minibatches optimizer steps,
+        """SkyRL's update on one batch: old log-probs recomputed by the trainer at the start weights, then n_minibatches optimizer steps,
         each on a contiguous part of `rows` that never splits a group (row.group_idx). row.advantage must already hold the GRPO advantage
         (t8_skyrl.grpo_advantages). Returns [(StepOut, grad norm)] per mini-batch."""
         return ppo_batch(self, rows, version, lr, n_minibatches, step_cfg)

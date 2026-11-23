@@ -1,4 +1,4 @@
-"""Lane T8, U1 CPU test (pass line: plan item U1): the row-parallel step on lane RL's fake Inkling against the kit's own run_step.
+"""U1 CPU test (pass line: plan item U1): the row-parallel step on the fake Inkling model against the kit's own run_step.
  1. one worker: gradients BITWISE equal to run_step, metrics equal; 2. two / three workers: metrics equal, gradients within 1e-5, A/A bitwise;
  3. refusals (long row, off-policy row) as run_step; 4. gates: a changed log-prob, changed routing and a non-finite gradient each raise and write STOP;
  5. seeds="weights": gradient of sum w log pi, sense "ascent"; 6. the visit tables (kept outputs, accumulators) and the host buffers' layout.
