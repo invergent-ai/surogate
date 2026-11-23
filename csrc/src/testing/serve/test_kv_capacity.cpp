@@ -102,8 +102,11 @@ int main() {
     }
 
     {
-        // Adapter banks: an automatic capacity without a draft head is sized after them, every
-        // other policy before them (as it was before they were allocated first).
+        // Adapter banks: an automatic capacity without a draft head or with a DFlash drafter is
+        // sized after them, MTP and explicit policies before them (as before they were allocated
+        // first). DFlash since lanes/OOM F4 (2026-11-23): its graph allowance (320 MiB on W5 at 8
+        // lanes) does not hold about 1.1 GiB of rank-16 banks, and the uncounted banks took the
+        // whole headroom of an RL engine that then ran out of memory.
         using sinfer::SpeculativeBackend;
         const auto automatic_policy = sinfer::KvCapacityPolicy::automatic(50);
         const auto explicit_policy  = sinfer::KvCapacityPolicy::explicit_capacity(129);
@@ -111,11 +114,11 @@ int main() {
                                                                 1360, 1000) == 1000,
                           "automatic KV capacity without a draft head must count the adapter banks");
         failures += check(sinfer::runtime::kv_sizing_free_bytes(automatic_policy, SpeculativeBackend::Mtp,
-                                                                1360, 1000) == 1360 &&
-                              sinfer::runtime::kv_sizing_free_bytes(automatic_policy,
-                                                                    SpeculativeBackend::DFlash, 1360,
-                                                                    1000) == 1360,
-                          "speculative automatic KV capacity must be sized as before the banks");
+                                                                1360, 1000) == 1360,
+                          "an MTP automatic KV capacity must be sized as before the banks");
+        failures += check(sinfer::runtime::kv_sizing_free_bytes(automatic_policy, SpeculativeBackend::DFlash,
+                                                                1360, 1000) == 1000,
+                          "a DFlash automatic KV capacity must count the adapter banks");
         failures += check(sinfer::runtime::kv_sizing_free_bytes(explicit_policy, SpeculativeBackend::None,
                                                                 1360, 1000) == 1360,
                           "explicit KV capacity must be checked as before the banks");

@@ -167,3 +167,73 @@ def test_the_cache_stays_within_its_cap_under_load(tmp_path):
         text = log.read_text()
         assert "out of device memory" not in text
         assert "worker loop fatal" not in text
+
+
+def kv_model(base):
+    return requests.get(base + "/kv_stats", timeout=2).json()["models"][0]
+
+
+def physical_bytes(model):
+    """Main + window bytes the engine has mapped, and the bytes automatic sizing planned for them:
+    the main cap in whole granules plus the window floor and one window granule of rounding."""
+    window = model["window"]
+    granule = model["granule_pages"]
+    main_cap = math.ceil(model["capacity_pages"] / granule) * granule * model["page_bytes"]
+    mapped = model["pages_mapped"] * model["page_bytes"] + window["pages_mapped"] * window["page_bytes"]
+    plan = main_cap + (window["floor_pages"] + window["granule_pages"]) * window["page_bytes"]
+    return mapped, plan
+
+
+@pytest.mark.skipif(not os.getenv("SUROGATE_OOM_TEST_W5"), reason="W5 (Inkling) shape: set SUROGATE_OOM_TEST_W5=1")
+def test_w5_main_and_window_stay_within_the_plan(tmp_path):
+    """lanes/OOM (2026-11-23): an elastic window class (M3-C) maps its holders' window pages beside
+    the main pool, which could map its whole cap as well; with eight lanes holding window pages and
+    the pool full of retained conversations a W5 engine ran out of device memory and aborted. The
+    flags come from SUROGATE_OOM_TEST_ARGS (the RL batch's: --enable-lora, DFlash, 132,096; or the
+    card command's). Eight long sessions, a second turn each, then one long fresh session: main +
+    window mapped bytes stay within the plan, no request fails, the engine lives."""
+    words = int(os.getenv("SUROGATE_OOM_TEST_WORDS", "50000"))
+    model_name = os.getenv("SUROGATE_OOM_TEST_MODEL", "test")
+    extra = {"logprobs": True, "top_logprobs": 0} if os.getenv("SUROGATE_OOM_TEST_LOGPROBS", "1") == "1" else {}
+    with server(tmp_path, "w5-plan", []) as (base, process, log):
+        peak = {"mapped": 0, "plan": 0}
+        done = threading.Event()
+
+        def sample():
+            while not done.is_set():
+                try:
+                    mapped, plan = physical_bytes(kv_model(base))
+                    if mapped > peak["mapped"]:
+                        peak.update(mapped=mapped, plan=plan)
+                except requests.RequestException:
+                    pass
+                time.sleep(0.1)
+
+        def turn(messages):
+            body = {"model": model_name, "messages": messages, "max_tokens": 32, "temperature": 1.0, **extra}
+            return requests.post(base + "/v1/chat/completions", json=body, timeout=1800)
+
+        sampler = threading.Thread(target=sample)
+        sampler.start()
+        statuses = []
+        try:
+            rng = random.Random(1123)
+            sessions = [[{"role": "user", "content": prompt(rng, words)}] for _ in range(8)]
+            with cf.ThreadPoolExecutor(8) as pool:
+                for messages, response in zip(sessions, pool.map(turn, sessions)):
+                    statuses.append(response.status_code)
+                    if response.status_code == 200:
+                        messages.append({"role": "assistant",
+                                         "content": response.json()["choices"][0]["message"].get("content") or "."})
+                        messages.append({"role": "user", "content": prompt(rng, 4000)})
+                statuses += [r.status_code for r in pool.map(turn, sessions)]
+            statuses.append(turn([{"role": "user", "content": prompt(rng, 2 * words)}]).status_code)
+        finally:
+            done.set()
+            sampler.join()
+        text = log.read_text()
+        assert process.poll() is None, "the engine exited:\n" + text[-2000:]
+        assert all(status == 200 for status in statuses), statuses
+        assert peak["mapped"] <= peak["plan"], f"mapped {peak['mapped'] >> 20} MiB, planned {peak['plan'] >> 20} MiB"
+        assert "out of device memory" not in text
+        assert "worker loop fatal" not in text and "CUDA_CHECK" not in text
