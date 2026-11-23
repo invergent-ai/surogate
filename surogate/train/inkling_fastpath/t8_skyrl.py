@@ -40,10 +40,29 @@ def grpo_advantages(scores, groups, cfg: SkyRLLoss = SkyRLLoss()) -> np.ndarray:
         lst = [s[i] for i in idx]
         if len(idx) == 1:
             mean, std = torch.tensor(0.0), torch.tensor(1.0)
-        else:  # SkyRL's exact calls: torch.tensor over a list of 0-d tensors gives torch's DEFAULT dtype (fp32) for the mean and std
+        else:  # SkyRL's exact calls (the list keeps the scores' dtype: fp64 here; SkyRL's production rewards are fp32)
             mean, std = torch.mean(torch.tensor(lst)), torch.std(torch.tensor([lst]))
         out[idx] = (v - mean) / (std + cfg.grpo_eps) if cfg.grpo_norm_by_std else v - mean
     return out.numpy()
+
+
+def grpo_advantages_rows(rows: list, score_by_trial: dict, cfg: SkyRLLoss = SkyRLLoss()) -> None:
+    """GRPO over ATTEMPTS, broadcast to their rows (review M3; SkyRL's step-wise mode does the same, trainer.py:1254-1290): one score per trial_idx,
+    groups = the rows' group_idx (one per trial), then row.advantage = its attempt's advantage. A group of one attempt gets mean 0, std 1 (SkyRL)."""
+    trial_group = {}
+    for r in rows:
+        if r.trial_idx is None or r.group_idx is None:
+            raise ValueError("every row needs trial_idx and group_idx")
+        if trial_group.setdefault(r.trial_idx, r.group_idx) != r.group_idx:
+            raise ValueError(f"trial {r.trial_idx} has rows in two groups")
+    trials = sorted(trial_group, key=str)
+    missing = [t for t in trials if t not in score_by_trial]
+    if missing:
+        raise ValueError(f"no score for trials {missing[:5]}")
+    adv = grpo_advantages([float(score_by_trial[t]) for t in trials], [trial_group[t] for t in trials], cfg)
+    by = dict(zip(trials, adv))
+    for r in rows:
+        r.advantage = float(by[r.trial_idx])
 
 
 def _ratio(lp, old, cfg):

@@ -5,7 +5,9 @@ a gradient. Real rows of 16,009 / 28,002 / 47,014 / 57,431 tokens (gate_rows.npz
   G10 (1 card, 16k + 28k rows) the lean K = 48 gradient of ALL FOUR expert keys == the stock path (ift_long.LongModel) at the same non-zero adapter,
       every tensor cos >= 0.9999, rel err <= 1 %, finite (bitwise expected, reported); A13 / A2 gradients non-zero.
   G12 (2 cards, 4 rows, two groups of two, GRPO advantages of synthetic scores) one SkyRL update `ppo_batch` with 2 mini-batches, lr 2e-5:
-      the stale gate (mini-batch 1 forward == the recomputed old log-probs, bitwise) and the replay gate on the old log-probs hold; mini-batch 2 runs at
+      FIRST at the zero adapter the workers' log-probs == the rollout's recorded log-probs at every loss token (the real replay check: these rows were
+      sampled at the zero adapter); then, at the non-zero test adapter, the stale gate (mini-batch 1 forward == the recomputed old log-probs, bitwise,
+      stale_checked_rows >= 1) and the replay gate on the old log-probs (here against the trainer's own log-probs: plumbing only) hold; mini-batch 2 runs at
       moved weights (some ratio != 1); all gradients finite; A and B masters both changed; host peak per worker reported (all four keys, K = 48, the 57k row).
 """
 from __future__ import annotations
@@ -114,6 +116,12 @@ def phase_g12(a, rows):
                                   train_keys=("A13", "B13", "A2", "B2"), run_dir=a.run_dir))
     rep = {}
     try:
+        lpz = tr.logprobs(rows)                               # the zero adapter = the rollouts' adapter: the real replay check
+        bad = sum(int((x[r.loss_mask[1:]].view(np.int32) != r.engine_lp[1:][r.loss_mask[1:]].astype(np.float32).view(np.int32)).sum())
+                  for r, x in zip(rows, lpz))
+        rep["replay_zero_adapter_mismatches"] = bad
+        rep["replay_zero_adapter_tokens"] = int(sum(int(r.loss_mask[1:].sum()) for r in rows))
+        log(f"G12 replay at the zero adapter: {bad} mismatches of {rep['replay_zero_adapter_tokens']}")
         tr.set_masters(nonzero_masters())
         before = [m.detach().clone() for m in tr.opt.masters]
         for k, r in enumerate(rows):
@@ -134,14 +142,16 @@ def phase_g12(a, rows):
             fin = all(bool(torch.isfinite(g).all()) for g in o.grads)
             rep["minibatches"].append({"grad_norm": n, "finite": fin, "rows": [x["T"] for x in o.rows], "clip_ratio": o.metrics.get("ppo_clip_ratio"),
                                        "ratio_max": o.metrics.get("ppo_ratio_max"), "abs_diff_mean": o.metrics.get("rollout_train_logprobs_abs_diff_mean"),
-                                       "workers": o.metrics["workers"], "tok_per_s_per_card": o.metrics["tok_per_s_per_card"]})
+                                       "workers": o.metrics["workers"], "tok_per_s_per_card": o.metrics["tok_per_s_per_card"],
+                                       "stale_checked_rows": o.metrics.get("stale_checked_rows", 0)})
             log(f"G12 mini-batch: {rep['minibatches'][-1]}")
         after = tr.opt.masters
         changed = {k: any(float((after[L * 4 + j] - before[L * 4 + j]).abs().max()) > 0 for L in range(24)) for j, k in enumerate(TS.LORA_KEYS)}
         rep["masters_changed"] = changed
         rep["host_peak_per_worker_gib"] = max(w["VmHWM_gib"] for m in rep["minibatches"] for w in m["workers"])
         mb2 = rep["minibatches"][1]
-        rep["pass"] = bool(all(m["finite"] for m in rep["minibatches"]) and all(changed.values()) and mb2["ratio_max"] is not None and mb2["ratio_max"] != 1.0)
+        rep["pass"] = bool(all(m["finite"] for m in rep["minibatches"]) and all(changed.values()) and mb2["ratio_max"] is not None and mb2["ratio_max"] != 1.0
+                           and rep["minibatches"][0]["stale_checked_rows"] >= 1 and bad == 0 and rep["replay_zero_adapter_tokens"] > 0)
     finally:
         tr.close()
     return rep

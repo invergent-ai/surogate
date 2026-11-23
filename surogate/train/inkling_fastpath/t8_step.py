@@ -256,6 +256,7 @@ class WorkerCore:
                 bad0 = int((lp32[mask[1:]].view(np.int32) != old32[mask[1:]].view(np.int32)).sum())
                 if bad0:  # the first mini-batch runs at the start weights: its forward must be the old log-probs, bit for bit
                     raise T8GateError(f"STALE GATE: row {i} (T {T}): {bad0} loss tokens differ from the recomputed old log-probs at unchanged weights")
+                out["stale_checked"] = True
         if on_policy:
             want = row.engine_lp[1:].astype(np.float32)
             have = old32 if old32 is not None else lp32
@@ -263,7 +264,9 @@ class WorkerCore:
             if bad:
                 raise T8GateError(f"REPLAY GATE: row {i} (T {T}): {bad} of {int(mask.sum())} loss tokens differ from the rollout's log-probs")
         out["replay_checked"] = bool(on_policy)
-        if rp is not None and on_policy:
+        # the routing gate compares THIS forward's own routing with the rollout's capture: in "ppo" mode only the first mini-batch runs at the
+        # start weights (proven by the stale gate); later mini-batches run at moved weights, where a near-tie routing decision may flip (review B1)
+        if rp is not None and on_policy and (mode != "ppo" or job.get("minibatch_index", 0) == 0):
             miss = self._check_routing(ctx, rp)
             if miss:
                 raise T8GateError(f"ROUTING GATE: row {i} (T {T}): {miss} covered positions differ from the rollout's capture")
@@ -278,7 +281,7 @@ class WorkerCore:
         out["mm"] = mm
         w = None
         out["bw"] = None
-        if cfg_step.behavior_is_cap is not None:
+        if cfg_step.behavior_is_cap is not None and mode != "ppo":  # SkyRL's preset applies no off-policy correction
             fn = behavior_weights_token if cfg_step.behavior_is_level == "token" else behavior_weights_sequence
             w, x = fn(lp, row.engine_lp, mask, float(cfg_step.behavior_is_cap))
             if len(x):
@@ -303,12 +306,13 @@ class WorkerCore:
             n_ = max(int(mask.sum()), 1)
             out["met"] = {"policy_loss": rloss * scale / n_, "mismatch_kl": 0.0, "is_masked": met["clipped_tokens"] / n_}
             out["ppo"] = met
+            out["seq_log_ratio_ppo"] = float(np.mean(lp[mask] - old[mask])) if mask.any() else 0.0
         elif mode == "weights":
             g = torch.as_tensor(float(row.notes["weight"]) * mask.astype(np.float32), dtype=torch.float32)
             out["met"] = {"policy_loss": 0.0, "mismatch_kl": 0.0, "is_masked": 0.0}
         else:
             raise ValueError(f"seeds {mode!r}")
-        out["seq_log_ratio"] = 0.0                            # one forward: lp_new is lp_start by construction
+        out["seq_log_ratio"] = out.pop("seq_log_ratio_ppo", 0.0)  # gspo / weights: one forward, lp_new is lp_start by construction
         parts = [("main", mask)]
         if self.cfg.split_final:
             fin = np.asarray(row.notes["final_mask"], dtype=bool) & mask
@@ -525,6 +529,8 @@ def compute_step(handles: list, layout: ParamLayout, flats: list, shapes: list, 
     job = {"step_cfg": step_cfg, "version": version, "seeds": seeds, "scale": scale, "minibatch_index": int(minibatch_index)}
     if seeds == "ppo" and step_cfg.aggregation != "token":
         raise ValueError("SkyRL's token mean needs aggregation 'token' (scale = the mini-batch's loss tokens)")
+    if seeds == "ppo" and cfg.head != "plain":
+        raise ValueError("seeds='ppo' is SkyRL's estimator on log pi: head must be 'plain' (the preset samples top-p 1.0 / top-k off, no score centering)")
     try:
         check_rows(rows, live, version, cfg)
         for h in handles:
@@ -559,6 +565,7 @@ def compute_step(handles: list, layout: ParamLayout, flats: list, shapes: list, 
         write_stop(cfg.run_dir, "replay gate skipped on a row")
         raise T8GateError(f"VERSION GATE: the replay gate was skipped on {m['replay_skipped_rows']} rows")
     m["stack"] = cfg.stack
+    m["stale_checked_rows"] = sum(1 for r in results if r.get("stale_checked"))
     dd = [r["rollout_train_abs_diff"] for r in results if "rollout_train_abs_diff" in r]
     if dd:  # SkyRL's logged statistic, reported beside the bitwise replay gate
         m["rollout_train_logprobs_abs_diff_mean"] = sum(x[0] for x in dd) / max(m["total_tokens"], 1)
@@ -771,20 +778,55 @@ def split_minibatches(rows: list, n: int) -> list:
     return [list(range(bounds[j], bounds[j + 1])) for j in range(n)]
 
 
+def check_groups_contiguous(rows: list) -> None:
+    """Every row carries a group_idx, and each group's rows form ONE contiguous run (SkyRL's mini-batches are prompt-contiguous)."""
+    seen, prev = set(), object()
+    for r in rows:
+        g = r.group_idx
+        if g is None:
+            raise ValueError("ppo_batch: a row without group_idx")
+        if g != prev:
+            if g in seen:
+                raise ValueError(f"ppo_batch: the rows of group {g} are not contiguous; order the rows by group first")
+            seen.add(g)
+            prev = g
+
+
 def ppo_batch(tr, rows: list, version, lr: float, n_minibatches: int, step_cfg: StepConfig | None):
+    """All or nothing: on any exception the masters and the optimizer state are put back as they were at entry (review m3)."""
+    import copy
+
     from dataclasses import replace
 
     step_cfg = step_cfg or StepConfig(max_policy_lag=None)
     if step_cfg.aggregation != "token":
         raise ValueError("token mean")
-    olds = tr.logprobs(rows)                                  # the start weights; the replay gate reads them in compute
-    for r, o in zip(rows, olds):
-        r.notes["old_lp"] = o
-    out = []
-    for k, part in enumerate(split_minibatches(rows, n_minibatches)):
-        o = tr.compute([rows[i] for i in part], version, replace(step_cfg), seeds="ppo", minibatch_index=k)
-        out.append((o, tr.apply(o, lr)))
-    return out
+    if tr.cfg.head != "plain":
+        raise ValueError("seeds='ppo' needs head='plain'")
+    check_groups_contiguous(rows)
+    cap = tr.cfg.max_row_tokens
+    need = [r.loss_mask.any() and (not cap or r.T <= cap) for r in rows]  # refused rows get no old log-probs (they would be refused anyway)
+    masters0 = [m.detach().clone() for m in tr.opt.masters]
+    state0 = copy.deepcopy(tr.opt.opt.state_dict())
+    try:
+        olds = tr.logprobs([r for r, n in zip(rows, need) if n])   # the start weights; the replay gate reads them in compute
+        it = iter(olds)
+        for r, n in zip(rows, need):
+            r.notes["old_lp"] = next(it) if n else np.zeros(r.T - 1, dtype=np.float32)
+        out = []
+        for k, part in enumerate(split_minibatches(rows, n_minibatches)):
+            o = tr.compute([rows[i] for i in part], version, replace(step_cfg), seeds="ppo", minibatch_index=k)
+            out.append((o, tr.apply(o, lr)))
+        return out
+    except BaseException:
+        with torch.no_grad():
+            for m, m0 in zip(tr.opt.masters, masters0):
+                m.copy_(m0)
+        tr.opt.opt.load_state_dict(state0)
+        tr.opt.sync_work()
+        if hasattr(tr, "_refresh"):
+            tr._refresh()
+        raise
 
 
 class SimpleVisit:

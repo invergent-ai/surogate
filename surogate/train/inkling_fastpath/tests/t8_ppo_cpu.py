@@ -159,6 +159,51 @@ def main():
     except TS.T8GateError as e:
         assert "REPLAY GATE" in str(e), str(e)
     print("gates: PASS")
+    # review fixes: attempt-level GRPO, contiguity, head, all-or-nothing
+    rows = make(version)
+    for r in rows:
+        r.trial_idx = r.trial_idx // 2 if False else r.trial_idx
+    multi = copy.deepcopy(rows[:6])
+    for k, r in enumerate(multi):
+        r.trial_idx = k // 2                                # 3 attempts of two rows each
+        r.group_idx = 0 if k < 4 else 1                     # group 0: attempts 0, 1; group 1: attempt 2
+    KS.grpo_advantages_rows(multi, {0: 1.0, 1: 0.0, 2: 1.0})
+    want = KS.grpo_advantages([1.0, 0.0, 1.0], [0, 0, 1])
+    assert [r.advantage for r in multi] == [want[0]] * 2 + [want[1]] * 2 + [want[2]] * 2, [r.advantage for r in multi]
+    try:
+        KS.grpo_advantages_rows(multi, {0: 1.0, 1: 0.0})
+        raise AssertionError("a missing score passed")
+    except ValueError:
+        pass
+    inter = copy.deepcopy(rows)
+    for k, r in enumerate(inter):
+        r.group_idx = k % 3
+    tr = FakeTrainer(cfg, 2)
+    for bad_rows, what in ((inter, "not contiguous"),):
+        try:
+            TS.ppo_batch(tr, bad_rows, version, LR, 2, StepConfig(max_policy_lag=None))
+            raise AssertionError(what)
+        except ValueError as e:
+            assert what in str(e), str(e)
+    tr_c = FakeTrainer(TS.T8Config(head="centred", max_row_tokens=10 ** 6, segment_keys=(), run_dir=tmp, visits=5, top_k=2, K=5), 1)
+    try:
+        TS.ppo_batch(tr_c, copy.deepcopy(rows), version, LR, 1, StepConfig(max_policy_lag=None))
+        raise AssertionError("ppo with the centred head")
+    except ValueError:
+        pass
+    m0 = [m.detach().clone() for m in tr.opt.masters]
+    bad3 = copy.deepcopy(rows)
+    t = int(np.flatnonzero(bad3[-1].loss_mask)[0])
+    bad3[-1].engine_lp[t] += 1e-3                           # the replay gate fires in the LAST mini-batch, after earlier optimizer steps
+    try:
+        TS.ppo_batch(tr, bad3, version, LR, 4, StepConfig(max_policy_lag=None))
+        raise AssertionError("no gate")
+    except TS.T8GateError:
+        pass
+    assert all(torch.equal(a, b) for a, b in zip(tr.opt.masters, m0)) and not tr.opt.opt.state, "not rolled back"
+    res = TS.ppo_batch(tr, copy.deepcopy(rows), version, LR, 1, StepConfig(max_policy_lag=None))
+    assert res[0][0].metrics["stale_checked_rows"] == len(rows)
+    print("review fixes: PASS")
     print("T8 PPO S2 CPU TEST: PASS")
     return 0
 
