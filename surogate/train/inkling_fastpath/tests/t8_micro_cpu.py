@@ -1,8 +1,8 @@
 """CPU checks of the micro-step driver (tests/t8_micro.py) on the fake model and on synthetic files. Pass line:
 (1) load_plan accepts the agreed form and refuses each broken variant (crc32, mask[0], no loss token, cap, split group, attempt in two groups);
 (2) G = -N x the first PPO mini-batch's gradient == the autograd gradient of sum_rows A sum_t log pi at the start weights, rel <= 1e-5;
-(3) the first-order prediction <G, k d> matches the fake's actual change of sum A sum_t log pi along k d (relative error shrinking with k: the
-    smaller k within 5 %);
+(3) the first-order prediction <G, k d> matches the fake's actual change of sum A sum_t log pi along k d within 1 % at k = 0.3 and 1 (larger k
+    flip the fake's top-k routing, a jump the first order does not hold);
 (4) the adapter states: U_k = theta0 + k d exactly; R12 per tensor of norm ||12 d||; a block state differs from theta0 only in its block and equals
     the whole state there; R12_<block> uses R12's draw;
 (5) the compare phase on synthetic reads passes on matching files and fails on a one-ulp change in Z (M1), U12 (M5) or base (M2), and on a missing
@@ -142,12 +142,10 @@ def main():
     errs = []
     with torch.no_grad():
         base = F_of(ref, rr)
-        for k in (10.0, 100.0):
+        for k in (0.3, 1.0):
             moved = FakeInkling(seed=0, rank=4, alpha=8)
             for p, t, dd in zip(moved.parameters(), theta0, delta):
                 p.copy_(t + k * dd)
-            for p, w in zip(ref.parameters(), theta0):
-                pass
             # base at theta0 exactly (the masters, not their bf16 work copies, so that the change is k d)
             at0 = FakeInkling(seed=0, rank=4, alpha=8)
             for p, t in zip(at0.parameters(), theta0):
@@ -156,7 +154,7 @@ def main():
             pred = k * fo["by_block"]["all"]
             errs.append(abs(dF - pred) / abs(pred))
             print(f"(3) k {k:g}: actual {dF:.6e}, predicted {pred:.6e}, rel err {errs[-1]:.2e}")
-    assert errs[0] <= 0.05, errs
+    assert max(errs) <= 0.01, errs
     del base
 
     # (4) the adapter states
