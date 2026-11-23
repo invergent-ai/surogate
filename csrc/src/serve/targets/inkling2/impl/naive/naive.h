@@ -1,7 +1,7 @@
 #pragma once
 
-// NAIVE "correct-first" kernels of the Inkling-2 target (lane e1), standing in for lane c's attention and lane
-// d's MoE until those land (DESIGN-target.md 5). Straight transcriptions of `inkling_ref.py`
+// NAIVE "correct-first" kernels of the Inkling-2 target, standing in for the attention kernels and the
+// MoE op until those land (DESIGN-target.md 5). Straight transcriptions of `inkling_ref.py`
 // (`inkling_attention_prologue`, `inkling_rel_attention`, `inkling_gate_sink`, `inkling_route`,
 // `inkling_quant_nvfp4_4o6`, `inkling_quant_mxfp8`, `inkling_softcap_swiglu`, `inkling_moe`) with fp32
 // accumulation; slow, never tuned, never used for a speed number. Replaced call by call as c / d deliver.
@@ -16,7 +16,7 @@
 
 namespace sinfer::targets::inkling2::naive {
 
-/// The layer tensors the naive attention reads (device pointers, BF16; layouts as lane b binds them).
+/// The layer tensors the naive attention reads (device pointers, BF16; layouts as the loader binds them).
 struct AttentionLayer {
     bool global             = false;
     const void* q_scale     = nullptr; ///< ne {128, 24}
@@ -28,7 +28,7 @@ struct AttentionLayer {
     const void* v_static    = nullptr;
 };
 
-/// One routed bank as lane b binds it (load::ExpertBank without the artifact types).
+/// One routed bank as the loader binds it (load::ExpertBank without the artifact types).
 struct ExpertBankView {
     bool nvfp4                 = true;
     std::int32_t experts = 0, rows_per_expert = 0, columns = 0;

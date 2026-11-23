@@ -1,4 +1,4 @@
-// The trainer's log-prob of a token through the inkling2 head (agent-EN 11:3x; g1b's ENGINE-OP IR): the bits every
+// The trainer's log-prob of a token through the inkling2 head (the engine-op trainer's IR): the bits every
 // log-prob the engine returns carries (api/ops/inkling_mix.h).
 
 #include "api/ops/inkling_mix.h"

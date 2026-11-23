@@ -1,6 +1,6 @@
 #pragma once
 
-// Lane f1 (ENGINE-INKLING): the KV pool a pipeline's stages share under `--kv-capacity auto`.
+// Window-bounded KV: the KV pool a pipeline's stages share under `--kv-capacity auto`.
 //
 // Every stage resolves its own capacity curve to a page count. With an elastic window class a stage's
 // page ledger also books each lane's window pages as main-page equivalents -- its window charge -- and

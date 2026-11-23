@@ -1,11 +1,11 @@
-"""ENGINE-INKLING lane T: the LEVEL-0 backward of the fast route (lanes/T/NOTES.md PLAN 3).
+"""The LEVEL-0 backward of the fast route.
 
 Forward = the engine's (ift_forward.forward: bitwise the engine's prefill, routing included). Backward, visits last to
 first: visit v is RECOMPUTED in torch from the engine's own visit inputs (the AttnRes stack slots it read, saved as the
-outputs of earlier visits) with lane L's validated math (ift_ref = lanes/L/inkling_ref_ad.py, vendored unchanged):
+outputs of earlier visits) with the validated reference math (ift_ref = inkling_ref_ad.py, vendored unchanged):
 W4A16 / W8A16 straight-through the activation and KV quantisers (rb / r8 are STE), routing REPLAYED from the engine's
 own ids, the expert LoRA from the fp32 masters; its vjp gives the gradient of the visit inputs and of the layer's LoRA.
-The weights are the ENGINE's (views of the loaded artifact, no copy); expert units come from lane d's exact decode.
+The weights are the ENGINE's (views of the loaded artifact, no copy); expert units come from the engine's exact decode.
 
 Autograd graph (built after the engine forward, `TrainForward.build`):
   x0 (leaf, no grad) -> EngineVisit(v) for v = 0..47 (inputs: the slots it reads + its layer's LoRA tensors; output: the
@@ -60,10 +60,10 @@ class _tick:
 
 
 # ---------------------------------------------------------------------------------------------------------------
-# the engine's weights in lane L's conventions (views; L's functions upcast on use)
+# the engine's weights in the reference's conventions (views; its functions upcast on use)
 # ---------------------------------------------------------------------------------------------------------------
 class EngineExperts:
-    """rig.PackedExperts over the engine's banks: dequant(name, e0, e1) -> exact bf16 units [g, 2304, K] (lane d's
+    """rig.PackedExperts over the engine's banks: dequant(name, e0, e1) -> exact bf16 units [g, 2304, K] (the engine's
     decode); g13 / g2 = per-expert amax, den13 / den2 = outer_scale_denominator (NVFP4; factor = amax / den)."""
 
     def __init__(self, eng: InklingEngine, layer: int, gate_w: torch.Tensor, gate_b: torch.Tensor):
@@ -138,7 +138,7 @@ class EngineWeights:
 
 
 # ---------------------------------------------------------------------------------------------------------------
-# MoE recompute: lane L's rig.moe_vec (vectorised over expert groups) with W4A16 and replayed routing
+# MoE recompute: the reference's rig.moe_vec (vectorised over expert groups) with W4A16 and replayed routing
 # ---------------------------------------------------------------------------------------------------------------
 EG = 16
 
@@ -255,7 +255,7 @@ def moe_vec(x, w, ids, lora=None):
 # one visit in torch, cut exactly as the engine's forward.cpp::run_visit (inputs at the start, partial at the end)
 # ---------------------------------------------------------------------------------------------------------------
 def _rel_scores(q, k, rel, b0, b1, k0, window, scale):
-    """Scores of query rows [b0, b1) against keys [k0, b1) as lane L's inkling_rel_attention forms them:
+    """Scores of query rows [b0, b1) against keys [k0, b1) as the reference's inkling_rel_attention forms them:
     [Hk, G, nq, K] fp32 (masked -inf), plus the distance index and the bias-validity mask for d_rel."""
     nq = b1 - b0
     hq, dh = q.shape[1], q.shape[2]
@@ -279,7 +279,7 @@ def _rel_scores(q, k, rel, b0, b1, k0, window, scale):
 
 
 class RelAttention(torch.autograd.Function):
-    """lane L's inkling_rel_attention (one segment, positions 0..T-1; exact fp32 softmax) with a flash-style backward:
+    """the reference's inkling_rel_attention (one segment, positions 0..T-1; exact fp32 softmax) with a flash-style backward:
     the forward keeps (q, k, v, rel, out, lse) only, the backward recomputes each query block's probabilities from lse.
     Gradients for q, k, v and rel (the dense relative logits) incl. the lse path (the sink gate reads lse)."""
 
@@ -348,7 +348,7 @@ class RelAttention(torch.autograd.Function):
 
 
 def attention(L, attn_in, pos, tau):
-    """lane L's InklingRef._attention for one fresh visit (one chunk, no carried state): [T, 3072] gated output."""
+    """the reference's InklingRef._attention for one fresh visit (one chunk, no carried state): [T, 3072] gated output."""
     if L.is_local and attn_in.shape[0] == 1:
         xq = xk = xv = attn_in[0]
     else:
@@ -419,7 +419,7 @@ def visit_torch(W: EngineWeights, vi, stack, partial, bank, ids, lora):
 # LoRA: fp32 masters (rig.make_lora layout) and the engine's bank table (the store's fold, lora_store.cpp set_slot)
 # ---------------------------------------------------------------------------------------------------------------
 def make_lora(device, seed=0, b_std=0.0, layers=24):
-    """PEFT-style init in rig.make_lora's order and generator (CPU, fixed): identical masters to lane L's rig."""
+    """PEFT-style init in rig.make_lora's order and generator (CPU, fixed): identical masters to the learnability rig."""
     g = torch.Generator(device="cpu").manual_seed(seed)
     out = []
     for _ in range(layers):
@@ -437,8 +437,8 @@ LORA_KEYS = ("A13", "B13", "A2", "B2")
 
 class EngineBanks:
     """The engine's expert-LoRA bank table of every physical layer for ONE slot (slot 0), built from the masters with
-    the store's fold: a = bf16(bf16(A) x alpha / r) (set_slot), b = bf16(B); the fused gate_up adapter split as lane
-    d's binding does (gate = B13 rows 2j, up = rows 2j + 1, A shared). Table order [0] router, [1] bias (empty),
+    the store's fold: a = bf16(bf16(A) x alpha / r) (set_slot), b = bf16(B); the fused gate_up adapter split as the
+    engine's MoE binding does (gate = B13 rows 2j, up = rows 2j + 1, A shared). Table order [0] router, [1] bias (empty),
     [2 + 3e + {0, 1, 2}] = gate / up / down. Rebuild after every optimizer step (refresh)."""
 
     def __init__(self, lora, device):

@@ -1,11 +1,11 @@
 #pragma once
 
-// Inkling-2-Mini's DSpark drafter as the target runs it (ENGINE-INKLING lane e2, rl/engine-inkling-2026-11-21/lanes/e2/
-// DESIGN-dspark.md): the load-time derived weights and the two round entries -- append context, propose -- that the
+// Inkling-2-Mini's DSpark drafter as the target runs it (DSpark design
+// notes): the load-time derived weights and the two round entries -- append context, propose -- that the
 // family's DFlash runtime reaches through the Variant's DSpark leaves. Op semantics: api/ops/dspark.h
-// (ref/dspark_ref.py). The drafter's GEMMs run on lane e1's invariant GEMM (inkling_gemm_inv[_group]).
+// (dspark_ref.py). The drafter's GEMMs run on the target's invariant GEMM (inkling_gemm_inv[_group]).
 //
-// Draft KV (agent-EN 13:5x): text-pool planes 48 / 49 / 50 = draft layers 0 / 1 / 2, FP8 e4m3 unit scale, the
+// Draft KV: text-pool planes 48 / 49 / 50 = draft layers 0 / 1 / 2, FP8 e4m3 unit scale, the
 // sequence's own block-table row; layers 0 and 2 read a block-anchored window of 1,024 keys before the anchor.
 
 #include "targets/inkling2/impl/load/bindings.h"
@@ -63,7 +63,7 @@ struct DSparkDerived {
 /// as sink layers {0, 1, 2, 3}; block 8. Checks the artifact's dspark block is Inkling-2-Mini's.
 [[nodiscard]] family::DFlashGeometry dspark_dflash_geometry(const load::ArtifactConfig& config);
 
-/// Derives the drafter's load-time weights from lane b's bound draft (w.has_draft); synchronous.
+/// Derives the drafter's load-time weights from the bindings' bound draft (w.has_draft); synchronous.
 void derive_dspark(const load::InklingWeights& w, DSparkDerived& out, bool fp8_weights = false, bool fp8_fold = false);
 /// The FP8 Markov fold (opt-in since M9: SUROGATE_SERVE_DSPARK_FP8_FOLD=1; the BF16 fold is the default).
 [[nodiscard]] bool dspark_fp8_fold_requested();
@@ -80,13 +80,13 @@ void derive_dspark(const load::InklingWeights& w, DSparkDerived& out, bool fp8_w
 /// The draft KV: planes of draft layers 0 / 1 / 2 (text-pool layers 48 / 49 / 50).
 struct DSparkKv {
     std::array<ops::DSparkPagedPlane, 3> planes{};
-    /// The same planes as the pool's batch views, for lane c's inkling_draft_attention (FP8 planes only).
+    /// The same planes as the pool's batch views, for inkling_draft_attention (FP8 planes only).
     std::array<PagedKVBatchLayerView, 3> views{};
-    std::uint32_t max_visible_keys = 0;  ///< the sequence capacity (lane c's workspace / split plan)
+    std::uint32_t max_visible_keys = 0;  ///< the sequence capacity (the attention workspace / split plan)
     bool naive_attention           = false; ///< ops::dspark_block_attention (BF16 planes, or the A/B knob)
 };
 
-/// SUROGATE_SERVE_DSPARK_NAIVE_ATTN=1 (read once): the naive block attention instead of lane c's (A/B only).
+/// SUROGATE_SERVE_DSPARK_NAIVE_ATTN=1 (read once): the naive block attention instead of the Inkling kernel's (A/B only).
 [[nodiscard]] bool dspark_naive_attention_forced();
 
 /// Context append: the committed columns' target features -> each draft layer's context K / V in its plane, and

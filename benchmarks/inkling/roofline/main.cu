@@ -1,4 +1,4 @@
-// ENGINE-INKLING lane h: day-1 roofline kit (RTX 5090, sm_120a). One binary, four parts:
+// Inkling-2-Mini roofline kit (RTX 5090, sm_120a). One binary, four parts:
 //   dram  (1) DRAM streaming read / write / copy + one-kernel-per-chunk weight streaming (stream / graph / graph+PDL)
 //   mma   (2) dense MMA peaks: mma.sync instruction ceilings (BF16, FP8 e4m3, NVFP4) + cuBLASLt GEMMs
 //   host  (3) pinned H2D / D2H / bidirectional, pageable H2D, P2P if two devices are visible

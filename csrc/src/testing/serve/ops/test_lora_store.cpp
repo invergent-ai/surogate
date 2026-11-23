@@ -332,7 +332,7 @@ void speculative_columns() {
     sinfer::ops::bind_ops_context(nullptr);
 }
 
-/// Per-bank rank (ModuleBinding::rank, lane ELORA): a store at max_rank 8 holds a module at the default rank
+/// Per-bank rank (ModuleBinding::rank): a store at max_rank 8 holds a module at the default rank
 /// (8) and an Inkling-expert-like fused pair at rank 2 (gate / up interleaved in one checkpoint B, one A).
 /// The small banks are (slots, 2) wide; an adapter of rank 2 lands in them bit for bit through every write
 /// path (host upload, in-place staging, device publication); rank 3 is refused for them only.

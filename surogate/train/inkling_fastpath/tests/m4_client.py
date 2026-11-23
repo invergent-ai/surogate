@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Lane T M4 engine client (stdlib only; runs next to the engine on gpubox1).
+"""M4 engine client (stdlib only; runs next to the engine on the GPU host).
 
   roll  <base_url> <out.json> [groups] [samples] [max_tokens]: GSPO-style groups of chat rollouts through the kit's
         request shape (reasoning_effort xhigh = 0.99 (rule 20), T 1.0, top_p 0.95, top_k 20, logprobs, token ids,

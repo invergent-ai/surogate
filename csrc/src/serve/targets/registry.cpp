@@ -718,7 +718,7 @@ std::vector<int> balanced_stage_bounds(const EngineOptions& options, artifact::R
 template <class Target>
 struct StagePreflight {
     std::uint32_t max_context = 0;
-    /// Lane f1: the real KV tokens every stage holds with every lane charged (the shared pool), and
+    /// Window KV: the real KV tokens every stage holds with every lane charged (the shared pool), and
     /// each stage's own capacity: that pool plus its lanes' window charge (pipeline_kv_share.h).
     std::uint32_t kv_tokens   = 0;
     std::vector<std::uint32_t> stage_kv_tokens;
@@ -731,7 +731,7 @@ struct StagePreflight {
 struct StageFit {
     std::size_t budget_bytes = 0;
     std::uint32_t kv_tokens  = 0;
-    /// Lane f1: the curve the stage resolved (pages, its minimum) and its per-lane window charge.
+    /// Window KV: the curve the stage resolved (pages, its minimum) and its per-lane window charge.
     runtime::PipelineStageKvFit pages{};
     /// What this stage counts against the run's need (runtime::pipeline_stage_held_tokens): the tokens left for KV when
     /// every lane holds its window charge, or the capacity itself when it is explicit.
@@ -865,7 +865,7 @@ preflight_pipeline(const EngineOptions& options, artifact::Reader& reader,
         if (automatic) {
             const auto layers = static_cast<std::uint32_t>(stage.pipeline_stage_last -
                                                            stage.pipeline_stage_first);
-            // Real KV (lane f1): a window class's per-lane charge holds no tokens of the context. An
+            // Real KV (window-bounded): a window class's per-lane charge holds no tokens of the context. An
             // explicit capacity is compared as it stands (pipeline_stage_held_tokens).
             const bool explicit_capacity = options.kv_capacity.mode == KvCapacityMode::Explicit;
             while (fit.held_tokens(options.max_concurrency, explicit_capacity) < wanted &&
@@ -890,7 +890,7 @@ preflight_pipeline(const EngineOptions& options, artifact::Reader& reader,
         }
         fits.push_back(fit.pages);
     }
-    // Lane f1: the stages share real KV, and each holds that plus its own lanes' window charge.
+    // Window KV: the stages share real KV, and each holds that plus its own lanes' window charge.
     const runtime::PipelineKvShare share = runtime::share_pipeline_kv(fits, options.max_concurrency);
     out.kv_tokens = share.shared_pages * share.page_tokens;
     for (const std::uint32_t pages : share.stage_pages) {
@@ -910,7 +910,7 @@ ConstructedTarget construct_pipeline(const EngineOptions& options, artifact::Rea
     LoadSummary summary;
     ModelSamplingDefaults sampling_defaults{};
     std::uint32_t resolved_kv      = 0;
-    std::vector<std::uint32_t> resolved_stage_kv; ///< lane f1: each stage's own share (pipeline_kv_share.h)
+    std::vector<std::uint32_t> resolved_stage_kv; ///< window KV: each stage's own share (pipeline_kv_share.h)
     std::uint32_t resolved_context = 0;
     const std::vector<int> bounds = [&] {
         // A target whose layers are not additive per stage (Inkling-2's looped core) names its own cut.
@@ -946,7 +946,7 @@ ConstructedTarget construct_pipeline(const EngineOptions& options, artifact::Rea
         // Zero until the preflight below has run, and then the shared values every stage --
         // stage 0 included -- is built with.
         if (!resolved_stage_kv.empty()) {
-            // Lane f1: the preflight sized the shared pool under auto (elastic window class);
+            // Window KV: the preflight sized the shared pool under auto (elastic window class);
             // the stage keeps that planning (EngineOptions::kv_capacity_resolved_automatically).
             stage_options.kv_capacity_resolved_automatically =
                 options.kv_capacity.mode == KvCapacityMode::Automatic;
@@ -1099,7 +1099,7 @@ ConstructedTarget construct_pipeline_target(const EngineOptions& requested) {
                                  Qwen38FlashNextInstance>(constructed);
     dispatch.template operator()<Qwen3_5, LoadedQwen3_5, Qwen3_5Instance>(constructed);
     dispatch.template operator()<Qwen3_5Moe, LoadedQwen3_5Moe, Qwen3_5MoeInstance>(constructed);
-    // Inkling-2: the stages split the 48 visits (lanes/e1/DESIGN-2card.md).
+    // Inkling-2: the stages split the 48 visits (2-card design).
     dispatch.template operator()<Inkling2, LoadedInkling2, Inkling2Instance>(constructed);
     if (constructed.has_value()) { return std::move(*constructed); }
     throw std::runtime_error("pipeline parallelism is not wired for artifact '" + identity.model_id + "'");

@@ -1,5 +1,5 @@
-"""The engine-op trainer as a backend of agent-EN-RL's kit shim (surogate/inkling_rl on branch inkling/RL; contract in
-its backend_fake.py / backend_rig.py): the forward IS the engine's (libsinfer.so through the lane-T shim, bit for bit
+"""The engine-op trainer as a backend of the RL glue's kit shim (surogate/inkling_rl; contract in
+its backend_fake.py / backend_rig.py): the forward IS the engine's (libsinfer.so through the trainer shim, bit for bit
 the engine's prompt log-probs, M2), the backward is LEVEL 0 (ift_backward).
 
 Contract:
@@ -10,7 +10,7 @@ Contract:
   replay_mixes_own = True: the forward routes itself and that IS the engine's routing; on covered positions the
   engine's captured ids are COMPARED (counted in self.r3_check), never injected;
   engine_sha = sha256 of the libsinfer.so loaded (the shim refuses a run whose rollouts came from another release).
-Rule 20 (owner 17:40): rows are the engine's token ids; nothing here renders text.
+Rule: rows are the engine's token ids; nothing here renders text.
 
 cfg (the kit config's inkling_rl.engine): bin_dir (dir with libsinfer.so = the pinned release + SHA256SUMS),
 shim (path of libsinfer_inkling_train.so; default <bin_dir>/serve_tests/...), artifact, device (0), lora_seed (0).

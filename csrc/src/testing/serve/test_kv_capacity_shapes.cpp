@@ -1,4 +1,4 @@
-// Lane f1 (ENGINE-INKLING): every serving shape plans. For each windowed target given on the command line
+// Every serving shape plans. For each windowed target given on the command line
 // (Inkling-2-Mini: an elastic window class charging 175 main pages per allocation; Gemma 3 270M: 95), a
 // grid of --max-model-len x --max-num-seqs x --max-num-batched-tokens x CUDA graphs on / off under
 // --kv-capacity auto, and for each shape the capacity curve's minimum, minimum + 1, middle, maximum - 1

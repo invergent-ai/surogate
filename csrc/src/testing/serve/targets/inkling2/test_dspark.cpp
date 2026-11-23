@@ -1,4 +1,4 @@
-// DSpark drafter ops (ENGINE-INKLING lane e2) against the golden vectors of ref/dspark_ref.py (make_vectors),
+// DSpark drafter ops against the golden vectors of the Python reference dspark_ref.py (make_vectors),
 // op by op with the REFERENCE's inputs (each op isolated), then the Markov chain end to end, then batch
 // invariance. Weights come from the checkpoint's mtp.safetensors; the target rows the drafter shares (embed rows
 // of the anchors, a slice of the unembed) and the fold from the vectors.
@@ -200,7 +200,7 @@ std::vector<std::uint16_t> slice(const std::vector<std::uint16_t>& v, std::size_
                                       v.begin() + static_cast<std::ptrdiff_t>(begin + n));
 }
 
-/// out BF16 / FP32 [n, tokens] = W [n, k] . x [k, tokens] on lane e1's invariant GEMM.
+/// out BF16 / FP32 [n, tokens] = W [n, k] . x [k, tokens] on the invariant GEMM (api/ops/inkling_mix.h).
 /// Tag fp8all: the drafter's dense linears run the FP8 route (per-row e4m3 + scale, ops::dspark_gemm_w8) exactly as
 /// the engine does after derive_dspark(fp8); the head and rnn_proj GEMMs stay BF16.
 bool g_fp8_weights = false;
@@ -386,7 +386,7 @@ int run(const std::string& dir, const std::string& tag) {
     kv.planes = {p0.view(), p1.view(), p2.view()};
     kv.max_visible_keys = static_cast<std::uint32_t>(max_pos);
     if (fp8) {
-        // lane c's inkling_draft_attention reads the same pages through the pool's batch-view form (FP8 planes only)
+        // inkling_draft_attention reads the same pages through the pool's batch-view form (FP8 planes only)
         const Plane* pls[3] = {&p0, &p1, &p2};
         for (int l = 0; l < 3; ++l) {
             const Plane& pl = *pls[l];
@@ -400,7 +400,7 @@ int run(const std::string& dir, const std::string& tag) {
             kv.views[static_cast<std::size_t>(l)] = v;
         }
     } else {
-        kv.naive_attention = true; // lane c's kernel takes FP8 planes only
+        kv.naive_attention = true; // inkling_draft_attention takes FP8 planes only
     }
     DBuf f_rnn(static_cast<std::size_t>(G::kHidden) * B * 2);
     WorkspaceArena work(std::max(D::dspark_append_workspace_bytes(1024),

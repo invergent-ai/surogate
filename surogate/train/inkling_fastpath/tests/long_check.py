@@ -1,6 +1,6 @@
-"""Lane T long-row path check (one card):
+"""Long-row path check (one card):
 1. EQUIVALENCE on a short row (o00[:1024], LoRA rig seed 7 b_std 1e-3): ift_long's gradient vs ift_backward's (the
-   path validated against lane L's rig), every LoRA tensor of every layer: cosine and relative error; losses equal.
+   path validated against the learnability rig), every LoRA tensor of every layer: cosine and relative error; losses equal.
 2. MEMORY / SPEED per row length with ift_long (stops at the first OOM): forward, backward, tok/s, peak.
 Usage: python long_check.py --bin B --artifact A --prompts DIR --lengths 4096,8192,16384,32768 --out report.json
 """

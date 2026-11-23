@@ -1,5 +1,5 @@
 """FP8 (E4M3FN) quantisation of Inkling-2-Mini's attention projections: the candidate schemes of
-the FP8-attention gate (rl/engine-inkling-2026-11-21/DESIGN.md section 10.1, ARTIFACT.md 4.4).
+the FP8-attention gate (design notes section 10.1, artifact contract 4.4).
 
 One rule for every scheme, applied to the BF16 weight ``W`` of ONE checkpoint tensor (the fused
 ``qkvr`` is quantised per source slice, so no scale ever mixes wq / wr / gate / sink / wk / wv):

@@ -185,11 +185,11 @@ def physical_bytes(model):
     return mapped, plan
 
 
-@pytest.mark.skipif(not os.getenv("SUROGATE_OOM_TEST_W5"), reason="W5 (Inkling) shape: set SUROGATE_OOM_TEST_W5=1")
-def test_w5_main_and_window_stay_within_the_plan(tmp_path):
-    """lanes/OOM (2026-11-23): an elastic window class (M3-C) maps its holders' window pages beside
+@pytest.mark.skipif(not os.getenv("SUROGATE_OOM_TEST_INKLING"), reason="Inkling-2-Mini shape: set SUROGATE_OOM_TEST_INKLING=1")
+def test_inkling_main_and_window_stay_within_the_plan(tmp_path):
+    """2026-11-23: an elastic window class (M3-C) maps its holders' window pages beside
     the main pool, which could map its whole cap as well; with eight lanes holding window pages and
-    the pool full of retained conversations a W5 engine ran out of device memory and aborted. The
+    the pool full of retained conversations an Inkling-2-Mini engine ran out of device memory and aborted. The
     flags come from SUROGATE_OOM_TEST_ARGS (the RL batch's: --enable-lora, DFlash, 132,096; or the
     card command's). Eight long sessions, a second turn each, then one long fresh session: main +
     window mapped bytes stay within the plan, no request fails, the engine lives."""

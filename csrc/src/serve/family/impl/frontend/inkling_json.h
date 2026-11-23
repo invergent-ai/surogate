@@ -1,6 +1,6 @@
 #pragma once
 
-// Inkling-2 frontend (ENGINE-INKLING lane f2): JSON with Python's semantics.
+// Inkling-2 frontend: JSON with Python's semantics.
 //
 // vLLM's Inkling renderer and parser are Python and lean on Python's json module and number types: a request body is
 // json.loads'ed (integers of any size kept exactly, NaN / Infinity accepted, a repeated key keeps its first position and

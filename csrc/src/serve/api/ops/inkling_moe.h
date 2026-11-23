@@ -1,11 +1,11 @@
 #pragma once
 
-// Inkling-2-Mini (inkling2_loop) routed mixture: the five lane-d ops of OPS.md section 3
+// Inkling-2-Mini (inkling2_loop) routed mixture: the five MoE ops of the op catalogue
 // (`inkling_route`, `inkling_quant_nvfp4_4o6`, `inkling_quant_mxfp8`, `inkling_softcap_swiglu`,
-// `inkling_moe`) in one header. Design and numerics: rl/engine-inkling-2026-11-21/lanes/d/DESIGN-moe.md.
+// `inkling_moe`) in one header. Design and numerics: the MoE design notes.
 // The semantic definition of every op is the python function of the same name in
-// rl/engine-inkling-2026-11-21/ref/inkling_ref.py, which follows the vLLM image's sm_120 kernels
-// (ref/src/vllm/models/inkling2/nvidia/ops/{moe,nvfp4,mxfp8,activation,moe_sm120}.py).
+// the Python reference inkling_ref.py (not in this repository), which follows the vLLM image's sm_120 kernels
+// (vllm/models/inkling2/nvidia/ops/{moe,nvfp4,mxfp8,activation,moe_sm120}.py).
 //
 // This op is deliberately NOT a `sparse_moe` geometry. The registered `sparse_moe` mixtures share a
 // codec-generic kernel family whose arithmetic follows the round's width (static activation scales,
@@ -83,7 +83,7 @@ struct InklingMoeWeights {
     InklingExpertBank w2;
 };
 
-/// The per-layer MoE payload lane e1's ModelView carries (`InklingMoePayload`, DESIGN-target 4).
+/// The per-layer MoE payload the target's ModelView carries (`InklingMoePayload`, DESIGN-target 4).
 using InklingMoePayload = InklingMoeWeights;
 
 /// Routed-expert capture for routing replay (R3): one row per VISIT. With the runtime's capture

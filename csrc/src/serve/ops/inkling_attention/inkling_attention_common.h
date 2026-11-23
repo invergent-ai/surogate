@@ -1,6 +1,6 @@
 #pragma once
 
-// Host-side validation shared by the Inkling attention entry points (ENGINE-INKLING lane c).
+// Host-side validation shared by the Inkling attention entry points.
 
 #include "api/ops/inkling_attention.h"
 

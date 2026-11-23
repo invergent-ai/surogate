@@ -1,4 +1,4 @@
-"""Lane T: torch.profiler table of one training micro-step (engine forward + long-row LEVEL-0 backward) at T tokens:
+"""A torch.profiler table of one training micro-step (engine forward + long-row LEVEL-0 backward) at T tokens:
 the top ops by CUDA time and by CPU time (where the LEVEL-1 time goes below the section timers).
 Usage: python prof_ops.py --bin B --artifact A --prompts DIR --tokens 8192 --out table.txt
 """

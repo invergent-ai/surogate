@@ -1,4 +1,4 @@
-// ENGINE-INKLING lane f2: the Inkling-2 path through the serving layer, against vLLM's own Python.
+// The Inkling-2 path through the serving layer, against vLLM's own Python.
 //
 // What sinfer_inkling_frontend_test proves for the renderer and parser functions, this proves for the code that carries
 // a request to them: the chat-completions parser in raw-chat mode (RequestLimits::raw_chat) accepts every body vLLM
@@ -63,7 +63,7 @@ std::vector<int> ints(const ink::PyValue* v) {
     return out;
 }
 
-// The renderer vectors to check against: renderer-099 (owner rule 2026-11-21 17:40: a request that sets no reasoning
+// The renderer vectors to check against: renderer-099 (the engine's default since 2026-11-21: a request that sets no reasoning
 // effort renders at 0.99; those vectors expect vLLM's ids for the same body with chat_template_kwargs.reasoning_effort
 // = 0.99, every other vector is vLLM's own as in renderer/). renderer/ (vLLM's default 0.9) only where 099 is missing.
 fs::path renderer_set(const fs::path& vectors) {

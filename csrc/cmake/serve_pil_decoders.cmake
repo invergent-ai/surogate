@@ -1,10 +1,10 @@
-# ENGINE-INKLING lane V-b: Pillow's own decoder libraries, so that JPEG and WebP decode to Pillow's pixels exactly
+# Inkling-2 vision: Pillow's own decoder libraries, so that JPEG and WebP decode to Pillow's pixels exactly
 # (media::decode::decode_image_pil, used only by the Inkling-2 vision processor). PNG / GIF / BMP need none: FFmpeg hands
 # their samples over unchanged and decode.cpp applies Pillow's mode rules.
 #
 # vLLM's Inkling-2 processor decodes images with Pillow; Pillow 13.0.0 in the reference image bundles libjpeg-turbo
 # 3.2.0 and decodes with the library defaults (JDCT_ISLOW, fancy upsampling, libjpeg's YCbCr tables). FFmpeg's MJPEG
-# decoder + swscale differ by up to 60 levels at chroma edges (lanes/Vb/NOTES.md, the decoder measurement). This builds
+# decoder + swscale differ by up to 60 levels at chroma edges (measured on the reference decoder). This builds
 # the same library version as a static, position-independent archive with hidden symbols (so it cannot interpose on a
 # Pillow loaded in the same process), C code only (no NASM on the build host). Verified: the 6 JPEG case images (4:2:0, 4:4:4, EXIF, no EOI, Adobe CMYK)
 # decode bit for bit to Pillow's pixels (Pillow's copy runs libjpeg-turbo's SIMD paths).

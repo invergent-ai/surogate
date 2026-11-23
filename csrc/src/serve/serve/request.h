@@ -254,7 +254,7 @@ struct GenerationRequest {
     /// (RequestLimits::raw_chat); `messages`, `tools` and the other conversation fields are then left empty.
     std::shared_ptr<const std::string> raw_chat_body;
     /// With raw_chat_body: the body's image parts (image_url / input_image), in body order, whose bytes the serving
-    /// layer acquires for the renderer (PromptInput::raw_chat_media; Inkling-2 vision, ENGINE-INKLING lane V-b).
+    /// layer acquires for the renderer (PromptInput::raw_chat_media; Inkling-2 vision).
     std::vector<ContentPart> raw_chat_images;
     std::vector<ChatTurn> messages;
     std::vector<ToolDefinition> tools;

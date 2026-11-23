@@ -58,7 +58,7 @@ struct Video {
 Image decode_image(std::span<const std::uint8_t> bytes, const Policy& policy);
 
 /// An image as Pillow holds it after `Image.open(...).load()` and before any mode conversion, reduced to 8-bit RGBA
-/// the way Pillow's own `convert("RGBA")` does (ENGINE-INKLING lane V-b; used only by the Inkling-2 processor, which
+/// the way Pillow's own `convert("RGBA")` does (used only by the Inkling-2 processor, which
 /// reproduces vLLM's `vllm/models/inkling2/processing.py::decode_image`). Differences from `decode_image`: NO EXIF /
 /// display-matrix orientation (Pillow does not transpose on open); the first frame; a JPEG lacking its EOI marker gets
 /// `FF D9` appended first (vLLM does that before Pillow sees the bytes); alpha is KEPT (255 where the source has none);

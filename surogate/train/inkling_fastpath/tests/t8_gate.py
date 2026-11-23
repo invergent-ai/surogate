@@ -1,4 +1,4 @@
-"""Lane T8, the U1 card gate. PASS LINES, written before any run (also in the lane notes):
+"""The U1 card gate. PASS LINES, written before any run:
 Phase "lean" (one card; rows of 16k and 28k; plain head):
   G1  the lean K = 48 backward == the stock path (ift_long.LongModel) on every LoRA tensor.
   G2  the truncated backward at K = 30 / 18 / 6 == the sum of the last K visits' contributions of the full lean backward.

@@ -1,10 +1,10 @@
-"""Lane T: the trainer on REAL kit rows in the kit's memory conditions (agent-EN 21:1x; PASS line in lanes/T/NOTES.md):
-EngineBackend + MasterAdamW (fp32 masters and moments on the host) + agent-EN-RL's run_step with host gradient accumulators
+"""The trainer on REAL kit rows in the kit's memory conditions (PASS line written before the run):
+EngineBackend + MasterAdamW (fp32 masters and moments on the host) + the RL glue's run_step with host gradient accumulators
 (inkling/RL 6ec1442c), rows in the order given (longest last, so it runs on top of everything earlier rows left behind).
 
 Reports per row: T, loss tokens, seconds and tok/s of its update (engine forward + backward + host accumulate), peak torch memory; and
 for the step: the scoring pass, the optimizer step, engine_mismatch_kl, finite gradients. An out-of-memory error is a RESULT (the row is
-named), not a crash. No adapter is saved: this run only measures memory and speed, and its update is discarded (LANE-RULES 22).
+named), not a crash. No adapter is saved: this run only measures memory and speed, and its update is discarded.
 Usage: python kit_row_check.py --bin B --artifact A --rollouts rollouts.bin --T 16150,28542,32510 --out report.json
 """
 

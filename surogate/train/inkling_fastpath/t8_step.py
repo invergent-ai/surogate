@@ -1,4 +1,4 @@
-"""Lane T8: the row-parallel GSPO step for W5 (interface: STEP-API; plan item U1). One coordinator, one worker per card, each row on one card.
+"""The row-parallel GSPO step for Inkling-2-Mini (interface: STEP-API; plan item U1). One coordinator, one worker per card, each row on one card.
 
 The per-row arithmetic is `inkling_rl.step.run_step`'s, split in two so that it can run on several cards:
  - plan_rows (coordinator): off-policy drop, refusals, R3 counters, the loss scale. Same order and rules as run_step, lines 126-167 and 193-196.
@@ -32,7 +32,7 @@ def param_keys(attn_rank: int) -> tuple:
     """The per-layer key order of every flat layout, master list and gradient list (experts first, so j < 4 are the expert keys)."""
     return LORA_KEYS + (ATTN_KEYS if attn_rank else ())
 # The code path is part of the gradient's definition: ift_long reads these at import, and its defaults are NOT the path the gates prove (review B1).
-# A0 = lane T's pre-lever stack, the one the census worker runs. The trainer sets them for its workers and every worker checks them after import.
+# A0 = the engine-op trainer's pre-lever stack, the one the census worker runs. The trainer sets them for its workers and every worker checks them after import.
 STACKS = {"A0": {"IFT_MOE_GM": "0", "IFT_MOE_DET": "0", "IFT_FAST_GEMM": "0", "IFT_ATTN_ADAPT": "0", "IFT_CHUNK": "1024", "IFT_MOE_FAST": "0",
                  "IFT_ATTN_TC": "0", "IFT_TF32": "0", "IFT_MOE_ROWS": "8192", "IFT_MOE_PAD_ROWS": "0", "IFT_MANUAL": "1", "IFT_OFFLOAD_MIN": "8192"}}
 WORKER_ENV = {"SUROGATE_INKLING_ATTN_EARLY_META": "0", "MALLOC_ARENA_MAX": "2", "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",

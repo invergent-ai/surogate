@@ -1,13 +1,13 @@
-// ENGINE-INKLING lane V-b: Inkling-2 image requests through the serving layer and the family Frontend.
+// Inkling-2 image requests through the serving layer and the family Frontend.
 //
 // What sinfer_inkling_vision_test proves for the functions, this proves for the path a request takes: the
 // chat-completions parser in raw-chat mode collects the body's image parts (GenerationRequest::raw_chat_images),
 // translate acquires their bytes (PromptInput::raw_chat_media; here from the data: URLs), and Frontend::prepare (vision
-// on, image limit 8 as lane V-a's capture, the default SERVED decode) returns vLLM's prompt ids, one VisionItem per
+// on, image limit 8 as the vector capture, the default SERVED decode) returns vLLM's prompt ids, one VisionItem per
 // image (grid in native patches, one token span over its pads, the payload = the normalisation of the pixels vLLM's
 // server fed its encoder), image token types on the pads, 1-D positions; count_tokens agrees;
 // a second prepare of the same images hits the media cache; refusals carry vLLM's words; a frontend with vision off
-// refuses every image request as vLLM at image limit 0. Vectors: rl/engine-inkling-2026-11-21/vectors/vision (lane V-a).
+// refuses every image request as vLLM at image limit 0. Vectors: vectors/vision (not in this repository).
 // CPU only. Skips (77) without INKLING_MODEL_DIR / INKLING_VECTORS.
 
 #include <api/family/frontend.h>
@@ -166,7 +166,7 @@ int main() {
     sinfer::family::FrontendOptions on;
     on.vision_enabled         = true;
     on.max_context            = 262'144;
-    on.image_limit_per_prompt = 8;  // lane V-a's capture: --limit-mm-per-prompt '{"image": 8}'
+    on.image_limit_per_prompt = 8;  // the vector capture: --limit-mm-per-prompt '{"image": 8}'
     const sinfer::family::Frontend frontend = FrontendTestAccess::create_component_with(resources, on);
     sinfer::family::FrontendOptions off = on;
     off.vision_enabled                       = false;
@@ -260,7 +260,7 @@ int main() {
                     ok = false;
                 }
                 pads += n;
-                // The pixels vLLM's server fed its encoder (V-a: decoded_rgb_served_k where they differ from
+                // The pixels vLLM's server fed its encoder (vectors: decoded_rgb_served_k where they differ from
                 // processing.py's decoded_rgb_k), normalised (sinfer_inkling_vision_test proves the normalisation
                 // against gather_patches): the payload must be exactly that.
                 const std::string ks = std::to_string(k);
@@ -325,7 +325,7 @@ int main() {
         }
         if (ok) { ++ok_cases; } else { ++failures; }
     }
-    // Review fixes (18:2x): the per-prompt Vision budget is checked from the headers before any payload is held; a URL
+    // Review fixes: the per-prompt Vision budget is checked from the headers before any payload is held; a URL
     // the chat parser cannot take is refused after the renderer's own checks (vision off -> vLLM's limit-0 text).
     {
         const std::string big = read_file(vision / "cases" / "img" / "grid_2560x2560.png");  // 4,096 tokens each

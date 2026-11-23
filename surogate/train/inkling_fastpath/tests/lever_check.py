@@ -1,8 +1,8 @@
-"""Lane T LEVEL-1 acceptance check, ONE process on ONE card (lanes/T/NOTES.md, LEVEL-1 plan). For the cumulative arms
+"""LEVEL-1 acceptance check, ONE process on ONE card (LEVEL-1 plan). For the cumulative arms
 (each adds one lever to the previous arm):
 
   gradient  every LoRA tensor, per row length: arm vs the arm before it (the lever alone), arm vs A0 (the whole stack),
-            and at the short length arm vs ift_backward (the path validated against lane L's rig). The line per lever:
+            and at the short length arm vs ift_backward (the path validated against the learnability rig). The line per lever:
             cos >= 0.9999 and rel err <= 1 %, finite.
   floor     the same arm run twice (A/A): noise-1 measured 0.46 % max at 8k with identical flags, so the 1 % line is read
             against the floor measured IN THIS SESSION.

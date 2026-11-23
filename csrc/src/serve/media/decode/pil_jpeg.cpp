@@ -1,4 +1,4 @@
-// ENGINE-INKLING lane V-b: a JPEG decoded the way Pillow 13 decodes it (the reference for Inkling-2's vision processor,
+// Inkling-2 vision: a JPEG decoded the way Pillow 13 decodes it (the reference for Inkling-2's vision processor,
 // vllm/models/inkling2/processing.py decode_image, and vLLM's server path multimodal/media/image.py), with the same
 // library: libjpeg-turbo 3.2.0 (csrc/cmake/serve_pil_decoders.cmake). Pillow (JpegImagePlugin.py + JpegDecode.c): the
 // mode follows the number of components -- 1 "L", 3 "RGB", 4 "CMYK" with rawmode "CMYK;I" (Adobe's inverted CMYK,

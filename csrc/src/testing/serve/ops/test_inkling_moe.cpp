@@ -1,6 +1,6 @@
 // sinfer_inkling_moe_test: Inkling-2-Mini's mixture (api/ops/inkling_moe.h) against host ports of
-// the reference semantics (rl/engine-inkling-2026-11-21/ref/inkling_ref.py, which follows the vLLM
-// image's sm_120 kernels). Design and criteria: rl/engine-inkling-2026-11-21/lanes/d/DESIGN-moe.md 9.
+// the reference semantics (the Python reference inkling_ref.py, which follows the vLLM
+// image's sm_120 kernels). Design and criteria: the mixture design, section 9.
 //
 //   quantisers (NVFP4 four-over-six, MXFP8): BIT-EXACT (every step is an IEEE _rn op or a cvt)
 //   SiTU: within 1 bf16 ulp (the device runs the reference's PTX approximations, the host exact math)
@@ -9,10 +9,10 @@
 //   dots; width invariance BIT-EXACT (T = 1 vs 24 vs 300 rounds, padding via live_tokens);
 //   capture rows; expert LoRA: zero adapter bit-equal, base tokens bit-equal, delta vs host.
 // Capture mode (`sinfer_inkling_moe_test --capture <moe_capture_v*.safetensors>`, written by
-// lanes/d/scripts/extract_moe_capture.py from lane a's eager capture of the vLLM image's own kernels): every stage
+// an extraction script (not in this repository) from an eager capture of the vLLM image's own kernels): every stage
 // compared BIT FOR BIT against the reference GPU kernels (routing, x quantisation, SiTU + requantisation on the
 // captured gate_up, the full op's y_q / down rows / output).
-// Golden-vector mode (lane a's vectors/) is added once their format is published (M3).
+// Golden-vector mode (vectors/) is added once their format is published (M3).
 
 #include "api/ops/inkling_moe.h"
 #include "api/ops/lora_store.h"
@@ -115,7 +115,7 @@ Nvfp4Row quant_nvfp4(const float* x, int k) {
         for (int j = 0; j < 16; ++j) {
             code6[j] = e2m1(xb[j] * inv6, v6[j]);
             code4[j] = e2m1(xb[j] * inv4, v4[j]);
-            // as the vLLM image's compiled kernels (measured on lane a's capture): fused in the row's power-of-two
+            // as the vLLM image's compiled kernels (measured on the eager capture): fused in the row's power-of-two
             // head, unfused in its tail
             if (head) {
                 err6[j] = std::fabs(std::fma(v6[j] * s6, outer, -xb[j]));
@@ -1108,7 +1108,7 @@ int test_state_contract(const Layer& l, const std::vector<float>& x, const Devic
                   bad + dirty);
 }
 
-/// PDL-chain regression (PDL audit, agent-EN 17:48 after lane c's FP8 finding): the engine's decode pattern -- per visit
+/// PDL-chain regression (PDL audit, after the attention FP8 finding): the engine's decode pattern -- per visit
 /// a PDL-launched writer fills ONE reused x buffer, then inkling_moe runs on it with ONE reused workspace arena (y,
 /// logits, ids, ... at the same addresses every visit) and the persistent state -- launched back to back, eager and as a
 /// CUDA graph; each visit's output (distinct buffers) vs run_moe on that visit's input (fresh buffers, synchronised).
@@ -1700,7 +1700,7 @@ int run_capture(const char* path, const char* dump_dir) {
 }
 
 /// Timing on real weights (M3, after parity): one CUDA-graph-captured call per T (PDL edges inside the graph),
-/// replayed; reports us / call, distinct experts touched, the bytes they imply and the share of 1,707 GB/s (lane h).
+/// replayed; reports us / call, distinct experts touched, the bytes they imply and the share of 1,707 GB/s (measured).
 int run_bench(const char* path) {
     const SafeTensors st = read_safetensors(path);
     const bool nv = st.meta.at("format") == "nvfp4";
@@ -1775,7 +1775,7 @@ int run_bench(const char* path) {
         bench_options.state = std::getenv("INKLING_BENCH_NOSTATE") != nullptr ? nullptr : persistent_state();
         bench_options.workspace_tokens = ws_tokens;
         // INKLING_BENCH_PRED_US=n: each graph starts with a 1-CTA kernel that triggers its PDL dependents at entry
-        // and spins n us (the engine's predecessors trigger early since e1 f9ebe0eb), so the route launches early
+        // and spins n us (the engine's predecessors trigger early since f9ebe0eb), so the route launches early
         // as in serving. Reported: us/call - n.
         const char* pred_text  = std::getenv("INKLING_BENCH_PRED_US");
         const double pred_us   = pred_text != nullptr ? std::atof(pred_text) : 0.0;

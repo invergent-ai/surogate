@@ -255,9 +255,9 @@ std::vector<TokenScore> score_logprobs_batch(const Tensor& logits, std::span<con
     void* storage = nullptr;
     const std::size_t storage_bytes = columns * (sizeof(RawTokenScores) + sizeof(TokenId));
     // A full device is a DeviceOutOfMemory, which the executor survives (the round's requests
-    // fail with a retryable 429), not an abort of the whole engine: on 2026-11-23 a W5 engine
+    // fail with a retryable 429), not an abort of the whole engine: on 2026-11-23 an Inkling-2-Mini engine
     // with 4 MiB left died here (CUDA_CHECK aborts) instead of failing one round
-    // (rl/engine-inkling-2026-11-21/lanes/OOM/DIAGNOSIS.md, F3).
+    // (out-of-memory diagnosis, finding F3).
     if (const cudaError_t allocated = cudaMallocAsync(&storage, storage_bytes, stream); allocated != cudaSuccess) {
         if (allocated == cudaErrorMemoryAllocation) {
             (void)cudaGetLastError();

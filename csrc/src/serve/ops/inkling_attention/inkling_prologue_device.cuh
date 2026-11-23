@@ -1,8 +1,8 @@
 #pragma once
 
-// The Inkling attention prologue's per-unit device code (ENGINE-INKLING lane c), shared by prologue_kernel and the decode
+// The Inkling attention prologue's per-unit device code, shared by prologue_kernel and the decode
 // attention kernel's in-kernel prologue (plain decode, W = 1): the same functions, so the same bits on both routes.
-// Semantics: api/ops/inkling_attention.h; numerics: lanes/c/DESIGN-attention.md section 1 (P1-P8).
+// Semantics: api/ops/inkling_attention.h; numerics: attention design notes, section 1 (P1-P8).
 
 #include "ops/inkling_attention/inkling_attention_device.cuh"
 

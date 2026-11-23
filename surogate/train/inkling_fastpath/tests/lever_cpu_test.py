@@ -1,4 +1,4 @@
-"""Lane T: CPU equivalence tests of the LEVEL-1 levers that are switched by a flag (no engine, no card).
+"""CPU equivalence tests of the LEVEL-1 levers that are switched by a flag (no engine, no card).
 
   plan     _moe_plan covers every row exactly once, batch limits hold
   moe      MoEGM's vjp with MOE_FAST=1 vs the group-major autograd path (MOE_FAST=0) on random experts with a skewed

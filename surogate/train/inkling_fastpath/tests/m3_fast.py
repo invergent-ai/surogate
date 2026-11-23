@@ -1,12 +1,12 @@
-"""Lane T M3, phase A (the fast route): LEVEL-0 backward on one real sequence.
+"""M3, phase A (the fast route): LEVEL-0 backward on one real sequence.
 
-1. FORWARD AGREEMENT (mapping check): the torch recompute of a visit (lane L's math, W4A16, engine routing) from the
+1. FORWARD AGREEMENT (mapping check): the torch recompute of a visit (the reference's math, W4A16, engine routing) from the
    engine's own visit inputs vs the engine's visit output (W4A4): relative L2 error per checked visit (a weight-mapping
    slip shows as O(1); act-quant noise is small).
 2. GRADIENT: expert LoRA r16 a32 on all 24 layers, rig.make_lora(seed 7, b_std 1e-3) masters, engine banks folded from
    them, loss = mean NLL of the sequence's targets through the ENGINE's forward; backward = LEVEL 0. Finite check; saves
-   the gradient slices lane L's R3 checks (layers 0 / 5 / 13 / 20 / 23, experts 0..15, A13 / B13 / A2 / B2), the
-   per-layer norms, the engine's routing and the ids for phase B (m3_rig.py: lane L's rig on the same routing).
+   the gradient slices the reference's R3 checks (layers 0 / 5 / 13 / 20 / 23, experts 0..15, A13 / B13 / A2 / B2), the
+   per-layer norms, the engine's routing and the ids for phase B (m3_rig.py: the learnability rig on the same routing).
 3. OVERFIT: 10 AdamW steps (lr 1e-3, fp32 masters + moments on the host) on the same sequence; the engine's loss must
    fall (banks refreshed from the masters before every forward).
 Usage: python m3_fast.py --bin B --artifact A --prompt o00.json --tokens 1024 --out DIR
@@ -39,7 +39,7 @@ def log(msg):
 
 
 class HostAdamW:
-    """fp32 AdamW with masters and moments on the host (lane L's rig.CpuAdamW)."""
+    """fp32 AdamW with masters and moments on the host (the rig's CpuAdamW)."""
 
     def __init__(self, params, **kw):
         self.dev = list(params)
@@ -107,7 +107,7 @@ def main():
     log(f"grad: loss {float(loss):.5f} finite {finite} fwd {t_fwd:.2f}s bwd {t_bwd:.2f}s peak "
         f"{rep['grad']['peak_gib']:.2f} GiB")
     # D1 (glue check): the same LEVEL-0 machinery over the torch recompute's OWN chain (W4A16, the engine's routing):
-    # its gradient is the exact gradient of that chain = what lane L's rig computes (an independent implementation).
+    # its gradient is the exact gradient of that chain = what the learnability rig computes (an independent implementation).
     for p in params:
         p.grad = None
     x0, routing = res["x0"], res["routing"]

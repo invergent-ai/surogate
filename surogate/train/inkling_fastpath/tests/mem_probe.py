@@ -1,4 +1,4 @@
-"""Lane T: memory / time probe of one training micro-step (engine forward + LEVEL-0 backward) per row length on one
+"""Memory / time probe of one training micro-step (engine forward + LEVEL-0 backward) per row length on one
 card. Rows: real prompt ids (o25 4,963 tokens, then o00 appended, repeated) cut to T. LoRA r16 on all 24 layers (rig
 init seed 7, b_std 1e-3). Reports peak torch allocation / reservation and the card's free memory; stops at the first
 OOM. Usage: python mem_probe.py --bin B --artifact A --prompts DIR --lengths 2048,4096,6144,8192 --out report.json

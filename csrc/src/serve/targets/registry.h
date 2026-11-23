@@ -50,7 +50,7 @@ using Qwen3Moe        = qwen3_moe::Package;
 using Qwen3_5     = qwen3_5::Package;
 using Qwen3_5Moe  = qwen3_5_moe::Package;
 using Qwen38FlashNext = qwen4exp::Package;
-/// Inkling-2-Mini: the looped 24-layer stack served as 48 layer visits (ENGINE-INKLING).
+/// Inkling-2-Mini: the looped 24-layer stack served as 48 layer visits.
 using Inkling2        = inkling2::Package;
 
 // One loaded model and one live instance, per target.

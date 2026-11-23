@@ -1,6 +1,6 @@
-// lanes/OOM F3 (rl/engine-inkling-2026-11-21/lanes/OOM/DIAGNOSIS.md, 2026-11-23): log-probability
+// Out-of-memory fix F3 (2026-11-23): log-probability
 // scoring on a full device fails with a DeviceOutOfMemory, which the executor survives (the round's
-// requests get a retryable 429), instead of aborting the process. A W5 engine with 4 MiB left died
+// requests get a retryable 429), instead of aborting the process. An Inkling-2-Mini engine with 4 MiB left died
 // at sampled_logprob.cu:254 (CUDA_CHECK(cudaMallocAsync) -> std::abort). Exits 77 without a device.
 //
 // The test fills the device with plain allocations, calls score_logprobs_batch, and requires the

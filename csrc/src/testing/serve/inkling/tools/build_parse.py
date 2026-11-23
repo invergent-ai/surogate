@@ -1,4 +1,4 @@
-# agent-EN-f2 (ENGINE-INKLING lane f2), 2026-11-21.
+# Inkling-2 parser vectors, 2026-11-21.
 # Parser corpus: model outputs (token ids) -> what vLLM's Inkling parser returns, for inkling_ref_driver.py parse.
 #
 # Outputs are built from REAL Inkling-2-Mini replies (the assistant message each real request of real_bodies.jsonl got:
@@ -9,7 +9,8 @@
 # plus deterministic variants that reach the parser's other branches (length cuts, whitespace, text after tools,
 # dropped special tokens, literal marker text, malformed tool JSON, tool_choice / include_reasoning, coercion).
 # Token ids come from the model's tokenizer.json (tokenizers, special tokens split in payload text).
-# Run with the lane venv: venv/bin/python -I build_parse.py REAL_BODIES REAL_RENDER_OUT OUT.jsonl
+# Run: INKLING_READS_DIR=<session records> INKLING_TOKENIZER=<model>/tokenizer.json \
+#   venv/bin/python -I build_parse.py REAL_BODIES REAL_RENDER_OUT OUT.jsonl
 import json
 import os
 import random
@@ -17,8 +18,17 @@ import sys
 
 import tokenizers
 
-IK = "/mnt/data/work/rl/inkling-2026-11-21"
-TOK = tokenizers.Tokenizer.from_file("/mnt/data/work/rl/engine-inkling-2026-11-21/model/tokenizer.json")
+
+
+def _required_env(name, what):
+    value = os.environ.get(name)
+    if not value:
+        sys.exit(f"build_parse.py: set {name} to {what}")
+    return value
+
+
+IK = _required_env("INKLING_READS_DIR", "the directory with the recorded surogates sessions")
+TOK = tokenizers.Tokenizer.from_file(_required_env("INKLING_TOKENIZER", "the model's tokenizer.json"))
 TOK.encode_special_tokens = True
 SP = {t.content: i for i, t in TOK.get_added_tokens_decoder().items()}
 MM, TX, TH = SP["<|message_model|>"], SP["<|content_text|>"], SP["<|content_thinking|>"]

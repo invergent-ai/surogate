@@ -1518,7 +1518,7 @@ ${SERVE_ROOT}/ops/launcher/head_linear.cu
   ${SERVE_ROOT}/ops/sparse_moe/prefill/sparse_moe_prefill_plan.cpp
   ${SERVE_ROOT}/ops/sparse_moe/small_t/sparse_moe_small_t_kernels.cu
   ${SERVE_ROOT}/ops/sparse_moe/small_t/sparse_moe_small_t_plan.cpp
-  # Inkling-2-Mini's mixture (ENGINE-INKLING lane d; api/ops/inkling_moe.h).
+  # Inkling-2-Mini's mixture (api/ops/inkling_moe.h).
   ${SERVE_ROOT}/ops/sparse_moe/inkling/inkling_moe_kernels.cu
   ${SERVE_ROOT}/ops/sparse_moe/inkling/inkling_nvfp4_gemm.cu
   ${SERVE_ROOT}/ops/sparse_moe/inkling/inkling_mxfp8_gemm.cu
@@ -1612,8 +1612,8 @@ set_source_files_properties(
   ${SERVE_ROOT}/ops/sparse_moe/marlin/marlin_moe_nvfp4_kernels_generated.cu
   PROPERTIES COMPILE_OPTIONS
   "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;-static-global-template-stub=false>")
-# Inkling-2-Mini hidden-stream ops (ENGINE-INKLING lane e1). -fmad=false: the reference fuses only
-# where it says fma, and so must these kernels (rl/engine-inkling-2026-11-21/lanes/e1/DESIGN-target.md 3).
+# Inkling-2-Mini hidden-stream ops. -fmad=false: the reference fuses only
+# where it says fma, and so must these kernels (the target design, section 3).
 target_sources(sinfer_ops PRIVATE
   ${SERVE_ROOT}/ops/inkling_mix/inkling_mix.cu
   ${SERVE_ROOT}/ops/inkling_mix/inkling_gemm_inv.cu
@@ -1624,8 +1624,8 @@ set_source_files_properties(${SERVE_ROOT}/ops/inkling_mix/inkling_mix.cu
   PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:-fmad=false>")
 set_source_files_properties(${SERVE_ROOT}/ops/inkling_mix/inkling_lora.cu
   PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:-fmad=false>")
-# Inkling-2-Mini DSpark drafter ops (ENGINE-INKLING lane e2, api/ops/dspark.h). -fmad=false: unfused like
-# rl/engine-inkling-2026-11-21/ref/dspark_ref.py; only the inkling2 target calls them.
+# Inkling-2-Mini DSpark drafter ops (api/ops/dspark.h). -fmad=false: unfused like
+# the Python reference (dspark_ref.py); only the inkling2 target calls them.
 target_sources(sinfer_ops PRIVATE ${SERVE_ROOT}/ops/dspark/dspark.cu)
 set_source_files_properties(${SERVE_ROOT}/ops/dspark/dspark.cu
   PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:-fmad=false>")
@@ -1734,9 +1734,9 @@ set_source_files_properties(
   PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>")
 target_link_libraries(sinfer_ops PUBLIC sinfer_core PRIVATE sinfer_nvfp4_tma sinfer_nvfp4_cutlass sinfer_fp8_block_sm90 sinfer_fp8_block_sm120 sinfer_gqa_sm90 sinfer_trtllm_moe CUDA::cublasLt)
 
-# ENGINE-INKLING lane c: the Inkling-2-Mini attention ops (api/ops/inkling_attention.h). An archive of its
+# The Inkling-2-Mini attention ops (api/ops/inkling_attention.h). An archive of its
 # own; only the inkling2 target calls it, so the other targets' code paths and numbers stay what they were.
-# In SINFER_SHARED_ARCHIVES (lane e1's wiring of the target, merge M3a+) so libsinfer carries it.
+# In SINFER_SHARED_ARCHIVES (the target's wiring) so libsinfer carries it.
 # No fast math: the kernels reproduce the reference's rounding with explicit intrinsics.
 add_library(sinfer_inkling_attention STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/inkling_attention/inkling_prologue.cu
@@ -1758,7 +1758,7 @@ if(SINFER_ENABLE_FFMPEG)
     ${SERVE_ROOT}/media/decode/decode.cpp)
   sinfer_internal_includes(sinfer_media_decode)
   target_link_libraries(sinfer_media_decode PRIVATE PkgConfig::FFMPEG)
-  # ENGINE-INKLING lane V-b: Pillow-exact JPEG pixels for the Inkling-2 vision processor (decode_image_pil only;
+  # Pillow-exact JPEG pixels for the Inkling-2 vision processor (decode_image_pil only;
   # decode_image / decode_video keep FFmpeg). OFF falls back to FFmpeg's JPEG / WebP pixels (levels off Pillow's).
   option(SINFER_PIL_DECODERS "Decode JPEG / WebP with Pillow's libraries (libjpeg-turbo, libwebp) for Inkling-2 vision" ON)
   if(SINFER_PIL_DECODERS)

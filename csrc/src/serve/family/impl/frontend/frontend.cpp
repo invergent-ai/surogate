@@ -1284,7 +1284,7 @@ public:
         return variables;
     }
 
-    /// An Inkling-2 prompt with its images (lane V-b): the ids vLLM's engine sees (renderer + multimodal prompt update),
+    /// An Inkling-2 prompt with its images: the ids vLLM's engine sees (renderer + multimodal prompt update),
     /// and per image the vision item and the tower's input payload.
     struct InklingPrompt {
         std::vector<int> ids;
@@ -1559,7 +1559,7 @@ public:
     /// Inkling-2's framing tokens when this checkpoint renders natively (PromptCapabilities::inkling2_chat).
     std::optional<fi::inkling::SpecialTokens> inkling;
     bool vision_enabled = true;
-    /// Inkling-2 (lane V-b): vLLM's per-prompt image count, 0 when vision is off (vLLM at image limit 0), and the
+    /// Inkling-2 (vision): vLLM's per-prompt image count, 0 when vision is off (vLLM at image limit 0), and the
     /// per-image token cap.
     std::uint64_t inkling_image_limit      = 0;
     std::uint64_t inkling_max_image_tokens = fi::inkling::kDefaultMaxImageTokens;

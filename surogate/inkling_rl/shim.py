@@ -12,8 +12,8 @@ Loop (trainer.py:1130-1240): orch_step = start_step + packs; if orch_step > 0: b
 then STABLE) and prune old broadcasts; stop at max_steps; wait for <run_dir>/rollouts/step_<orch_step>/rollouts.bin; one
 step with version = orch_step; log + metrics; checkpoint when step > 0 and step % save_steps == 0; step += 1. Resume:
 start_step = newest checkpoint K + 1 (its weights are broadcast again as step_<K+1>).
-Engine identity (agent-EN 17:4x): the run's engine release sha (libsinfer.so) is recorded in every metrics line and
-checkpoint; a backend that loads engine code (T's) must report the same sha, else the shim refuses to start; a batch dir
+Engine identity: the run's engine release sha (libsinfer.so) is recorded in every metrics line and
+checkpoint; a backend that loads engine code (the engine-op trainer) must report the same sha, else the shim refuses to start; a batch dir
 carrying ENGINE_SHA with another value is refused.
 Optimizer: fp32 AdamW on fp32 MASTERS (host), global grad-norm clip; the backend's work parameters hold bf16(master) (the
 values a bf16 broadcast hands the engine; with alpha / r = 2 the engine's fold of them is exact), gradients of the work
@@ -134,13 +134,13 @@ def make_backend(cfg: dict):
 
         return RigBackend(cfg)
     if kind == "engine":
-        # agent-EN-T's engine-op trainer (branch inkling/T, surogate/train/inkling_fastpath/backend_engine.py, class
+        # the engine-op trainer (surogate/train/inkling_fastpath/backend_engine.py, class
         # EngineBackend(cfg)): the forward = the pinned release libsinfer.so's own ops. Its modules import each other flat,
         # so its directory goes on sys.path (inkling_rl.engine.code_dir; nothing of it is vendored here).
         ec = ir.get("engine") or {}
         code_dir = ec.get("code_dir")
         if not code_dir or not os.path.isdir(code_dir):
-            raise ValueError("inkling_rl.engine.code_dir must name inkling/T's surogate/train/inkling_fastpath")
+            raise ValueError("inkling_rl.engine.code_dir must name a checkout's surogate/train/inkling_fastpath")
         sys.path.insert(0, code_dir)
         from backend_engine import EngineBackend  # noqa: E402
 

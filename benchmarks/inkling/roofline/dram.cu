@@ -2,7 +2,7 @@
 // 0.5-4 GiB buffer in fixed chunks, ONE kernel per chunk (as one GEMV / MoE kernel reads its weights), launched
 // (a) on a stream, (b) as a CUDA graph, (c) as a CUDA graph with programmatic dependent launch (each kernel triggers
 // its dependents at entry, reads its chunk, then waits for its predecessor before its single dependent store: the
-// "weights do not depend on the previous kernel" prefetch pattern lanes c / d plan).
+// "weights do not depend on the previous kernel" prefetch pattern the attention / MoE kernels plan).
 //
 // Correctness: the buffer holds word[i] = i * 2654435761 (mod 2^32); every read kernel adds its words into one
 // uint32 counter; the host compares with the closed form.

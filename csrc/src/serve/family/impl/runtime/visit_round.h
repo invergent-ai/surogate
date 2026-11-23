@@ -1,7 +1,7 @@
 #pragma once
 
-// The round a visit-schedule target runs (ENGINE-INKLING lane e1, rl/engine-inkling-2026-11-21/lanes/e1/
-// DESIGN-target.md 1.3). A target that declares `visit_schedule` replaces the family's layer loop: every
+// The round a visit-schedule target runs (target design
+// notes, section 1.3). A target that declares `visit_schedule` replaces the family's layer loop: every
 // TextContext entry (prompt chunk, decode batch, verify batch, mixed round) stages its columns, embeds into
 // the residual as usual, and hands this description to `Variant::run_visits`. Nothing here is read by any
 // other target. Not instantiated per Variant: the Variant's own header names these types.

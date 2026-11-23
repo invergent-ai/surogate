@@ -1,4 +1,4 @@
-"""Inkling-2 artifact (lane b, ARTIFACT.md I-1): converter + reader round trip on a tiny synthetic
+"""Inkling-2 artifact (ARTIFACT.md I-1): converter + reader round trip on a tiny synthetic
 ``inkling2_loop`` checkpoint with the real tensor names, NVFP4 and MXFP8 expert layers, a loop core,
 a global layer inside the core and a DSpark drafter. CPU only, seconds.
 

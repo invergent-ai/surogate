@@ -1,4 +1,4 @@
-// Inkling-2-Mini attention LoRA delta (lane e1, S10): per-token, fixed-order arithmetic (api/ops/inkling_mix.h
+// Inkling-2-Mini attention LoRA delta (S10): per-token, fixed-order arithmetic (api/ops/inkling_mix.h
 // inkling_lora_delta). Compiled with -fmad=false: every fused multiply-add is an explicit fmaf.
 
 #include "api/ops/inkling_mix.h"

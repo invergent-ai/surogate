@@ -1,8 +1,8 @@
 #pragma once
 
-// Device helpers shared by the Inkling attention kernels (ENGINE-INKLING lane c). Every arithmetic
+// Device helpers shared by the Inkling attention kernels. Every arithmetic
 // helper here reproduces one operation of vLLM's Inkling2 sm_120 kernels exactly as they issue it
-// (lanes/c/DESIGN-attention.md section 1): explicit PTX for the approximate instructions, `__f*_rn`
+// (attention design notes, section 1): explicit PTX for the approximate instructions, `__f*_rn`
 // where the reference compiles with `enable_fp_fusion=False` (nvcc contracts `a * b + c` by default).
 
 #include "api/ops/inkling_attention.h"
