@@ -116,6 +116,7 @@ def main():
     lps = tr.logprobs(rr)
     for r, x in zip(rr, lps):                                 # the rows as sampled at these weights (the replay gate's premise)
         r.engine_lp = np.concatenate([[0.0], x]).astype(np.float64) * r.loss_mask
+        r.routed = None                                       # the capture was taken at other weights; the micro-step's rows carry none
     ref = FakeInkling(seed=0, rank=4, alpha=8)
     with torch.no_grad():
         for p, w in zip(ref.parameters(), tr.work):
