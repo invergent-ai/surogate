@@ -14,7 +14,7 @@ import t8_center as RC
 import t8_lean as TL
 from ift_engine import InklingEngine
 from t8_engine import AttnAdapters, T8Engine
-from t8_step import ATTN_SLICES, LORA_KEYS, ParamLayout, T8Config, T8GateError, WorkerCore, param_keys, serve, verify_stack
+from t8_step import ATTN_SLICES, LORA_KEYS, ParamLayout, T8Config, T8GateError, WorkerCore, accumulate_row, param_keys, serve, verify_stack
 
 # rows n and input width k of each S10 slice (targets/inkling2/impl/lora_attention.h; wo_ud [2304, 3072])
 SLICE_DIMS = {"q": (3072, 2304), "r": (384, 2304), "g": (3072, 2304), "s": (24, 2304), "k": (1024, 2304), "v": (1024, 2304), "o": (2304, 3072)}
@@ -160,50 +160,16 @@ class T8Worker(WorkerCore):
     def _backward_part(self, ctx, row, g_lp, sup, part):
         g = g_lp.to(self.dev)
         head = None if sup is None else (lambda W, hid, tg, gg: RC.head_grad_centered(W, hid, gg, sup))
-        retries = 0
-        lean = bool(self.cfg.lean_host)
-        if lean:  # the last visit (in the backward's reverse order: the smallest index) of each layer inside [v_first, 48)
-            last = {}
-            for v in range(self.v_first, len(self.eng.visits)):
-                L = self.eng.visits[v].layer
-                last[L] = min(last.get(L, v), v)
-        while True:
-            pg, ps = {}, {}
-            added = [False]
 
-            def on_grad(v, layer, j, gj):
-                if (layer, j) not in self.layout.index:
-                    return
-                if lean and not bool(torch.isfinite(gj).all()):
-                    raise T8GateError(f"FINITE GATE: T {row.T}: layer {layer} {self.layout.keys[j]} (visit {v}) holds non-finite values")
-                c = gj.float().cpu()
-                if j in self.seg_keys:
-                    k = (part, self._segment_name(v), layer, self.layout.keys[j])
-                    ps[k] = c.clone() if k not in ps else ps[k].add_(c)
-                pg[(layer, j)] = c if (layer, j) not in pg else pg[(layer, j)].add_(c)
-                if lean and v == last[layer]:  # the row's sum of this tensor is complete: into the worker's sum now, same addition as before
-                    self.layout.view(self.flat, layer, j).add_(pg.pop((layer, j)))
-                    added[0] = True
+        def run(on_grad, qb):
+            TL.backward_row(self.eng, self.W, ctx["ids"], ctx["res"], self.lora, B.ALPHA / B.RANK, self.v_first, g, self.buffers, on_grad,
+                            head_grad=head, q_block=qb, train_idx=self.train_idx, empty_host_each_visit=bool(self.cfg.lean_host),
+                            attn_scale=(self.cfg.attn_alpha / self.cfg.attn_rank) if self.cfg.attn_rank else None)
 
-            oom = False
-            try:
-                TL.backward_row(self.eng, self.W, ctx["ids"], ctx["res"], self.lora, B.ALPHA / B.RANK, self.v_first, g, self.buffers, on_grad,
-                                head_grad=head, q_block=ctx["qb"], train_idx=self.train_idx, empty_host_each_visit=lean,
-                                attn_scale=(self.cfg.attn_alpha / self.cfg.attn_rank) if self.cfg.attn_rank else None)
-            except torch.OutOfMemoryError:
-                oom = True
-            if not oom:
-                return pg, ps, retries, ctx["qb"]
-            if added[0]:
-                raise RuntimeError(f"row of {row.T} tokens: out of card memory at query block {ctx['qb']} after part of its gradient was added "
-                                   "(lean_host): the row cannot be retried")
-            # outside the except block: the traceback's frames no longer hold tensors
-            pg, ps = None, None
-            torch.cuda.empty_cache()
-            if ctx["qb"] <= 8:
-                raise RuntimeError(f"row of {row.T} tokens: out of card memory at query block 8")
-            ctx["qb"] //= 2
-            retries += 1
+        visits = [self.eng.visits[v].layer for v in range(len(self.eng.visits))]
+        pg, ps, retries, qb = accumulate_row(self, run, row.T, part, ctx["qb"], visits, torch.cuda.empty_cache)
+        ctx["qb"] = qb
+        return pg, ps, retries, qb
 
     def _release(self, ctx):
         # torch's pinned allocator rounds to powers of two and reuses a freed block only for its own size class (U0): a new class leaves the old

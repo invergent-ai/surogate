@@ -221,6 +221,55 @@ class ParamLayout:
 # ---------------------------------------------------------------------------------------------------------------------
 # worker side: the arithmetic of one row
 # ---------------------------------------------------------------------------------------------------------------------
+def accumulate_row(w, run, T: int, part: str, qb: int, visit_layers: list, empty_cache):
+    """One row's backward and where its gradient goes (worker w: layout, flat, seg_keys, cfg, v_first, _segment_name).
+    run(on_grad, q_block) runs the backward; it may raise torch.OutOfMemoryError.
+    Default: the row's sums are collected per (layer, key) and returned (the caller checks them and adds them); an out-of-memory row is retried
+    with the query block halved (floor 8).
+    lean_host: a tensor's row sum goes into w.flat at its layer's LAST visit (the same fp32 additions in the same order as the default); a row
+    that runs out of memory AFTER its first such addition raises (no retry: w.flat now holds part of the row; the step must fail, never go on)."""
+    lean = bool(w.cfg.lean_host)
+    last = {}
+    for v in range(w.v_first, len(visit_layers)):
+        L = visit_layers[v]
+        last[L] = min(last.get(L, v), v)
+    retries = 0
+    while True:
+        pg, ps = {}, {}
+        added = [False]
+
+        def on_grad(v, layer, j, gj):
+            if (layer, j) not in w.layout.index:
+                return
+            if lean and not bool(torch.isfinite(gj).all()):
+                raise T8GateError(f"FINITE GATE: T {T}: layer {layer} {w.layout.keys[j]} (visit {v}) holds non-finite values")
+            c = gj.float().cpu()
+            if j in w.seg_keys:
+                k = (part, w._segment_name(v), layer, w.layout.keys[j])
+                ps[k] = c.clone() if k not in ps else ps[k].add_(c)
+            pg[(layer, j)] = c if (layer, j) not in pg else pg[(layer, j)].add_(c)
+            if lean and v == last[layer]:
+                w.layout.view(w.flat, layer, j).add_(pg.pop((layer, j)))
+                added[0] = True
+
+        oom = False
+        try:
+            run(on_grad, qb)
+        except torch.OutOfMemoryError:
+            oom = True
+        if not oom:
+            return pg, ps, retries, qb
+        pg, ps = None, None                                   # outside the except block: the traceback's frames no longer hold tensors
+        empty_cache()
+        if added[0]:
+            raise RuntimeError(f"row of {T} tokens: out of card memory at query block {qb} after part of its gradient was added to the step's sum "
+                               "(lean_host): the step fails; it is not retried and returns no gradient")
+        if qb <= 8:
+            raise RuntimeError(f"row of {T} tokens: out of card memory at query block 8")
+        qb //= 2
+        retries += 1
+
+
 class WorkerCore:
     """Subclasses give: visits_first (first visit of the backward), _forward, _check_routing, _support, _backward."""
 
@@ -546,8 +595,8 @@ def compute_step(handles: list, layout: ParamLayout, flats: list, shapes: list, 
         for h in handles:
             h.call("begin_step")
         results = run_rows(handles, rows, live, job)
-    except T8GateError as e:
-        write_stop(cfg.run_dir, str(e))
+    except Exception as e:                                    # a gate, or a worker failure (e.g. lean_host's no-retry path): STOP, no gradient
+        write_stop(cfg.run_dir, f"{type(e).__name__}: {e}"[:2000])
         raise
     wall = time.time() - t0
     fin = [h.call("finish_step") for h in handles]
