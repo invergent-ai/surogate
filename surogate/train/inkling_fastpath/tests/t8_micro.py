@@ -480,9 +480,9 @@ def phase_compare(a):
     rec = {r.notes["plan_row"]: r.engine_lp.astype(np.float32) for r in rows}
     full = len(rows)
     out = {}
-    out["M1_engine_Z_vs_base"] = cmp_reads(R["Z"], R["base"], masks)
+    out["M1_engine_Z_vs_base"] = cmp_reads(R.get("Z", {}), R.get("base", {}), masks)   # a failed round leaves reads missing: counted, not a crash
     out["M2_old_vs_recorded"] = cmp_reads(old, rec, masks)
-    out["M2_old_vs_engine_base"] = cmp_reads(old, R["base"], masks)
+    out["M2_old_vs_engine_base"] = cmp_reads(old, R.get("base", {}), masks)
     for w in RT_ADAPTERS:
         out[f"M5_trainer_vs_engine_{w}"] = cmp_reads(R[f"trainer_{w}"], R.get(w, {}), masks)
     rep["compare"] = {k: {"rows": v[0], "equal": v[1], "differ": v[2]} for k, v in out.items()}

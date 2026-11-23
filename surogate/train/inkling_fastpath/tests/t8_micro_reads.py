@@ -18,7 +18,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 
-def post(url, path, body, timeout=3600):
+TIMEOUT_S = 300   # a 57k-token row scores in about 5-10 s on this build (pre-check: 11-14k tok/s at 11k); an adapter load takes seconds
+
+
+def post(url, path, body, timeout=TIMEOUT_S):
     req = urllib.request.Request(url + path, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         raw = r.read()
@@ -77,7 +80,9 @@ def main():
         model = a.model if name == "base" else name
         t0 = time.time()
         if name != "base":
-            post(a.url, "/v1/load_lora_adapter", {"lora_name": name, "lora_path": path}, timeout=900)
+            r = post(a.url, "/v1/load_lora_adapter", {"lora_name": name, "lora_path": path})
+            if not (isinstance(r, str) and "added successfully" in r):
+                raise SystemExit(f"load of {name} answered {str(r)[:200]!r}")
         res = {}
         try:
             for n in rows:
@@ -88,7 +93,9 @@ def main():
                 res[f"lp_{n}"] = out
         finally:
             if name != "base":
-                post(a.url, "/v1/unload_lora_adapter", {"lora_name": name}, timeout=900)
+                r = post(a.url, "/v1/unload_lora_adapter", {"lora_name": name})
+                if not (isinstance(r, str) and "removed successfully" in r):
+                    raise SystemExit(f"unload of {name} answered {str(r)[:200]!r}")
         tok = sum(Ts[n] for n in rows)
         np.savez(os.path.join(a.out, f"{name}.part{a.part}.npz"), **res)
         print(f"part {a.part} {name}: {len(rows)} rows, {tok} tokens, {time.time() - t0:.0f} s, {tok / max(time.time() - t0, 1e-9):.0f} tok/s", flush=True)

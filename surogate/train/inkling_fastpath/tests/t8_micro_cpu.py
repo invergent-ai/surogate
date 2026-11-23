@@ -209,7 +209,8 @@ def main():
             os.remove(os.path.join(rd, f))
         V = {"base": {n: MI.lp_at_mask(old[n], prow[n].loss_mask) for n in prow}, "U12": moved}
         write("base", V["base"], prow)
-        write("Z", V["base"], prow)
+        if drop != "Z":
+            write("Z", V["base"], prow)
         write("U12", moved, prow)
         for w in ("R12", "U4") + MI.ROUND2:
             if w != drop:
@@ -253,6 +254,10 @@ def main():
         assert rc != 0 and not rep[flag], (tag, rep)
     rc, rep = scenario("drop", drop="R12")
     assert rc != 0 and not rep["M6"], rep
+    open(os.path.join(run, "rounds.txt"), "w").write("r1 failed\n")      # round 1 died before Z: compare still writes a complete micro.json
+    rc, rep = scenario("r1 failed", drop="Z")
+    assert rc != 0 and not rep["M1"] and rep["rounds"] == {"r1": "failed"} and rep["compare"]["M1_engine_Z_vs_base"]["rows"] == 0, rep
+    open(os.path.join(run, "rounds.txt"), "w").write("r1 ran\nr2 ran\nr3 skipped_for_budget\n")
     rc, rep = scenario("drop2", drop="U12_after")               # round 2 is reported, not a line
     assert rc == 0 and rep["pass"] and not rep["reads_complete"]["U12_after"], rep
     rc, rep = scenario("partial", partial="U12_inside")           # a read on some rows only: parts kept, no reads/<X>.npz, recorded
