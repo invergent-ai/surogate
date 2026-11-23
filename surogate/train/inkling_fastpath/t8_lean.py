@@ -187,7 +187,8 @@ def forward_keep(eng, ids: torch.Tensor, adapters_per_layer, buffers: RowBuffers
 
 
 def backward_row(eng, W, ids, vals: dict, lora_host: list, scale: float, v_first: int, g_lp: torch.Tensor, buffers: RowBuffers,
-                 on_grad, head_grad=None, q_block: int | None = None, train_idx=(0, 1, 2, 3), attn_scale=None) -> None:
+                 on_grad, head_grad=None, q_block: int | None = None, train_idx=(0, 1, 2, 3), attn_scale=None,
+                 empty_host_each_visit: bool = False) -> None:
     """The reverse loop of ift_long.LongModel over visits >= v_first. g_lp [T - 1] = the seed on the per-target log-probs.
     lora_host: per physical layer {A13, B13, A2, B2} (fp32 values on the host). on_grad(v, layer, key index, gradient on the card)."""
     dev = g_lp.device
@@ -270,6 +271,8 @@ def backward_row(eng, W, ids, vals: dict, lora_host: list, scale: float, v_first
                     if gj is not None:
                         on_grad(v, vi.layer, j, gj.detach())
                 del gr, lt, leaves, lora
+                if empty_host_each_visit:  # S4 (b): the freed pinned blocks of this visit (other size classes than the next visit's) go back
+                    torch._C._host_emptyCache()
     finally:
         LG._q_block = saved_q_block
         LG.SINK_DUMMIES.clear()

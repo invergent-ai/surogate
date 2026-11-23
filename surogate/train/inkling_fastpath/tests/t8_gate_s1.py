@@ -13,6 +13,9 @@ a gradient. Real rows of 16,009 / 28,002 / 47,014 / 57,431 tokens (gate_rows.npz
       2026-11-23 12:3x before any run): at the zero adapter the workers' log-probs == the rollout's at EVERY loss token, counted separately over the
       final-reply tokens (1,505) and the rest: 0 mismatches in both; then one `ppo_batch` (1 mini-batch, plain head) on them completes, finite, with
       replay_checked_final_tokens == 1,505 and the stale gate on every row.
+  G17 (2 cards; the 4 gate rows 16k / 28k / 47k / 57k; written 2026-11-23 12:5x before any run): S4 (a) + (b), `lean_host`: one `compute`
+      (seeds "weights", K = 48, four expert keys, segment sums off) with lean_host off and on: gradients BITWISE equal on every tensor; host peak per
+      worker (VmHWM, the 57k row's worker) reported for both; tok/s for both (the per-visit pinned-pool emptying costs time).
 """
 from __future__ import annotations
 
@@ -201,9 +204,38 @@ def phase_g16(a, rows):
     return rep
 
 
+def phase_g17(a, rows):
+    from surogate.inkling_rl.step import StepConfig
+    import t8_step as TS
+
+    cards = tuple(int(x) for x in a.cards.split(","))
+    rep = {"runs": {}}
+    outs = {}
+    for lean in (False, True):
+        tr = TS.T8Trainer(TS.T8Config(bin_dir=a.bin, artifact=a.artifact, cards=cards, K=48, head="plain", max_row_tokens=58010, segment_keys=(),
+                                      train_keys=("A13", "B13", "A2", "B2"), run_dir=a.run_dir, lean_host=lean))
+        try:
+            tr.set_masters(nonzero_masters())
+            o = tr.compute(rows, None, StepConfig(max_policy_lag=None), seeds="weights")
+        finally:
+            tr.close()
+        outs[lean] = o.grads
+        rep["runs"][str(lean)] = {"tok_per_s_per_card": o.metrics["tok_per_s_per_card"], "wall_s": o.metrics["wall_s"],
+                                  "workers": [{"card": w["card"], "VmHWM_gib": w["VmHWM_gib"], "card_peak_torch_gib": w["card_peak_torch_gib"]} for w in o.metrics["workers"]],
+                                  "rows": [{"T": r["T"], "worker": r["worker"], "seconds": r["seconds"], "oom_retries": r["oom_retries"]} for r in o.rows]}
+        log(f"G17 lean_host={lean}: {rep['runs'][str(lean)]}")
+    bit = all(torch.equal(x, y) for x, y in zip(outs[False], outs[True]))
+    nz = sum(1 for x in outs[True] if bool(x.ne(0).any()))
+    rep["bitwise"] = bool(bit)
+    rep["nonzero_tensors"] = nz
+    rep["host_peak_gib"] = {k: max(w["VmHWM_gib"] for w in v["workers"]) for k, v in rep["runs"].items()}
+    rep["pass"] = bool(bit and nz > 0)
+    return rep
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--phase", required=True, choices=("g10", "g12", "g16"))
+    ap.add_argument("--phase", required=True, choices=("g10", "g12", "g16", "g17"))
     ap.add_argument("--bin", required=True)
     ap.add_argument("--artifact", required=True)
     ap.add_argument("--rows", required=True)
@@ -212,7 +244,7 @@ def main():
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     rows = GT.gate_rows(a.rows)
-    rep = {"g10": phase_g10, "g12": phase_g12, "g16": phase_g16}[a.phase](a, rows)
+    rep = {"g10": phase_g10, "g12": phase_g12, "g16": phase_g16, "g17": phase_g17}[a.phase](a, rows)
     json.dump(rep, open(a.out, "w"), indent=1, default=float)
     print(f"T8 GATE S1 {a.phase}: {'PASS' if rep['pass'] else 'FAIL'}", flush=True)
     return 0 if rep["pass"] else 4

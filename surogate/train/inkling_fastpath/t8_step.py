@@ -83,6 +83,9 @@ class T8Config:
     attn_alpha: float = 32.0        # scale alpha / rank (0.5 at rank 64)
     allow_lagged: bool = False      # False: a row sampled by another adapter version stops the step (its replay gate could not run)
     row_timeout_s: float = 3600.0   # a worker that answers no request for this long ends the step
+    lean_host: bool = False         # S4 (a) + (b): no per-row copy of a visited-once layer's gradient (added straight into the worker's sum; looped
+                                    # layers keep their per-row sum until their last visit: same additions in the same order, bitwise), and torch's
+                                    # pinned pool emptied after every visit. A row that runs out of card memory after its first add is NOT retried.
 
 
 def validate_config(cfg: T8Config) -> None:
@@ -93,6 +96,8 @@ def validate_config(cfg: T8Config) -> None:
         raise ValueError(f"attn_rank {cfg.attn_rank}: the engine's S10 kernels take ranks 1..64")
     if cfg.attn_rank and cfg.attn_alpha / cfg.attn_rank not in (0.125, 0.25, 0.5, 1.0, 2.0, 4.0):
         raise ValueError("attn_alpha / attn_rank must be a power of two (the store's bf16 fold is then exact)")
+    if cfg.lean_host and cfg.split_final:
+        raise ValueError("lean_host adds straight into the step's sum: with split_final the two parts would be added in another order")
     if cfg.attn_rank and not set(cfg.train_keys) & set(ATTN_KEYS):
         raise ValueError("attn_rank > 0 but no attention key in train_keys: the attention adapter would run at B = 0 for the whole run")
     if not cfg.train_keys or set(cfg.train_keys) - set(param_keys(cfg.attn_rank)):

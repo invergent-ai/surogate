@@ -161,27 +161,42 @@ class T8Worker(WorkerCore):
         g = g_lp.to(self.dev)
         head = None if sup is None else (lambda W, hid, tg, gg: RC.head_grad_centered(W, hid, gg, sup))
         retries = 0
+        lean = bool(self.cfg.lean_host)
+        if lean:  # the last visit (in the backward's reverse order: the smallest index) of each layer inside [v_first, 48)
+            last = {}
+            for v in range(self.v_first, len(self.eng.visits)):
+                L = self.eng.visits[v].layer
+                last[L] = min(last.get(L, v), v)
         while True:
             pg, ps = {}, {}
+            added = [False]
 
             def on_grad(v, layer, j, gj):
                 if (layer, j) not in self.layout.index:
                     return
+                if lean and not bool(torch.isfinite(gj).all()):
+                    raise T8GateError(f"FINITE GATE: T {row.T}: layer {layer} {self.layout.keys[j]} (visit {v}) holds non-finite values")
                 c = gj.float().cpu()
                 if j in self.seg_keys:
                     k = (part, self._segment_name(v), layer, self.layout.keys[j])
                     ps[k] = c.clone() if k not in ps else ps[k].add_(c)
                 pg[(layer, j)] = c if (layer, j) not in pg else pg[(layer, j)].add_(c)
+                if lean and v == last[layer]:  # the row's sum of this tensor is complete: into the worker's sum now, same addition as before
+                    self.layout.view(self.flat, layer, j).add_(pg.pop((layer, j)))
+                    added[0] = True
 
             oom = False
             try:
                 TL.backward_row(self.eng, self.W, ctx["ids"], ctx["res"], self.lora, B.ALPHA / B.RANK, self.v_first, g, self.buffers, on_grad,
-                                head_grad=head, q_block=ctx["qb"], train_idx=self.train_idx,
+                                head_grad=head, q_block=ctx["qb"], train_idx=self.train_idx, empty_host_each_visit=lean,
                                 attn_scale=(self.cfg.attn_alpha / self.cfg.attn_rank) if self.cfg.attn_rank else None)
             except torch.OutOfMemoryError:
                 oom = True
             if not oom:
                 return pg, ps, retries, ctx["qb"]
+            if added[0]:
+                raise RuntimeError(f"row of {row.T} tokens: out of card memory at query block {ctx['qb']} after part of its gradient was added "
+                                   "(lean_host): the row cannot be retried")
             # outside the except block: the traceback's frames no longer hold tensors
             pg, ps = None, None
             torch.cuda.empty_cache()
