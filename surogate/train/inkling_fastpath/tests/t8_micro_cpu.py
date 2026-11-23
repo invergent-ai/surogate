@@ -76,7 +76,7 @@ def main():
         "mask0": lambda z: z["mask_0"].__setitem__(0, True),
         "no loss": lambda z: z["mask_1"].__setitem__(slice(None), False),
         "split group": lambda z: z["group_idx"].__setitem__(0, 3),
-        "attempt in two groups": lambda z: (z["trial_idx"].__setitem__(1, 0)),
+        "attempt in two groups": lambda z: z["trial_idx"].__setitem__(3, 0),   # row 3 is in group 1, attempt 0 in group 0
         "positive lp": lambda z: z["lp_2"].__setitem__(np.flatnonzero(z["mask_2"])[0], 0.5),
     }
     for what, mut in bads.items():
