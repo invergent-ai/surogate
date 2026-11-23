@@ -83,9 +83,11 @@ class T8Config:
     attn_alpha: float = 32.0        # scale alpha / rank (0.5 at rank 64)
     allow_lagged: bool = False      # False: a row sampled by another adapter version stops the step (its replay gate could not run)
     row_timeout_s: float = 3600.0   # a worker that answers no request for this long ends the step
-    lean_host: bool = False         # S4 (a) + (b): no per-row copy of a visited-once layer's gradient (added straight into the worker's sum; looped
-                                    # layers keep their per-row sum until their last visit: same additions in the same order, bitwise), and torch's
-                                    # pinned pool emptied after every visit. A row that runs out of card memory after its first add is NOT retried.
+    lean_host: bool = False         # S4 (a): no per-row copy of a visited-once layer's gradient (added straight into the worker's sum; looped
+                                    # layers keep their per-row sum until their last visit: same additions in the same order, bitwise).
+                                    # A row that runs out of card memory after its first add is NOT retried: the step fails (STOP, masters restored).
+    empty_pinned_each_visit: bool = False  # S4 (b): torch's pinned pool emptied after every visit. G17 (g17-2): (a) + (b) together saved 1.1 GiB host
+                                    # per worker at 57k but cost 15 % tok/s (171 -> 146); off by default
 
 
 def validate_config(cfg: T8Config) -> None:
