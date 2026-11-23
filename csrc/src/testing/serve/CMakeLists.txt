@@ -200,6 +200,15 @@ sinfer_add_op_test(sinfer_ngram_ple_segments_test SOURCES ops/test_ngram_ple_seg
 # Inkling-2-Mini hidden-stream ops (ENGINE-INKLING lane e1): T1-T5 of lanes/e1/DESIGN-target.md 8.
 sinfer_add_op_test(sinfer_inkling_mix_test SOURCES targets/inkling2/test_inkling_mix.cpp LIBRARIES sinfer_ops)
 sinfer_add_op_test(sinfer_inkling_invariance_test SOURCES targets/inkling2/test_inkling_invariance.cpp LIBRARIES sinfer_ops)
+# Attention LoRA delta: the tiled shrink / expand kernels bit-identical to the original per-(token, slice) kernels
+# (kept in the test as the reference); `--bench` times both. -fmad=false as the op's own source.
+sinfer_add_op_test(sinfer_inkling_lora_tiled_test SOURCES targets/inkling2/test_inkling_lora_tiled.cu LIBRARIES sinfer_ops)
+set_source_files_properties(targets/inkling2/test_inkling_lora_tiled.cu
+  PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:-fmad=false>")
+# Expert LoRA shrink: the rank-group kernel bit-identical to the original one-warp-per-bank kernel (kept in the test).
+sinfer_add_op_test(sinfer_inkling_moe_lora_shrink_test SOURCES targets/inkling2/test_inkling_moe_lora_shrink.cu LIBRARIES sinfer_ops)
+set_source_files_properties(targets/inkling2/test_inkling_moe_lora_shrink.cu
+  PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>")
 # Lane e1: CUDA graph launch cost by graph shape (plain / PDL / memcpy nodes / split); a bench (exit 77 without a GPU).
 sinfer_add_test(sinfer_inkling_graph_launch_bench SOURCES targets/inkling2/bench_graph_launch.cu LIBRARIES CUDA::cudart)
 # Lane mx: critical-path cost of the mix ops in a decode-like PDL graph, reference vs latency-cut kernels (a bench).

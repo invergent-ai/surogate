@@ -809,19 +809,51 @@ __global__ __launch_bounds__(128) void combine_kernel(const __nv_bfloat16* __res
 }
 
 // ---------------------------------------------------------------------------------------------
-// LoRA shrink: a warp per (slot, bank); 16 ranks per pass; fixed per-lane k order and a fixed
-// butterfly, so a row's low vector never depends on the round.
-// ---------------------------------------------------------------------------------------------
+// The N rank chains of one lane of a LoRA shrink warp over its source row: acc[r] = fma chain over the lane's k
+// blocks (k = lane * 8 + 256 * i, ascending; within a block of 8 the even element, then the odd, of each word) of
+// A[r][k] * x[k], from 0. Every A load of a block is issued before its first multiply-add.
+template <int N>
+__device__ __forceinline__ void lora_shrink_chains(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* a,
+                                                   std::int32_t source_k, int lane, float* acc) {
+#pragma unroll 2
+    for (int k = lane * 8; k < source_k; k += 256) {
+        const uint4 xv = __ldcg(reinterpret_cast<const uint4*>(x + k)); // x / y rows through L2 (PDL audit)
+        const std::uint32_t xw[4] = {xv.x, xv.y, xv.z, xv.w};
+        uint4 av[N];
+#pragma unroll
+        for (int r = 0; r < N; ++r) {
+            av[r] = __ldca(reinterpret_cast<const uint4*>(a + static_cast<std::int64_t>(r) * source_k + k));
+        }
+#pragma unroll
+        for (int r = 0; r < N; ++r) {
+            const std::uint32_t aw[4] = {av[r].x, av[r].y, av[r].z, av[r].w};
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                acc[r] = __fmaf_rn(__uint_as_float(aw[i] << 16), __uint_as_float(xw[i] << 16), acc[r]);
+                acc[r] = __fmaf_rn(__uint_as_float(aw[i] & 0xFFFF0000U), __uint_as_float(xw[i] & 0xFFFF0000U),
+                                   acc[r]);
+            }
+        }
+    }
+}
+
+// LoRA shrink: a warp per (slot, bank, group of kLoraShrinkRanks ranks); fixed per-lane k order and a fixed
+// butterfly per rank, so a row's low vector never depends on the round (nor on how the ranks are split over warps:
+// every rank's chain is its own).
+constexpr int kLoraShrinkRanks = 4;
 __global__ __launch_bounds__(256) void lora_shrink_kernel(const __nv_bfloat16* __restrict__ source,
                                                           std::int32_t source_k, bool gate_up,
                                                           const std::int32_t* __restrict__ ids,
                                                           LiveTokens live, LoraRound lora) {
     pdl::wait_for_dependencies();
     pdl::trigger_dependents();
-    const int lane  = static_cast<int>(threadIdx.x) & 31;
-    const int banks = gate_up ? 2 : 1;
-    const int task  = static_cast<int>(blockIdx.x) * 8 + (static_cast<int>(threadIdx.x) >> 5);
-    const int index = task / banks;
+    const int lane   = static_cast<int>(threadIdx.x) & 31;
+    const int banks  = gate_up ? 2 : 1;
+    const int groups = max(1, (lora.rank + kLoraShrinkRanks - 1) / kLoraShrinkRanks);
+    const int warp   = static_cast<int>(blockIdx.x) * 8 + (static_cast<int>(threadIdx.x) >> 5);
+    const int task   = warp / groups;
+    const int group  = warp - task * groups;
+    const int index  = task / banks;
     const int bank_index = task - index * banks;
     if (index >= live.tokens * kTopK) { return; }
     const int token  = index / kTopK;
@@ -829,38 +861,29 @@ __global__ __launch_bounds__(256) void lora_shrink_kernel(const __nv_bfloat16* _
     if (expert < 0 || token >= live_count(live)) { return; }
     const int slot = lora_slot_of(lora, token);
     if (slot < 0) { return; }
-    const LoraBank& bank = lora_bank(lora, expert, gate_up ? bank_index : 2);
+    const LoraBank bank = lora_bank(lora, expert, gate_up ? bank_index : 2); // one read of the bank's fields
+    const int r0        = group * kLoraShrinkRanks;
+    if (r0 >= bank.rank) { return; }
     const __nv_bfloat16* x =
         source + static_cast<std::int64_t>(gate_up ? token : index) * source_k;
     const auto* a = static_cast<const __nv_bfloat16*>(bank.a) + static_cast<std::int64_t>(slot) * bank.a_stride;
     float* low    = lora.low + static_cast<std::int64_t>(index) * lora.low_stride + bank_index * bank.rank;
-    for (int r0 = 0; r0 < bank.rank; r0 += 16) {
-        float acc[16];
+    const int rank = bank.rank;
+    float acc[kLoraShrinkRanks];
 #pragma unroll
-        for (int r = 0; r < 16; ++r) { acc[r] = 0.0F; }
-        for (int k = lane * 8; k < source_k; k += 256) {
-            const uint4 xv = __ldcg(reinterpret_cast<const uint4*>(x + k)); // x / y rows through L2 (PDL audit)
-            const std::uint32_t xw[4] = {xv.x, xv.y, xv.z, xv.w};
+    for (int r = 0; r < kLoraShrinkRanks; ++r) { acc[r] = 0.0F; }
+    const __nv_bfloat16* rows = a + static_cast<std::int64_t>(r0) * source_k;
+    static_assert(kLoraShrinkRanks == 4, "the switch below covers 1..4 live ranks");
+    switch (min(kLoraShrinkRanks, rank - r0)) {
+    case 4: lora_shrink_chains<4>(x, rows, source_k, lane, acc); break;
+    case 3: lora_shrink_chains<3>(x, rows, source_k, lane, acc); break;
+    case 2: lora_shrink_chains<2>(x, rows, source_k, lane, acc); break;
+    default: lora_shrink_chains<1>(x, rows, source_k, lane, acc); break;
+    }
 #pragma unroll
-            for (int r = 0; r < 16; ++r) {
-                if (r0 + r < bank.rank) {
-                    const uint4 av = *reinterpret_cast<const uint4*>(
-                        a + static_cast<std::int64_t>(r0 + r) * source_k + k);
-                    const std::uint32_t aw[4] = {av.x, av.y, av.z, av.w};
-#pragma unroll
-                    for (int i = 0; i < 4; ++i) {
-                        acc[r] = __fmaf_rn(__uint_as_float(aw[i] << 16), __uint_as_float(xw[i] << 16), acc[r]);
-                        acc[r] = __fmaf_rn(__uint_as_float(aw[i] & 0xFFFF0000U),
-                                           __uint_as_float(xw[i] & 0xFFFF0000U), acc[r]);
-                    }
-                }
-            }
-        }
-#pragma unroll
-        for (int r = 0; r < 16; ++r) {
-            const float total = warp_sum(acc[r]);
-            if (lane == 0 && r0 + r < bank.rank) { low[r0 + r] = total; }
-        }
+    for (int r = 0; r < kLoraShrinkRanks; ++r) {
+        const float total = warp_sum(acc[r]);
+        if (lane == 0 && r0 + r < rank) { low[r0 + r] = total; }
     }
 }
 
@@ -1109,8 +1132,11 @@ void launch_combine(const __nv_bfloat16* down, const std::int32_t* ids, LiveToke
 void launch_lora_shrink(const __nv_bfloat16* source, std::int32_t source_k, bool gate_up,
                         const std::int32_t* ids, LiveTokens live, const LoraRound& lora,
                         cudaStream_t stream) {
-    const std::int64_t tasks = static_cast<std::int64_t>(live.tokens) * kTopK * (gate_up ? 2 : 1);
-    launch("lora shrink", dim3(static_cast<unsigned>((tasks + 7) / 8)), dim3(256), stream,
+    // The warps cover ranks [0, lora.rank): every expert bank's rank is at most lora.rank (the binding gives all banks of a
+    // table one rank, inkling_moe.cpp sizes low_stride from it), as the old one-warp-per-bank kernel's low layout assumed.
+    const std::int64_t groups = std::max<std::int64_t>(1, (lora.rank + kLoraShrinkRanks - 1) / kLoraShrinkRanks);
+    const std::int64_t warps  = static_cast<std::int64_t>(live.tokens) * kTopK * (gate_up ? 2 : 1) * groups;
+    launch("lora shrink", dim3(static_cast<unsigned>((warps + 7) / 8)), dim3(256), stream,
            lora_shrink_kernel, source, source_k, gate_up, ids, live, lora);
 }
 
