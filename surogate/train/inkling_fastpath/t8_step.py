@@ -23,6 +23,14 @@ from surogate.inkling_rl.records import Row, replay_rows
 from surogate.inkling_rl.step import StepConfig, behavior_weights_sequence, behavior_weights_token, drop_off_policy, mismatch
 
 LORA_KEYS = ("A13", "B13", "A2", "B2")
+# S3: S10 attention LoRA, per physical layer and slice (q, r, gate, sink, k, v of qkvr; o = wo_ud): A [R, k] and B [n, R]
+ATTN_SLICES = ("q", "r", "g", "s", "k", "v", "o")
+ATTN_KEYS = tuple(f"{s}{ab}" for s in ATTN_SLICES for ab in ("A", "B"))
+
+
+def param_keys(attn_rank: int) -> tuple:
+    """The per-layer key order of every flat layout, master list and gradient list (experts first, so j < 4 are the expert keys)."""
+    return LORA_KEYS + (ATTN_KEYS if attn_rank else ())
 # The code path is part of the gradient's definition: ift_long reads these at import, and its defaults are NOT the path the gates prove (review B1).
 # A0 = lane T's pre-lever stack, the one RX's census worker runs. The trainer sets them for its workers and every worker checks them after import.
 STACKS = {"A0": {"IFT_MOE_GM": "0", "IFT_MOE_DET": "0", "IFT_FAST_GEMM": "0", "IFT_ATTN_ADAPT": "0", "IFT_CHUNK": "1024", "IFT_MOE_FAST": "0",
@@ -71,6 +79,8 @@ class T8Config:
     visits: int = 48
     top_k: int = 8
     stack: str = "A0"               # the code path (STACKS); set for the workers and checked in each of them
+    attn_rank: int = 0              # S10 attention LoRA rank on the seven slices; 0 = none; 64 = the owner's choice (SkyRL: 128)
+    attn_alpha: float = 32.0        # scale alpha / rank (0.5 at rank 64)
     allow_lagged: bool = False      # False: a row sampled by another adapter version stops the step (its replay gate could not run)
     row_timeout_s: float = 3600.0   # a worker that answers no request for this long ends the step
 
@@ -79,7 +89,11 @@ def validate_config(cfg: T8Config) -> None:
     """A misspelt option must not silently change the estimator (review M3)."""
     if cfg.head not in ("centred", "plain"):
         raise ValueError(f'head {cfg.head!r}: "centred" or "plain"')
-    if not cfg.train_keys or set(cfg.train_keys) - set(LORA_KEYS):
+    if cfg.attn_rank and not (1 <= int(cfg.attn_rank) <= 64):
+        raise ValueError(f"attn_rank {cfg.attn_rank}: the engine's S10 kernels take ranks 1..64")
+    if cfg.attn_rank and cfg.attn_alpha / cfg.attn_rank not in (0.125, 0.25, 0.5, 1.0, 2.0, 4.0):
+        raise ValueError("attn_alpha / attn_rank must be a power of two (the store's bf16 fold is then exact)")
+    if not cfg.train_keys or set(cfg.train_keys) - set(param_keys(cfg.attn_rank)):
         raise ValueError(f"train_keys {cfg.train_keys!r}")
     if set(cfg.segment_keys) - set(cfg.train_keys):
         raise ValueError(f"segment_keys {cfg.segment_keys!r} must be among train_keys {cfg.train_keys!r}")
@@ -182,9 +196,10 @@ class ParamLayout:
 
     def __init__(self, shapes: list, layers, keys):
         self.index = {}
+        self.keys = tuple(shapes[0])
         off = 0
         for L in layers:
-            for j, k in enumerate(LORA_KEYS):
+            for j, k in enumerate(self.keys):
                 if k in keys:
                     n = int(np.prod(shapes[L][k]))
                     self.index[(L, j)] = (off, n, tuple(shapes[L][k]))
@@ -206,7 +221,7 @@ class WorkerCore:
 
     def setup_sums(self, layout: ParamLayout, flat: torch.Tensor, cfg: T8Config):
         self.layout, self.flat, self.cfg = layout, flat, cfg
-        self.seg_keys = {LORA_KEYS.index(k) for k in cfg.segment_keys}
+        self.seg_keys = {layout.keys.index(k) for k in cfg.segment_keys}
         self.seg_acc = {}
 
     def begin_step(self):
@@ -317,7 +332,7 @@ class WorkerCore:
                 row_seg[k] = t if k not in row_seg else row_seg[k].add_(t)
         for (L, j), t in row_grad.items():
             if not bool(torch.isfinite(t).all()):
-                raise T8GateError(f"FINITE GATE: row {i} (T {T}): layer {L} {LORA_KEYS[j]} holds non-finite values")
+                raise T8GateError(f"FINITE GATE: row {i} (T {T}): layer {L} {self.layout.keys[j]} holds non-finite values")
             self.layout.view(self.flat, L, j).add_(t)
         for k, t in row_seg.items():
             self.seg_acc[k] = t if k not in self.seg_acc else self.seg_acc[k].add_(t)
@@ -523,7 +538,7 @@ def compute_step(handles: list, layout: ParamLayout, flats: list, shapes: list, 
     total = sum_flats(flats)
     grads = []
     for L, sh in enumerate(shapes):
-        for j, k in enumerate(LORA_KEYS):
+        for j, k in enumerate(layout.keys):
             if (L, j) in layout.index:
                 grads.append(layout.view(total, L, j).clone())
             else:
@@ -578,15 +593,23 @@ class T8Trainer:
         validate_config(cfg)
         physical = self._physical_cards(cfg.cards)
         self.cfg, self.B = cfg, B
-        self.shapes = TW.param_shapes()
-        n_all = sum(int(np.prod(s[k])) for s in self.shapes for k in LORA_KEYS)
+        self.shapes = TW.param_shapes(cfg.attn_rank)
+        self.keys = tuple(self.shapes[0])
+        n_all = sum(int(np.prod(s[k])) for s in self.shapes for k in self.keys)
         self.work_flat = torch.empty(n_all, dtype=torch.float32).share_memory_()
         self.work_layers = TW.work_views(self.work_flat, self.shapes)
         init = B.make_lora("cpu", seed=cfg.lora_seed, b_std=0.0)
         for d, lo in zip(self.work_layers, init):
             for k in LORA_KEYS:
                 d[k].copy_(lo[k].detach())
-        self.work = [torch.nn.Parameter(d[k], requires_grad=True) for d in self.work_layers for k in LORA_KEYS]
+        if cfg.attn_rank:  # SkyRL: A kaiming-uniform (a = sqrt(5): U(+-1 / sqrt(fan_in))), B zero; own generator
+            g = torch.Generator().manual_seed(int(cfg.lora_seed) + 1000)
+            for d in self.work_layers:
+                for s in ATTN_SLICES:
+                    A = d[f"{s}A"]
+                    A.copy_((torch.rand(A.shape, generator=g) * 2 - 1) / float(A.shape[1]) ** 0.5)
+                    d[f"{s}B"].zero_()
+        self.work = [torch.nn.Parameter(d[k], requires_grad=True) for d in self.work_layers for k in self.keys]
         self.opt = MasterAdamW(self.work, lr=5e-5, weight_decay=0.0, max_grad_norm=1.0)  # masters = the exact init; work = bf16(master)
         v_first = cfg.visits - int(cfg.K)
         visits = [SimpleVisit(v) for v in range(cfg.visits)]
@@ -647,15 +670,15 @@ class T8Trainer:
         """The current fp32 masters in the rig layout (copies)."""
         out, i = [], 0
         for _ in self.shapes:
-            out.append({k: self.opt.masters[i + j].detach().clone() for j, k in enumerate(LORA_KEYS)})
-            i += len(LORA_KEYS)
+            out.append({k: self.opt.masters[i + j].detach().clone() for j, k in enumerate(self.keys)})
+            i += len(self.keys)
         return out
 
     def set_masters(self, layers: list) -> None:
         i = 0
         with torch.no_grad():
             for d in layers:
-                for k in LORA_KEYS:
+                for k in self.keys:
                     self.opt.masters[i].copy_(torch.as_tensor(np.asarray(d[k]), dtype=torch.float32))
                     i += 1
         self.opt.sync_work()

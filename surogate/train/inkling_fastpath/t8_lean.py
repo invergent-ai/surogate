@@ -17,6 +17,7 @@ import ift_backward as B
 import ift_forward as F
 import ift_long as LG
 import ift_ref as RA
+import t8_visit as TV
 from ift_engine import Segment
 
 D, EPS = B.D, B.EPS
@@ -186,7 +187,7 @@ def forward_keep(eng, ids: torch.Tensor, adapters_per_layer, buffers: RowBuffers
 
 
 def backward_row(eng, W, ids, vals: dict, lora_host: list, scale: float, v_first: int, g_lp: torch.Tensor, buffers: RowBuffers,
-                 on_grad, head_grad=None, q_block: int | None = None, train_idx=(0, 1, 2, 3)) -> None:
+                 on_grad, head_grad=None, q_block: int | None = None, train_idx=(0, 1, 2, 3), attn_scale=None) -> None:
     """The reverse loop of ift_long.LongModel over visits >= v_first. g_lp [T - 1] = the seed on the per-target log-probs.
     lora_host: per physical layer {A13, B13, A2, B2} (fp32 values on the host). on_grad(v, layer, key index, gradient on the card)."""
     dev = g_lp.device
@@ -244,16 +245,20 @@ def backward_row(eng, W, ids, vals: dict, lora_host: list, scale: float, v_first
                     continue
                 ps = prod[v]
                 lo = lora_host[vi.layer]
-                lt = [lo[k].to(dev) for k in B.LORA_KEYS]
+                keys = [k for k in lo if k != "scale"]          # the layer's key order: the 4 expert keys, then the attention keys (S3)
+                lt = [lo[k].to(dev) for k in keys]
                 n = len(vi.stack)
                 sinks = [sink_for(p, v - 1) for p in ps]
                 with torch.enable_grad(), torch.device(dev):
                     ins = [torch.zeros(1, dtype=F32, device=dev).expand(T, D) for _ in ps]
                     leaves = [t.detach().requires_grad_(j in train_idx) for j, t in enumerate(lt)]  # keys not trained: no vjp
                     want = [t for t in leaves if t.requires_grad]
-                    lora = dict(zip(B.LORA_KEYS, leaves)) | {"scale": scale}
+                    lora = dict(zip(keys, leaves)) | {"scale": scale}
+                    if attn_scale is not None:
+                        lora["attn"] = {s: (lora[f"{s}A"], lora[f"{s}B"]) for s in TV.ATTN_SLICES}
+                        lora["attn_scale"] = attn_scale
                     LG.SINK_DUMMIES.clear()
-                    out = LG.visit_torch_long(W, vi, ins[:n], ins[n], (ins[n + 1], ins[n + 2]) if vi.looped else None,
+                    out = TV.visit_torch_t8(W, vi, ins[:n], ins[n], (ins[n + 1], ins[n + 2]) if vi.looped else None,
                                               vals["routing"][v], lora, act_vals=[host_vals[p] for p in ps], act_sinks=sinks)
                     with B._tick("bwd.autograd"):
                         got = torch.autograd.grad(out, want + list(LG.SINK_DUMMIES), g_out, allow_unused=True)

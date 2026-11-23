@@ -8,18 +8,31 @@ import numpy as np
 import torch
 
 import ift_backward as B
+import ift_engine as E
 import ift_forward as F
 import t8_center as RC
 import t8_lean as TL
 from ift_engine import InklingEngine
-from t8_step import LORA_KEYS, ParamLayout, T8Config, T8GateError, WorkerCore, serve, verify_stack
+from t8_engine import AttnAdapters, T8Engine
+from t8_step import ATTN_SLICES, LORA_KEYS, ParamLayout, T8Config, T8GateError, WorkerCore, param_keys, serve, verify_stack
+
+# rows n and input width k of each S10 slice (targets/inkling2/impl/lora_attention.h; wo_ud [2304, 3072])
+SLICE_DIMS = {"q": (3072, 2304), "r": (384, 2304), "g": (3072, 2304), "s": (24, 2304), "k": (1024, 2304), "v": (1024, 2304), "o": (2304, 3072)}
 
 GIB = 2 ** 30
 
 
-def param_shapes() -> list:
-    """Per physical layer {key: shape} of the expert LoRA (the layout of ift_backward.make_lora)."""
-    return [{"A13": (B.E, B.RANK, B.D), "B13": (B.E, 2 * B.I, B.RANK), "A2": (B.E, B.RANK, B.I), "B2": (B.E, B.D, B.RANK)} for _ in range(24)]
+def param_shapes(attn_rank: int = 0) -> list:
+    """Per physical layer {key: shape}: the expert LoRA (the layout of ift_backward.make_lora), then the S10 attention LoRA if attn_rank."""
+    out = []
+    for _ in range(24):
+        d = {"A13": (B.E, B.RANK, B.D), "B13": (B.E, 2 * B.I, B.RANK), "A2": (B.E, B.RANK, B.I), "B2": (B.E, B.D, B.RANK)}
+        if attn_rank:
+            for s in ATTN_SLICES:
+                n, k = SLICE_DIMS[s]
+                d[f"{s}A"], d[f"{s}B"] = (attn_rank, k), (n, attn_rank)
+        out.append(d)
+    return out
 
 
 def work_views(flat: torch.Tensor, shapes: list) -> list:
@@ -27,7 +40,7 @@ def work_views(flat: torch.Tensor, shapes: list) -> list:
     out, off = [], 0
     for sh in shapes:
         d = {}
-        for k in LORA_KEYS:
+        for k in sh:
             n = int(np.prod(sh[k]))
             d[k] = flat[off:off + n].view(sh[k])
             off += n
@@ -39,7 +52,7 @@ class T8Worker(WorkerCore):
     def __init__(self, cfg: T8Config, work_flat: torch.Tensor, sum_flat: torch.Tensor, shapes: list, layout_layers: list, card: int = -1):
         self.stack_flags = verify_stack(cfg.stack)            # before anything runs: the path the gates proved
         self.card = card
-        self.eng = InklingEngine(cfg.bin_dir, cfg.artifact, 0)
+        self.eng = T8Engine(cfg.bin_dir, cfg.artifact, 0) if cfg.attn_rank else InklingEngine(cfg.bin_dir, cfg.artifact, 0)
         self.dev = self.eng.dev
         self.W = B.EngineWeights(self.eng)
         self.v_first = len(self.eng.visits) - int(cfg.K)
@@ -47,8 +60,11 @@ class T8Worker(WorkerCore):
             raise ValueError(f"K = {cfg.K}")
         self.lora = work_views(work_flat, shapes)
         self.banks = B.EngineBanks(self.lora, self.dev)
+        self.attn = AttnBanks(self.lora, self.dev, cfg.attn_rank, cfg.attn_alpha) if cfg.attn_rank else None
+        if self.attn is not None:
+            self.eng.attn_layers = self.attn.adapters
         self.buffers = None
-        self.train_idx = tuple(j for j, k in enumerate(LORA_KEYS) if k in cfg.train_keys)
+        self.train_idx = tuple(j for j, k in enumerate(param_keys(cfg.attn_rank)) if k in cfg.train_keys)
         self.setup_sums(ParamLayout(shapes, layout_layers, cfg.train_keys), sum_flat, cfg)
 
     def begin_step(self):
@@ -58,6 +74,8 @@ class T8Worker(WorkerCore):
     # ------------------------------------------------------------------ adapter
     def refresh(self):
         self.banks.refresh(self.lora)
+        if self.attn is not None:
+            self.attn.refresh(self.lora)
         torch.cuda.current_stream(self.eng.device).synchronize()
 
     def _adapters(self):
@@ -72,9 +90,18 @@ class T8Worker(WorkerCore):
         for lo in self.lora:
             if bool(lo["B13"].ne(0).any()) or bool(lo["B2"].ne(0).any()):
                 raise T8GateError("zero-adapter check: the current masters have B != 0")
+        for lo in self.lora:
+            for s in (ATTN_SLICES if self.attn is not None else ()):
+                if bool(lo[f"{s}B"].ne(0).any()):
+                    raise T8GateError(f"zero-adapter check: attention slice {s} has B != 0")
         ids = self._ids(row)
         with torch.no_grad():
-            a = F.forward(self.eng, ids, save=False, adapters_per_layer=None)
+            saved, self.eng.attn_layers = getattr(self.eng, "attn_layers", None), None   # the base: no adapter of either kind
+            try:
+                a = F.forward(self.eng, ids, save=False, adapters_per_layer=None)
+            finally:
+                if self.attn is not None:
+                    self.eng.attn_layers = saved
             la = F.logprobs(self.eng, a["hidden"], ids)
             b = F.forward(self.eng, ids, save=False, adapters_per_layer=self._adapters())
             lb = F.logprobs(self.eng, b["hidden"], ids)
@@ -142,14 +169,15 @@ class T8Worker(WorkerCore):
                     return
                 c = gj.float().cpu()
                 if j in self.seg_keys:
-                    k = (part, self._segment_name(v), layer, LORA_KEYS[j])
+                    k = (part, self._segment_name(v), layer, self.layout.keys[j])
                     ps[k] = c.clone() if k not in ps else ps[k].add_(c)
                 pg[(layer, j)] = c if (layer, j) not in pg else pg[(layer, j)].add_(c)
 
             oom = False
             try:
                 TL.backward_row(self.eng, self.W, ctx["ids"], ctx["res"], self.lora, B.ALPHA / B.RANK, self.v_first, g, self.buffers, on_grad,
-                                head_grad=head, q_block=ctx["qb"], train_idx=self.train_idx)
+                                head_grad=head, q_block=ctx["qb"], train_idx=self.train_idx,
+                                attn_scale=(self.cfg.attn_alpha / self.cfg.attn_rank) if self.cfg.attn_rank else None)
             except torch.OutOfMemoryError:
                 oom = True
             if not oom:
@@ -188,6 +216,41 @@ class T8Worker(WorkerCore):
             self.buffers.close()
             self.buffers = None
         self.eng.close()
+
+
+class AttnBanks:
+    """The S10 bank tables of every physical layer for ONE slot (slot 0): qkvr = 6 LoraBank (kQkvrLoraSlices order), wo_ud = 1, built with the
+    store's fold: a = bf16(bf16(A) x alpha / r), b = bf16(B) (ops/lora_store set_slot). Rebuild after every optimizer step (refresh)."""
+
+    def __init__(self, lora, device, rank: int, alpha: float):
+        self.rank, self.scale = int(rank), float(alpha) / float(rank)
+        self.slot = torch.zeros(4, dtype=torch.int32, device=device)
+        self.layers, self.adapters = [], []
+        for lo in lora:
+            st, tabs = {}, {}
+            for group, slices in (("qkvr", ATTN_SLICES[:6]), ("wo", ("o",))):
+                table = (E.LoraBank * len(slices))()
+                for i, s in enumerate(slices):
+                    n, k = SLICE_DIMS[s]
+                    st[s] = (torch.empty(self.rank, k, dtype=torch.bfloat16, device=device), torch.empty(n, self.rank, dtype=torch.bfloat16, device=device))
+                    bank = table[i]
+                    bank.a, bank.b = st[s][0].data_ptr(), st[s][1].data_ptr()
+                    bank.a_stride, bank.b_stride = self.rank * k, n * self.rank
+                    bank.rank, bank.n, bank.k = self.rank, n, k
+                tabs[group] = torch.frombuffer(bytearray(bytes(table)), dtype=torch.uint8).to(device)
+            ad = AttnAdapters()
+            ad.qkvr_table, ad.wo_table = tabs["qkvr"].data_ptr(), tabs["wo"].data_ptr()
+            ad.uniform_slot, ad.rank = self.slot.data_ptr(), self.rank
+            self.layers.append({"store": st, "tables": tabs})
+            self.adapters.append(ad)
+        self.refresh(lora)
+
+    @torch.no_grad()
+    def refresh(self, lora):
+        for lo, L in zip(lora, self.layers):
+            for s, (a, b) in L["store"].items():
+                a.copy_((lo[f"{s}A"].detach().to(torch.bfloat16).float() * self.scale).to(torch.bfloat16))
+                b.copy_(lo[f"{s}B"].detach().to(torch.bfloat16))
 
 
 def worker_main(conn, cfg, work_flat, sum_flat, shapes, layers, card=-1):
