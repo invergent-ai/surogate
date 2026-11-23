@@ -1,7 +1,7 @@
 #pragma once
 
 // Implements: include/sinfer/ops/sampling.h
-// Match: contiguous BF16 logits, physical stride >= token domain, and at most
+// Match: contiguous BF16 or FP32 logits, physical stride >= token domain, and at most
 // sixteen columns on the multi-block route.
 // Algorithm assumptions: 256-thread/2-item partial tiles feed bounded top-20
 // group merges through caller-owned workspace; unsupported finite geometries
@@ -29,8 +29,9 @@ namespace sinfer::ops {
 /// and are served by the candidate routes, which skip these rows in turn. Exactly
 /// one route writes each column, so neither the token counts nor the output is
 /// touched twice.
+template <typename LogitT>
 __global__ void sampling_update_greedy_targets_kernel(
-    const __nv_bfloat16* logits, std::int32_t* targets, const SamplingConfig* configs,
+    const LogitT* logits, std::int32_t* targets, const SamplingConfig* configs,
     int domain, int physical_rows, int width) {
     const int col = blockIdx.x;
     const int row = blockIdx.y;
@@ -41,7 +42,7 @@ __global__ void sampling_update_greedy_targets_kernel(
     const auto base = (static_cast<std::int64_t>(row) * width + col) * physical_rows;
     for (int v = threadIdx.x; v < domain; v += blockDim.x) {
         if (sampling_suppressed(cfg, v, col)) { continue; }
-        const float value = __bfloat162float(logits[base + v]) +
+        const float value = logit_value(logits[base + v]) +
                             (cfg.logit_bias != nullptr ? cfg.logit_bias[v] : 0.0F);
         const auto key = sampling_sort_key(value, v);
         if (key > best) { best = key; }
@@ -50,8 +51,9 @@ __global__ void sampling_update_greedy_targets_kernel(
     if (threadIdx.x == 0) { targets[row * width + col] = sampling_key_index(best); }
 }
 
+template <typename LogitT>
 __launch_bounds__(kSamplerBlock) __global__
-    void sampling_full_vocab_kernel(const __nv_bfloat16* logits, std::int32_t* out,
+    void sampling_full_vocab_kernel(const LogitT* logits, std::int32_t* out,
                                     const SamplingConfig* configs,
                                     const std::int32_t* logical_positions, std::int32_t purpose,
                                     std::int32_t token_domain, std::int32_t physical_rows) {
@@ -77,7 +79,7 @@ __launch_bounds__(kSamplerBlock) __global__
         float local = -CUDART_INF_F;
         for (int v = tid; v < token_domain; v += kSamplerBlock) {
             local = fmaxf(local,
-                          sampling_adjusted_logit(__bfloat162float(logits[base + v]), v, cfg) *
+                          sampling_adjusted_logit(logit_value(logits[base + v]), v, cfg) *
                               inv_temp);
         }
         red_val[tid] = local;
@@ -94,7 +96,7 @@ __launch_bounds__(kSamplerBlock) __global__
     int best_v = INT_MAX;
     for (int v = tid; v < token_domain; v += kSamplerBlock) {
         const float x =
-            sampling_adjusted_logit(__bfloat162float(logits[base + v]), v, cfg) * inv_temp;
+            sampling_adjusted_logit(logit_value(logits[base + v]), v, cfg) * inv_temp;
         if (x < floor_value) { continue; }
         const float z = x + sampling_gumbel(cfg.seed, position, key.purpose, static_cast<unsigned>(v));
         if (sampling_better(z, v, best, best_v)) {
@@ -122,8 +124,164 @@ __launch_bounds__(kSamplerBlock) __global__
     }
 }
 
+// The same draw in two launches (agent-EN GO 15:3x, S1; lane c): sampling_full_vocab_kernel walks a
+// 201k-token row with one CTA (~230 us a step at any batch). Here each row is cut into
+// kSamplerFullVocabChunkItems-token chunks, one CTA each; the per-token expression is the
+// kernel's above verbatim, and the winner is the argmax under the same strict total order
+// (sampling_better: higher z, then lower id; a NaN z never wins), which does not depend on how
+// the row is partitioned -- so the token is the one sampling_full_vocab_kernel draws. A min_p row
+// needs the row maximum first: its chunks write their maxima, and the finalize kernel takes the
+// floor from them (an exact max) and runs the single-CTA pass above for that row. No atomics
+// besides the token count, no counters.
+//
+// `no_floor` is -INFINITY from the host: the per-token loop compares against it exactly as the
+// kernel above compares against its run-time floor, so the compiler sees the same expression
+// (x is used twice) and emits the same arithmetic (checked on the SASS).
+template <typename LogitT>
 __launch_bounds__(kSamplerBlock) __global__
-    void sample_row_kernel(const __nv_bfloat16* logits, std::int32_t* out,
+    void sampling_full_vocab_partial_kernel(const LogitT* logits, const SamplingConfig* configs,
+                                            const std::int32_t* logical_positions,
+                                            std::int32_t purpose, std::int32_t token_domain,
+                                            std::int32_t physical_rows, float2* partials,
+                                            std::int32_t chunks, float no_floor) {
+    const int chunk          = static_cast<int>(blockIdx.x);
+    const int col            = static_cast<int>(blockIdx.y);
+    const SamplingConfig cfg = configs[col];
+    if (!sampling_untruncated(cfg)) { return; }
+
+    const std::int64_t base = static_cast<std::int64_t>(col) * physical_rows;
+    const int tid           = static_cast<int>(threadIdx.x);
+    const float inv_temp    = 1.0f / cfg.temperature;
+    const SampleKey key     = sample_key(cfg, logical_positions[col], purpose);
+    const int position      = key.position;
+    const int begin         = chunk * kSamplerFullVocabChunkItems;
+    const int end           = min(token_domain, begin + kSamplerFullVocabChunkItems);
+
+    __shared__ float red_val[kSamplerBlock];
+    __shared__ int red_idx[kSamplerBlock];
+
+    if (cfg.min_p > 0.0f) {
+        float local = -CUDART_INF_F;
+        for (int v = begin + tid; v < end; v += kSamplerBlock) {
+            local = fmaxf(local,
+                          sampling_adjusted_logit(logit_value(logits[base + v]), v, cfg) *
+                              inv_temp);
+        }
+        red_val[tid] = local;
+        __syncthreads();
+        for (int s = kSamplerBlock / 2; s > 0; s >>= 1) {
+            if (tid < s) { red_val[tid] = fmaxf(red_val[tid], red_val[tid + s]); }
+            __syncthreads();
+        }
+        if (tid == 0) { partials[static_cast<std::int64_t>(col) * chunks + chunk] = make_float2(red_val[0], 0.0f); }
+        return;
+    }
+
+    const float floor_value = no_floor;
+    float best = -CUDART_INF_F;
+    int best_v = INT_MAX;
+    for (int v = begin + tid; v < end; v += kSamplerBlock) {
+        const float x =
+            sampling_adjusted_logit(logit_value(logits[base + v]), v, cfg) * inv_temp;
+        if (x < floor_value) { continue; }
+        const float z = x + sampling_gumbel(cfg.seed, position, key.purpose, static_cast<unsigned>(v));
+        if (sampling_better(z, v, best, best_v)) {
+            best   = z;
+            best_v = v;
+        }
+    }
+    red_val[tid] = best;
+    red_idx[tid] = best_v;
+    __syncthreads();
+    for (int s = kSamplerBlock / 2; s > 0; s >>= 1) {
+        if (tid < s &&
+            sampling_better(red_val[tid + s], red_idx[tid + s], red_val[tid], red_idx[tid])) {
+            red_val[tid] = red_val[tid + s];
+            red_idx[tid] = red_idx[tid + s];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        partials[static_cast<std::int64_t>(col) * chunks + chunk] = make_float2(red_val[0], __int_as_float(red_idx[0]));
+    }
+}
+
+template <typename LogitT>
+__launch_bounds__(kSamplerBlock) __global__
+    void sampling_full_vocab_finalize_kernel(const LogitT* logits, std::int32_t* out,
+                                             const SamplingConfig* configs,
+                                             const std::int32_t* logical_positions,
+                                             std::int32_t purpose, std::int32_t token_domain,
+                                             std::int32_t physical_rows, const float2* partials,
+                                             std::int32_t chunks) {
+    const int col            = static_cast<int>(blockIdx.x);
+    const SamplingConfig cfg = configs[col];
+    if (!sampling_untruncated(cfg)) { return; }
+    const int tid       = static_cast<int>(threadIdx.x);
+    const float2* parts = partials + static_cast<std::int64_t>(col) * chunks;
+
+    __shared__ float red_val[kSamplerBlock];
+    __shared__ int red_idx[kSamplerBlock];
+
+    float best = -CUDART_INF_F;
+    int best_v = INT_MAX;
+    if (cfg.min_p > 0.0f) {
+        // The row maximum from the chunk maxima, then sampling_full_vocab_kernel's pass.
+        const std::int64_t base = static_cast<std::int64_t>(col) * physical_rows;
+        const float inv_temp    = 1.0f / cfg.temperature;
+        const SampleKey key     = sample_key(cfg, logical_positions[col], purpose);
+        const int position      = key.position;
+        float local = -CUDART_INF_F;
+        for (int c = tid; c < chunks; c += kSamplerBlock) { local = fmaxf(local, parts[c].x); }
+        red_val[tid] = local;
+        __syncthreads();
+        for (int s = kSamplerBlock / 2; s > 0; s >>= 1) {
+            if (tid < s) { red_val[tid] = fmaxf(red_val[tid], red_val[tid + s]); }
+            __syncthreads();
+        }
+        const float floor_value = red_val[0] + __logf(cfg.min_p);
+        __syncthreads();
+        for (int v = tid; v < token_domain; v += kSamplerBlock) {
+            const float x =
+                sampling_adjusted_logit(logit_value(logits[base + v]), v, cfg) * inv_temp;
+            if (x < floor_value) { continue; }
+            const float z = x + sampling_gumbel(cfg.seed, position, key.purpose, static_cast<unsigned>(v));
+            if (sampling_better(z, v, best, best_v)) {
+                best   = z;
+                best_v = v;
+            }
+        }
+    } else {
+        for (int c = tid; c < chunks; c += kSamplerBlock) {
+            const float2 pc = parts[c];
+            const int v     = __float_as_int(pc.y);
+            if (sampling_better(pc.x, v, best, best_v)) {
+                best   = pc.x;
+                best_v = v;
+            }
+        }
+    }
+    red_val[tid] = best;
+    red_idx[tid] = best_v;
+    __syncthreads();
+    for (int s = kSamplerBlock / 2; s > 0; s >>= 1) {
+        if (tid < s &&
+            sampling_better(red_val[tid + s], red_idx[tid + s], red_val[tid], red_idx[tid])) {
+            red_val[tid] = red_val[tid + s];
+            red_idx[tid] = red_idx[tid + s];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        const int picked = red_idx[0] == INT_MAX ? 0 : red_idx[0];
+        out[col]         = picked;
+        if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
+    }
+}
+
+template <typename LogitT>
+__launch_bounds__(kSamplerBlock) __global__
+    void sample_row_kernel(const LogitT* logits, std::int32_t* out,
                            const SamplingConfig* configs, const std::int32_t* logical_positions,
                            std::int32_t purpose, std::int32_t token_domain,
                            std::int32_t physical_rows) {
@@ -141,7 +299,7 @@ __launch_bounds__(kSamplerBlock) __global__
         int bi   = INT_MAX;
         for (int v = tid; v < token_domain; v += blockDim.x) {
             if (sampling_suppressed(cfg, v)) { continue; }
-            const float x = __bfloat162float(logits[base + v]) +
+            const float x = logit_value(logits[base + v]) +
                             (cfg.logit_bias != nullptr ? cfg.logit_bias[v] : 0.0F);
             if (sampling_better(x, v, bv, bi)) {
                 bv = x;
@@ -220,8 +378,12 @@ __launch_bounds__(kSamplerBlock) __global__
 ///
 /// Launched after sampling_partial_topk_kernel, whose first CTA zeroes the row's
 /// group_done counter; the last CTA here zeroes it again for the next call.
+///
+/// FP32 rows take the same 16-byte loads, four logits each, with twice the loads in
+/// flight so a chunk is still kSamplerGreedyChunkItems tokens.
+template <typename LogitT>
 __launch_bounds__(kSamplerBlock) __global__
-    void sampling_greedy_kernel(const __nv_bfloat16* logits, std::int32_t* out,
+    void sampling_greedy_kernel(const LogitT* logits, std::int32_t* out,
                                 const SamplingConfig* cfg_ptr, std::int32_t token_domain,
                                 std::int32_t physical_rows, std::int32_t chunks,
                                 SamplingWorkspace workspace) {
@@ -230,14 +392,16 @@ __launch_bounds__(kSamplerBlock) __global__
     __shared__ unsigned long long warp_keys[kSamplerBlock / 32];
     __shared__ int is_last;
 
-    const __nv_bfloat16* row = logits + static_cast<std::int64_t>(col) * physical_rows;
+    const LogitT* row        = logits + static_cast<std::int64_t>(col) * physical_rows;
     const int begin          = chunk * kSamplerGreedyChunkItems;
     const int end            = min(token_domain, begin + kSamplerGreedyChunkItems);
     // The chunk is requested before the row's config arrives, so the two latencies
     // overlap; a stochastic row's CTA reads its chunk for nothing, from L2, where the
     // head just left it. The config's few fields are read through a reference.
-    constexpr int kVector = 8;
+    constexpr int kVector = static_cast<int>(sizeof(uint4) / sizeof(LogitT));
     constexpr int kUnroll = kSamplerGreedyChunkItems / (kSamplerBlock * kVector);
+    static_assert(kSamplerGreedyChunkItems % (kSamplerBlock * kVector) == 0,
+                  "a greedy chunk is a whole number of vector steps");
     const bool aligned    = (reinterpret_cast<std::uintptr_t>(row + begin) & 15u) == 0;
     const int vector_end  = aligned ? begin + (end - begin) / kVector * kVector : begin;
     uint4 packed[kUnroll];
@@ -257,11 +421,11 @@ __launch_bounds__(kSamplerBlock) __global__
         for (int step = 0; step < kUnroll; ++step) {
             const int v = begin + (step * kSamplerBlock + static_cast<int>(threadIdx.x)) * kVector;
             if (v < vector_end) {
-                const auto* values = reinterpret_cast<const __nv_bfloat16*>(&packed[step]);
+                const auto* values = reinterpret_cast<const LogitT*>(&packed[step]);
 #pragma unroll
                 for (int i = 0; i < kVector; ++i) {
                     // + 0: the sum the biased path forms, so a denormal flushes the same way.
-                    const unsigned long long key = sampling_sort_key(__bfloat162float(values[i]) + 0.0F, v + i);
+                    const unsigned long long key = sampling_sort_key(logit_value(values[i]) + 0.0F, v + i);
                     if (key > best) { best = key; }
                 }
             }
@@ -272,7 +436,7 @@ __launch_bounds__(kSamplerBlock) __global__
         // The raw logit plus bias: a greedy row takes no temperature or penalty, and
         // a barred token is skipped outright.
         if (!plain && sampling_suppressed(cfg, v)) { continue; }
-        const float x = __bfloat162float(row[v]) + (bias != nullptr ? bias[v] : 0.0F);
+        const float x = logit_value(row[v]) + (bias != nullptr ? bias[v] : 0.0F);
         const unsigned long long key = sampling_sort_key(x, v);
         if (key > best) { best = key; }
     }
@@ -300,8 +464,9 @@ __launch_bounds__(kSamplerBlock) __global__
 // is neither wide nor greedy): the best `cap` keys of each 512-token tile. A resident
 // grid walks the [batch][partial] tiles (see sampling_for_each_unit); the first CTA zeroes
 // every row's group_done counter, which the greedy and finalize launches after it count on.
+template <typename LogitT>
 __launch_bounds__(kSamplerBlock) __global__
-    void sampling_partial_topk_kernel(const __nv_bfloat16* logits, const SamplingConfig* cfg_ptr,
+    void sampling_partial_topk_kernel(const LogitT* logits, const SamplingConfig* cfg_ptr,
                                       std::int32_t token_domain, std::int32_t physical_rows,
                                       std::int32_t batch, SamplingWorkspace workspace) {
     __shared__ typename SamplingPartialSort::TempStorage sort_storage;
@@ -324,7 +489,7 @@ __launch_bounds__(kSamplerBlock) __global__
         for (int item = 0; item < kSamplerItemsPerThread; ++item) {
             const int v = tile_start + item * blockDim.x + threadIdx.x;
             if (v < token_domain) {
-                const float x = sampling_adjusted_logit(__bfloat162float(logits[base + v]), v, cfg);
+                const float x = sampling_adjusted_logit(logit_value(logits[base + v]), v, cfg);
                 keys[item]    = sampling_sort_key(x, v);
             } else {
                 keys[item] = 0ull;

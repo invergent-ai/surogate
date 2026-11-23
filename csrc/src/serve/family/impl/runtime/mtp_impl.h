@@ -275,7 +275,7 @@ auto mtp_narrow_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
         Tensor target_positions  = over(frame.target_positions, DType::I32, {1, batch_size});
         Tensor target_rope       = over(frame.target_rope_positions, DType::I32, {1, batch_size});
         Tensor target_tokens     = over(frame.target_argmax, DType::I32, {1, batch_size});
-        Tensor target_logits     = over(frame.target_logits, DType::BF16, {vocab, 1, batch_size});
+        Tensor target_logits     = over(frame.target_logits, frame.target_logits.dtype, {vocab, 1, batch_size});
         Tensor target_hidden     = over(frame.target_hidden, DType::BF16, {hidden_width, 1, batch_size});
         Tensor alignment_hidden  = over(frame.alignment_hidden, DType::BF16, {frame.alignment_hidden.ne[0], 1, batch_size});
         Tensor licensed_tokens   = over(frame.licensed_tokens, DType::I32, {batch_size});
@@ -303,7 +303,7 @@ auto mtp_narrow_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
 
         // The token, sampled the way the ordinary round samples; it is the round's whole licence.
         narrow_step = "sample";
-        Tensor logits_flat    = over(frame.target_logits, DType::BF16, {vocab, batch_size});
+        Tensor logits_flat    = over(frame.target_logits, frame.target_logits.dtype, {vocab, batch_size});
         Tensor positions_flat = over(frame.target_positions, DType::I32, {batch_size});
         ops::sample(logits_flat, licensed_tokens, state.execution.model.geometry.token_domain,
                     frame.sampling, positions_flat, ops::kSamplePurposeDecode, state.execution.work,

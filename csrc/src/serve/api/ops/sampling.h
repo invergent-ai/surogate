@@ -59,7 +59,15 @@ struct SamplingConfig {
     /// the token it feeds -- so the request's random stream goes on as if it had not been
     /// preempted. Every other purpose ignores it.
     std::int32_t continue_decode_key        = 0;
+    /// Nonzero (set by the runtime for a DSpark target, lane e2): a speculative verify of an UNTRUNCATED stochastic row
+    /// draws each column's token exactly as ordinary decoding draws it (Gumbel-max keyed by the fed token's cache
+    /// position and kSamplePurposeDecode) and accepts a draft iff it equals that token -- the committed tokens are
+    /// those of MTP-off decoding with the same seed. Zero: the one-hot rejection rule. Ignored outside verification.
+    std::int32_t speculative_coupled        = 0;
 };
+// A public header, copied to the device every round and sized into the persistent layout (24 -> 26 words per lane at
+// M10): a change of this size is deliberate and needs every separately built consumer rebuilt (review R5 minor 5).
+static_assert(sizeof(SamplingConfig) == 104, "SamplingConfig layout changed");
 
 /// The (position, purpose) a row's draw is keyed by; see SamplingConfig::continue_decode_key.
 struct SampleKey {
@@ -78,7 +86,7 @@ inline SampleKey sample_key(const SamplingConfig& config, std::int32_t position,
 }
 
 // Recompute greedy verification tokens when a request has logit overrides.
-// logits: BF16 [physical_rows,width,batch], targets: I32 [width,batch].
+// logits: BF16 or FP32 [physical_rows,width,batch], targets: I32 [width,batch].
 // Rows without overrides and stochastic rows are left unchanged.
 void sampling_update_greedy_targets(const Tensor& logits, Tensor& targets,
                                     std::int32_t token_domain, const SamplingConfig* configs,
@@ -93,7 +101,7 @@ void sampling_update_greedy_targets(const Tensor& logits, Tensor& targets,
                                                             std::int32_t max_lanes);
 
 /**
- * Produces one token id per independent request row. `logits` is contiguous BF16
+ * Produces one token id per independent request row. `logits` is contiguous BF16 or FP32
  * [physical_rows,B], `out` and `logical_positions` are contiguous I32 [B], and only vocabulary
  * rows v in [0,token_domain) participate. `configs` is a device-resident contiguous
  * SamplingConfig[B] array. Greedy and stochastic rows may coexist in one invocation.

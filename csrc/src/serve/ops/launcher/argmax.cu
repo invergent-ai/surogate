@@ -1,5 +1,5 @@
 // Implements: include/sinfer/ops/argmax.h
-// Match: validated contiguous BF16 logits and I32 output.
+// Match: validated contiguous BF16 or FP32 logits and I32 output.
 // Algorithm assumptions: one tile uses a direct reduction; larger domains use
 // zero-initialized atomic winners across route-selected row tiles.
 #include "ops/launcher/argmax.h"
@@ -32,13 +32,15 @@ int tiled_block_for(std::int32_t physical_rows, std::int32_t valid_rows, std::in
     return kArgmaxBlock;
 }
 
+template <typename LogitT>
 void argmax_tiled_atomic_launch(const Tensor& logits, Tensor& out, std::int32_t valid_rows,
                                 int block, cudaStream_t stream);
 
-} // namespace
-
-void argmax_launch(const Tensor& logits, Tensor& out, std::int32_t valid_rows,
-                   cudaStream_t stream) {
+// The element type is the only difference between the BF16 and FP32 routes: both
+// take the same tiles, blocks and tie order.
+template <typename LogitT>
+void argmax_launch_typed(const Tensor& logits, Tensor& out, std::int32_t valid_rows,
+                         cudaStream_t stream) {
     const std::int32_t physical_rows = logits.ne[0];
     const std::int32_t t_count       = logits.ne[1];
     if (t_count == 0) { return; }
@@ -46,19 +48,31 @@ void argmax_launch(const Tensor& logits, Tensor& out, std::int32_t valid_rows,
     constexpr int kTileElems = kArgmaxBlock * kArgmaxItemsPerThread;
     const int tiled_blocks   = div_up(valid_rows, kTileElems);
     if (tiled_blocks < 2) {
-        argmax_kernel<<<static_cast<unsigned int>(t_count), kArgmaxBlock, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(logits.data), static_cast<std::int32_t*>(out.data),
+        argmax_kernel<LogitT><<<static_cast<unsigned int>(t_count), kArgmaxBlock, 0, stream>>>(
+            static_cast<const LogitT*>(logits.data), static_cast<std::int32_t*>(out.data),
             valid_rows, physical_rows);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
 
-    argmax_tiled_atomic_launch(logits, out, valid_rows,
-                               tiled_block_for(physical_rows, valid_rows, t_count), stream);
+    argmax_tiled_atomic_launch<LogitT>(logits, out, valid_rows,
+                                       tiled_block_for(physical_rows, valid_rows, t_count), stream);
+}
+
+} // namespace
+
+void argmax_launch(const Tensor& logits, Tensor& out, std::int32_t valid_rows,
+                   cudaStream_t stream) {
+    if (logits.dtype == DType::FP32) {
+        argmax_launch_typed<float>(logits, out, valid_rows, stream);
+    } else {
+        argmax_launch_typed<__nv_bfloat16>(logits, out, valid_rows, stream);
+    }
 }
 
 namespace {
 
+template <typename LogitT>
 void argmax_tiled_atomic_launch(const Tensor& logits, Tensor& out, std::int32_t valid_rows,
                                 int block, cudaStream_t stream) {
     const std::int32_t physical_rows = logits.ne[0];
@@ -72,8 +86,8 @@ void argmax_tiled_atomic_launch(const Tensor& logits, Tensor& out, std::int32_t 
                                    stream));
         const dim3 grid(static_cast<unsigned int>(tiled_blocks),
                         static_cast<unsigned int>(token_count));
-        argmax_tiled_atomic_kernel<<<grid, block, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(logits_slice.data),
+        argmax_tiled_atomic_kernel<LogitT><<<grid, block, 0, stream>>>(
+            static_cast<const LogitT*>(logits_slice.data),
             static_cast<std::int32_t*>(out_slice.data), valid_rows, physical_rows);
         CUDA_CHECK(cudaGetLastError());
     });

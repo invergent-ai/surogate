@@ -850,6 +850,38 @@ int test_routed_experts_wire() {
     }
     const std::string without = make_chat_completion_response("id-p", "m", 1, "ok", "", "stop", usage);
     failures += check(without.find("routed_experts") == std::string::npos, "absent unless requested");
+
+    // /v1/completions returns the same object (it was dropped there): the request flag parses, the choice carries the
+    // chat route's routed_experts byte for byte, with the raw-text prefix verifiers reads; Inkling-2's shape
+    // [n, 48, 8] int16; absent unless requested.
+    const Json completion_body = {{"model", "m"}, {"prompt", "hi"}, {"return_routed_experts", true}};
+    failures += check(parse_completion_request(completion_body, default_limits()).return_routed_experts,
+                      "completions: return_routed_experts parsed");
+    const std::string completion = make_completion_response("cmpl-r", "m", 1, "ok", "stop", usage, detail);
+    failures += check(completion.find("\"routed_experts\":{\"data\":\"") != std::string::npos,
+                      "completions: routed_experts serialises with data first and no spaces");
+    const Json completion_json = Json::parse(completion);
+    failures += check(completion_json["choices"][0].contains("routed_experts") &&
+                          completion_json["choices"][0]["routed_experts"].dump() == routed.dump(),
+                      "completions: routed_experts == the chat route's");
+    TokenDetail inkling;
+    inkling.include_routed_experts = true;
+    inkling.routed_layers          = 48;
+    inkling.routed_top_k           = 8;
+    inkling.routed_start           = 5;
+    inkling.routed_experts.resize(3 * 48 * 8);
+    for (std::size_t i = 0; i < inkling.routed_experts.size(); ++i) {
+        inkling.routed_experts[i] = static_cast<std::int16_t>(i % 256);
+    }
+    const Json inkling_json = Json::parse(make_completion_response("cmpl-i", "m", 1, "ok", "length", usage, inkling));
+    const Json& inkling_routed = inkling_json["choices"][0]["routed_experts"];
+    failures += check(inkling_routed["shape"] == Json::array({3, 48, 8}) && inkling_routed["dtype"] == "int16" &&
+                          inkling_routed["start"] == 5 &&
+                          inkling_routed["data"].get<std::string>().size() == (3 * 48 * 8 * 2 + 2) / 3 * 4,
+                      "completions: Inkling-2 routed_experts [n, 48, 8] int16");
+    const std::string completion_without = make_completion_response("cmpl-p", "m", 1, "ok", "stop", usage, {});
+    failures += check(completion_without.find("routed_experts") == std::string::npos,
+                      "completions: absent unless requested");
     return failures;
 }
 

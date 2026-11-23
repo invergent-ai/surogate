@@ -12,8 +12,9 @@
 namespace sinfer::ops::detail {
 namespace {
 
-template <class Schedule, bool Full>
-void launch_variant(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+template <class Schedule, bool Full, bool kDelta = false>
+void launch_variant(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream,
+                    const __nv_bfloat16* delta = nullptr) {
     // This is the same row-split MMA kernel ops/linear and ops/linear_add run,
     // and it stages each scale row (k/16 bytes) with a 16-byte cp.async, which
     // is aligned only when k % 256 == 0. Both of those refuse a k that is not;
@@ -33,20 +34,29 @@ void launch_variant(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t 
     const W8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), intermediate};
     const dim3 grid(static_cast<unsigned>(intermediate / (Schedule::BM / 2)),
                     static_cast<unsigned>(div_up(x.ne[1], Schedule::BN)), 1u);
-    w8_rowsplit_gemm_mma_kernel<Schedule, Full, W8Epilogue::SwiGluSplitHalf>
-        <<<grid, Schedule::THREADS, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data),
-                                                 static_cast<const std::uint8_t*>(w.qdata),
-                                                 static_cast<const std::uint8_t*>(w.scales), output,
-                                                 gate_up_rows, hidden, x.ne[1], hidden);
+    if constexpr (kDelta) {   // the same tiles, plus the pre-activation delta in the epilogue
+        const W8SwiGluDeltaOutput with_delta{output, delta, gate_up_rows};
+        w8_rowsplit_gemm_mma_kernel<Schedule, Full, W8Epilogue::SwiGluSplitHalf, W8SwiGluDeltaOutput>
+            <<<grid, Schedule::THREADS, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data),
+                                                     static_cast<const std::uint8_t*>(w.qdata),
+                                                     static_cast<const std::uint8_t*>(w.scales), with_delta,
+                                                     gate_up_rows, hidden, x.ne[1], hidden);
+    } else {
+        w8_rowsplit_gemm_mma_kernel<Schedule, Full, W8Epilogue::SwiGluSplitHalf>
+            <<<grid, Schedule::THREADS, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data),
+                                                     static_cast<const std::uint8_t*>(w.qdata),
+                                                     static_cast<const std::uint8_t*>(w.scales), output,
+                                                     gate_up_rows, hidden, x.ne[1], hidden);
+    }
 }
 
-template <class Schedule>
+template <class Schedule, bool kDelta = false>
 void launch_route(const Tensor& x, const Weight& w, Tensor& out,
-                  cudaStream_t stream) {
+                  cudaStream_t stream, const __nv_bfloat16* delta = nullptr) {
     if ((x.ne[1] % Schedule::BN) == 0) {
-        launch_variant<Schedule, true>(x, w, out, stream);
+        launch_variant<Schedule, true, kDelta>(x, w, out, stream, delta);
     } else {
-        launch_variant<Schedule, false>(x, w, out, stream);
+        launch_variant<Schedule, false, kDelta>(x, w, out, stream, delta);
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -135,6 +145,20 @@ void w8_linear_swiglu_mma_r128_c80_launch(const Tensor& x, const Weight& w,
                                           Tensor& out, cudaStream_t stream) {
     using Schedule = W8RowSplitMmaGemmSchedule<128, 80, 64, 16, 2>;
     launch_route<Schedule>(x, w, out, stream);
+}
+
+// The runtime-MMA route's two tiles (w8_linear_swiglu_runtime_mma) with a BF16 pre-activation delta [T][2 * I]
+// added to the FP32 gate / up accumulators before the SiLU.
+void w8_linear_swiglu_mma_r32_c128_delta_launch(const Tensor& x, const Weight& w, Tensor& out,
+                                                const __nv_bfloat16* delta, cudaStream_t stream) {
+    using Schedule = W8RowSplitMmaGemmSchedule<32, 128, 32, 16, 2>;   // = w8_linear_swiglu_mma_r32_c128_launch
+    launch_route<Schedule, true>(x, w, out, stream, delta);
+}
+
+void w8_linear_swiglu_mma_r64_c128_delta_launch(const Tensor& x, const Weight& w, Tensor& out,
+                                                const __nv_bfloat16* delta, cudaStream_t stream) {
+    using Schedule = W8RowSplitMmaGemmSchedule<64, 128, 64, 16, 2>;   // = w8_linear_swiglu_mma_r64_c128_launch
+    launch_route<Schedule, true>(x, w, out, stream, delta);
 }
 
 } // namespace sinfer::ops::detail

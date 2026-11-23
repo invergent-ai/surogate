@@ -233,7 +233,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--enable-sleep-mode] [--elastic-kv|--no-elastic-kv] [--elastic-kv-overcommit] "
            "[--gpu-memory-limit-mib N] [--prefix-cache-host-gb N] "
            "[--model name=path[,key=value...]] [--model-priority high|normal|low] "
-           "[--enable-lora] [--lora-modules name=path,...] [--max-loras N] [--max-lora-rank N] "
+           "[--enable-lora] [--lora-modules name=path,...] [--max-loras N] [--max-lora-rank N] [--max-expert-lora-rank N] "
            "[--capture-routing] "
            "[--lm-head-draft|--full-head-draft] [--thinking|--no-thinking] [--preserve-thinking] "
            "[--thinking-retention off|loop|all] [--thinking-retention-mb N] [--thinking-retention-ttl T] "
@@ -274,6 +274,7 @@ std::string serve_usage_text(const char* argv0) {
            "         the pool (0.01) free while others run, grows sequences a round at a time and,\n"
            "         when the pool runs short, preempts the running request that arrived last and\n"
            "         recomputes it later; reserve commits prompt + max_tokens at admission.\n"
+           "         A DSpark engine (Inkling, --spec dflash) reserves unless ondemand is given explicitly.\n"
            "       --kv-cache-dtype defaults to auto: BF16 for attention-only models and on "
            "Hopper, FP8 for hybrids elsewhere.\n"
            "         fp8 and fp8_e4m3 select the same format. Skip-layer indices keep BF16.\n"
@@ -340,6 +341,8 @@ std::string serve_usage_text(const char* argv0) {
            "       --enable-lora enables adapters; --lora-modules loads named adapters at "
            "startup.\n"
            "         --max-loras defaults to 1 and --max-lora-rank to 32 per model.\n"
+           "         --max-expert-lora-rank N sizes the routed-expert banks apart from --max-lora-rank\n"
+           "         (Inkling-2-Mini; 0 = --max-lora-rank).\n"
            "       --lora-swap in-place makes POST /v1/load_lora_adapter of a loaded name swap the\n"
            "         bytes at a round boundary: running requests continue on the new adapter and\n"
            "         none are held (the body's \"in_place\" overrides; drain is the default). Each\n"
@@ -481,8 +484,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             const std::string mode = require_value("--kv-admission");
             if (mode == "reserve") {
                 options.kv_admission.mode = KvAdmission::Reserve;
+                options.kv_admission.explicit_on_demand = false;
             } else if (mode == "ondemand" || mode == "on-demand") {
                 options.kv_admission.mode = KvAdmission::OnDemand;
+                options.kv_admission.explicit_on_demand = true;
             } else {
                 throw std::invalid_argument("--kv-admission must be reserve or ondemand");
             }
@@ -827,6 +832,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--max-lora-rank") {
             options.max_lora_rank = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-lora-rank"), "max-lora-rank"));
+        } else if (arg == "--max-expert-lora-rank") {
+            options.max_expert_lora_rank = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--max-expert-lora-rank"), "max-expert-lora-rank"));
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head          = ProposalHead::Optimized;
             options.speculative.proposal_head_explicit = true;
@@ -899,7 +907,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     options.api_key = resolve_api_key(api_key, api_key_file);
     if (!max_context_explicit) { options.max_context = 0; } // auto by default
     if (!options.devices.empty()) {
-        for (std::size_t i = 0; i < options.devices.size(); ++i) {
+        // SUROGATE_SERVE_TEST_SHARED_DEVICES=1 (tests only): pipeline stages may share a GPU (cli/options.cpp too).
+        const char* shared_raw = std::getenv("SUROGATE_SERVE_TEST_SHARED_DEVICES");
+        const bool shared      = shared_raw != nullptr && std::string_view(shared_raw) == "1";
+        for (std::size_t i = 0; i < options.devices.size() && !shared; ++i) {
             for (std::size_t j = 0; j < i; ++j) {
                 if (options.devices[i] == options.devices[j]) {
                     throw std::invalid_argument("--devices must contain distinct GPUs");
@@ -1035,6 +1046,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         if (options.max_loras == 0) { throw std::invalid_argument("--max-loras must be positive"); }
         if (options.max_lora_rank == 0) {
             throw std::invalid_argument("--max-lora-rank must be positive");
+        }
+        if (options.max_expert_lora_rank > options.max_lora_rank) {
+            throw std::invalid_argument("--max-expert-lora-rank must not exceed --max-lora-rank");
         }
         if (options.lora_modules.size() > options.max_loras) {
             throw std::invalid_argument("--lora-modules names " +

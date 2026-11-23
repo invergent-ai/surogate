@@ -98,7 +98,8 @@ std::string make_chat_completion_tool_response(const std::string& id, const std:
                                                const std::string& reasoning,
                                                const std::vector<ToolCall>& tool_calls,
                                                const CompletionUsage& usage,
-                                               const TokenDetail& detail = {});
+                                               const TokenDetail& detail = {},
+                                               const char* finish_reason = "tool_calls");
 std::string make_chat_chunk_token_detail(const std::string& id, const std::string& model,
                                          std::int64_t created, const TokenDetail& detail, bool include_usage);
 
@@ -120,6 +121,10 @@ std::string make_chat_chunk_content(const std::string& id, const std::string& mo
 std::string make_chat_chunk_tool_calls(const std::string& id, const std::string& model,
                                        std::int64_t created,
                                        const std::vector<ToolCall>& tool_calls, bool include_usage);
+/// One chunk with streamed tool-call pieces (vLLM's DeltaToolCall shape): {"index", "id", "type", "function": {"name",
+/// "arguments"}} on a call's first piece, {"index", "function": {"arguments"}} on the others.
+std::string make_chat_chunk_tool_call_deltas(const std::string& id, const std::string& model, std::int64_t created,
+                                             const std::vector<ToolCallDelta>& deltas, bool include_usage);
 std::string make_chat_chunk_final(const std::string& id, const std::string& model,
                                   std::int64_t created, const char* finish_reason,
                                   bool include_usage, const std::string& parallel_decoding_details = {});

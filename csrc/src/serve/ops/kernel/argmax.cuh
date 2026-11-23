@@ -1,7 +1,7 @@
 #pragma once
 
 // Implements: include/sinfer/ops/argmax.h
-// Match: contiguous BF16 [physical_rows,C], valid_rows <= physical_rows, with
+// Match: contiguous BF16 or FP32 [physical_rows,C], valid_rows <= physical_rows, with
 // tuned routes qualified for the 248077-row and 131072-row vocabularies.
 // Algorithm assumptions: one CTA reduces each blockDim.x-row tile and an atomic
 // winner selects the exact value/lower-id maximum per column.
@@ -18,6 +18,16 @@ namespace sinfer::ops {
 // larger 2-D grid exposes enough resident CTAs without oversized reductions.
 inline constexpr int kArgmaxBlock          = 512;
 inline constexpr int kArgmaxItemsPerThread = 1;
+
+#ifndef SINFER_OPS_LOGIT_VALUE
+#define SINFER_OPS_LOGIT_VALUE
+/// One logit as the float every logits-consuming op compares and sums. Rows are BF16 on
+/// every target but those that keep FP32 logits (a softcapped head whose values near the
+/// cap must not be rounded); the BF16 overload is the conversion those ops always made.
+/// Guarded because the sampling kernel headers define the same set.
+__device__ __forceinline__ float logit_value(__nv_bfloat16 x) { return __bfloat162float(x); }
+__device__ __forceinline__ float logit_value(float x) { return x; }
+#endif
 
 __device__ __forceinline__ bool argmax_better(float value, std::int32_t index, float best_value,
                                               std::int32_t best_index) {
@@ -54,16 +64,17 @@ __device__ __forceinline__ void argmax_block_reduce(float& value, std::int32_t& 
     if (warp == 0) { argmax_warp_reduce(value, index); }
 }
 
+template <typename LogitT>
 __launch_bounds__(kArgmaxBlock) __global__
-    void argmax_kernel(const __nv_bfloat16* logits, std::int32_t* out, std::int32_t valid_rows,
+    void argmax_kernel(const LogitT* logits, std::int32_t* out, std::int32_t valid_rows,
                        std::int32_t physical_rows) {
     const std::int32_t t    = static_cast<std::int32_t>(blockIdx.x);
     const std::int64_t base = static_cast<std::int64_t>(t) * physical_rows;
 
-    float best_value        = __bfloat162float(logits[base]);
+    float best_value        = logit_value(logits[base]);
     std::int32_t best_index = 0;
     for (std::int32_t v = static_cast<std::int32_t>(threadIdx.x); v < valid_rows; v += blockDim.x) {
-        const float value = __bfloat162float(logits[base + v]);
+        const float value = logit_value(logits[base + v]);
         if (argmax_better(value, v, best_value, best_index)) {
             best_value = value;
             best_index = v;
@@ -92,8 +103,9 @@ __launch_bounds__(kArgmaxBlock) __global__
     if (threadIdx.x == 0) { out[t] = indices[0]; }
 }
 
+template <typename LogitT>
 __launch_bounds__(kArgmaxBlock) __global__
-    void argmax_tiled_atomic_kernel(const __nv_bfloat16* logits, std::int32_t* out,
+    void argmax_tiled_atomic_kernel(const LogitT* logits, std::int32_t* out,
                                     std::int32_t valid_rows, std::int32_t physical_rows) {
     const std::int32_t t    = static_cast<std::int32_t>(blockIdx.y);
     const std::int64_t base = static_cast<std::int64_t>(t) * physical_rows;
@@ -106,7 +118,7 @@ __launch_bounds__(kArgmaxBlock) __global__
     for (int item = 0; item < kArgmaxItemsPerThread; ++item) {
         const std::int32_t v = tile_start + threadIdx.x + item * blockDim.x;
         if (v < valid_rows) {
-            const float value = __bfloat162float(logits[base + v]);
+            const float value = logit_value(logits[base + v]);
             if (argmax_better(value, v, best_value, best_index)) {
                 best_value = value;
                 best_index = v;
@@ -119,7 +131,7 @@ __launch_bounds__(kArgmaxBlock) __global__
 
     int current = out[t];
     while (true) {
-        const float current_value = __bfloat162float(logits[base + current]);
+        const float current_value = logit_value(logits[base + current]);
         if (!argmax_better(best_value, best_index, current_value, current)) { break; }
         const int observed = atomicCAS(reinterpret_cast<int*>(out + t), current, best_index);
         if (observed == current) { break; }

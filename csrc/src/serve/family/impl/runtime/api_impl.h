@@ -231,6 +231,11 @@ void Program<Variant>::evict_retained_lane(std::uint32_t lane) noexcept {
 }
 
 template <>
+void Program<Variant>::drop_shared_prefixes() noexcept {
+    impl_->drop_shared_prefixes();
+}
+
+template <>
 void Program<Variant>::spill_retained_lane(std::uint32_t lane) noexcept {
     impl_->spill_retained_lane(lane);
 }
@@ -298,6 +303,11 @@ bool Program<Variant>::kv_under_pressure() const noexcept {
 template <>
 bool Program<Variant>::kv_service_pressure() noexcept {
     return impl_->kv_service_pressure();
+}
+
+template <>
+void Program<Variant>::kv_round_boundary() noexcept {
+    impl_->kv_round_boundary();
 }
 
 template <>
@@ -427,6 +437,23 @@ template <>
 void Program<Variant>::adopt_pipeline_decode_features(std::span<const std::uint32_t> lanes,
     std::span<const std::byte> packet) {
     impl_->adopt_pipeline_decode_features(lanes, packet);
+}
+
+template <>
+bool Program<Variant>::pipeline_drafts_on_head() const noexcept {
+    return impl_->pipeline_drafts_on_head();
+}
+
+template <>
+std::span<const std::byte> Program<Variant>::prepare_pipeline_drafts(std::span<const std::uint32_t> lanes,
+                                                                     std::span<const runtime::RoundBudget> budgets,
+                                                                     std::uint32_t window) {
+    return impl_->prepare_pipeline_drafts(lanes, budgets, window);
+}
+
+template <>
+void* Program<Variant>::pipeline_draft_import_buffer() const noexcept {
+    return impl_->pipeline_draft_import_buffer();
 }
 
 template <>

@@ -1,12 +1,14 @@
 #include "ops/launcher/sampled_logprob.h"
 
 #include "core/device.h"
+#include "core/device_memory_error.h"
 #include "api/ops/sampled_logprob.h"
 #include <algorithm>
 #include "ops/common/warp.cuh"
 
 #include <cmath>
 #include <cstdint>
+#include <string>
 #include <cuda_bf16.h>
 
 namespace sinfer::ops::detail {
@@ -15,6 +17,10 @@ namespace {
 constexpr int kThreads = 512;
 constexpr int kVector  = 8; // BF16 logits per 16-byte load
 constexpr int kUnroll  = 4; // loads each thread keeps in flight
+
+/// One logit as a float: BF16 rows on every target but those that keep FP32 logits.
+__device__ __forceinline__ float logit_value(__nv_bfloat16 x) { return __bfloat162float(x); }
+__device__ __forceinline__ float logit_value(float x) { return x; }
 
 /// Calls `visit(x)` for every logit of the row, scaled by `inverse`. An aligned row
 /// is read 16 bytes at a time, kUnroll loads issued before any is used: one block
@@ -44,18 +50,46 @@ __device__ __forceinline__ void for_each_scaled(const __nv_bfloat16* __restrict_
     for (int v = vector_end + tid; v < domain; v += kThreads) { visit(__bfloat162float(row[v]) * inverse); }
 }
 
+/// The FP32 row: the same walk, four logits per 16-byte load, padding lanes -inf.
+template <class Visit>
+__device__ __forceinline__ void for_each_scaled(const float* __restrict__ row, int domain,
+                                                float inverse, Visit&& visit) {
+    constexpr int kFloatVector = 4; // FP32 logits per 16-byte load
+    const int tid        = static_cast<int>(threadIdx.x);
+    const int vector_end =
+        (reinterpret_cast<std::uintptr_t>(row) & 15u) == 0 ? domain / kFloatVector * kFloatVector : 0;
+    for (int base = tid * kFloatVector; base < vector_end; base += kThreads * kFloatVector * kUnroll) {
+        float4 packed[kUnroll];
+#pragma unroll
+        for (int u = 0; u < kUnroll; ++u) {
+            const int v = base + u * kThreads * kFloatVector;
+            packed[u]   = v < vector_end ? *reinterpret_cast<const float4*>(row + v)
+                                         : make_float4(-INFINITY, -INFINITY, -INFINITY, -INFINITY);
+        }
+#pragma unroll
+        for (int u = 0; u < kUnroll; ++u) {
+            visit(packed[u].x * inverse);
+            visit(packed[u].y * inverse);
+            visit(packed[u].z * inverse);
+            visit(packed[u].w * inverse);
+        }
+    }
+    for (int v = vector_end + tid; v < domain; v += kThreads) { visit(row[v] * inverse); }
+}
+
 /// One block per column: a max pass and a sum pass over the vocabulary, each
 /// reduced within warps and then across them through shared memory. The scale is
 /// applied to every logit before both passes, so the maximum subtracted is the
 /// maximum of the scaled row and the sum stays in range.
+template <typename LogitT>
 __global__ void __launch_bounds__(kThreads)
-sampled_logprob_kernel(const __nv_bfloat16* __restrict__ logits, const int* __restrict__ tokens,
+sampled_logprob_kernel(const LogitT* __restrict__ logits, const int* __restrict__ tokens,
                        float* __restrict__ out, const SamplingConfig* __restrict__ configs,
                        const int vocab, const int domain) {
     constexpr int kWarps = kThreads / 32;
     __shared__ float partial[kWarps];
     const int column         = static_cast<int>(blockIdx.x);
-    const __nv_bfloat16* row = logits + static_cast<std::size_t>(column) * vocab;
+    const LogitT* row        = logits + static_cast<std::size_t>(column) * vocab;
     const int tid            = static_cast<int>(threadIdx.x);
     const int warp           = tid >> 5;
     const int lane           = tid & 31;
@@ -85,7 +119,7 @@ sampled_logprob_kernel(const __nv_bfloat16* __restrict__ logits, const int* __re
         for (int w = 0; w < kWarps; ++w) { total += partial[w]; }
         const int token = tokens[column];
         const float chosen =
-            token >= 0 && token < domain ? __bfloat162float(row[token]) * inverse : NAN;
+            token >= 0 && token < domain ? logit_value(row[token]) * inverse : NAN;
         out[column] = chosen - (block_max + logf(total));
     }
 }
@@ -98,9 +132,15 @@ void sampled_logprob_launch(const Tensor& logits, const Tensor& tokens, Tensor& 
     const int vocab   = logits.ne[0];
     const int columns = logits.ne[1];
     if (columns <= 0) { return; }
-    sampled_logprob_kernel<<<static_cast<unsigned>(columns), kThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(logits.data), static_cast<const int*>(tokens.data),
-        static_cast<float*>(out.data), configs, vocab, static_cast<int>(token_domain));
+    if (logits.dtype == DType::FP32) {
+        sampled_logprob_kernel<float><<<static_cast<unsigned>(columns), kThreads, 0, stream>>>(
+            static_cast<const float*>(logits.data), static_cast<const int*>(tokens.data),
+            static_cast<float*>(out.data), configs, vocab, static_cast<int>(token_domain));
+    } else {
+        sampled_logprob_kernel<__nv_bfloat16><<<static_cast<unsigned>(columns), kThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(logits.data), static_cast<const int*>(tokens.data),
+            static_cast<float*>(out.data), configs, vocab, static_cast<int>(token_domain));
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -108,7 +148,10 @@ void sampled_logprob_launch(const Tensor& logits, const Tensor& tokens, Tensor& 
 
 namespace sinfer::ops {
 namespace {
-__global__ void score_kernel(const __nv_bfloat16* all_logits, const int* tokens,
+using detail::logit_value;
+
+template <typename LogitT>
+__global__ void score_kernel(const LogitT* all_logits, const int* tokens,
                              RawTokenScores* output, int vocab, int domain,
                              const SamplingConfig* configs, int uniform_count,
                              int width, const int* counts) {
@@ -126,7 +169,7 @@ __global__ void score_kernel(const __nv_bfloat16* all_logits, const int* tokens,
     __shared__ float normalizer;
     const int tid = threadIdx.x;
     float best = -INFINITY;
-    for (int i = tid; i < domain; i += 512) best = fmaxf(best, __bfloat162float(logits[i]));
+    for (int i = tid; i < domain; i += 512) best = fmaxf(best, logit_value(logits[i]));
     values[tid] = best;
     __syncthreads();
     for (int step = 256; step; step >>= 1) {
@@ -136,9 +179,9 @@ __global__ void score_kernel(const __nv_bfloat16* all_logits, const int* tokens,
     float maximum = values[0];
     float sum = 0;
     int rank = 0;
-    const float selected = __bfloat162float(logits[token]);
+    const float selected = logit_value(logits[token]);
     for (int i = tid; i < domain; i += 512) {
-        const float value = __bfloat162float(logits[i]);
+        const float value = logit_value(logits[i]);
         sum += expf(value - maximum);
         rank += value >= selected;
     }
@@ -162,7 +205,7 @@ __global__ void score_kernel(const __nv_bfloat16* all_logits, const int* tokens,
         for (int i = tid; i < domain; i += 512) {
             bool used = false;
             for (int j = 0; j < k; ++j) used |= top[j].token_id == i;
-            float v = __bfloat162float(logits[i]);
+            float v = logit_value(logits[i]);
             if (!used && (v > value || (v == value && i < index))) { value = v; index = i; }
         }
         values[tid] = value; indices[tid] = index;
@@ -184,32 +227,58 @@ void score_logprobs_device(const Tensor& logits, const Tensor& tokens, int domai
                           cudaStream_t stream, int width, const int* counts) {
     const int columns = logits.ne[1] * logits.ne[2];
     if (!output || !configs || width <= 0 || columns <= 0 || columns % width ||
-        logits.dtype != DType::BF16 || !logits.data || domain <= 0 || domain > logits.ne[0] ||
+        (logits.dtype != DType::BF16 && logits.dtype != DType::FP32) || !logits.data || domain <= 0 ||
+        domain > logits.ne[0] ||
         tokens.dtype != DType::I32 || !tokens.data || tokens.ne[0] * tokens.ne[1] < columns) {
         throw std::invalid_argument("invalid batched log-probability scoring arguments");
     }
-    score_kernel<<<columns, 512, 0, stream>>>(static_cast<const __nv_bfloat16*>(logits.data),
-        static_cast<const int*>(tokens.data), output, logits.ne[0], domain, configs, -1, width, counts);
+    if (logits.dtype == DType::FP32) {
+        score_kernel<float><<<columns, 512, 0, stream>>>(static_cast<const float*>(logits.data),
+            static_cast<const int*>(tokens.data), output, logits.ne[0], domain, configs, -1, width, counts);
+    } else {
+        score_kernel<__nv_bfloat16><<<columns, 512, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(logits.data), static_cast<const int*>(tokens.data), output,
+            logits.ne[0], domain, configs, -1, width, counts);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
 std::vector<TokenScore> score_logprobs_batch(const Tensor& logits, std::span<const TokenId> tokens,
                                             int domain, int top_k, cudaStream_t stream) {
     const auto columns = tokens.size();
-    if (logits.dtype != DType::BF16 || !logits.data || domain <= 0 || domain > logits.ne[0] ||
+    if ((logits.dtype != DType::BF16 && logits.dtype != DType::FP32) || !logits.data || domain <= 0 ||
+        domain > logits.ne[0] ||
         columns == 0 || columns > std::size_t(logits.ne[1]) || top_k < 0 || top_k > 20 ||
         std::any_of(tokens.begin(), tokens.end(), [domain](auto token) { return token < 0 || token >= domain; })) {
         throw std::invalid_argument("invalid log-probability scoring arguments");
     }
     void* storage = nullptr;
-    CUDA_CHECK(cudaMallocAsync(&storage, columns * (sizeof(RawTokenScores) + sizeof(TokenId)), stream));
+    const std::size_t storage_bytes = columns * (sizeof(RawTokenScores) + sizeof(TokenId));
+    // A full device is a DeviceOutOfMemory, which the executor survives (the round's requests
+    // fail with a retryable 429), not an abort of the whole engine: on 2026-11-23 a W5 engine
+    // with 4 MiB left died here (CUDA_CHECK aborts) instead of failing one round
+    // (rl/engine-inkling-2026-11-21/lanes/OOM/DIAGNOSIS.md, F3).
+    if (const cudaError_t allocated = cudaMallocAsync(&storage, storage_bytes, stream); allocated != cudaSuccess) {
+        if (allocated == cudaErrorMemoryAllocation) {
+            (void)cudaGetLastError();
+            throw DeviceOutOfMemory("log-probability scoring: cudaMallocAsync of " + std::to_string(storage_bytes) +
+                                    " bytes failed: out of memory");
+        }
+        CUDA_CHECK(allocated);
+    }
     auto* device_out = static_cast<RawTokenScores*>(storage);
     auto* device_tokens = reinterpret_cast<TokenId*>(device_out + columns);
     std::vector<RawTokenScores> host(columns);
     try {
         CUDA_CHECK(cudaMemcpyAsync(device_tokens, tokens.data(), tokens.size_bytes(), cudaMemcpyHostToDevice, stream));
-        score_kernel<<<columns, 512, 0, stream>>>(static_cast<const __nv_bfloat16*>(logits.data),
-            device_tokens, device_out, logits.ne[0], domain, nullptr, top_k, 1, nullptr);
+        if (logits.dtype == DType::FP32) {
+            score_kernel<float><<<columns, 512, 0, stream>>>(static_cast<const float*>(logits.data),
+                device_tokens, device_out, logits.ne[0], domain, nullptr, top_k, 1, nullptr);
+        } else {
+            score_kernel<__nv_bfloat16><<<columns, 512, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(logits.data), device_tokens, device_out, logits.ne[0], domain,
+                nullptr, top_k, 1, nullptr);
+        }
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaMemcpyAsync(host.data(), device_out, columns * sizeof(RawTokenScores),
                                    cudaMemcpyDeviceToHost, stream));
@@ -228,17 +297,19 @@ TokenScore score_logprobs(const Tensor& logits, TokenId token, int domain, int t
 }
 
 namespace {
-__global__ void gather_logits_kernel(const __nv_bfloat16* logits, const TokenId* ids,
+template <typename LogitT>
+__global__ void gather_logits_kernel(const LogitT* logits, const TokenId* ids,
                                       float* values, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) values[i] = __bfloat162float(logits[ids[i]]);
+    if (i < n) values[i] = logit_value(logits[ids[i]]);
 }
 }
 
 std::vector<float> gather_candidate_logits(const Tensor& logits, std::span<const TokenId> tokens,
                                             int domain, cudaStream_t stream, DeviceSpan scratch,
                                             std::span<float> host) {
-    if (logits.dtype != DType::BF16 || !logits.data || domain <= 0 || domain > logits.ne[0] ||
+    if ((logits.dtype != DType::BF16 && logits.dtype != DType::FP32) || !logits.data || domain <= 0 ||
+        domain > logits.ne[0] ||
         tokens.empty() || tokens.size() > 256 || !scratch.data ||
         scratch.bytes < tokens.size() * (sizeof(TokenId) + sizeof(float)) || host.size() < tokens.size() ||
         std::any_of(tokens.begin(), tokens.end(), [domain](auto id) { return id < 0 || id >= domain; })) {
@@ -247,8 +318,13 @@ std::vector<float> gather_candidate_logits(const Tensor& logits, std::span<const
     auto* ids = static_cast<TokenId*>(scratch.data);
     auto* values = reinterpret_cast<float*>(ids + tokens.size());
     CUDA_CHECK(cudaMemcpyAsync(ids, tokens.data(), tokens.size_bytes(), cudaMemcpyHostToDevice, stream));
-    gather_logits_kernel<<<1, 256, 0, stream>>>(static_cast<const __nv_bfloat16*>(logits.data),
-                                               ids, values, tokens.size());
+    if (logits.dtype == DType::FP32) {
+        gather_logits_kernel<float><<<1, 256, 0, stream>>>(static_cast<const float*>(logits.data),
+                                                          ids, values, tokens.size());
+    } else {
+        gather_logits_kernel<__nv_bfloat16><<<1, 256, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(logits.data), ids, values, tokens.size());
+    }
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaMemcpyAsync(host.data(), values, tokens.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));

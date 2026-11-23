@@ -2,6 +2,7 @@
 #include "family/impl/runtime/schedule.h"
 #include "api/ops/sampled_logprob.h"
 #include "family/impl/runtime/workspace_recipe.h"
+#include "family/impl/runtime/dspark_round.h"
 
 #include "api/ops/argmax.h"
 #include "api/ops/attn_input_proj.h"
@@ -76,6 +77,14 @@ DFlashPersistentState& dflash_state(DFlashBatchContext& state) { return state.df
 
 DFlashPersistentState& dflash_state(DFlashAppendContext& state) { return state.dflash; }
 
+/// A DSpark target's leaves get the text pool (its draft planes), the per-lane f_rnn and the round's workspace.
+template <class Context>
+family::DSparkRuntime dspark_runtime(Context& state) {
+    DFlashPersistentState& d = dflash_state(state);
+    return family::DSparkRuntime{&d.decoder.text_kv, d.dspark_f_rnn, &state.execution.work,
+                                 state.execution.device.stream};
+}
+
 template <class V>
 DFlashFeatureSink prefill_feature_sink_impl(PrefillContext& state,
                                             DFlashFeatureSink::PrefillConsumer consume_prefill) {
@@ -123,6 +132,14 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
     if constexpr (!V::supports_dflash) {
         throw std::logic_error("DFlash context append is unavailable for this target");
     } else {
+        if constexpr (family::dspark_drafter<V>()) {
+            // DSpark (dspark_round.h): the target's own context append into its draft planes.
+            family::dspark_append_if<V>(
+                state.execution.model, dspark_runtime(state),
+                family::DSparkAppendArgs{features, positions, commit_counts, lanes, table_rows,
+                                         envelope.min_count == static_cast<std::uint32_t>(features.ne[1])});
+            return;
+        }
         const auto& config = state.execution.model.geometry.dflash;
         const std::int32_t width   = features.ne[1];
         const std::int32_t batch   = features.ne[2];
@@ -246,6 +263,15 @@ void propose_batch_impl(DFlashBatchContext& state, family::DFlashDecodeState& fr
         state.execution.work.reset();
         ops::prepare_masked_block(anchors, frontiers, valid_columns, config.mask_token, ids,
                                   positions, state.execution.device.stream);
+        if constexpr (family::dspark_drafter<V>()) {
+            // DSpark (dspark_round.h): the block's positions above are the verify's cache positions; the target's
+            // own drafter runs from the anchor at its frontier and writes k drafts.
+            family::dspark_propose_if<V>(state.execution.model, dspark_runtime(state),
+                                         family::DSparkProposeArgs{anchors, frontiers, lanes, full_rows, drafts,
+                                                                   batch_size, static_cast<std::int32_t>(k),
+                                                                   frame.sampling});
+            return;
+        }
         Tensor residual = state.execution.work.alloc(DType::BF16, {config.hidden, columns});
         ops::embedding(ids.view({columns}), state.execution.model.token_embedding, residual,
                        state.execution.device.stream);
@@ -463,17 +489,23 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         Tensor accepted         = frame.accepted_drafts.slice(0, 0, batch_size);
 
         state.execution.work.reset();
-        Tensor compact_features = state.execution.work.alloc(
-            DType::BF16, {state.execution.model.geometry.dflash.feature_rows,
-                          frame.append_positions.ne[0], batch_size});
-        ops::prepare_ragged_prefix(dflash_state(state).pending_features, lanes, context_starts,
-                                   frontiers, compact_features, append_positions, append_counts,
-                                   state.execution.device.stream);
-        append_context_impl<Variant>(state, compact_features, append_positions, append_counts,
-                                     lanes, dflash_rows,
-                                     {0, static_cast<std::uint32_t>(frame.append_positions.ne[0])});
-
         const auto& stage = state.execution.stage;
+        // DSpark on a pipeline (dspark_round.h): the drafter stage appended this round's context and proposed its
+        // drafts before the first stage launched (dflash_pipeline_propose); no stage appends here. Every other
+        // target (and DSpark on one card) appends as before.
+        const bool dspark_split = family::dspark_drafter<Variant>() && stage.features != nullptr;
+        if (!dspark_split) {
+            Tensor compact_features = state.execution.work.alloc(
+                DType::BF16, {state.execution.model.geometry.dflash.feature_rows,
+                              frame.append_positions.ne[0], batch_size});
+            ops::prepare_ragged_prefix(dflash_state(state).pending_features, lanes, context_starts,
+                                       frontiers, compact_features, append_positions, append_counts,
+                                       state.execution.device.stream);
+            append_context_impl<Variant>(state, compact_features, append_positions, append_counts,
+                                         lanes, dflash_rows,
+                                         {0, static_cast<std::uint32_t>(frame.append_positions.ne[0])});
+        }
+
         const auto metadata = stage.residual_bytes +
             static_cast<std::size_t>(state.execution.model.geometry.dflash.feature_rows) * sizeof(std::uint16_t);
         const auto stream = state.execution.device.stream;
@@ -495,6 +527,22 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                                        cudaMemcpyDeviceToDevice, stream));
             CUDA_CHECK(cudaMemcpyAsync(target_positions.data, frontiers.data, frontiers.bytes(),
                                        cudaMemcpyDeviceToDevice, stream));
+        } else if (dspark_split) {
+            // The first stage of a DSpark pipeline: the drafter stage's verify ids and positions (the fields the
+            // boundary packet carries to the later stages), from the pinned draft import the driver filled.
+            if (stage.draft_import_pinned == nullptr) {
+                throw std::logic_error("DSpark pipeline stage has no draft import");
+            }
+            const auto* imported = static_cast<const std::int32_t*>(stage.draft_import_pinned);
+            const auto count     = static_cast<std::size_t>(width) * static_cast<std::size_t>(batch_size);
+            CUDA_CHECK(cudaMemcpyAsync(verify_ids.data, imported, count * sizeof(std::int32_t),
+                                       cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(target_positions.data, imported + kDSparkDraftImportStride,
+                                       count * sizeof(std::int32_t), cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpy2DAsync(drafts.data, drafts.nb[1],
+                                         static_cast<const std::int32_t*>(verify_ids.data) + 1,
+                                         verify_ids.nb[1], k * sizeof(std::int32_t), batch_size,
+                                         cudaMemcpyDeviceToDevice, stream));
         } else {
             propose_batch_impl<Variant>(state, frame, batch_size, k, envelopes);
             ops::speculative_prepare_verify_ids(anchors, drafts, extents, verify_ids, stream);
@@ -590,6 +638,54 @@ void dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size, std
                          DecodeGraphExecutable* executable) {
     auto body = dflash_decode_batch_body(state, batch_size, k, envelopes, target_envelope);
     run_prepared(state, executable, body);
+}
+
+void dflash_pipeline_propose(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
+                             DFlashEnvelopes envelopes, void* draft_export) {
+    if constexpr (!family::dspark_drafter<Variant>()) {
+        (void)state; (void)batch_size; (void)k; (void)envelopes; (void)draft_export;
+        throw std::logic_error("only a DSpark target proposes ahead of a pipeline round");
+    } else {
+        // The first half of dflash_decode_batch_body, run eagerly on the drafter stage before the round's first stage
+        // launches: the ingress, the context append of the lanes' pending columns, the proposal and the verify ids.
+        // The same ops on the same inputs as the single-card body; the verify half then skips them (dspark_split).
+        if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumBatchColumns) ||
+            k > kDFlashDecodeMaximumDrafts || draft_export == nullptr) {
+            throw std::logic_error("DSpark pipeline proposal state is incomplete");
+        }
+        family::DFlashDecodeState& frame = state.frame;
+        const std::int32_t width          = static_cast<std::int32_t>(k) + 1;
+        const auto stream                 = state.execution.device.stream;
+        CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, &state.host_ingress, sizeof(family::DFlashDecodeIngress),
+                                   cudaMemcpyHostToDevice, stream));
+        Tensor anchors          = frame.anchors.slice(0, 0, batch_size);
+        Tensor frontiers        = frame.execution_frontiers.slice(0, 0, batch_size);
+        Tensor context_starts   = frame.context_frontiers.slice(0, 0, batch_size);
+        Tensor extents          = frame.proposal_extents.slice(0, 0, batch_size);
+        Tensor dflash_rows      = frame.dflash_kv_table_rows.slice(0, 0, batch_size);
+        Tensor lanes            = frame.lanes.slice(0, 0, batch_size);
+        Tensor append_positions = frame.append_positions.slice(1, 0, batch_size);
+        Tensor append_counts    = frame.append_counts.slice(0, 0, batch_size);
+        Tensor drafts           = frame.draft_tokens.slice(1, 0, batch_size);
+        Tensor verify_ids       = frame.verify_ids.slice(1, 0, batch_size);
+        Tensor target_positions = frame.proposal_positions.slice(1, 0, batch_size);
+
+        state.execution.work.reset();
+        Tensor compact_features = state.execution.work.alloc(
+            DType::BF16, {state.execution.model.geometry.dflash.feature_rows, frame.append_positions.ne[0], batch_size});
+        ops::prepare_ragged_prefix(dflash_state(state).pending_features, lanes, context_starts, frontiers,
+                                   compact_features, append_positions, append_counts, stream);
+        append_context_impl<Variant>(state, compact_features, append_positions, append_counts, lanes, dflash_rows,
+                                     {0, static_cast<std::uint32_t>(frame.append_positions.ne[0])});
+        if (k == 0) { return; } // nothing proposed: every stage verifies the anchor at its frontier
+        propose_batch_impl<Variant>(state, frame, batch_size, k, envelopes);
+        ops::speculative_prepare_verify_ids(anchors, drafts, extents, verify_ids, stream);
+        const auto count = static_cast<std::size_t>(width) * static_cast<std::size_t>(batch_size);
+        auto* out        = static_cast<std::int32_t*>(draft_export);
+        CUDA_CHECK(cudaMemcpyAsync(out, verify_ids.data, count * sizeof(std::int32_t), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(out + kDSparkDraftImportStride, target_positions.data, count * sizeof(std::int32_t),
+                                   cudaMemcpyDeviceToHost, stream));
+    }
 }
 
 } // namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS::schedule

@@ -118,6 +118,7 @@ void LoraStore::configure(std::int32_t slots, std::int32_t max_rank, std::int32_
     max_rank_       = max_rank;
     scratch_tokens_ = max_tokens;
     versions_       = std::make_unique<std::atomic<std::uint32_t>[]>(static_cast<std::size_t>(slots));
+    kv_generations_ = std::make_unique<std::atomic<std::uint64_t>[]>(static_cast<std::size_t>(slots));
     // The device memory -- scratch, slot cell, banks -- is allocated by
     // ensure_banks, in one arena, so that under sleep mode the whole adapter
     // estate is a single Offload region of the engine. Direct users that never
@@ -159,7 +160,6 @@ void LoraStore::set_slot(const void* base_key, std::int32_t port, std::int32_t s
         b.size() != static_cast<std::size_t>(out_dim) * rank) {
         throw std::invalid_argument("lora_store: A must be [rank,in] and B [out,rank]");
     }
-
     const Key key{base_key, port};
     auto found = banks_.find(key);
     if (found == banks_.end()) {
@@ -191,21 +191,27 @@ void LoraStore::set_slot(const void* base_key, std::int32_t port, std::int32_t s
     if (bank.view.k != in_dim || bank.view.n != out_dim) {
         throw std::invalid_argument("lora_store: two adapters disagree on this projection's shape");
     }
+    const std::int32_t bank_rank = bank.view.rank; // max_rank unless the binding named a smaller one
+    if (rank > bank_rank) {
+        throw std::invalid_argument("lora_store: adapter rank " + std::to_string(rank) +
+                                    " exceeds this bank's rank " + std::to_string(bank_rank));
+    }
+    advance_kv_generation(slot); // after every refusal: a refused write leaves the slot's prefix state alone
 
-    // A padded to max_rank rows, with alpha/r folded in; rows past `rank` stay
+    // A padded to the bank's rank rows, with alpha/r folded in; rows past `rank` stay
     // zero so a short adapter contributes nothing through them.
-    std::vector<std::uint16_t> a_padded(static_cast<std::size_t>(max_rank_) * in_dim, 0);
+    std::vector<std::uint16_t> a_padded(static_cast<std::size_t>(bank_rank) * in_dim, 0);
     for (std::int32_t r = 0; r < rank; ++r) {
         for (std::int32_t i = 0; i < in_dim; ++i) {
             const float value = bf16_to_float(a[static_cast<std::size_t>(r) * in_dim + i]) * scale;
             a_padded[static_cast<std::size_t>(r) * in_dim + i] = float_to_bf16(value);
         }
     }
-    // B padded to max_rank columns, likewise.
-    std::vector<std::uint16_t> b_padded(static_cast<std::size_t>(out_dim) * max_rank_, 0);
+    // B padded to the bank's rank columns, likewise.
+    std::vector<std::uint16_t> b_padded(static_cast<std::size_t>(out_dim) * bank_rank, 0);
     for (std::int32_t row = 0; row < out_dim; ++row) {
         for (std::int32_t r = 0; r < rank; ++r) {
-            b_padded[static_cast<std::size_t>(row) * max_rank_ + r] =
+            b_padded[static_cast<std::size_t>(row) * bank_rank + r] =
                 b[static_cast<std::size_t>(row) * rank + r];
         }
     }
@@ -369,6 +375,7 @@ void LoraStore::register_module(std::int32_t layer, std::string module, ModuleBi
         binding.source_row(binding.out - 1) >= binding.checkpoint_out()) {
         throw std::invalid_argument("lora_store: a module binding needs a key and positive shapes");
     }
+    if (binding.rank < 0) { throw std::invalid_argument("lora_store: a module binding's rank must not be negative"); }
     auto& parts = directory_[{layer, std::move(module)}];
     for (const auto& part : parts) {
         if (part.in != binding.in || part.checkpoint_out() != binding.checkpoint_out() ||
@@ -449,18 +456,30 @@ void LoraStore::ensure_banks() {
     for (const auto& [where, parts] : directory_) {
       for (const auto& binding : parts) {
         const Key key{binding.key, binding.port};
-        if (banks_.find(key) != banks_.end()) { continue; }
-        const auto [existing, inserted] = queued.emplace(key, &binding);
-        if (!inserted) {
-            if (existing->second->in != binding.in || existing->second->out != binding.out) {
-                throw std::logic_error("LoRA aliases disagree on the projection shape");
+        if (const auto built = banks_.find(key); built != banks_.end()) {
+            // A binding registered after its bank was built (a later ensure_banks) must agree with it.
+            if (built->second.view.k != binding.in || built->second.view.n != binding.out ||
+                built->second.view.rank != binding_rank(binding)) {
+                throw std::logic_error("LoRA alias disagrees with its existing bank's shape or rank");
             }
             continue;
         }
+        const auto [existing, inserted] = queued.emplace(key, &binding);
+        if (!inserted) {
+            if (existing->second->in != binding.in || existing->second->out != binding.out ||
+                binding_rank(*existing->second) != binding_rank(binding)) {
+                throw std::logic_error("LoRA aliases disagree on the projection shape or rank");
+            }
+            continue;
+        }
+        const std::int32_t rank = binding_rank(binding);
+        if (rank > max_rank_) {
+            throw std::invalid_argument("lora_store: a module binding's rank exceeds --max-lora-rank");
+        }
         const std::size_t a_bytes =
-            static_cast<std::size_t>(slots_) * max_rank_ * binding.in * sizeof(std::uint16_t);
+            static_cast<std::size_t>(slots_) * rank * binding.in * sizeof(std::uint16_t);
         const std::size_t b_bytes =
-            static_cast<std::size_t>(slots_) * binding.out * max_rank_ * sizeof(std::uint16_t);
+            static_cast<std::size_t>(slots_) * binding.out * rank * sizeof(std::uint16_t);
         planned.push_back({key, a_bytes, b_bytes, &binding});
         total += a_bytes + b_bytes + static_cast<std::size_t>(slots_) * binding.out * 8 + 768;
         if (replacements_.contains(key)) { total += slots_ * sizeof(void*) + 256; }
@@ -485,9 +504,10 @@ void LoraStore::ensure_banks() {
         bank.b             = arena->alloc_bytes(item.b_bytes).data;
         bank.view.a        = bank.a;
         bank.view.b        = bank.b;
-        bank.view.a_stride = static_cast<std::int64_t>(max_rank_) * binding.in;
-        bank.view.b_stride = static_cast<std::int64_t>(binding.out) * max_rank_;
-        bank.view.rank     = max_rank_;
+        const std::int32_t rank = binding_rank(binding);
+        bank.view.a_stride = static_cast<std::int64_t>(rank) * binding.in;
+        bank.view.b_stride = static_cast<std::int64_t>(binding.out) * rank;
+        bank.view.rank     = rank;
         bank.view.n        = binding.out;
         bank.view.k        = binding.in;
         bank.affine = arena->alloc_bytes(static_cast<std::size_t>(slots_) * binding.out * 8).data;
@@ -596,6 +616,13 @@ void LoraStore::validate_module(std::int32_t layer, const std::string& module,
             std::to_string(binding.checkpoint_out()) + "," + std::to_string(binding.in) +
             "] -- the adapter was trained against a different model");
     }
+    for (const auto& part : module_parts(layer, module)) {
+        if (rank > binding_rank(part)) {
+            throw std::invalid_argument("adapter module '" + module + "' on layer " + std::to_string(layer) +
+                                        " has rank " + std::to_string(rank) + " but this engine serves it at rank " +
+                                        std::to_string(binding_rank(part)) + " at most");
+        }
+    }
 }
 
 void LoraStore::set_module_slot(std::int32_t layer, const std::string& module, std::int32_t slot,
@@ -655,6 +682,11 @@ void LoraStore::validate_device_module(const DeviceAdapterModule& m) const {
         throw std::invalid_argument("invalid device adapter module: " + m.module);
     }
     for (const auto& binding : parts) {
+        if (m.rank > binding_rank(binding)) {
+            throw std::invalid_argument("device adapter module '" + m.module + "' exceeds its bank's rank");
+        }
+    }
+    for (const auto& binding : parts) {
         if (!banks_.contains(Key{binding.key, binding.port})) {
             throw std::logic_error("device adapter bank was not created at startup");
         }
@@ -671,6 +703,7 @@ void LoraStore::validate_device_module(const DeviceAdapterModule& m) const {
 void LoraStore::set_device_module(std::int32_t slot, const DeviceAdapterModule& m) {
     validate_device_module(m);
     if (slot < 0 || slot >= slots_) { throw std::invalid_argument("invalid adapter slot"); }
+    advance_kv_generation(slot);
     const ScopedDevice on_store(device_);
     for (const auto& binding : module_parts(m.layer, m.module)) {
         auto& bank = banks_.at(Key{binding.key, binding.port});
@@ -683,7 +716,7 @@ void LoraStore::set_device_module(std::int32_t slot, const DeviceAdapterModule& 
         for (std::int32_t row = 0; row < binding.out; row += group) {
             const auto* source = static_cast<const std::uint16_t*>(m.b) +
                                  static_cast<std::size_t>(binding.source_row(row)) * m.rank;
-            CUDA_CHECK(cudaMemcpy2D(b + static_cast<std::size_t>(row) * max_rank_, max_rank_ * 2,
+            CUDA_CHECK(cudaMemcpy2D(b + static_cast<std::size_t>(row) * bank.view.rank, bank.view.rank * 2,
                                     source, m.rank * 2, m.rank * 2,
                                     std::min(group, binding.out - row), cudaMemcpyDeviceToDevice));
         }
@@ -728,6 +761,7 @@ void LoraStore::clear_slot(std::int32_t slot) {
         identities_.erase(slot);
     }
     if (slot < 0 || slot >= slots_) { return; }
+    advance_kv_generation(slot);
     const ScopedDevice on_store(device_);
     for (auto& [key, replacement] : replacements_) {
         void* empty = nullptr;
@@ -836,10 +870,10 @@ LoraStore::stage_modules(std::int32_t slot, const std::vector<StagedModule>& mod
         const StagedModule& m = *item.fill->module;
         const Bank& bank      = *item.bank;
         if (item.part == 0) {
-            // A padded to max_rank rows with alpha/r folded in, as set_slot writes it.
+            // A padded to the bank's rank rows with alpha/r folded in, as set_slot writes it.
             auto* out              = reinterpret_cast<std::uint16_t*>(out_bytes);
             const std::int32_t in  = bank.view.k;
-            for (std::int32_t r = 0; r < max_rank_; ++r) {
+            for (std::int32_t r = 0; r < bank.view.rank; ++r) {
                 for (std::int32_t i = 0; i < in; ++i) {
                     out[static_cast<std::size_t>(r) * in + i] =
                         r < m.rank ? float_to_bf16(bf16_to_float((*m.a)[static_cast<std::size_t>(r) * in + i]) *
@@ -848,13 +882,14 @@ LoraStore::stage_modules(std::int32_t slot, const std::vector<StagedModule>& mod
                 }
             }
         } else if (item.part == 1) {
-            // B padded to max_rank columns, the binding's rows of the checkpoint's B.
+            // B padded to the bank's rank columns, the binding's rows of the checkpoint's B.
             auto* out                      = reinterpret_cast<std::uint16_t*>(out_bytes);
             const ModuleBinding& binding   = *item.fill->binding;
+            const std::int32_t bank_rank   = bank.view.rank;
             for (std::int32_t row = 0; row < bank.view.n; ++row) {
                 const std::size_t source = static_cast<std::size_t>(binding.source_row(row)) * m.rank;
-                for (std::int32_t r = 0; r < max_rank_; ++r) {
-                    out[static_cast<std::size_t>(row) * max_rank_ + r] =
+                for (std::int32_t r = 0; r < bank_rank; ++r) {
+                    out[static_cast<std::size_t>(row) * bank_rank + r] =
                         r < m.rank ? (*m.b)[source + r] : std::uint16_t{0};
                 }
             }
@@ -897,6 +932,9 @@ LoraStore::stage_modules(std::int32_t slot, const std::vector<StagedModule>& mod
 void LoraStore::commit_staged(const StagedSlot& staged) {
     const std::int32_t slot = staged.slot_;
     if (slot < 0 || slot >= slots_) { throw std::invalid_argument("lora_store: staged slot is out of range"); }
+    // Before the first byte moves: KV computed from here on is the new adapter's, and every
+    // prefix computed under the old bytes stops matching (slot_kv_generation).
+    advance_kv_generation(slot);
     const auto t0 = std::chrono::steady_clock::now();
     const ScopedDevice on_store(device_ < 0 ? current_device() : device_);
     cudaStream_t stream = nullptr;
@@ -985,6 +1023,22 @@ void LoraStore::set_slot_version(std::int32_t slot, std::uint32_t version) noexc
     if (versions_ && slot >= 0 && slot < slots_) { versions_[slot].store(version, std::memory_order_relaxed); }
 }
 
+std::uint64_t LoraStore::slot_kv_generation(std::int32_t slot) const noexcept {
+    return kv_generations_ && slot >= 0 && slot < slots_ ? kv_generations_[slot].load(std::memory_order_acquire)
+                                                         : 0U;
+}
+
+void LoraStore::advance_kv_generation(std::int32_t slot) noexcept {
+    if (!kv_generations_ || slot < 0 || slot >= slots_) { return; }
+    // Unique across the process, so a value never comes back for any slot of any store. The
+    // slot's value first, then the clock: a planner that sees the new clock re-plans and reads
+    // the new generation.
+    static std::atomic<std::uint64_t> issued{0};
+    const std::uint64_t next = issued.fetch_add(1, std::memory_order_relaxed) + 1U;
+    kv_generations_[slot].store(next, std::memory_order_release);
+    kv_clock_.fetch_add(1, std::memory_order_acq_rel);
+}
+
 void LoraStore::write_uniform_slot(std::int32_t slot, cudaStream_t stream) const {
     std::int32_t* cell = uniform_cell_;
     if (cell == nullptr) { return; }
@@ -1028,6 +1082,32 @@ std::vector<int> LoraStoreSet::devices() const {
 
 LoraStore& lora_store_for_current_device() {
     return engine_slot<LoraStoreSet>().for_device(LoraStore::current_device());
+}
+
+namespace {
+const LoraStore* peek_current_store() noexcept {
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return nullptr;
+    }
+    try {
+        return engine_slot<LoraStoreSet>().peek(device);
+    } catch (...) {
+        return nullptr;
+    }
+}
+} // namespace
+
+std::uint64_t lora_slot_kv_generation(std::int32_t slot) noexcept {
+    if (slot < 0) { return 0; }
+    const LoraStore* store = peek_current_store();
+    return store != nullptr ? store->slot_kv_generation(slot) : 0U;
+}
+
+std::uint64_t lora_kv_generation_clock() noexcept {
+    const LoraStore* store = peek_current_store();
+    return store != nullptr ? store->kv_generation_clock() : 0U;
 }
 
 namespace {

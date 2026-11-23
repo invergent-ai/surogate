@@ -53,6 +53,73 @@ target_include_directories(sinfer_jinja_compat_test PRIVATE
 add_test(NAME sinfer_jinja_compat_test COMMAND sinfer_jinja_compat_test)
 set_property(GLOBAL APPEND PROPERTY SINFER_SERVE_TEST_TARGETS sinfer_jinja_compat_test)
 
+# ENGINE-INKLING lane f2: the native Inkling-2 renderer / output parser against vLLM's own Python (token-exact
+# vectors in rl/engine-inkling-2026-11-21/vectors). CPU only and deliberately not linked to libsinfer.so: the
+# frontend tokenizer and the Inkling sources are compiled in, so it builds in a minute and runs where no device is.
+# Skips (77) without INKLING_MODEL_DIR / INKLING_VECTORS.
+add_executable(sinfer_inkling_frontend_test
+  inkling/test_inkling_frontend.cpp
+  ${SERVE_ROOT}/family/impl/frontend/inkling_json.cpp
+  ${SERVE_ROOT}/family/impl/frontend/inkling_render.cpp
+  ${SERVE_ROOT}/family/impl/frontend/inkling_parse.cpp
+  ${SERVE_ROOT}/family/impl/frontend/tokenizer.cpp
+  ${SERVE_ROOT}/../tokenizer/tokenizer.cpp
+  ${SERVE_ROOT}/../tokenizer/tok_profile.cpp
+  ${SERVE_ROOT}/../tokenizer/unicode.cpp
+  ${SERVE_ROOT}/../tokenizer/unicode_data.cpp)
+target_include_directories(sinfer_inkling_frontend_test PRIVATE
+  ${SERVE_ROOT} ${SERVE_ROOT}/.. ${SERVE_ROOT}/../tokenizer ${SINFER_JSON_INCLUDE}
+  ${SUROGATE_VENDOR_DIR} ${SUROGATE_VENDOR_DIR}/utf8proc ${minja_SOURCE_DIR}/include ${fmt_SOURCE_DIR}/include)
+target_compile_definitions(sinfer_inkling_frontend_test PRIVATE FMT_HEADER_ONLY=1)
+target_compile_options(sinfer_inkling_frontend_test PRIVATE -UNDEBUG)
+target_link_libraries(sinfer_inkling_frontend_test PRIVATE sinfer_text Threads::Threads)
+add_test(NAME sinfer_inkling_frontend_test COMMAND sinfer_inkling_frontend_test)
+set_tests_properties(sinfer_inkling_frontend_test PROPERTIES SKIP_RETURN_CODE 77)
+set_property(GLOBAL APPEND PROPERTY SINFER_SERVE_TEST_TARGETS sinfer_inkling_frontend_test)
+# ENGINE-INKLING lane V-b: Inkling-2 image requests (renderer with images, Pillow-faithful decode, the 40 px grid, the
+# [4N, 1200] payload) against lane V-a's vision vectors from vLLM (vectors/vision). CPU only, same pattern as above plus
+# the FFmpeg decoder library. Skips (77) without INKLING_MODEL_DIR / INKLING_VECTORS.
+add_executable(sinfer_inkling_vision_test
+  inkling/test_inkling_vision.cpp
+  ${SERVE_ROOT}/family/impl/frontend/inkling_json.cpp
+  ${SERVE_ROOT}/family/impl/frontend/inkling_render.cpp
+  ${SERVE_ROOT}/family/impl/frontend/inkling_vision.cpp
+  ${SERVE_ROOT}/family/impl/frontend/tokenizer.cpp
+  ${SERVE_ROOT}/../tokenizer/tokenizer.cpp
+  ${SERVE_ROOT}/../tokenizer/tok_profile.cpp
+  ${SERVE_ROOT}/../tokenizer/unicode.cpp
+  ${SERVE_ROOT}/../tokenizer/unicode_data.cpp)
+target_include_directories(sinfer_inkling_vision_test PRIVATE
+  ${SERVE_ROOT} ${SERVE_ROOT}/.. ${SERVE_ROOT}/../tokenizer ${SINFER_JSON_INCLUDE}
+  ${SUROGATE_VENDOR_DIR} ${SUROGATE_VENDOR_DIR}/utf8proc ${minja_SOURCE_DIR}/include ${fmt_SOURCE_DIR}/include)
+target_compile_definitions(sinfer_inkling_vision_test PRIVATE FMT_HEADER_ONLY=1)
+target_compile_options(sinfer_inkling_vision_test PRIVATE -UNDEBUG)
+target_link_libraries(sinfer_inkling_vision_test PRIVATE sinfer_text sinfer_media_decode Threads::Threads)
+add_test(NAME sinfer_inkling_vision_test COMMAND sinfer_inkling_vision_test)
+set_tests_properties(sinfer_inkling_vision_test PROPERTIES SKIP_RETURN_CODE 77)
+set_property(GLOBAL APPEND PROPERTY SINFER_SERVE_TEST_TARGETS sinfer_inkling_vision_test)
+# The same sources: Inkling-2 streaming (inkling::StreamParser) -- the concatenated deltas equal the non-streamed
+# message for every parser vector, and deltas come as the tokens do. The frontend gate's streaming check.
+add_executable(sinfer_inkling_stream_test
+  inkling/test_inkling_stream.cpp
+  ${SERVE_ROOT}/family/impl/frontend/inkling_json.cpp
+  ${SERVE_ROOT}/family/impl/frontend/inkling_render.cpp
+  ${SERVE_ROOT}/family/impl/frontend/inkling_parse.cpp
+  ${SERVE_ROOT}/family/impl/frontend/tokenizer.cpp
+  ${SERVE_ROOT}/../tokenizer/tokenizer.cpp
+  ${SERVE_ROOT}/../tokenizer/tok_profile.cpp
+  ${SERVE_ROOT}/../tokenizer/unicode.cpp
+  ${SERVE_ROOT}/../tokenizer/unicode_data.cpp)
+target_include_directories(sinfer_inkling_stream_test PRIVATE
+  ${SERVE_ROOT} ${SERVE_ROOT}/.. ${SERVE_ROOT}/../tokenizer ${SINFER_JSON_INCLUDE}
+  ${SUROGATE_VENDOR_DIR} ${SUROGATE_VENDOR_DIR}/utf8proc ${minja_SOURCE_DIR}/include ${fmt_SOURCE_DIR}/include)
+target_compile_definitions(sinfer_inkling_stream_test PRIVATE FMT_HEADER_ONLY=1)
+target_compile_options(sinfer_inkling_stream_test PRIVATE -UNDEBUG)
+target_link_libraries(sinfer_inkling_stream_test PRIVATE sinfer_text Threads::Threads)
+add_test(NAME sinfer_inkling_stream_test COMMAND sinfer_inkling_stream_test)
+set_tests_properties(sinfer_inkling_stream_test PROPERTIES SKIP_RETURN_CODE 77)
+set_property(GLOBAL APPEND PROPERTY SINFER_SERVE_TEST_TARGETS sinfer_inkling_stream_test)
+
 function(sinfer_add_test name)
   cmake_parse_arguments(arg "NEEDS_SOURCE_DIR" "" "SOURCES;LIBRARIES" ${ARGN})
   add_executable(${name} ${arg_SOURCES})
@@ -121,6 +188,8 @@ sinfer_add_op_test(sinfer_sparse_gqa_batch_test SOURCES ops/test_sparse_gqa_batc
 sinfer_add_op_test(sinfer_mixed_attention_workspace_test SOURCES ops/test_mixed_attention_workspace.cpp
   LIBRARIES sinfer_ops)
 sinfer_add_op_test(sinfer_marlin_fp8_wide_test SOURCES ops/test_marlin_fp8_wide.cpp LIBRARIES sinfer_ops)
+# lanes/OOM F3: log-prob scoring on a full device is a DeviceOutOfMemory, not an abort.
+sinfer_add_op_test(sinfer_sampled_logprob_oom_test SOURCES ops/test_sampled_logprob_oom.cpp LIBRARIES sinfer_ops)
 sinfer_add_op_test(sinfer_marlin_fused_parent_test SOURCES ops/test_marlin_fused_parent.cpp LIBRARIES sinfer_ops)
 sinfer_add_op_test(sinfer_marlin_moe_reduce_test SOURCES ops/test_marlin_moe_reduce.cpp LIBRARIES sinfer_ops)
 # Weight-only NVFP4 (NVFP4_A16): the load-time Marlin rewrite, the dense GEMM at every row-block
@@ -128,6 +197,22 @@ sinfer_add_op_test(sinfer_marlin_moe_reduce_test SOURCES ops/test_marlin_moe_red
 sinfer_add_op_test(sinfer_nvfp4_marlin_test SOURCES ops/test_nvfp4_marlin.cpp LIBRARIES sinfer_ops)
 sinfer_add_op_test(sinfer_sparse_moe_fp8_sm90_test SOURCES ops/test_sparse_moe_fp8_sm90.cu LIBRARIES sinfer_ops)
 sinfer_add_op_test(sinfer_ngram_ple_segments_test SOURCES ops/test_ngram_ple_segments.cpp LIBRARIES sinfer_ops)
+# Inkling-2-Mini hidden-stream ops (ENGINE-INKLING lane e1): T1-T5 of lanes/e1/DESIGN-target.md 8.
+sinfer_add_op_test(sinfer_inkling_mix_test SOURCES targets/inkling2/test_inkling_mix.cpp LIBRARIES sinfer_ops)
+sinfer_add_op_test(sinfer_inkling_invariance_test SOURCES targets/inkling2/test_inkling_invariance.cpp LIBRARIES sinfer_ops)
+# Lane e1: CUDA graph launch cost by graph shape (plain / PDL / memcpy nodes / split); a bench (exit 77 without a GPU).
+sinfer_add_test(sinfer_inkling_graph_launch_bench SOURCES targets/inkling2/bench_graph_launch.cu LIBRARIES CUDA::cudart)
+# Lane mx: critical-path cost of the mix ops in a decode-like PDL graph, reference vs latency-cut kernels (a bench).
+sinfer_add_op_test(sinfer_inkling_mix_bench SOURCES targets/inkling2/bench_inkling_mix.cu LIBRARIES sinfer_ops)
+# Lane e1: wo GEMM per call in a PDL graph, generic vs narrow kernel (the wo plan's op gate; a bench).
+sinfer_add_op_test(sinfer_inkling_wo_bench SOURCES targets/inkling2/bench_wo_narrow.cu LIBRARIES sinfer_ops)
+# Inkling-2-Mini DSpark drafter ops (ENGINE-INKLING lane e2) vs ref/dspark_ref.py's golden vectors (argument: the
+# vector dir with mtp.safetensors; lanes/e2/card_dspark_test.sh stages it).
+sinfer_add_op_test(sinfer_dspark_test SOURCES targets/inkling2/test_dspark.cpp
+  ${SERVE_ROOT}/targets/inkling2/impl/dspark.cpp LIBRARIES sinfer_ops sinfer_inkling_attention)
+# Inkling-2-Mini's mixture (ENGINE-INKLING lane d): quantisers bit-exact, SiTU, router, MoE vs a host
+# pipeline, width invariance, capture rows, expert LoRA (rl/engine-inkling-2026-11-21/lanes/d/DESIGN-moe.md 9).
+sinfer_add_op_test(sinfer_inkling_moe_test SOURCES ops/test_inkling_moe.cpp LIBRARIES sinfer_ops)
 
 function(sinfer_add_linear_test name source)
   sinfer_add_op_test(${name}
@@ -153,6 +238,11 @@ target_compile_options(sinfer_qwen4exp_mtp_workspace_test PRIVATE -UNDEBUG)
 # head, MTP's bound unchanged.
 sinfer_add_test(sinfer_lora_graph_plan_test SOURCES test_lora_graph_plan.cpp)
 target_compile_options(sinfer_lora_graph_plan_test PRIVATE -UNDEBUG)
+# Lane f1 (ENGINE-INKLING): every serving shape of the windowed targets plans and finalizes affinely under
+# --kv-capacity auto (and as a pipeline stage), and the curve's minimum holds one full request + its window
+# charge. Needs a device context only; artifacts by --inkling / --gemma3 (77 without them).
+sinfer_add_test(sinfer_kv_capacity_shapes_test SOURCES test_kv_capacity_shapes.cpp)
+target_compile_options(sinfer_kv_capacity_shapes_test PRIVATE -UNDEBUG)
 add_executable(sinfer_radix_prefix_cache_test test_radix_prefix_cache.cpp)
 target_include_directories(sinfer_radix_prefix_cache_test PRIVATE ${SERVE_ROOT})
 target_compile_options(sinfer_radix_prefix_cache_test PRIVATE -UNDEBUG)
@@ -172,6 +262,20 @@ sinfer_add_test(sinfer_artifact_reader_test
 sinfer_add_test(sinfer_artifact_materialization_test
   SOURCES test_artifact_materialization.cpp
   LIBRARIES sinfer_artifact)
+# Inkling-2 (lane b): the MXFP8 / FP8 1x128 formats; with INKLING2_ARTIFACT, the converted artifact.
+sinfer_add_test(sinfer_inkling2_artifact_formats_test
+  SOURCES test_inkling2_artifact_formats.cpp
+  LIBRARIES sinfer_artifact)
+sinfer_add_test(sinfer_inkling2_bindings_test
+  SOURCES test_inkling2_bindings.cpp ${SERVE_ROOT}/targets/inkling2/impl/load/bindings.cpp
+  LIBRARIES sinfer_artifact)
+# Compile-only check of the same sources (no link, no CUDA objects): fits the SMALL build queue.
+add_library(sinfer_inkling2_load_check OBJECT EXCLUDE_FROM_ALL
+  test_inkling2_bindings.cpp test_inkling2_artifact_formats.cpp
+  ${SERVE_ROOT}/targets/inkling2/impl/load/bindings.cpp)
+target_include_directories(sinfer_inkling2_load_check PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR} ${SERVE_ROOT} ${SINFER_JSON_INCLUDE} ${SUROGATE_VENDOR_DIR}
+  ${CUDAToolkit_INCLUDE_DIRS})
 # surogate vendor patch (csrc/src/serve/PATCHES.md): the media-decode test
 # exercises real FFmpeg decoding and cannot pass against the stub.
 if(SINFER_ENABLE_FFMPEG)
@@ -259,6 +363,17 @@ sinfer_add_test(sinfer_kv_cache_test
 sinfer_add_test(sinfer_kv_admission_test
   SOURCES test_kv_admission.cpp
   LIBRARIES sinfer_core)
+# Window-bounded KV pages (lane f1): the host-only page manager; needs no device. Header-only
+# (core/kv_window_pages.h), so it links nothing and builds in seconds without libsinfer.so.
+add_executable(sinfer_kv_window_pages_test test_kv_window_pages.cpp)
+target_include_directories(sinfer_kv_window_pages_test PRIVATE ${SERVE_ROOT})
+target_compile_options(sinfer_kv_window_pages_test PRIVATE -UNDEBUG)
+add_test(NAME sinfer_kv_window_pages_test COMMAND sinfer_kv_window_pages_test)
+set_property(GLOBAL APPEND PROPERTY SINFER_SERVE_TEST_TARGETS sinfer_kv_window_pages_test)
+# The pool's window class on a device (exits 77 without one).
+sinfer_add_test(sinfer_kv_window_pool_test
+  SOURCES test_kv_window_pool.cpp
+  LIBRARIES sinfer_core)
 sinfer_add_test(sinfer_elastic_kv_region_test
   SOURCES test_elastic_kv_region.cpp
   LIBRARIES sinfer_core)
@@ -299,6 +414,23 @@ sinfer_add_test(sinfer_prompt_parity_test
   NEEDS_SOURCE_DIR
   LIBRARIES sinfer_serve sinfer_engine sinfer_core)
 target_include_directories(sinfer_prompt_parity_test PRIVATE
+  ${SERVE_ROOT}/family/export
+  ${SERVE_ROOT}/family/impl)
+# ENGINE-INKLING lane f2: the Inkling-2 path through the serving layer (raw-chat parse, translate, Frontend detection,
+# render, count, reply bytes) against vLLM's vectors. CPU; skips (77) without INKLING_MODEL_DIR / INKLING_VECTORS.
+sinfer_add_test(sinfer_inkling_wiring_test
+  SOURCES inkling/test_inkling_wiring.cpp
+  LIBRARIES sinfer_serve sinfer_engine sinfer_core)
+target_include_directories(sinfer_inkling_wiring_test PRIVATE
+  ${SERVE_ROOT}/family/export
+  ${SERVE_ROOT}/family/impl)
+# ENGINE-INKLING lane V-b: Inkling-2 image requests through the serving layer (raw-chat image collection, translate's
+# acquisition) and Frontend::prepare / count_tokens (vision on / off) against lane V-a's vectors. CPU; skips (77)
+# without INKLING_MODEL_DIR / INKLING_VECTORS.
+sinfer_add_test(sinfer_inkling_vision_wiring_test
+  SOURCES inkling/test_inkling_vision_wiring.cpp
+  LIBRARIES sinfer_serve sinfer_engine sinfer_core)
+target_include_directories(sinfer_inkling_vision_wiring_test PRIVATE
   ${SERVE_ROOT}/family/export
   ${SERVE_ROOT}/family/impl)
 # The tokenizer_config.json chat-template contract: three JSON strings and no
@@ -779,6 +911,10 @@ sinfer_add_fused_linear_test(
   ops/linear_swiglu/test_w8_a16.cpp
   ops/linear_swiglu/linear_swiglu_test_common.cpp)
 sinfer_add_fused_linear_test(
+  sinfer_linear_swiglu_w8_delta_test
+  ops/linear_swiglu/test_w8_preactivation_delta.cpp
+  ops/linear_swiglu/linear_swiglu_test_common.cpp)
+sinfer_add_fused_linear_test(
   sinfer_linear_swiglu_nvfp4_test
   ops/linear_swiglu/test_nvfp4.cpp
   ops/linear_swiglu/linear_swiglu_test_common.cpp)
@@ -879,3 +1015,53 @@ if(_sinfer_serve_test_targets)
   list(LENGTH _sinfer_serve_test_targets _sinfer_serve_test_count)
   message(STATUS "serve tests: ${_sinfer_serve_test_count} targets under `serve-tests`")
 endif()
+
+# ENGINE-INKLING lane c: the Inkling attention op test links its own archive and sinfer_core directly
+# (libsinfer does not hold the archive yet). Not in the SINFER_SERVE_TEST_TARGETS aggregate.
+add_executable(sinfer_inkling_attention_test EXCLUDE_FROM_ALL ops/test_inkling_attention.cpp)
+target_include_directories(sinfer_inkling_attention_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR} ${SERVE_ROOT} ${CUDAToolkit_INCLUDE_DIRS})
+target_link_libraries(sinfer_inkling_attention_test PRIVATE sinfer_inkling_attention)
+target_compile_options(sinfer_inkling_attention_test PRIVATE
+  $<$<COMPILE_LANGUAGE:CXX>:-fno-fast-math> $<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off> -UNDEBUG)
+add_test(NAME sinfer_inkling_attention_test COMMAND sinfer_inkling_attention_test)
+set_tests_properties(sinfer_inkling_attention_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# ENGINE-INKLING lane c, S1: the split full-vocabulary draw vs the one-CTA kernel through ops::sample() (old-vs-new
+# token and count identity) -- compiles the sampling launcher / wrapper itself and links sinfer_core only.
+add_executable(sinfer_sampling_split_test EXCLUDE_FROM_ALL ops/test_sampling_split.cu
+  ${SERVE_ROOT}/ops/launcher/sampling.cu ${SERVE_ROOT}/ops/wrapper/sampling.cpp)
+target_include_directories(sinfer_sampling_split_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR} ${SERVE_ROOT} ${CUDAToolkit_INCLUDE_DIRS})
+target_link_libraries(sinfer_sampling_split_test PRIVATE sinfer_core)
+target_compile_options(sinfer_sampling_split_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+
+# ENGINE-INKLING lane e2 (agent-EN-e2c): the split route of untruncated stochastic verify rows through
+# ops::speculative_accept_greedy_drafts -- batch / width invariance, determinism, the T1 distribution (chi-square over
+# many seeds) and old-vs-new; compiles the speculative + sampling launchers / wrappers itself, links sinfer_core only.
+add_executable(sinfer_spec_exact_split_test EXCLUDE_FROM_ALL ops/test_spec_exact_split.cu
+  ${SERVE_ROOT}/ops/launcher/speculative_round.cu ${SERVE_ROOT}/ops/wrapper/speculative_round.cpp
+  ${SERVE_ROOT}/ops/launcher/sampling.cu ${SERVE_ROOT}/ops/wrapper/sampling.cpp)
+target_include_directories(sinfer_spec_exact_split_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR} ${SERVE_ROOT} ${CUDAToolkit_INCLUDE_DIRS})
+target_link_libraries(sinfer_spec_exact_split_test PRIVATE sinfer_core)
+target_compile_options(sinfer_spec_exact_split_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+
+# ENGINE-INKLING lane T (agent-EN-T): the engine-op trainer's fast-route shim (extern "C", ctypes from
+# surogate/train/inkling_fastpath/) over libsinfer.so -- the trainer drives the engine's own Inkling forward.
+# A shared library beside the op tests (inkbuild copies serve_tests/ back); nothing in the engine links it.
+add_library(sinfer_inkling_train SHARED EXCLUDE_FROM_ALL ${SERVE_ROOT}/inkling_fastpath/inkling_train_shim.cpp)
+target_include_directories(sinfer_inkling_train PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR} ${SERVE_ROOT} ${SINFER_JSON_INCLUDE} ${SUROGATE_VENDOR_DIR} ${CUDAToolkit_INCLUDE_DIRS})
+target_link_libraries(sinfer_inkling_train PRIVATE sinfer_shared CUDA::cudart)
+set_target_properties(sinfer_inkling_train PROPERTIES BUILD_RPATH "$ORIGIN:$ORIGIN/.." CXX_VISIBILITY_PRESET default)
+target_compile_options(sinfer_inkling_train PRIVATE
+  $<$<COMPILE_LANGUAGE:CXX>:-fno-fast-math> $<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>)
+# lane T8 (additive): the same shim + explicit S10 attention LoRA (inkling_fastpath/inkling_train_shim_t8.cpp); nothing links it.
+add_library(sinfer_inkling_train_t8 SHARED EXCLUDE_FROM_ALL ${SERVE_ROOT}/inkling_fastpath/inkling_train_shim_t8.cpp)
+target_include_directories(sinfer_inkling_train_t8 PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR} ${SERVE_ROOT} ${SINFER_JSON_INCLUDE} ${SUROGATE_VENDOR_DIR} ${CUDAToolkit_INCLUDE_DIRS})
+target_link_libraries(sinfer_inkling_train_t8 PRIVATE sinfer_shared CUDA::cudart)
+set_target_properties(sinfer_inkling_train_t8 PROPERTIES BUILD_RPATH "$ORIGIN:$ORIGIN/.." CXX_VISIBILITY_PRESET default)
+target_compile_options(sinfer_inkling_train_t8 PRIVATE
+  $<$<COMPILE_LANGUAGE:CXX>:-fno-fast-math> $<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>)

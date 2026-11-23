@@ -13,6 +13,7 @@
 
 #include <array>
 #include <cstddef>
+#include <memory>
 #include <cstdint>
 #include <optional>
 #include <stdexcept>
@@ -58,6 +59,11 @@ struct RequestLimits {
     /// --overlong-max-tokens reject: a max_tokens below 1 is left for vLLM's check after the prompt is counted
     /// (serve/vllm_max_tokens.h), which is where vLLM refuses it, instead of being refused while parsing.
     bool vllm_max_tokens = false;
+    /// The routed model renders its prompt from the request body itself (PromptCapabilities::inkling2_chat): the
+    /// conversation fields -- messages, tools, tool_choice, parallel_tool_calls, chat_template_kwargs,
+    /// reasoning_effort -- are vLLM's renderer's to read and validate (family/impl/frontend/inkling_render.h), so this
+    /// parser leaves them alone instead of refusing what vLLM accepts.
+    bool raw_chat = false;
 };
 
 struct CompletionUsage {
@@ -65,6 +71,9 @@ struct CompletionUsage {
     int completion_tokens = 0;
     /// The part of prompt_tokens served from the prefix cache instead of being prefilled.
     int cached_tokens     = 0;
+    /// usage.completion_tokens_details.reasoning_tokens, written only when set: vLLM writes it for a model served with
+    /// a reasoning parser, and Inkling-2's replies report it as vLLM does (the harness's cost record reads it).
+    std::optional<int> reasoning_tokens;
 };
 
 /// Usage from an outcome's counts. The cached part is the prompt tokens the prefix cache supplied
@@ -105,6 +114,16 @@ struct ToolCall {
     std::string id;
     std::string name;
     std::string arguments_json;
+};
+
+/// One streamed piece of a tool call (Chat Completions `delta.tool_calls[]`, as vLLM streams them): the call's first
+/// piece carries its id, type and name; later pieces append to its arguments.
+struct ToolCallDelta {
+    int index = 0;
+    bool opens = false;                   // first piece: id + type "function" + function.name
+    std::string id;                       // when opens
+    std::string name;                     // when opens
+    std::optional<std::string> arguments; // function.arguments appended (absent = none)
 };
 
 enum class ToolChoiceMode {
@@ -231,6 +250,12 @@ struct GenerationRequest {
     /// completion request and empty for a chat one; the two are the same request otherwise, so
     /// everything below -- sampling, stops, streaming, adapters, limits -- is shared.
     std::optional<std::string> raw_prompt;
+    /// The chat-completions body as the client sent it, for a model that renders its prompt from it
+    /// (RequestLimits::raw_chat); `messages`, `tools` and the other conversation fields are then left empty.
+    std::shared_ptr<const std::string> raw_chat_body;
+    /// With raw_chat_body: the body's image parts (image_url / input_image), in body order, whose bytes the serving
+    /// layer acquires for the renderer (PromptInput::raw_chat_media; Inkling-2 vision, ENGINE-INKLING lane V-b).
+    std::vector<ContentPart> raw_chat_images;
     std::vector<ChatTurn> messages;
     std::vector<ToolDefinition> tools;
     std::size_t tool_name_max_length = 64;
@@ -305,7 +330,7 @@ struct GenerationRequest {
     }
 
     [[nodiscard]] std::size_t media_item_count() const noexcept {
-        std::size_t count = 0;
+        std::size_t count = raw_chat_images.size();  // empty unless the model renders the raw body (Inkling-2)
         for (const ChatTurn& message : messages) {
             for (const ContentPart& part : message.content) {
                 if (part.kind == ContentKind::Image || part.kind == ContentKind::Video) { ++count; }

@@ -22,9 +22,13 @@ namespace {
 
 // Keep both projections in FP32 through SiLU: rounding them to BF16 first can
 // exceed the fused operation's error bound around the activation's steep region.
+// With kDelta, delta [token][2 * intermediate] (BF16, [gate; up]) is added to the FP32 sums before the SiLU: an
+// adapter round's shared-expert delta (sparse_moe_nvfp4.cu); a zero delta gives the plain kernel's bits.
+template <bool kDelta = false>
 __global__ void w8_swiglu_generic_kernel(
     const __nv_bfloat16* x, const std::int8_t* codes, const __half* scales,
-    __nv_bfloat16* out, int intermediate, int k, std::int64_t pairs) {
+    __nv_bfloat16* out, int intermediate, int k, std::int64_t pairs,
+    const __nv_bfloat16* delta = nullptr) {
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     for (std::int64_t pair = static_cast<std::int64_t>(blockIdx.x) * 4 + warp;
@@ -45,6 +49,11 @@ __global__ void w8_swiglu_generic_kernel(
         }
         gate = warp_reduce_sum(gate);
         up = warp_reduce_sum(up);
+        if constexpr (kDelta) {
+            const __nv_bfloat16* d = delta + token * 2 * static_cast<std::int64_t>(intermediate);
+            gate += __bfloat162float(d[row]);
+            up += __bfloat162float(d[intermediate + row]);
+        }
         if (lane == 0) { out[pair] = __float2bfloat16_rn(silu(gate) * up); }
     }
 }
@@ -228,6 +237,17 @@ void w8_linear_swiglu_generic_launch(const Tensor& x, const Weight& w, Tensor& o
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::int8_t*>(w.qdata),
         static_cast<const __half*>(w.scales), static_cast<__nv_bfloat16*>(out.data),
         out.ne[0], w.k, pairs);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void w8_linear_swiglu_generic_delta_launch(const Tensor& x, const Weight& w, Tensor& out,
+                                           const __nv_bfloat16* delta, cudaStream_t stream) {
+    const std::int64_t pairs = static_cast<std::int64_t>(out.ne[0]) * out.ne[1];
+    const auto blocks = static_cast<unsigned>(std::min<std::int64_t>((pairs + 3) / 4, 65535));
+    w8_swiglu_generic_kernel<true><<<blocks, 128, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::int8_t*>(w.qdata),
+        static_cast<const __half*>(w.scales), static_cast<__nv_bfloat16*>(out.data),
+        out.ne[0], w.k, pairs, delta);
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -147,6 +147,27 @@ int main() {
     failures += check(server.at("sampling_defaults").at("server_overrides").at("temperature").get<float>() == 0.6F,
                       "decision temperature leaked into the sampling overrides");
     {
+        // Review R8 minor 2: the record names what the engine does. A default DSpark engine holds the OnDemand option
+        // and reserves; without an effective value (a caller outside the server) the option is what is known.
+        const auto admission = [&](const ServeOptions& kv_options, std::optional<bool> effective) {
+            return Json::parse(format_server_start_json("serve-test", 1000, kv_options, sampling_defaults,
+                                                         "deployment-alias", load, memory, environment, std::nullopt,
+                                                         effective))
+                .at("engine")
+                .at("kv_admission");
+        };
+        ServeOptions reserve_options;
+        reserve_options.kv_admission.mode = sinfer::KvAdmission::Reserve;
+        failures += check(ServeOptions{}.kv_admission.mode == sinfer::KvAdmission::OnDemand &&
+                              admission(ServeOptions{}, false) == "reserve",
+                          "a default option on a reserving engine is not logged as reserve");
+        failures += check(admission(ServeOptions{}, true) == "ondemand", "an on-demand engine is not logged as ondemand");
+        failures += check(admission(reserve_options, false) == "reserve", "a reserve engine is not logged as reserve");
+        failures += check(admission(ServeOptions{}, std::nullopt) == "ondemand" &&
+                              admission(reserve_options, std::nullopt) == "reserve",
+                          "without an effective value the record does not follow the option");
+    }
+    {
         const Json uncalibrated = Json::parse(format_server_start_json(
             "serve-test", 1000, ServeOptions{}, sampling_defaults, "deployment-alias", load, memory,
             environment, std::nullopt));

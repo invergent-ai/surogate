@@ -6,6 +6,8 @@
 #include "family/impl/runtime/attention_workspace.h"
 #include "family/impl/adaptive_dflash.h"
 #include "family/impl/runtime/residual_policy.h"
+#include "family/impl/runtime/visit_round.h"
+#include "family/impl/runtime/dspark_round.h"
 #include "api/ops/batch_invariant.h"
 #include "ops/linear/marlin/marlin_plane.h"
 #include "family/impl/runtime/linear_state_slots.h"
@@ -29,6 +31,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
@@ -86,6 +89,38 @@ geometry_global_geometry_layers(const family::TextGeometry& g) {
     return out;
 }
 
+/// Window-bounded KV pages (lane f1, rl/engine-inkling-2026-11-21/lanes/f1/DESIGN-window-kv.md):
+/// on unless SUROGATE_SERVE_KV_WINDOW_PAGING=0, which keeps every windowed layer on full-context
+/// pages as before (the A/B for token identity).
+[[nodiscard]] inline bool kv_window_paging_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SUROGATE_SERVE_KV_WINDOW_PAGING");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+/// The sliding window of each KV-owning attention layer, in the pool's numbering (0 = whole
+/// context), or empty when no layer has one -- which leaves the pool exactly as it was. The
+/// window is the one attention runs with (layer_sliding_window, residual_policy.h), so a page the
+/// kernels can read is never released. A target whose KV planes are not one per layer (Inkling's
+/// per-visit planes) states them itself: `static std::vector<std::int32_t> kv_layer_windows(g)`.
+template <class V>
+[[nodiscard]] std::vector<std::int32_t> variant_kv_layer_windows(const family::TextGeometry& g) {
+    if (!kv_window_paging_enabled()) { return {}; }
+    std::vector<std::int32_t> out;
+    if constexpr (requires { V::kv_layer_windows(g); }) {
+        out = V::kv_layer_windows(g);
+    } else {
+        for (std::int32_t layer = 0; layer < g.layers; ++layer) {
+            if (!g.layer_attends(layer) || !g.layer_owns_kv(layer)) { continue; }
+            out.push_back(layer_sliding_window(layer, g));
+        }
+    }
+    const bool any = std::any_of(out.begin(), out.end(), [](std::int32_t w) { return w > 0; });
+    return any ? out : std::vector<std::int32_t>{};
+}
+
 } // namespace
 
 namespace {
@@ -140,6 +175,18 @@ template <class V>
 
 
 constexpr std::size_t kMiB        = 1024ULL * 1024ULL;
+
+/// One DFlash graph topology class's memory allowance: the target's measured bound when it states one
+/// (`dflash_graph_allowance_per_class_bytes`, e.g. inkling2's DSpark rounds), else the family's 64 / 96 MiB.
+template <class V>
+[[nodiscard]] std::uint64_t dflash_graph_class_allowance_bytes(std::uint64_t final_visible) {
+    if constexpr (requires { V::dflash_graph_allowance_per_class_bytes; }) {
+        (void)final_visible;
+        return V::dflash_graph_allowance_per_class_bytes;
+    } else {
+        return (final_visible <= 4096 ? 64ULL : 96ULL) * kMiB;
+    }
+}
 constexpr std::size_t kArenaAlign = 256ULL;
 
 enum class GdnWorkspacePath : std::uint8_t {
@@ -175,6 +222,8 @@ std::int32_t checked_i32(std::uint64_t value, const char* label) {
 KvCacheStorage resolve_kv_storage(KvCacheStorage storage, const family::TextGeometry& geometry,
                                   int sm) {
     if (storage != KvCacheStorage::Auto) { return storage; }
+    // A target that states its own default (Inkling-2: unit-scale e4m3, as its reference serves it).
+    if (family::kv_storage_fp8_default<Variant>()) { return KvCacheStorage::Fp8E4M3; }
     return geometry_gdn_layers(geometry) == 0 || sm == 90 ? KvCacheStorage::BFloat16
                                                           : KvCacheStorage::Fp8E4M3;
 }
@@ -252,13 +301,64 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     const std::uint32_t mtp_physical_pages = static_cast<std::uint32_t>(
         checked_i32(static_cast<std::uint64_t>(plan.main_page_groups) + mtp_extra_pages,
                     "MTP Paged KV physical pages exceed int32"));
+    // Window class of the text pool: a constant, so the capacity curve stays affine in the
+    // full-context pages, and its stride counts only the planes that keep the whole context.
+    std::vector<std::int32_t> layer_windows = variant_kv_layer_windows<Variant>(plan.geometry);
+    // Extra text-pool planes a target appends after its own (DSpark's draft KV, family/impl/runtime/dspark_round.h),
+    // with their windows; empty for every other target, which leaves the pool exactly as it was.
+    // A pipeline puts them on the LAST stage only (the drafter runs beside the head; e1 / f1c 15:30, 2-card 1M).
+    const bool stage_holds_last_layer =
+        plan.pipeline_stage_last == 0 || plan.pipeline_stage_last >= static_cast<std::int32_t>(plan.geometry.layers);
+    const std::vector<std::int32_t> extra_kv_planes =
+        stage_holds_last_layer ? family::variant_extra_kv_planes<Variant>(plan.geometry, plan.features)
+                               : std::vector<std::int32_t>{};
+    if (!layer_windows.empty()) {
+        layer_windows.insert(layer_windows.end(), extra_kv_planes.begin(), extra_kv_planes.end());
+    }
+    KvWindowClassSize window_class;
+    if (!layer_windows.empty()) {
+        const auto window_tokens =
+            static_cast<std::uint32_t>(*std::max_element(layer_windows.begin(), layer_windows.end()));
+        static const std::uint32_t image_windows = [] {
+            const char* raw = std::getenv("SUROGATE_SERVE_KV_WINDOW_IMAGES");
+            return raw ? static_cast<std::uint32_t>(std::strtoul(raw, nullptr, 10)) : 8U;
+        }();
+        // A pipeline stage holds one round per micro-batch group in flight (PipelineProgram:
+        // one group per stage unless SUROGATE_SERVE_PIPELINE_GROUPS says otherwise); 4 covers
+        // the 2- and 4-card splits, the env value any other.
+        const bool stage = !(plan.pipeline_stage_first == 0 && plan.pipeline_stage_last == 0) &&
+                           (plan.pipeline_stage_first > 0 || plan.pipeline_stage_last < plan.geometry.layers);
+        std::uint32_t rounds = 1;
+        if (stage) {
+            const char* raw = std::getenv("SUROGATE_SERVE_PIPELINE_GROUPS");
+            const long groups = raw != nullptr && *raw != '\0' ? std::strtol(raw, nullptr, 10) : 0;
+            rounds = std::min(plan.max_concurrency, groups >= 1 ? static_cast<std::uint32_t>(groups) : 4U);
+        }
+        window_class = plan_kv_window_class(window_tokens, plan.max_concurrency,
+                                            static_cast<std::uint32_t>(effective_prefill_chunk),
+                                            image_windows, rounds);
+        if (plan.kv_window_elastic && plan.elastic_kv) {
+            // M3-C (lanes/f1/DESIGN-M3-kv-lever.md C): the static bound above becomes the virtual
+            // span; the device holds the round transient (+ a granule) and what holders are charged.
+            window_class.elastic         = true;
+            window_class.lane_charge     = kv_window_lane_charge(window_tokens);
+            const std::uint32_t steady   = plan.max_concurrency * window_class.lane_charge;
+            window_class.transient_pages = window_class.lane_pages > steady ? window_class.lane_pages - steady : 1U;
+        }
+    }
     LayoutBuilder builder;
     PersistentLayout out;
     out.decoder = family::plan_decoder_state(
         builder, family::DecoderStateSpec{
-                     .full_attention_layers     = geometry_full_attention_layers(plan.geometry),
-                     .text_kv_layers = family::detail::stage_kv_layers(
-                         plan.geometry, plan.pipeline_stage_first, plan.pipeline_stage_last),
+                     .full_attention_layers     = static_cast<std::uint32_t>(
+                         geometry_full_attention_layers(plan.geometry) +
+                         static_cast<std::int32_t>(extra_kv_planes.size())),
+                     .text_kv_layers = [&] {
+                         family::KvLayerRange range = family::detail::stage_kv_layers(
+                             plan.geometry, plan.pipeline_stage_first, plan.pipeline_stage_last);
+                         range.last += static_cast<std::uint32_t>(extra_kv_planes.size());
+                         return range;
+                     }(),
                      .mtp_layers                = plan.geometry.mtp_layers,
                      .capacity                  = plan.capacity,
                      .kv_heads                  = plan.geometry.kv_heads,
@@ -282,29 +382,39 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .text_physical_page_cap    = plan.elastic_kv ? plan.main_page_groups : 0U,
                      .elastic_kv_overcommit     = plan.elastic_kv && plan.elastic_kv_overcommit,
                      .mtp_physical_page_groups  = mtp_physical_pages,
-                     .linear_attention =
-                         {
-                             .layers         = geometry_gdn_layers(plan.geometry),
-                             // A short convolution runs over the residual width itself and
-                             // carries no recurrent image; a delta net convolves its own fused
-                             // q|k|v and the recurrent matrix is the mixer. One pool, two
-                             // shapes, and the mixer kind is what tells them apart.
-                             .conv_channels  = schedule::kLinearMixer == family::LinearMixer::ShortConv
-                                                   ? plan.geometry.hidden
-                                                   : plan.geometry.convolution_dim(),
-                             .conv_width     = plan.geometry.gdn_conv_state_width(),
-                             .value_heads    = schedule::kLinearMixer == family::LinearMixer::ShortConv
-                                                   ? 0
-                                                   : plan.geometry.gdn_value_heads,
-                             .value_head_dim = schedule::kLinearMixer == family::LinearMixer::ShortConv
-                                                   ? 0
-                                                   : plan.geometry.gdn_value_head_dim,
-                             .key_head_dim   = schedule::kLinearMixer == family::LinearMixer::ShortConv
-                                                   ? 0
-                                                   : plan.geometry.gdn_key_head_dim,
-                             .slot_count     = linear_state_slots,
-                             .conv_dtype     = DType::BF16,
-                         },
+                     .layer_windows             = std::move(layer_windows),
+                     .window_class              = window_class,
+                     // A visit-schedule target keeps its per-visit conv state in this pool
+                     // (family/impl/runtime/visit_round.h); every other target's spec is unchanged.
+                     .linear_attention = [&]() -> LinearAttentionStatePoolSpec {
+                         if constexpr (family::visit_schedule<Variant>()) {
+                             return family::visit_state_spec_if<Variant>(plan.geometry, linear_state_slots);
+                         } else {
+                             return LinearAttentionStatePoolSpec
+                             {
+                                 .layers         = geometry_gdn_layers(plan.geometry),
+                                 // A short convolution runs over the residual width itself and
+                                 // carries no recurrent image; a delta net convolves its own fused
+                                 // q|k|v and the recurrent matrix is the mixer. One pool, two
+                                 // shapes, and the mixer kind is what tells them apart.
+                                 .conv_channels  = schedule::kLinearMixer == family::LinearMixer::ShortConv
+                                                       ? plan.geometry.hidden
+                                                       : plan.geometry.convolution_dim(),
+                                 .conv_width     = plan.geometry.gdn_conv_state_width(),
+                                 .value_heads    = schedule::kLinearMixer == family::LinearMixer::ShortConv
+                                                       ? 0
+                                                       : plan.geometry.gdn_value_heads,
+                                 .value_head_dim = schedule::kLinearMixer == family::LinearMixer::ShortConv
+                                                       ? 0
+                                                       : plan.geometry.gdn_value_head_dim,
+                                 .key_head_dim   = schedule::kLinearMixer == family::LinearMixer::ShortConv
+                                                       ? 0
+                                                       : plan.geometry.gdn_key_head_dim,
+                                 .slot_count     = linear_state_slots,
+                                 .conv_dtype     = DType::BF16,
+                             };
+                         }
+                     }(),
                      .ple = speculative_ple_spec(
                          ResidualHooks<Variant>::ple_state_spec(plan.geometry, linear_state_slots),
                          plan),
@@ -348,6 +458,21 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                                  ? static_cast<std::int32_t>(plan.max_concurrency)
                                  : 0,
                      });
+    }
+    // A visit-schedule target's verify records, planned so --kv-capacity auto counts them (were a DeviceBuffer).
+    if constexpr (family::visit_schedule<Variant>()) {
+        if (plan.speculative_backend != SpeculativeBackend::None) {
+            const LinearAttentionStatePoolSpec state = family::visit_state_spec_if<Variant>(plan.geometry, linear_state_slots);
+            const auto channels = static_cast<std::size_t>(state.conv_channels);
+            const auto visits   = static_cast<std::size_t>(state.layers);
+            const auto width    = static_cast<std::size_t>(plan.draft_window + 1U);
+            const auto rows     = static_cast<std::size_t>(decode_batch_capacity(plan.max_concurrency, plan.speculative_backend));
+            const std::size_t old_bytes = (channels * 3 * visits * rows * 2 + 255) & ~std::size_t{255};
+            out.visit_records = builder.add(old_bytes + channels * width * visits * rows * 2, 256, "visit records");
+        }
+        if (const std::size_t state = family::visit_target_state_bytes_if<Variant>(); state > 0) {
+            out.visit_target_state = builder.add(state, 256, "visit target state");
+        }
     }
     if constexpr (Variant::supports_dflash) {
         if (plan.features.dflash()) {
@@ -401,6 +526,13 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                                                    static_cast<std::int32_t>(plan.draft_window + 1U),
                                                    static_cast<std::int32_t>(plan.max_concurrency)},
                                                   "DFlash pending target features");
+            if constexpr (family::dspark_drafter<Variant>()) {
+                // DSpark: each lane's Markov feature (mix row 3 of its last committed column), read by the proposal.
+                dflash.dspark_f_rnn = add_tensor(builder, DType::BF16,
+                                                 {plan.geometry.dflash.hidden,
+                                                  static_cast<std::int32_t>(plan.max_concurrency)},
+                                                 "DSpark per-lane Markov feature");
+            }
         }
     }
 
@@ -417,7 +549,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                                          .batch_capacity = decode_batch_capacity(plan.max_concurrency, plan.speculative_backend),
                                          .draft_window   = plan.draft_window,
                                          .enable_mtp     = plan.features.mtp(),
-                                         .enable_dflash  = plan.features.dflash()});
+                                         .enable_dflash  = plan.features.dflash(),
+                                         .logits_dtype   = family::logits_dtype<Variant>()});
     out.prefill_hidden = add_tensor(
         builder, DType::BF16, {round_hidden, effective_prefill_chunk}, "step prefill hidden");
     family::complete_round_state_layout(builder, out.round);
@@ -487,10 +620,43 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     // cap in whole granules, though, up to one granule past the cap's pages, so that last
     // granule is charged too: one granule less a page, a constant that keeps the curve affine.
     if (out.decoder.text_kv.pool.spec.elastic) {
-        const std::size_t per_page = out.decoder.text_kv.payload_bytes() / physical_pages;
+        // The full-context planes only: window-class planes sit in the arena (a constant).
+        std::size_t full_plane_bytes = 0;
+        for (const auto& plane : out.decoder.text_kv.pool.planes) {
+            if (plane.spec.window == 0) { full_plane_bytes += plane.storage.region.bytes; }
+        }
+        const std::size_t per_page = full_plane_bytes / physical_pages;
         const std::uint32_t granule = std::max(out.decoder.text_kv.pool.elastic_granule_pages, 1U);
         out.elastic_plane_bytes =
             per_page * (static_cast<std::size_t>(plan.main_page_groups) + granule - 1U);
+        // M3-C: an elastic window class's floor (whole granules) is held for the engine's life;
+        // its other pages come out of the main pages above through the ledger. A constant.
+        const auto& text_pool = out.decoder.text_kv.pool;
+        if (text_pool.spec.window_elastic && text_pool.window_elastic_bytes != 0) {
+            std::size_t window_page_bytes = 0;
+            for (const auto& plane : text_pool.planes) {
+                if (plane.spec.window > 0) { window_page_bytes += plane.storage.region.bytes / plane.storage.shape[3]; }
+            }
+            out.elastic_plane_bytes += window_page_bytes * text_pool.spec.window_floor_pages;
+            // The charge as the pool computes it (one page's stride summed over the window planes,
+            // over the same sum for the full-context planes, rounded up; PagedKVPool's
+            // window_page_bytes_ / main_page_bytes_): the capacity curve adds it per lane
+            // (make_sequence_planner_impl). Not from the region bytes: a plane's storage is
+            // rounded up to whole granules, so bytes / pages depends on the page count.
+            std::size_t window_stride = 0, main_stride = 0;
+            for (const auto& plane : text_pool.planes) {
+                if (plane.spec.leading_extent <= 0 || plane.spec.head_extent <= 0) { continue; }
+                const std::size_t stride = static_cast<std::size_t>(
+                    Tensor(nullptr, plane.spec.dtype,
+                           {plane.spec.leading_extent, static_cast<std::int32_t>(kPagedKVPageSize),
+                            plane.spec.head_extent, 1})
+                        .bytes());
+                (plane.spec.window > 0 ? window_stride : main_stride) += stride;
+            }
+            out.kv_window_lane_charge_pages =
+                kv_window_main_equivalent(text_pool.spec.window_lane_charge, window_stride, main_stride);
+            out.kv_window_page_charge_pages = kv_window_main_equivalent(1, window_stride, main_stride);
+        }
     }
     return out;
 }
@@ -630,6 +796,16 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                  std::int32_t last, family::TextPhase phase, GdnWorkspacePath path,
                                  std::int32_t batch_size, std::int32_t min_width,
                                  std::int32_t max_width, ops::GqaExecutionEnvelope envelope) {
+        // A visit-schedule target replaces the layer loop and books its own round
+        // (family/impl/runtime/visit_round.h).
+        if constexpr (family::visit_schedule<Variant>()) {
+            (void)path;
+            (void)min_width;
+            scratch(layout, family::visit_workspace_if<Variant>(
+                                plan.geometry, phase, batch_size, max_width, last,
+                                envelope.max_visible_keys, plan.lora_enabled));
+            return;
+        }
         // The embedded input a per-layer-input family keeps beside the residual. The layers
         // write the residual in place, so `capture_per_layer_source` copies the embedding once
         // and holds it from the round's arena for the whole layer loop -- and nothing booked
@@ -926,6 +1102,10 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 if (compact_input) {
                     matrix(layout, DType::BF16, plan.geometry.dflash.feature_rows, tokens);
                 }
+                if constexpr (family::dspark_drafter<Variant>()) {
+                    scratch(layout, family::dspark_append_workspace_bytes_if<Variant>(tokens));
+                    return finish(layout);
+                }
                 (void)workspace_recipe::dflash_context(layout, tokens, plan.geometry.dflash);
                 {
                     auto layer = layout.scope();
@@ -935,6 +1115,11 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             };
             const auto dflash_proposal_capacity = [&](std::int32_t width, std::int32_t batch) {
                 WorkspaceLayoutBuilder layout;
+                if constexpr (family::dspark_drafter<Variant>()) {
+                    (void)width;
+                    scratch(layout, family::dspark_propose_workspace_bytes_if<Variant>(batch, plan.capacity));
+                    return finish(layout);
+                }
                 const std::int32_t tokens = width * batch;
                 matrix(layout, DType::BF16, plan.geometry.dflash.hidden, tokens);
                 {
@@ -976,7 +1161,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             };
 
             out.dflash_context = dflash_context_capacity(chunk, false);
-            for (auto window : dflash_draft_windows(plan.draft_window, plan.adaptive_dflash)) {
+            for (auto window : dflash_draft_windows(plan.draft_window, plan.adaptive_dflash, family::dspark_drafter<Variant>())) {
                 const auto round_width = static_cast<std::int32_t>(window + 1);
                 for (std::int32_t batch = 1; batch <= batch_capacity; ++batch) {
                     const std::int32_t aggregate = round_width * batch;
@@ -989,7 +1174,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                 text_envelope);
                     const std::size_t accept =
                         ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
-                            plan.geometry.token_domain, window, window, batch, batch);
+                            plan.geometry.token_domain, window, window, batch, batch,
+                            family::dspark_drafter<Variant>()); // split routes: DSpark targets only
                     const std::size_t proposal =
                         window == 0 ? 0 : dflash_proposal_capacity(round_width, batch);
                     out.dflash_round =
@@ -1049,7 +1235,13 @@ void validate_target_options(const EngineOptions& options,
             throw std::invalid_argument("kv_capacity must be at least max_context");
         }
         const std::uint32_t requested_pages = page_count(options.kv_capacity.explicit_tokens);
-        if (requested_pages < minimum_pages || requested_pages > maximum_pages64) {
+        // Lane f1: a pipeline stage's explicit capacity that is the shared resolution of auto came
+        // from the capacity curve itself, whose maximum counts an elastic window class's charge per
+        // lane (lanes x (logical + charge)); the planner clamps it to that curve. Capping it at
+        // lanes x logical refused every 2-stage --kv-capacity auto --max-num-seqs 1 engine (the
+        // preflight resolves logical + charge: 1,059,776 tokens at 1M; e1b, BOARD 17:27).
+        if (requested_pages < minimum_pages ||
+            (requested_pages > maximum_pages64 && !options.kv_capacity_resolved_automatically)) {
             throw std::invalid_argument(
                 "kv_capacity is outside the usable range for max_context and max_concurrency");
         }
@@ -1147,9 +1339,10 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         const std::uint64_t virtual_pages =
             static_cast<std::uint64_t>(inputs.max_concurrency) * page_count(inputs.capacity);
         impl->main_page_virtual = static_cast<std::uint32_t>(
-            std::max<std::uint64_t>(main_page_groups,
-                                    std::min<std::uint64_t>(virtual_pages,
-                                                            std::numeric_limits<std::uint32_t>::max())));
+            std::max<std::uint64_t>({main_page_groups,
+                                     std::min<std::uint64_t>(virtual_pages,
+                                                             std::numeric_limits<std::uint32_t>::max()),
+                                     inputs.main_page_virtual_floor}));
     }
     impl->kv_capacity         = static_cast<std::uint32_t>(checked_i32(
         static_cast<std::uint64_t>(main_page_groups) * static_cast<std::uint32_t>(kPagedKVPageSize),
@@ -1173,6 +1366,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->kv_skip_layers      = inputs.kv_skip_layers;
     impl->elastic_kv          = inputs.elastic_kv;
     impl->elastic_kv_overcommit = inputs.elastic_kv_overcommit;
+    impl->kv_window_elastic     = inputs.kv_window_elastic;
     impl->prefix_cache_host_bytes = inputs.prefix_cache_host_bytes;
     impl->weights_identity        = inputs.weights_identity;
     impl->persistent          = persistent_layout(*impl);
@@ -1225,7 +1419,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                 checked_mul(per_batch_allowance, decode_batch_capacity(impl->max_concurrency, impl->speculative_backend),
                             "MTP exact-b graph allowance");
         } else {
-            for (auto window : dflash_draft_windows(impl->draft_window, impl->adaptive_dflash)) {
+            for (auto window : dflash_draft_windows(impl->draft_window, impl->adaptive_dflash, family::dspark_drafter<Variant>())) {
                 const auto class_allowance = [&](std::uint32_t batch_size) {
                     const auto profiles = dflash_graph_profiles(impl->capacity, window, batch_size);
                     return graph_topology_allowance(
@@ -1234,7 +1428,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                             const std::uint64_t final_visible = std::min<std::uint64_t>(
                                 impl->capacity,
                                 static_cast<std::uint64_t>(profile.max) + window + 1ULL);
-                            return (final_visible <= 4096 ? 64ULL : 96ULL) * kMiB;
+                            return dflash_graph_class_allowance_bytes<Variant>(final_visible);
                         },
                         "DFlash graph allowance");
                 };
@@ -1256,6 +1450,23 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             impl->request_transient_capacity_bytes, "request transient reservation"),
         checked_add(impl->graph_allowance_bytes, impl->persistent.checkpoints.reservation_bytes(),
                     "conversation snapshot allowance"), "sequence graph allowance");
+    // Lane f1 (diagnostics, SUROGATE_SERVE_PLAN_DUMP=1): the device reservation by part, one line per candidate.
+    static const bool plan_dump = std::getenv("SUROGATE_SERVE_PLAN_DUMP") != nullptr;
+    if (plan_dump) {
+        const auto mib = [](std::size_t bytes) { return static_cast<double>(bytes) / (1024.0 * 1024.0); };
+        const WorkspacePlan& w = impl->workspace;
+        std::fprintf(stderr,
+                     "plan-dump: pages %u | persistent %.1f MiB (kv payload %.1f) elastic planes %.1f | workspace %.1f "
+                     "(text_prefill %.1f ordinary_round %.1f mtp_prefill %.1f mtp_round %.1f dflash_context %.1f "
+                     "dflash_round %.1f vision %.1f) | request transient %.1f | graphs %.1f | checkpoints %.1f | "
+                     "total %.1f MiB\n",
+                     main_page_groups, mib(impl->persistent.bytes), mib(impl->persistent.kv_payload_bytes),
+                     mib(impl->persistent.elastic_plane_bytes), mib(w.capacity), mib(w.text_prefill),
+                     mib(w.ordinary_round), mib(w.mtp_prefill), mib(w.mtp_round), mib(w.dflash_context),
+                     mib(w.dflash_round), mib(w.vision_encode), mib(impl->request_transient_capacity_bytes),
+                     mib(impl->graph_allowance_bytes), mib(impl->persistent.checkpoints.reservation_bytes()),
+                     mib(impl->device_reservation_bytes));
+    }
     return impl;
 }
 
@@ -1328,6 +1539,15 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .kv_skip_layers = family::detail::kv_precision_layers(geometry, options.kv_cache_skip_layers),
         .elastic_kv                = options.elastic_kv,
         .elastic_kv_overcommit     = options.elastic_kv_overcommit,
+        .kv_window_elastic         = [&] {
+            // Lane f1 M3-C: the window class follows demand when the cache is sized to the device.
+            const char* raw = std::getenv("SUROGATE_SERVE_KV_WINDOW_ELASTIC");
+            if (raw != nullptr && *raw != '\0') { return options.elastic_kv && std::strcmp(raw, "0") != 0; }
+            // A pipeline stage's explicit capacity that is the shared resolution of auto counts as
+            // auto (EngineOptions::kv_capacity_resolved_automatically; the preflight assumed it).
+            return options.elastic_kv && (options.kv_capacity.mode == KvCapacityMode::Automatic ||
+                                          options.kv_capacity_resolved_automatically);
+        }(),
         .proposal_head             = options.speculative.proposal_head,
         .features                  = family::startup_features(options),
         .use_cuda_graph            = options.use_cuda_graph,
@@ -1350,23 +1570,65 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         }(),
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);
-    const std::uint32_t minimum_pages = std::max(logical_pages, inputs.max_concurrency);
-    const std::uint64_t maximum_pages64 =
+    std::uint32_t minimum_pages = std::max(logical_pages, inputs.max_concurrency);
+    std::uint64_t maximum_pages64 =
         static_cast<std::uint64_t>(inputs.max_concurrency) * logical_pages;
     if (maximum_pages64 > std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error("maximum Main KV page count exceeds uint32");
     }
-    const auto maximum_pages = static_cast<std::uint32_t>(maximum_pages64);
 
     auto planner     = std::make_unique<family::detail::SequencePlannerImpl<Variant>>();
     planner->inputs  = inputs;
     planner->minimum = build_sequence_candidate(inputs, minimum_pages);
+    // Lane f1 M3-C: an elastic window class charges every text allocation its window pages in the
+    // main ledger, so one full-context request needs logical_pages + charge and every lane at full
+    // context max_concurrency x that. Without it the curve topped out at max_concurrency x
+    // logical_pages: --max-num-seqs 1 --max-model-len 98304 resolved 1,536 pages and refused a
+    // 92.6k prompt (1,447 pages + 175 charged) with nothing else in the pool (e1, card 7 14:35).
+    // The lane term of the minimum keeps its meaning (every graph-capture row holds one page, now
+    // charged one window page as well). Zero charge (every model without an elastic window class)
+    // leaves the curve as it was.
+    if (const std::uint32_t charge = planner->minimum->persistent.kv_window_lane_charge_pages; charge != 0) {
+        const std::uint64_t per_lane = static_cast<std::uint64_t>(logical_pages) + charge;
+        const std::uint64_t minimum64 = std::max<std::uint64_t>(
+            per_lane, static_cast<std::uint64_t>(inputs.max_concurrency) *
+                          (1ULL + planner->minimum->persistent.kv_window_page_charge_pages));
+        maximum_pages64 = static_cast<std::uint64_t>(inputs.max_concurrency) * per_lane;
+        if (maximum_pages64 > std::numeric_limits<std::uint32_t>::max()) {
+            throw std::overflow_error("maximum Main KV page count exceeds uint32");
+        }
+        minimum_pages    = static_cast<std::uint32_t>(minimum64);
+        // Every candidate lays out the curve's whole span: with the span following the page count
+        // past lanes x logical_pages, a plane's granule rounding made bytes per page differ between
+        // the minimum, minimum + 1 and the resolved count, and small auto shapes (16,384 x 4,
+        // 32,768 x 4) refused to start: "physical sequence layout is not affine" (M5, lanes h / f2b).
+        inputs.main_page_virtual_floor = static_cast<std::uint32_t>(maximum_pages64);
+        planner->inputs  = inputs;
+        planner->minimum = build_sequence_candidate(inputs, minimum_pages);
+        if (planner->minimum->persistent.kv_window_lane_charge_pages != charge) {
+            throw std::logic_error("KV window lane charge depends on the page count");
+        }
+    }
+    const auto maximum_pages = static_cast<std::uint32_t>(maximum_pages64);
+    // Lane f1: the upper bound validate_target_options leaves to the curve. A pipeline stage's shared
+    // capacity resolved from auto is the smallest stage's resolution of its own curve, so it never exceeds
+    // this stage's maximum (lanes x (logical + window charge)); one that does means the stages planned
+    // different curves, and clamping it here would give this stage a pool the others do not share.
+    if (options.kv_capacity.mode == KvCapacityMode::Explicit && options.kv_capacity_resolved_automatically &&
+        page_count(options.kv_capacity.explicit_tokens) > maximum_pages) {
+        throw std::invalid_argument(
+            "pipeline stage KV capacity " + std::to_string(options.kv_capacity.explicit_tokens) +
+            " tokens exceeds this stage's maximum of " +
+            std::to_string(static_cast<std::uint64_t>(maximum_pages) * kPagedKVPageSize) +
+            " (max_concurrency x (max_context + window charge))");
+    }
     planner->curve   = runtime::SequenceCapacityCurve{
           .main_page_tokens                     = static_cast<std::uint32_t>(kPagedKVPageSize),
           .minimum_main_page_groups             = minimum_pages,
           .maximum_main_page_groups             = maximum_pages,
           .minimum_device_reservation_bytes     = planner->minimum->device_reservation_bytes,
           .bytes_per_additional_main_page_group = 0,
+          .window_lane_charge_pages             = planner->minimum->persistent.kv_window_lane_charge_pages,
     };
     if (minimum_pages < maximum_pages) {
         auto adjacent = build_sequence_candidate(inputs, minimum_pages + 1U);

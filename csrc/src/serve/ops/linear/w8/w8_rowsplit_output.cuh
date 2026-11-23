@@ -43,6 +43,16 @@ struct W8ContiguousOutput {
     }
 };
 
+// A contiguous output whose SwiGLU epilogue first adds a BF16 pre-activation delta to the FP32 accumulators:
+// delta[col * delta_ld + row] to the gate of output row `row`, delta[col * delta_ld + m/2 + row] to its up (the
+// [gate; up] layout of the parent's product). An adapter round's shared-expert delta goes in this way
+// (sparse_moe_nvfp4.cu), so a zero delta reproduces the plain epilogue bit for bit.
+struct W8SwiGluDeltaOutput : W8ContiguousOutput {
+    static constexpr bool kPreactivationDelta = true;   // the trait w8_swiglu_value tests
+    const __nv_bfloat16* delta;
+    std::int32_t delta_ld;
+};
+
 template <std::int32_t Rows0, std::int32_t Rows1>
 struct W8SplitOutput2 {
     static_assert(Rows0 > 0 && Rows1 > 0);

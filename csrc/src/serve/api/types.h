@@ -97,6 +97,9 @@ enum class KvAdmission : std::uint8_t {
 
 struct KvAdmissionOptions {
     KvAdmission mode               = KvAdmission::OnDemand;
+    /// Set only by an explicit --kv-admission ondemand. A DSpark engine stays on Reserve without it
+    /// (lane f1): its recompute has not been shown on every route. No other engine reads it.
+    bool explicit_on_demand        = false;
     /// Decode tokens a request is entitled to beyond its prompt when it is admitted.
     std::uint32_t headroom_tokens  = 256;
     /// Fraction of the KV pool an admission leaves free while other requests run, so their
@@ -235,6 +238,8 @@ struct EngineOptions {
     /// launch geometry the projection hooks and a captured graph both need.
     std::uint32_t lora_slots    = 0;
     std::uint32_t lora_max_rank = 0;
+    /// The routed-expert banks' rank where a target sizes them apart (Inkling-2-Mini); 0 = lora_max_rank.
+    std::uint32_t lora_max_expert_rank = 0;
     /// Prepare the adapter machinery even with no adapters named: banks are
     /// preallocated and the delta kernels captured, so adapters loaded later
     /// through the runtime endpoints work under the graphs recorded at startup.
@@ -324,6 +329,11 @@ struct EngineOptions {
     // under automatic sizing) and every page past it is admitted through a device-wide gate
     // on free memory, so co-resident engines share the device's idle KV.
     bool elastic_kv_overcommit         = false;
+    // Lane f1: set by the pipeline on each stage when its explicit kv_capacity is the shared
+    // resolution of `--kv-capacity auto` (construct_pipeline). The stage then plans as under auto
+    // where that matters -- an elastic window class (layouts_impl.h kv_window_elastic) -- which is
+    // what the preflight that resolved the shared capacity assumed. False everywhere else.
+    bool kv_capacity_resolved_automatically = false;
     // Everything this process may hold on each of its devices -- weights, cache, workspaces
     // and the CUDA context -- in bytes; 0 = the whole card. Automatic sizing (KV capacity,
     // context, expert slots) reads free memory within this budget, and the elastic KV cache,
@@ -500,6 +510,9 @@ struct OutputOptions {
     bool structured = false; // generated JSON stays in content; stop tokens are still hidden
     bool raw                     = false;
     bool preserve_special_tokens = false;
+    /// Each round also publishes the token ids it accepted (OutputDelta::token_ids), for a reader that parses the
+    /// stream from ids (Inkling-2 streaming). Off for every other request: their deltas are unchanged.
+    bool report_token_ids = false;
 };
 
 struct RequestOptions {
@@ -674,6 +687,11 @@ struct PromptCapabilities {
     /// Qwen3-Coder's `<function=NAME><parameter=KEY>` calls (Qwen3.5 / Qwen3.6): served with vLLM's qwen3_coder
     /// parser unless told otherwise (serve/vllm_qwen3_parser.h).
     bool qwen3_coder_tool_calls = false;
+    /// Inkling-2: no chat template; the prompt is rendered token by token from the request body
+    /// (PromptOptions::raw_chat_request, family/impl/frontend/inkling_render.h) and the reply is read back with vLLM's
+    /// Inkling parser (inkling_parse.h), both token-exact to vLLM. Set when the vocabulary spells Inkling's framing
+    /// tokens and the artifact carries no chat template.
+    bool inkling2_chat = false;
     /// The template is handed a message's text parts as a list and writes them one after the other,
     /// as Qwen's `render_content` does -- so "a" and "b" render as "ab", which is what vLLM and
     /// transformers produce. Without it the parts are joined with a newline first, as vLLM does for
@@ -688,11 +706,19 @@ struct PromptOptions {
     bool preserve_thinking = false;
     bool add_vision_id     = false;
     std::vector<std::string> tool_jsons;
+    /// The chat-completions request body exactly as the client sent it, for a checkpoint that renders its prompt from
+    /// the request itself rather than through a chat template (PromptCapabilities::inkling2_chat). Filled by the
+    /// serving layer only for such a checkpoint; null for every other one, whose prompt is the messages above.
+    std::shared_ptr<const std::string> raw_chat_request;
 };
 
 struct PromptInput {
     std::vector<ChatMessage> messages;
     PromptOptions options;
+    /// The images of `options.raw_chat_request` (Inkling-2, ENGINE-INKLING lane V-b): their bytes, acquired by the serving
+    /// layer from the body's image_url / input_image parts, in the body's order (message order, part order). Empty for
+    /// every other checkpoint, whose media travel inside `messages`.
+    std::vector<OwnedMedia> raw_chat_media;
 };
 
 struct PromptSummary {
@@ -823,6 +849,9 @@ struct OutputDelta {
     OutputChannel channel = OutputChannel::Content;
     std::string text;
     std::optional<TokenScoreDelta> scores;
+    /// OutputOptions::report_token_ids only: the generated tokens this round accepted, in order, without the stop
+    /// token that ended the generation (carried by a delta of its own, `text` empty). Empty otherwise.
+    std::vector<TokenId> token_ids;
 };
 
 class OutputSink {
@@ -1049,6 +1078,12 @@ struct RuntimeStats {
     std::uint32_t kv_granule_pages             = 0;
     std::uint32_t kv_pages_resident_at_granule = 0;
     std::size_t kv_page_bytes                  = 0;
+    // Elastic window class (M3-C) of the main pool; zero without one (see PagedKVOccupancy).
+    std::uint32_t kv_window_mapped_pages       = 0;
+    std::uint32_t kv_window_charged_pages      = 0;
+    std::uint32_t kv_window_floor_pages        = 0;
+    std::uint32_t kv_window_granule_pages      = 0;
+    std::size_t kv_window_page_bytes           = 0;
     // Times the queue head could not be given a lane although the admission ledger found it
     // unblocked -- it is waiting on pages the ledger cannot attribute, most often KV still
     // committed to a retained GPU prefix. A benign retry, but a rising count means admission

@@ -62,6 +62,19 @@ __device__ __forceinline__ int w8g32_swz64(int row, int col) {
     return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
 }
 
+// One SwiGLU output element from the FP32 accumulators. An Output that carries a pre-activation delta
+// (W8SwiGluDeltaOutput) adds it to both halves first; every other Output computes exactly silu(gate) * up.
+template <class Output>
+__device__ __forceinline__ float w8_swiglu_value(const Output& output, float gate, float up, std::int32_t row,
+                                                 std::int32_t col, std::int32_t half) {
+    if constexpr (requires { Output::kPreactivationDelta; }) {
+        const __nv_bfloat16* d = output.delta + static_cast<std::int64_t>(col) * output.delta_ld;
+        gate += __bfloat162float(d[row]);
+        up += __bfloat162float(d[half + row]);
+    }
+    return silu(gate) * up;
+}
+
 template <class Cfg, bool Full, W8Epilogue Epilogue = W8Epilogue::Store,
           class Output = W8ContiguousOutput, bool ScaleRows8 = false>
 __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gemm_mma_kernel(
@@ -319,29 +332,29 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
                     const float* up_acc   = acc[mi + kGateMt][ni];
                     if constexpr (Full) {
                         *output_tile.at(r0, c0) =
-                            __float2bfloat16_rn(silu(gate_acc[0]) * up_acc[0]);
+                            __float2bfloat16_rn(w8_swiglu_value(output, gate_acc[0], up_acc[0], r0, c0, m / 2));
                         *output_tile.at(r0, c1) =
-                            __float2bfloat16_rn(silu(gate_acc[1]) * up_acc[1]);
+                            __float2bfloat16_rn(w8_swiglu_value(output, gate_acc[1], up_acc[1], r0, c1, m / 2));
                         *output_tile.at(r1, c0) =
-                            __float2bfloat16_rn(silu(gate_acc[2]) * up_acc[2]);
+                            __float2bfloat16_rn(w8_swiglu_value(output, gate_acc[2], up_acc[2], r1, c0, m / 2));
                         *output_tile.at(r1, c1) =
-                            __float2bfloat16_rn(silu(gate_acc[3]) * up_acc[3]);
+                            __float2bfloat16_rn(w8_swiglu_value(output, gate_acc[3], up_acc[3], r1, c1, m / 2));
                     } else {
                         if (r0 < m / 2 && c0 < n) {
                             *output_tile.at(r0, c0) =
-                                __float2bfloat16_rn(silu(gate_acc[0]) * up_acc[0]);
+                                __float2bfloat16_rn(w8_swiglu_value(output, gate_acc[0], up_acc[0], r0, c0, m / 2));
                         }
                         if (r0 < m / 2 && c1 < n) {
                             *output_tile.at(r0, c1) =
-                                __float2bfloat16_rn(silu(gate_acc[1]) * up_acc[1]);
+                                __float2bfloat16_rn(w8_swiglu_value(output, gate_acc[1], up_acc[1], r0, c1, m / 2));
                         }
                         if (r1 < m / 2 && c0 < n) {
                             *output_tile.at(r1, c0) =
-                                __float2bfloat16_rn(silu(gate_acc[2]) * up_acc[2]);
+                                __float2bfloat16_rn(w8_swiglu_value(output, gate_acc[2], up_acc[2], r1, c0, m / 2));
                         }
                         if (r1 < m / 2 && c1 < n) {
                             *output_tile.at(r1, c1) =
-                                __float2bfloat16_rn(silu(gate_acc[3]) * up_acc[3]);
+                                __float2bfloat16_rn(w8_swiglu_value(output, gate_acc[3], up_acc[3], r1, c1, m / 2));
                         }
                     }
                 }
@@ -387,26 +400,26 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
                         const float up10      = up_shared[local_r1 * BN + local_c0];
                         const float up11      = up_shared[local_r1 * BN + local_c1];
                         if constexpr (Full) {
-                            *output_tile.at(r0, c0) = __float2bfloat16_rn(silu(gate_acc[0]) * up00);
-                            *output_tile.at(r0, c1) = __float2bfloat16_rn(silu(gate_acc[1]) * up01);
-                            *output_tile.at(r1, c0) = __float2bfloat16_rn(silu(gate_acc[2]) * up10);
-                            *output_tile.at(r1, c1) = __float2bfloat16_rn(silu(gate_acc[3]) * up11);
+                            *output_tile.at(r0, c0) = __float2bfloat16_rn(w8_swiglu_value(output, gate_acc[0], up00, r0, c0, m / 2));
+                            *output_tile.at(r0, c1) = __float2bfloat16_rn(w8_swiglu_value(output, gate_acc[1], up01, r0, c1, m / 2));
+                            *output_tile.at(r1, c0) = __float2bfloat16_rn(w8_swiglu_value(output, gate_acc[2], up10, r1, c0, m / 2));
+                            *output_tile.at(r1, c1) = __float2bfloat16_rn(w8_swiglu_value(output, gate_acc[3], up11, r1, c1, m / 2));
                         } else {
                             if (r0 < m / 2 && c0 < n) {
                                 *output_tile.at(r0, c0) =
-                                    __float2bfloat16_rn(silu(gate_acc[0]) * up00);
+                                    __float2bfloat16_rn(w8_swiglu_value(output, gate_acc[0], up00, r0, c0, m / 2));
                             }
                             if (r0 < m / 2 && c1 < n) {
                                 *output_tile.at(r0, c1) =
-                                    __float2bfloat16_rn(silu(gate_acc[1]) * up01);
+                                    __float2bfloat16_rn(w8_swiglu_value(output, gate_acc[1], up01, r0, c1, m / 2));
                             }
                             if (r1 < m / 2 && c0 < n) {
                                 *output_tile.at(r1, c0) =
-                                    __float2bfloat16_rn(silu(gate_acc[2]) * up10);
+                                    __float2bfloat16_rn(w8_swiglu_value(output, gate_acc[2], up10, r1, c0, m / 2));
                             }
                             if (r1 < m / 2 && c1 < n) {
                                 *output_tile.at(r1, c1) =
-                                    __float2bfloat16_rn(silu(gate_acc[3]) * up11);
+                                    __float2bfloat16_rn(w8_swiglu_value(output, gate_acc[3], up11, r1, c1, m / 2));
                             }
                         }
                     }

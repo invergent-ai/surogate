@@ -265,6 +265,34 @@ void parse_content_parts(const OJson& content, ChatTurn& turn, std::size_t index
     }
 }
 
+/// The image parts of a body the model's own renderer reads (RequestLimits::raw_chat; Inkling-2): their sources, in
+/// message order and part order (vLLM's parse_chat_messages order), for the serving layer to acquire. Whether images
+/// are allowed at all, and how many, is the renderer's call (vLLM's wording); everything else in the messages is left
+/// to it too, so parts this does not recognise are skipped here.
+void collect_raw_chat_images(const OJson& body, GenerationRequest& out) {
+    if (!body.contains("messages") || !body.at("messages").is_array()) { return; }
+    for (const OJson& message : body.at("messages")) {
+        if (!message.is_object() || !message.contains("content") || !message.at("content").is_array()) { continue; }
+        for (const OJson& part : message.at("content")) {
+            if (!part.is_object() || !part.contains("type") || !part.at("type").is_string()) { continue; }
+            const std::string& type = part.at("type").get_ref<const std::string&>();
+            if (type != "image_url" && type != "input_image") { continue; }
+            ContentPart image;
+            image.kind     = ContentKind::Image;
+            image.type_raw = type;
+            try {
+                image.source = parse_media_url(part, "image_url");
+            } catch (const ApiException& error) {
+                // Refused when its bytes are acquired (translate), after the renderer's own checks: vLLM refuses a
+                // request with images at image limit 0 for the count, whatever the URL.
+                image.kind = ContentKind::Unsupported;
+                image.text = error.error().message;
+            }
+            out.raw_chat_images.push_back(std::move(image));
+        }
+    }
+}
+
 /// A tool result's text. Clients that speak in content parts (Claude Code, Cursor, agent SDKs)
 /// send it as a list of text parts; vLLM joins those with newlines, so this does too.
 std::string tool_message_text(const OJson& item, std::size_t index) {
@@ -813,10 +841,14 @@ GenerationRequest parse_chat_completion_request(const OJson& body, const Request
     }
     out.model = body.at("model").get<std::string>();
 
-    parse_tools(body, out);
-    parse_tool_choice(body, out);
-    out.parallel_tool_calls = get_bool(body, "parallel_tool_calls", true);
-    parse_messages(body, out);
+    if (!limits.raw_chat) {
+        parse_tools(body, out);
+        parse_tool_choice(body, out);
+        out.parallel_tool_calls = get_bool(body, "parallel_tool_calls", true);
+        parse_messages(body, out);
+    } else {
+        collect_raw_chat_images(body, out);
+    }
     parse_stop(body, out, limits);
     parse_sampling(body, out);
 
@@ -827,13 +859,15 @@ GenerationRequest parse_chat_completion_request(const OJson& body, const Request
         }
         out.include_usage = get_bool(body.at("stream_options"), "include_usage", false);
     }
-    parse_openai_enable_thinking(body, out);
-    if (body.contains("enable_thinking") && !body.at("enable_thinking").is_null()) {
-        out.enable_thinking       = get_bool(body, "enable_thinking", false);
-        out.enable_thinking_param = "enable_thinking";
+    if (!limits.raw_chat) {
+        parse_openai_enable_thinking(body, out);
+        if (body.contains("enable_thinking") && !body.at("enable_thinking").is_null()) {
+            out.enable_thinking       = get_bool(body, "enable_thinking", false);
+            out.enable_thinking_param = "enable_thinking";
+        }
+        parse_openai_reasoning_effort(body, out);
+        out.preserve_thinking = parse_openai_preserve_thinking(body);
     }
-    parse_openai_reasoning_effort(body, out);
-    out.preserve_thinking = parse_openai_preserve_thinking(body);
 
     parse_max_tokens(body, "max_completion_tokens", limits, out);
     if (!out.max_tokens_set) { parse_max_tokens(body, "max_tokens", limits, out); }
@@ -907,6 +941,9 @@ static Json chat_completion_payload(const std::string& id, const std::string& mo
                        {"completion_tokens", usage.completion_tokens},
                        {"total_tokens", usage.prompt_tokens + usage.completion_tokens},
                        {"prompt_tokens_details", Json{{"cached_tokens", usage.cached_tokens}}}}}};
+    if (usage.reasoning_tokens) {
+        payload["usage"]["completion_tokens_details"] = Json{{"reasoning_tokens", *usage.reasoning_tokens}};
+    }
     // The prompt's ids sit at the top level, where vLLM puts them, because they
     // belong to the request rather than to any one choice.
     if (detail.include_token_ids) { payload["prompt_token_ids"] = detail.prompt_token_ids; }
@@ -940,8 +977,9 @@ std::string make_chat_completion_tool_response(const std::string& id, const std:
                                                std::int64_t created, const std::string& content,
                                                const std::string& reasoning,
                                                const std::vector<ToolCall>& tool_calls,
-                                               const CompletionUsage& usage, const TokenDetail& detail) {
-    Json payload = chat_completion_payload(id, model, created, content, reasoning, "tool_calls", usage, detail);
+                                               const CompletionUsage& usage, const TokenDetail& detail,
+                                               const char* finish_reason) {
+    Json payload = chat_completion_payload(id, model, created, content, reasoning, finish_reason, usage, detail);
     Json& message = payload["choices"][0]["message"];
     if (content.empty()) { message["content"] = nullptr; }
     message["tool_calls"] = tool_calls_json(tool_calls, false);
@@ -1005,6 +1043,29 @@ std::string make_chat_chunk_tool_calls(const std::string& id, const std::string&
     return sse_event(payload);
 }
 
+std::string make_chat_chunk_tool_call_deltas(const std::string& id, const std::string& model, std::int64_t created,
+                                             const std::vector<ToolCallDelta>& deltas, bool include_usage) {
+    Json calls = Json::array();
+    for (const ToolCallDelta& delta : deltas) {
+        Json item = Json::object();
+        Json function = Json::object();
+        if (delta.opens) {
+            item["id"]       = delta.id;
+            item["type"]     = "function";
+            function["name"] = delta.name;
+        }
+        item["index"] = delta.index;
+        if (delta.arguments) { function["arguments"] = *delta.arguments; }
+        item["function"] = std::move(function);
+        calls.push_back(std::move(item));
+    }
+    Json payload       = base_chunk(id, model, created);
+    payload["choices"] = Json::array(
+        {Json{{"index", 0}, {"delta", Json{{"tool_calls", std::move(calls)}}}, {"finish_reason", nullptr}}});
+    if (include_usage) { payload["usage"] = nullptr; }
+    return sse_event(payload);
+}
+
 std::string make_chat_chunk_final(const std::string& id, const std::string& model,
                                   std::int64_t created, const char* finish_reason,
                                   bool include_usage, const std::string& parallel_decoding_details) {
@@ -1024,6 +1085,9 @@ std::string make_chat_chunk_usage(const std::string& id, const std::string& mode
                               {"completion_tokens", usage.completion_tokens},
                               {"total_tokens", usage.prompt_tokens + usage.completion_tokens},
                               {"prompt_tokens_details", Json{{"cached_tokens", usage.cached_tokens}}}};
+    if (usage.reasoning_tokens) {
+        payload["usage"]["completion_tokens_details"] = Json{{"reasoning_tokens", *usage.reasoning_tokens}};
+    }
     return sse_event(payload);
 }
 
@@ -1146,6 +1210,9 @@ std::string make_completion_response(const std::string& id, const std::string& m
         payload["choices"][0]["token_ids"] = detail.completion_token_ids;
     }
     if (!detail.lora_versions.empty()) { payload["choices"][0]["lora_versions"] = detail.lora_versions; }
+    // Rollout Routing Replay (return_routed_experts): the same choice.routed_experts object as the chat routes
+    // ({"data", "shape" [n, layers, top_k], "start", "dtype" "int16"}). Absent unless requested.
+    if (detail.include_routed_experts) { payload["choices"][0]["routed_experts"] = chat["choices"][0]["routed_experts"]; }
     if (detail.include_logprobs) {
         Json tokens = Json::array(), probabilities = Json::array(), top = Json::array(), offsets = Json::array();
         std::size_t offset = detail.text_offset;

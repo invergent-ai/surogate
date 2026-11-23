@@ -403,9 +403,10 @@ bool split_module(const std::string& module, std::int32_t& layer, std::string& k
     if (!direct && at == std::string::npos) { return false; }
     const auto prefix = direct ? std::string{} : module.substr(0, at);
     bool text = false;
+    // "model.llm" / "llm": Inkling2 checkpoints name their decoder `model.llm.layers.N` (vLLM's inkling2 adapters too).
     for (const std::string_view allowed : {"", "model", "model.model", "transformer", "language_model",
         "language_model.model", "model.language_model", "model.language_model.model", "text_model",
-        "model.text_model", "model.text_model.model"}) {
+        "model.text_model", "model.text_model.model", "model.llm", "llm"}) {
         text |= prefix == allowed;
     }
     if (!text) { return false; }

@@ -1518,6 +1518,11 @@ ${SERVE_ROOT}/ops/launcher/head_linear.cu
   ${SERVE_ROOT}/ops/sparse_moe/prefill/sparse_moe_prefill_plan.cpp
   ${SERVE_ROOT}/ops/sparse_moe/small_t/sparse_moe_small_t_kernels.cu
   ${SERVE_ROOT}/ops/sparse_moe/small_t/sparse_moe_small_t_plan.cpp
+  # Inkling-2-Mini's mixture (ENGINE-INKLING lane d; api/ops/inkling_moe.h).
+  ${SERVE_ROOT}/ops/sparse_moe/inkling/inkling_moe_kernels.cu
+  ${SERVE_ROOT}/ops/sparse_moe/inkling/inkling_nvfp4_gemm.cu
+  ${SERVE_ROOT}/ops/sparse_moe/inkling/inkling_mxfp8_gemm.cu
+  ${SERVE_ROOT}/ops/sparse_moe/inkling/inkling_moe.cpp
   ${SERVE_ROOT}/ops/linear/bf16/bf16_cublaslt.cpp
   ${SERVE_ROOT}/ops/linear/mxfp8/mxfp8.cu
   ${SERVE_ROOT}/ops/linear/mxfp8/mxfp8_cublaslt.cpp
@@ -1607,6 +1612,23 @@ set_source_files_properties(
   ${SERVE_ROOT}/ops/sparse_moe/marlin/marlin_moe_nvfp4_kernels_generated.cu
   PROPERTIES COMPILE_OPTIONS
   "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;-static-global-template-stub=false>")
+# Inkling-2-Mini hidden-stream ops (ENGINE-INKLING lane e1). -fmad=false: the reference fuses only
+# where it says fma, and so must these kernels (rl/engine-inkling-2026-11-21/lanes/e1/DESIGN-target.md 3).
+target_sources(sinfer_ops PRIVATE
+  ${SERVE_ROOT}/ops/inkling_mix/inkling_mix.cu
+  ${SERVE_ROOT}/ops/inkling_mix/inkling_gemm_inv.cu
+  ${SERVE_ROOT}/ops/inkling_mix/inkling_head_logprob.cu
+  ${SERVE_ROOT}/ops/inkling_mix/inkling_lora.cu
+  ${SERVE_ROOT}/ops/inkling_mix/inkling_gemm_f32.cpp)
+set_source_files_properties(${SERVE_ROOT}/ops/inkling_mix/inkling_mix.cu
+  PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:-fmad=false>")
+set_source_files_properties(${SERVE_ROOT}/ops/inkling_mix/inkling_lora.cu
+  PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:-fmad=false>")
+# Inkling-2-Mini DSpark drafter ops (ENGINE-INKLING lane e2, api/ops/dspark.h). -fmad=false: unfused like
+# rl/engine-inkling-2026-11-21/ref/dspark_ref.py; only the inkling2 target calls them.
+target_sources(sinfer_ops PRIVATE ${SERVE_ROOT}/ops/dspark/dspark.cu)
+set_source_files_properties(${SERVE_ROOT}/ops/dspark/dspark.cu
+  PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:-fmad=false>")
 # Vendor-tuned CPU GEMM, optional and injected by path. Both live outside the
 # tree as reference checkouts rather than vendored dependencies, so a build with
 # neither must still work -- the encoder's own AVX-512 microkernel is always
@@ -1703,7 +1725,26 @@ set(SINFER_CUTLASS_INCLUDE "${cutlass_SOURCE_DIR}/include")
 # constructor, which then died with SIGILL on hosts without it (seen on one of Modal's H100
 # machines; four other serve tests that build a pool died the same way).
 sinfer_cuda_archive(sinfer_ops)
+# Inkling's MoE reproduces the reference kernels' rounding points (`enable_fp_fusion=False`): no
+# multiply-add contraction in its own sources. Its numerics use explicit _rn intrinsics as well.
+set_source_files_properties(
+  ${SERVE_ROOT}/ops/sparse_moe/inkling/inkling_moe_kernels.cu
+  ${SERVE_ROOT}/ops/sparse_moe/inkling/inkling_nvfp4_gemm.cu
+  ${SERVE_ROOT}/ops/sparse_moe/inkling/inkling_mxfp8_gemm.cu
+  PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>")
 target_link_libraries(sinfer_ops PUBLIC sinfer_core PRIVATE sinfer_nvfp4_tma sinfer_nvfp4_cutlass sinfer_fp8_block_sm90 sinfer_fp8_block_sm120 sinfer_gqa_sm90 sinfer_trtllm_moe CUDA::cublasLt)
+
+# ENGINE-INKLING lane c: the Inkling-2-Mini attention ops (api/ops/inkling_attention.h). An archive of its
+# own; only the inkling2 target calls it, so the other targets' code paths and numbers stay what they were.
+# In SINFER_SHARED_ARCHIVES (lane e1's wiring of the target, merge M3a+) so libsinfer carries it.
+# No fast math: the kernels reproduce the reference's rounding with explicit intrinsics.
+add_library(sinfer_inkling_attention STATIC EXCLUDE_FROM_ALL
+  ${SERVE_ROOT}/ops/inkling_attention/inkling_prologue.cu
+  ${SERVE_ROOT}/ops/inkling_attention/inkling_rel_attention.cu
+  ${SERVE_ROOT}/ops/inkling_attention/inkling_attn_linear.cu)
+sinfer_internal_includes(sinfer_inkling_attention)
+sinfer_cuda_archive(sinfer_inkling_attention)
+target_link_libraries(sinfer_inkling_attention PUBLIC sinfer_core)
 
 # Product-independent text and media mechanisms.
 add_library(sinfer_text STATIC EXCLUDE_FROM_ALL
@@ -1717,6 +1758,15 @@ if(SINFER_ENABLE_FFMPEG)
     ${SERVE_ROOT}/media/decode/decode.cpp)
   sinfer_internal_includes(sinfer_media_decode)
   target_link_libraries(sinfer_media_decode PRIVATE PkgConfig::FFMPEG)
+  # ENGINE-INKLING lane V-b: Pillow-exact JPEG pixels for the Inkling-2 vision processor (decode_image_pil only;
+  # decode_image / decode_video keep FFmpeg). OFF falls back to FFmpeg's JPEG / WebP pixels (levels off Pillow's).
+  option(SINFER_PIL_DECODERS "Decode JPEG / WebP with Pillow's libraries (libjpeg-turbo, libwebp) for Inkling-2 vision" ON)
+  if(SINFER_PIL_DECODERS)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/serve_pil_decoders.cmake)
+    target_sources(sinfer_media_decode PRIVATE ${SERVE_ROOT}/media/decode/pil_jpeg.cpp ${SERVE_ROOT}/media/decode/pil_webp.cpp)
+    target_compile_definitions(sinfer_media_decode PRIVATE SINFER_PIL_JPEG=1 SINFER_PIL_WEBP=1)
+    target_link_libraries(sinfer_media_decode PRIVATE sinfer_libjpeg_turbo sinfer_libwebpdemux)
+  endif()
 else()
   add_library(sinfer_media_decode STATIC EXCLUDE_FROM_ALL
     ${SERVE_ROOT}/media/decode/decode_stub.cpp)
@@ -1791,6 +1841,7 @@ add_subdirectory(${SERVE_ROOT}/targets/qwen3_moe serve_t_qwen3_moe EXCLUDE_FROM_
 add_subdirectory(${SERVE_ROOT}/targets/qwen3_5 serve_t_qwen3_5 EXCLUDE_FROM_ALL)
 add_subdirectory(${SERVE_ROOT}/targets/qwen3_5_moe serve_t_qwen3_5_moe EXCLUDE_FROM_ALL)
 add_subdirectory(${SERVE_ROOT}/targets/qwen4exp serve_t_qwen4exp EXCLUDE_FROM_ALL)
+add_subdirectory(${SERVE_ROOT}/targets/inkling2 serve_t_inkling2 EXCLUDE_FROM_ALL)
 
 target_link_libraries(sinfer_engine
   PRIVATE
@@ -1862,7 +1913,8 @@ foreach(candidate IN ITEMS
     sinfer_engine sinfer_core sinfer_ops sinfer_artifact sinfer_text sinfer_encoder
     sinfer_nvfp4_tma sinfer_nvfp4_cutlass sinfer_fp8_block_sm90 sinfer_fp8_block_sm120 sinfer_gqa_sm90 sinfer_trtllm_moe sinfer_media_decode
     sinfer_serve sinfer_media_acquire sinfer_product_prompt_input
-    sinfer_product_load_progress sinfer_product_cuda_visibility)
+    sinfer_product_load_progress sinfer_product_cuda_visibility
+    sinfer_inkling_attention)
   if(TARGET ${candidate})
     list(APPEND SINFER_SHARED_ARCHIVES ${candidate})
   endif()

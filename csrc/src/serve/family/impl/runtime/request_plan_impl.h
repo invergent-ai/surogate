@@ -2,14 +2,17 @@
 #include "family/impl/runtime/prefill_graph.h"
 #include "family/impl/runtime/program.h"
 #include "runtime/generation/readout_policy.h"
+#include "runtime/engine/kv_admission_policy.h"
 #include <cstdlib>
 
 #include "family/impl/runtime/schedule.h"
+#include "family/impl/runtime/dspark_round.h"
 
 #include <algorithm>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+#include <string_view>
 
 namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS {
 namespace {
@@ -146,7 +149,14 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     if (gpu_prefix_readout && (prompt.has_media() || options.requested_output_tokens != 1)) {
         throw InvalidRequest("GPU prefix readout requires one-token text requests");
     }
+    if (gpu_prefix_readout && window_paging()) {
+        // An image keeps its lane's window pages, and up to 1,025 images cannot be held by the
+        // window class's fixed size (DESIGN-window-kv.md 4.3).
+        throw InvalidRequest("GPU prefix readouts are not supported with window-bounded KV "
+                             "(SUROGATE_SERVE_KV_WINDOW_PAGING=0 turns it off)");
+    }
     prune_gpu_prefixes();
+    drop_stale_adapter_prefixes();
     if (gpu_prefix_readout) {
         if (options.gpu_prefix) {
             const auto found = gpu_prefixes.find(options.gpu_prefix.get());
@@ -204,13 +214,20 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     // 128-aligned, and a follow-up with a short output budget then killed the engine.
     const std::uint32_t graph_reach_tokens =
         PrefillGraphFamily::graph_prefill_reach(base->summary.prompt_tokens);
+    // DSpark (dspark_round.h) writes its draft block's own K / V at [frontier, frontier + 8) of its text-pool planes
+    // every round whatever k is: the reservation covers that block past the last output position. 0 elsewhere.
+    const std::uint32_t draft_block_tokens =
+        family::dspark_drafter<Variant>() && speculative_backend == SpeculativeBackend::DFlash
+            ? static_cast<std::uint32_t>(cfg.dflash.block_size)
+            : 0U;
     const std::uint32_t reserved_context_tokens = static_cast<std::uint32_t>(std::min<std::uint64_t>(
         capacity,
         std::max<std::uint64_t>(
             static_cast<std::uint64_t>(base->summary.prompt_tokens) +
                 (base->summary.effective_output_tokens == 0
                      ? 0U
-                     : base->summary.effective_output_tokens - 1U),
+                     : base->summary.effective_output_tokens - 1U) +
+                draft_block_tokens,
             graph_reach_tokens)));
     base->text_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
     if (speculative_backend == SpeculativeBackend::Mtp) {
@@ -239,10 +256,25 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
         throw std::invalid_argument("resumed request does not describe its generated tokens");
     }
     base->resume = options.resume;
+    // Lane f1: a DSpark row whose tokens depend on its drafts (top_p < 1, top_k > 0, min_p, one-hot verification) keeps
+    // its whole reservation and is never preempted, unless SUROGATE_SERVE_KV_TRUNCATED_ONDEMAND=1. true for other models.
+    const bool recompute_allowed = [&] {
+        if (!family::dspark_drafter<Variant>() || speculative_backend != SpeculativeBackend::DFlash) { return true; }
+        static const bool truncated_on_demand = [] {
+            const char* raw = std::getenv("SUROGATE_SERVE_KV_TRUNCATED_ONDEMAND");
+            return raw != nullptr && std::string_view(raw) == "1";
+        }();
+        // install_sampling's switch and the split routes' (the coupled verify is a split route)
+        static const bool coupled = runtime::kv_dspark_verify_coupled(std::getenv("SUROGATE_SPEC_COUPLED"),
+                                                                      std::getenv("SUROGATE_SPEC_EXACT_SPLIT"));
+        return truncated_on_demand ||
+               runtime::kv_dspark_row_recomputes_exactly(base->sampling.temperature, base->sampling.top_k,
+                                                         base->sampling.top_p, base->sampling.min_p, coupled);
+    }();
     base->summary.on_demand_kv = kv_on_demand_ && !base->target_only && !gpu_prefix_readout &&
                                  options.prompt_logprobs < 0 &&
                                  !(options.capture_routing && routing_capture_enabled) &&
-                                 options.next_token_candidates.empty() && !options.reserve_kv;
+                                 options.next_token_candidates.empty() && !options.reserve_kv && recompute_allowed;
     if (options.resume && !base->summary.on_demand_kv) {
         throw std::invalid_argument("a request that cannot be recomputed was preempted");
     }
@@ -348,7 +380,8 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             return plan_request_for_sequence(lane, value.state, prompt, base_plan, true)
                 .summary().reusable_prompt_tokens;
         }, speculative_backend == SpeculativeBackend::None &&
-           decoder->linear_attention.layer_count() == 0 && decoder->ple.empty());
+           decoder->linear_attention.layer_count() == 0 && decoder->ple.empty() &&
+           !window_paging()); // a saved window exists at its frontiers only
         // A host-tier snapshot is usable only while the pool still holds every object of it (another
         // replica may have needed the room) and they are complete; the plan keeps them until done.
         std::shared_ptr<family::detail::HostKvPool::Lease> host_lease;
@@ -368,7 +401,8 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         const auto& hashes = base_plan.impl_->page_hashes;
         if (hashes && !shared_prefixes.empty()) {
             if (auto entry = find_shared_prefix(prompt, *hashes, base_plan.impl_->lora_slot);
-                entry && entry->tokens > resident.summary().reusable_prompt_tokens) {
+                entry && entry->tokens > resident.summary().reusable_prompt_tokens &&
+                (!window_paging() || entry->window)) {
                 auto shared = plan_request_for_sequence(lane, entry->state, prompt, base_plan, true);
                 if (shared.impl_->reuse == ReusePath::AppendAtFrontier &&
                     shared.impl_->reuse_base == entry->tokens) {
@@ -400,6 +434,8 @@ RequestPlan ProgramImplCore::plan_request_for_sequence(std::uint32_t lane,
     }
     if (base_plan.impl_ == nullptr) { throw std::logic_error("request base plan is empty"); }
     const RequestBasePlanImpl& base = *base_plan.impl_;
+    // What the request's adapter slot holds now: state computed under other bytes is not reused.
+    const std::uint64_t lora_generation = adapter_kv_generation(base.lora_slot);
 
     auto plan                         = std::make_unique<RequestPlanImpl>();
     plan->summary                     = base.summary;
@@ -466,7 +502,8 @@ RequestPlan ProgramImplCore::plan_request_for_sequence(std::uint32_t lane,
         if (base.gpu_prefix) {
             const auto frontier = sequence.execution_frontier;
             if (!sequence.target_only || !sequence.tail_hidden_valid || frontier > prompt.token_ids.size() ||
-                !family::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity, frontier, base.lora_slot)) {
+                !family::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity, frontier, base.lora_slot,
+                                                lora_generation)) {
                 throw std::invalid_argument("request does not extend its GPU prefix with the same adapter");
             }
             plan->reuse = ReusePath::AppendAtFrontier;
@@ -482,7 +519,8 @@ RequestPlan ProgramImplCore::plan_request_for_sequence(std::uint32_t lane,
         std::uint32_t count = 1;
         while (count < limit && sequence.cached_scores[count].selected.token_id == prompt.token_ids[count] &&
                sequence.cached_scores[count].top.size() >= std::size_t(needed)) ++count;
-        if (limit >= 1 && family::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity, count, base.lora_slot)) {
+        if (limit >= 1 && family::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity, count, base.lora_slot,
+                                                         lora_generation)) {
             plan->reusable_scores = count;
         }
     }
@@ -509,9 +547,12 @@ RequestPlan ProgramImplCore::plan_request_for_sequence(std::uint32_t lane,
         const bool dflash_append_ready =
             speculative_backend != SpeculativeBackend::DFlash ||
             sequence.dflash_context_frontier == sequence.execution_frontier;
-        if (append_frontier != 0 && dflash_append_ready &&
+        // Window-bounded KV: a frontier whose window is gone is no append point; the checkpoint
+        // below may still be one.
+        const bool append_window_ready = window_reusable(sequence, append_frontier, archived);
+        if (append_frontier != 0 && dflash_append_ready && append_window_ready &&
             family::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
-                                            append_frontier, base.lora_slot)) {
+                                            append_frontier, base.lora_slot, lora_generation)) {
             plan->reuse      = ReusePath::AppendAtFrontier;
             plan->reuse_base = append_frontier;
         } else if ((!archived || decoder->can_acquire_checkpoint(lane)) &&
@@ -520,7 +561,7 @@ RequestPlan ProgramImplCore::plan_request_for_sequence(std::uint32_t lane,
                    family::detail::prefix_matches(prompt, sequence.ledger,
                                                    sequence.prefix_identity,
                                                    sequence.rewrite_checkpoint.frontier,
-                                                   base.lora_slot)) {
+                                                   base.lora_slot, lora_generation)) {
             plan->reuse      = restore_path(sequence.rewrite_checkpoint.kind);
             plan->reuse_base = sequence.rewrite_checkpoint.frontier;
         }
@@ -581,6 +622,13 @@ RequestPlan ProgramImplCore::plan_request_for_sequence(std::uint32_t lane,
         plan->reuse_base = 0;
     }
 
+    // Window-bounded KV: whatever path was chosen must find its window there (a checkpoint whose
+    // window was not kept, a saved state's inner prefix, the prompt-logprobs step back): otherwise start over.
+    if (plan->reuse != ReusePath::FullReset && !window_reusable(sequence, plan->reuse_base, archived)) {
+        plan->reuse      = ReusePath::FullReset;
+        plan->reuse_base = 0;
+    }
+
     // Snapshot storage follows the request's existing prefix-cache policy.
     static const std::optional<RewriteCheckpointSpec> kNoCheckpoint;
     const std::optional<RewriteCheckpointSpec>& desired =
@@ -590,7 +638,7 @@ RequestPlan ProgramImplCore::plan_request_for_sequence(std::uint32_t lane,
         desired && plan->reuse != ReusePath::FullReset && sequence.rewrite_checkpoint.valid &&
         sequence.rewrite_checkpoint.frontier == desired->frontier &&
         family::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
-                                        desired->frontier, base.lora_slot);
+                                        desired->frontier, base.lora_slot, lora_generation);
     if (!desired) {
         plan->rewrite_checkpoint_action = RewriteCheckpointAction::Drop;
     } else if (existing_checkpoint_matches) {

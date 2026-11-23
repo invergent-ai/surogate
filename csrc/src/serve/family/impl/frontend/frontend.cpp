@@ -4,6 +4,9 @@
 #include <api/family/prepared_prompt.h>
 
 #include "family/impl/frontend/chat_template.h"
+#include "family/impl/frontend/digest.h"
+#include "family/impl/frontend/inkling_render.h"
+#include "family/impl/frontend/inkling_vision.h"
 #include "family/impl/frontend/media_cache.h"
 #include "family/impl/frontend/processor.h"
 #include "family/impl/frontend/test_access.h"
@@ -17,7 +20,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <exception>
 #include <cstdlib>
 #include <cctype>
 #include <cstddef>
@@ -399,6 +404,21 @@ bool spells_qwen3_coder_tool_calls(const fi::Tokenizer& tokenizer) {
         if (ids.size() != 1) { return false; }
     }
     return true;
+}
+
+/// Inkling-2's framing tokens, when the vocabulary spells each of them as one special token. Such a checkpoint ships no
+/// chat template: vLLM renders its prompt token by token from the request (vllm/renderers/inkling_encoding.py), and
+/// so does this frontend (inkling_render.h).
+std::optional<fi::inkling::SpecialTokens> inkling_tokens(const fi::Tokenizer& tokenizer) {
+    for (const std::string_view marker : {"<|message_model|>", "<|content_thinking|>", "<|content_invoke_tool_json|>",
+                                          "<|end_message|>", "<|content_model_end_sampling|>"}) {
+        const std::optional<int> id = tokenizer.token_id(marker);
+        if (!id || !tokenizer.is_special_token(*id)) { return std::nullopt; }
+    }
+    try {
+        return fi::inkling::SpecialTokens::resolve(
+            [&](std::string_view spelling) { return tokenizer.token_id(spelling); });
+    } catch (const std::invalid_argument&) { return std::nullopt; }
 }
 
 /// The reasoning markers a checkpoint states, or the `<think>` pair when it states none.
@@ -1120,8 +1140,23 @@ public:
                                              .render_chat_template = chat_template.rendered_by_tokenizer()})),
           processor(processor_options(resources, options.gemma_image_tokens)), reasoning(reasoning_syntax(resources)),
           vision_enabled(options.vision_enabled),
+          inkling_image_limit(options.vision_enabled ? options.image_limit_per_prompt : 0),
+          inkling_max_image_tokens(options.max_image_tokens),
+          inkling_decode_path(options.image_decode_as_served ? fi::inkling::DecodePath::Served
+                                                             : fi::inkling::DecodePath::Processor),
           has_chat_template(!resources.chat_template_jinja.empty() ||
                             !options.chat_template_override.empty()) {
+        // Inkling-2 (no template, its own framing tokens): the model opens a thinking block itself,
+        // `<|message_model|><|content_thinking|>`, and `<|end_message|>` closes it -- the thought the
+        // output session tracks (the thinking guard among its readers). The reply as a whole is read
+        // back by vLLM's Inkling parser in the serving layer, not by this split.
+        if (!has_chat_template && options.chat_template_override.empty()) { inkling = inkling_tokens(*tokenizer); }
+        if (inkling) {
+            reasoning.muse_glimmer = false;
+            reasoning.open         = "<|content_thinking|>";
+            reasoning.close        = "<|end_message|>";
+            reasoning.model_opens  = true;
+        }
         reasoning.marker_tokens = special_marker_tokens(*tokenizer, reasoning);
         if (const char* probe = std::getenv("SUROGATE_SERVE_TRACE_REASONING"); probe != nullptr) {
             std::fprintf(stderr,
@@ -1161,6 +1196,15 @@ public:
                                                },
                                                reasoning)
                 : chat_template.capabilities();
+        if (inkling) {
+            // What the serving layer may ask of the request is vLLM's Inkling renderer's business: the request body
+            // reaches it whole (PromptOptions::raw_chat_request). The switch is accepted and, as there, has no
+            // effect on the prompt; the model thinks when it chooses to.
+            capabilities                     = PromptCapabilities{};
+            capabilities.inkling2_chat       = true;
+            capabilities.enable_thinking     = true;
+            capabilities.thinking_by_default = true;
+        }
         capabilities.gemma4_tool_calls = spells_gemma4_tool_calls(*tokenizer);
         capabilities.qwen3_coder_tool_calls =
             chat_template.rendered_by_tokenizer() && spells_qwen3_coder_tool_calls(*tokenizer) &&
@@ -1238,6 +1282,175 @@ public:
                 std::string(reasoning_effort_name(*options.reasoning_effort));
         }
         return variables;
+    }
+
+    /// An Inkling-2 prompt with its images (lane V-b): the ids vLLM's engine sees (renderer + multimodal prompt update),
+    /// and per image the vision item and the tower's input payload.
+    struct InklingPrompt {
+        std::vector<int> ids;
+        std::vector<fi::VisionItem> items;
+        std::vector<std::shared_ptr<const PreparedMediaPayload>> payloads;
+        fi::MediaCacheRequestStats cache;
+        std::size_t media_bytes        = 0;
+        std::uint64_t vision_tokens    = 0;
+        std::size_t patch_bytes        = 0;
+        double media_seconds           = 0.0;
+    };
+
+    /// Inkling-2's prompt for the request body the serving layer handed over: vLLM's renderer, token for token, and
+    /// with vision on (a load-time option) its images: decoded and preprocessed as vLLM's Inkling2ImageProcessor does
+    /// (inkling_vision.h), each image part one <|content_image|> + N x <|unused_200054|>. Throws
+    /// std::invalid_argument (inkling::RequestError) where vLLM refuses the request.
+    [[nodiscard]] InklingPrompt prepare_inkling(const PromptInput& input, const PreparationControl& control) const {
+        const PromptOptions& options = input.options;
+        if (!options.raw_chat_request) {
+            throw std::invalid_argument(
+                "this model renders its prompt from the chat-completions request itself; "
+                "ask it through /v1/chat/completions");
+        }
+        const fi::inkling::ChatRequest request =
+            fi::inkling::parse_chat_request(*options.raw_chat_request, inkling_image_limit);
+        InklingPrompt out;
+        std::vector<std::uint64_t> image_tokens;
+        if (!request.image_urls.empty()) {
+            if (!media_cache) { throw std::logic_error("Inkling vision is enabled without a media cache"); }
+            if (input.raw_chat_media.size() != request.image_urls.size()) {
+                throw std::invalid_argument("the request's images were not acquired: " +
+                                            std::to_string(input.raw_chat_media.size()) + " of " +
+                                            std::to_string(request.image_urls.size()));
+            }
+            const auto started = Clock::now();
+            const std::uint64_t cap             = inkling_max_image_tokens;
+            const fi::inkling::DecodePath path  = inkling_decode_path;
+            const std::size_t count             = input.raw_chat_media.size();
+            // 1. Sizes from the headers, before any pixel is decoded or any payload byte is held: vLLM's per-image
+            //    refusals (pixel limit, encoder-cache cap), then this engine's per-prompt Vision budget -- the bound
+            //    every processor enforces and the media cache's live bytes are sized for (an Inkling token's payload,
+            //    4 x 1,200 bf16 = 9,600 bytes, is below a Qwen token's 12,288).
+            std::vector<fi::Sha256Digest> digests;
+            digests.reserve(count);
+            std::uint64_t planned = 0;
+            for (const OwnedMedia& media : input.raw_chat_media) {
+                fi::check_preparation_control(control);
+                digests.push_back(fi::sha256(media.bytes, [&control] { fi::check_preparation_control(control); }));
+                const fi::inkling::ImageProbe probe = fi::inkling::probe_image(media.bytes, path);
+                const std::uint64_t tokens = fi::inkling::image_grid(probe.height, probe.width).tokens();
+                if (tokens > cap) {
+                    throw fi::inkling::RequestError(fi::inkling::image_too_large_message(tokens, cap));
+                }
+                planned += tokens;
+            }
+            if (planned > processor.max_vision_tokens) {
+                throw fi::ProcessorError(fi::ProcessorErrorKind::BudgetExceeded, "vision tokens exceed processor budget");
+            }
+            // 2. Decode and payload for every image at once on the media cache's workers (single-flight by content),
+            //    as the Qwen processor does: a failure stops the others and waits for them before it is thrown.
+            fi::MediaPreparationPermit permit = media_cache->acquire_request(control);
+            std::atomic<bool> stop{false};
+            const PreparationControl worker_control{
+                .deadline     = control.deadline,
+                .cancellation = CancellationView([&stop] { return stop.load(std::memory_order_relaxed); }),
+            };
+            const media::decode::Policy policy{
+                .max_bytes                = processor.max_encoded_media_bytes,
+                .max_decoded_pixels       = processor.max_decoded_pixels,
+                .max_decoded_video_pixels = processor.max_decoded_video_pixels,
+                .checkpoint               = [&worker_control] { fi::check_preparation_control(worker_control); },
+            };
+            std::vector<fi::PendingMedia> pending;
+            pending.reserve(count);
+            std::exception_ptr failure;
+            for (std::size_t k = 0; k < count; ++k) {
+                const std::span<const std::uint8_t> bytes = input.raw_chat_media[k].bytes;
+                const fi::Sha256Digest digest             = digests[k];
+                try {
+                    pending.push_back(media_cache->begin_prepare(
+                        fi::MediaCacheKey{.digest = digest, .modality = fi::Modality::Image}, worker_control,
+                        [this, bytes, digest, cap, path, &policy, &worker_control]() {
+                            const fi::inkling::DecodedImage image = fi::inkling::decode_image(bytes, policy, path);
+                            const fi::inkling::ImageGrid grid = fi::inkling::image_grid(image.height, image.width);
+                            if (grid.tokens() > cap) {  // a header that understated the decoded size
+                                throw fi::inkling::RequestError(fi::inkling::image_too_large_message(grid.tokens(), cap));
+                            }
+                            const std::size_t rows = static_cast<std::size_t>(grid.tokens()) * fi::inkling::kPatchesPerToken;
+                            auto payload = media_cache->allocate_payload(rows * fi::inkling::kPatchFeatures, worker_control);
+                            fi::inkling::write_patches_merge(image, payload->mutable_span());
+                            fi::VisionItem item;
+                            item.modality = fi::Modality::Image;
+                            // In native 20 px patches, as every Vision item's grid: 2 x 2 of them per decoder token.
+                            item.grid        = {1, grid.rows * fi::inkling::kMergeSize, grid.cols * fi::inkling::kMergeSize};
+                            item.patch_count = rows;
+                            item.content_digest = digest;
+                            return fi::PreparedMedia{std::move(item), std::move(payload)};
+                        }));
+                } catch (...) {
+                    failure = std::current_exception();
+                    stop.store(true, std::memory_order_relaxed);
+                    break;
+                }
+            }
+            std::size_t patch_cursor = 0;
+            for (fi::PendingMedia& flight : pending) {
+                fi::PreparedMedia prepared;
+                try {
+                    prepared = media_cache->await(flight, failure ? PreparationControl{} : control, out.cache);
+                } catch (...) {
+                    if (!failure) {
+                        failure = std::current_exception();
+                        stop.store(true, std::memory_order_relaxed);
+                    }
+                    // The builder borrows this frame: wait for it to stop before leaving.
+                    fi::MediaCacheRequestStats discarded;
+                    try {
+                        (void)media_cache->await(flight, {}, discarded);
+                    } catch (...) {}
+                    continue;
+                }
+                if (failure) { continue; }
+                fi::VisionItem item = prepared.item;
+                item.patch_begin    = patch_cursor;
+                patch_cursor += item.patch_count;
+                image_tokens.push_back(item.patch_count / fi::inkling::kPatchesPerToken);
+                out.vision_tokens += image_tokens.back();
+                out.patch_bytes += prepared.payload->patch_elements * sizeof(std::uint16_t);
+                out.media_bytes += input.raw_chat_media[out.items.size()].bytes.size();
+                out.items.push_back(std::move(item));
+                out.payloads.push_back(std::move(prepared.payload));
+            }
+            if (failure) {
+                try {
+                    std::rethrow_exception(failure);
+                } catch (const media::decode::Error& error) {
+                    // A decode budget (pixels, bytes) is the client's: the same refusal as the other processors'.
+                    throw fi::ProcessorError(fi::ProcessorErrorKind::BudgetExceeded, error.what());
+                }
+            }
+            permit.reset();
+            out.media_seconds = std::chrono::duration<double>(Clock::now() - started).count();
+        }
+        out.ids = fi::inkling::render_chat(
+            request,
+            [this](std::string_view text) {
+                return tokenizer->encode(text, {.parse_added_tokens = false, .add_bos = false});
+            },
+            *inkling, image_tokens);
+        // Each image's pads are one run (payload text never encodes to a special token), in image order.
+        std::size_t image = 0;
+        for (std::size_t i = 0; i < out.ids.size();) {
+            if (out.ids[i] != inkling->image_pad) {
+                ++i;
+                continue;
+            }
+            std::size_t end = i;
+            while (end < out.ids.size() && out.ids[end] == inkling->image_pad) { ++end; }
+            if (image >= out.items.size() || end - i != image_tokens[image]) {
+                throw std::logic_error("Inkling image pads do not match the prepared images");
+            }
+            out.items[image++].token_spans.push_back(fi::TokenSpan{i, end - i});
+            i = end;
+        }
+        if (image != out.items.size()) { throw std::logic_error("Inkling prompt lost an image's pads"); }
+        return out;
     }
 
     /// Renders the conversation with whichever renderer this checkpoint's template
@@ -1343,7 +1556,14 @@ public:
     bool preserves_thinking = false;
     /// The artifact's template has a developer role of its own (see consolidate_system_messages).
     bool supports_developer_role = false;
+    /// Inkling-2's framing tokens when this checkpoint renders natively (PromptCapabilities::inkling2_chat).
+    std::optional<fi::inkling::SpecialTokens> inkling;
     bool vision_enabled = true;
+    /// Inkling-2 (lane V-b): vLLM's per-prompt image count, 0 when vision is off (vLLM at image limit 0), and the
+    /// per-image token cap.
+    std::uint64_t inkling_image_limit      = 0;
+    std::uint64_t inkling_max_image_tokens = fi::inkling::kDefaultMaxImageTokens;
+    fi::inkling::DecodePath inkling_decode_path = fi::inkling::DecodePath::Served;
     /// Whether anything was compiled above. A checkpoint with no template is a base model, and
     /// only the raw-prompt path can serve it.
     bool has_chat_template = true;
@@ -1354,7 +1574,8 @@ public:
     Impl(std::shared_ptr<const fi::Tokenizer> tokenizer_, StopPolicy policy_, OutputOptions output,
          bool starts_in_reasoning, fi::ReasoningSyntax reasoning)
         : tokenizer(std::move(tokenizer_)), policy(std::move(policy_)),
-          preserve_special(output.raw || output.preserve_special_tokens) {
+          preserve_special(output.raw || output.preserve_special_tokens),
+          report_token_ids(output.report_token_ids) {
         state.in_reasoning = starts_in_reasoning && !output.raw && !output.structured;
         // The raw path publishes the stream as the model wrote it, markers included, so it
         // is given no pair to act on.
@@ -1369,6 +1590,8 @@ public:
     std::shared_ptr<const fi::Tokenizer> tokenizer;
     StopPolicy policy;
     bool preserve_special = false;
+    /// OutputOptions::report_token_ids: each preview also publishes the ids it accepted (stop token excluded).
+    bool report_token_ids = false;
     DecoderState state;
     DecoderState preview_state;
     PublishedOutput preview_output;
@@ -1531,6 +1754,14 @@ runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
     impl_->preview_output.clear();
 
     const auto complete = [&](std::uint32_t count, FinishReason reason) {
+        if (impl_->report_token_ids) {
+            // The ids the round accepted, as the reply's text has them: a stop token is not part of it.
+            const std::size_t kept = reason == FinishReason::StopToken && count != 0 ? count - 1 : count;
+            if (kept != 0) {
+                impl_->preview_output.push_back(
+                    OutputDelta{.token_ids = std::vector<TokenId>(tokens.begin(), tokens.begin() + kept)});
+            }
+        }
         impl_->preview_ready = true;
         return runtime::OutputDecision{.accepted_tokens = count, .finish_reason = reason};
     };
@@ -1660,6 +1891,11 @@ Frontend FrontendTestAccess::create_component(const FrontendResources& resources
     return Frontend(std::make_shared<const Frontend::Impl>(resources, false, options));
 }
 
+Frontend FrontendTestAccess::create_component_with(const FrontendResources& resources,
+                                                   const FrontendOptions& options) {
+    return Frontend(std::make_shared<const Frontend::Impl>(resources, false, options));
+}
+
 const PreparedPromptData& PreparedPromptAccess::view(const PreparedPrompt& prompt) {
     if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
     return *prompt.data_;
@@ -1695,6 +1931,50 @@ const PreparedPromptData& FrontendTestAccess::inspect(const PreparedPrompt& prom
 PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& control) const {
     fi::check_preparation_control(control);
     const auto start                      = Clock::now();
+    if (impl_->inkling) {
+        auto prepared               = std::make_unique<PreparedPromptData>();
+        PreparedPromptData& result  = *prepared;
+        result.uses_chat_template   = true;
+        Impl::InklingPrompt inkling;
+        try {
+            inkling = impl_->prepare_inkling(input, control);
+        } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
+        result.prepare.tokenize_seconds =
+            std::chrono::duration<double>(Clock::now() - start).count() - inkling.media_seconds;
+        fi::check_preparation_control(control, "tokenization");
+        result.token_ids.assign(inkling.ids.begin(), inkling.ids.end());
+        // Plain 1-D positions on all three axes (the decoder has no M-RoPE); image pads are typed as image tokens.
+        assign_text_positions(result);
+        (void)checked_token_count(result.token_ids.size());
+        if (!inkling.items.empty()) {
+            for (const fi::VisionItem& item : inkling.items) {
+                for (const fi::TokenSpan& span : item.token_spans) {
+                    std::fill_n(result.token_types.begin() + static_cast<std::ptrdiff_t>(span.begin), span.count,
+                                static_cast<std::uint8_t>(fi::Modality::Image));
+                }
+            }
+            result.media_payloads = std::move(inkling.payloads);
+            result.vision_items.reserve(inkling.items.size());
+            for (fi::VisionItem& item : inkling.items) { result.vision_items.push_back(convert_vision_item(std::move(item))); }
+            result.prepare.media_items              = result.vision_items.size();
+            result.prepare.media_bytes              = inkling.media_bytes;
+            result.prepare.raw_patches              = inkling.vision_tokens * fi::inkling::kPatchesPerToken;
+            result.prepare.vision_tokens            = inkling.vision_tokens;
+            result.prepare.patch_bytes              = inkling.patch_bytes;
+            result.prepare.media_cache_hits         = inkling.cache.hits;
+            result.prepare.media_cache_misses       = inkling.cache.misses;
+            result.prepare.media_singleflight_waits = inkling.cache.singleflight_waits;
+            result.prepare.built_patch_bytes        = inkling.cache.built_patch_bytes;
+            result.prepare.reused_patch_bytes       = inkling.cache.reused_patch_bytes;
+            result.prepare.media_preprocess_seconds = inkling.media_seconds;
+            result.prepare.media_preprocess_work_seconds = inkling.cache.build_seconds;
+        }
+        result.identity.reusable   = true;
+        // The model writes `<|message_model|><|content_thinking|>` itself: a prompt never ends in a thought.
+        result.starts_in_reasoning = false;
+        result.prepare.seconds     = std::chrono::duration<double>(Clock::now() - start).count();
+        return PreparedPrompt(std::move(prepared));
+    }
     const PromptOptions options           = input.options;
     std::vector<fi::ChatMessage> messages = convert_messages(std::move(input.messages));
     if (impl_->tokenizer->renders_chat_template()) {
@@ -1890,6 +2170,15 @@ std::vector<std::string> Frontend::token_texts(std::span<const TokenId> ids) con
 
 std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl& control) const {
     fi::check_preparation_control(control);
+    if (impl_->inkling) {
+        std::size_t ids = 0;
+        try {
+            ids = impl_->prepare_inkling(input, control).ids.size();
+        } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
+        const std::uint32_t count = checked_token_count(ids);
+        fi::check_preparation_control(control, "tokenization");
+        return count;
+    }
     const PromptOptions options           = input.options;
     std::vector<fi::ChatMessage> messages = convert_messages(std::move(input.messages));
     if (impl_->tokenizer->renders_chat_template()) {
@@ -1956,7 +2245,7 @@ MediaCacheSummary Frontend::media_cache_summary() const {
     };
 }
 
-bool Frontend::supports_chat() const noexcept { return impl_->has_chat_template; }
+bool Frontend::supports_chat() const noexcept { return impl_->has_chat_template || impl_->inkling.has_value(); }
 
 std::vector<std::pair<TokenId, std::string>> Frontend::named_special_tokens() const {
     std::vector<std::pair<TokenId, std::string>> out;

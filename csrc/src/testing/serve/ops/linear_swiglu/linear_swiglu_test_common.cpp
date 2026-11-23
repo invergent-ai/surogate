@@ -135,7 +135,8 @@ double silu_fp64(double value) {
 std::vector<double> linear_swiglu_oracle_fp64(const Profile& profile,
                                               const quantized_weight::PackedWeight& weight,
                                               const std::vector<std::uint16_t>& activation,
-                                              std::int32_t tokens) {
+                                              std::int32_t tokens,
+                                              const std::vector<std::uint16_t>* delta = nullptr) {
     const auto active_by_column = index_nonzero_activations(activation, profile.input_rows, tokens);
     std::vector<double> output(checked_elements(profile.output_rows, tokens, "oracle output size"));
 
@@ -162,8 +163,14 @@ std::vector<double> linear_swiglu_oracle_fp64(const Profile& profile,
                     }
                 }
                 for (std::int32_t token = 0; token < tokens; ++token) {
-                    const double fused = silu_fp64(gate[static_cast<std::size_t>(token)]) *
-                                         up[static_cast<std::size_t>(token)];
+                    double g = gate[static_cast<std::size_t>(token)];
+                    double u = up[static_cast<std::size_t>(token)];
+                    if (delta != nullptr) {   // [token][2 * output_rows], [gate; up]
+                        const std::size_t base = static_cast<std::size_t>(token) * 2 * profile.output_rows;
+                        g += test::bf16_to_f32((*delta)[base + row]);
+                        u += test::bf16_to_f32((*delta)[base + profile.output_rows + row]);
+                    }
+                    const double fused = silu_fp64(g) * u;
                     output[static_cast<std::size_t>(token) * profile.output_rows + row] = fused;
                 }
             }
@@ -322,6 +329,100 @@ int run_profile(std::string_view label, const Profile& profile,
                          host_activation.data(), host_activation.size() * sizeof(std::uint16_t));
     failures += verify_unchanged(std::string(label) + " weight", device_weight,
                                  host_weight.payload.data(), host_weight.payload.size());
+    return failures;
+}
+
+int run_preactivation_delta_profile(std::string_view label, const Profile& profile,
+                                    std::span<const std::int32_t> token_cases, bool expect_route) {
+    validate_profile(profile);
+    if (token_cases.empty()) { throw std::invalid_argument("linear_swiglu delta test: no token cases"); }
+    for (std::size_t index = 0; index < token_cases.size(); ++index) {
+        if (token_cases[index] <= 0 || (index != 0 && token_cases[index] <= token_cases[index - 1])) {
+            throw std::invalid_argument("linear_swiglu delta test: token cases must be positive and increasing");
+        }
+    }
+    if (!cuda_available()) {
+        std::cout << "SKIP: no usable CUDA device\n";
+        return 77;
+    }
+    const std::int32_t maximum_tokens = token_cases.back();
+    quantized_weight::PackedWeight host_weight = quantized_weight::make_patterned_weight(
+        profile.qtype, profile.gate_up_rows, profile.input_rows, profile.seed, {});
+    const std::vector<std::uint16_t> host_activation = make_activation(profile, maximum_tokens);
+    // A small pseudo-random pre-activation delta, [token][2 * output_rows] BF16 in [-0.25, 0.25].
+    std::vector<std::uint16_t> host_delta(static_cast<std::size_t>(maximum_tokens) * profile.gate_up_rows);
+    for (std::size_t index = 0; index < host_delta.size(); ++index) {
+        const double unit = static_cast<double>(mix64(profile.seed * 7919ULL + index) >> 11) * 0x1.0p-53;
+        host_delta[index] = test::f32_to_bf16(static_cast<float>(0.5 * unit - 0.25));
+    }
+    const std::vector<double> reference =
+        linear_swiglu_oracle_fp64(profile, host_weight, host_activation, maximum_tokens, &host_delta);
+
+    test::GuardedDeviceBuffer device_weight(host_weight.payload.size());
+    device_weight.copy_from_host(host_weight.payload.data(), host_weight.payload.size());
+    const Weight weight = host_weight.device_weight(device_weight.data());
+    test::GuardedDeviceBuffer device_activation(host_activation.size() * sizeof(std::uint16_t));
+    device_activation.copy_from_host(host_activation.data(), host_activation.size() * sizeof(std::uint16_t));
+    test::GuardedDeviceBuffer device_delta(host_delta.size() * sizeof(std::uint16_t));
+    device_delta.copy_from_host(host_delta.data(), host_delta.size() * sizeof(std::uint16_t));
+    test::GuardedDeviceBuffer device_zero(host_delta.size() * sizeof(std::uint16_t));
+    device_zero.fill(0);
+    WorkspaceArena workspace(std::max<std::size_t>(ops::linear_swiglu_workspace_capacity_bytes(
+        profile.qtype, profile.gate_up_rows, profile.input_rows, ops::LinearPolicy::A16Only, 1, maximum_tokens), 256));
+
+    int failures = 0;
+    for (const std::int32_t tokens : token_cases) {
+        const std::string case_label = std::string(label) + " T=" + std::to_string(tokens);
+        const std::size_t elements = checked_elements(profile.output_rows, tokens, "output size");
+        test::GuardedDeviceBuffer plain(elements * sizeof(std::uint16_t));
+        test::GuardedDeviceBuffer zero(elements * sizeof(std::uint16_t));
+        test::GuardedDeviceBuffer shifted(elements * sizeof(std::uint16_t));
+        plain.fill(0xff); zero.fill(0xff); shifted.fill(0xff);
+        Tensor x(device_activation.data(), DType::BF16, {profile.input_rows, tokens});
+        Tensor out_plain(plain.data(), DType::BF16, {profile.output_rows, tokens});
+        Tensor out_zero(zero.data(), DType::BF16, {profile.output_rows, tokens});
+        Tensor out_shifted(shifted.data(), DType::BF16, {profile.output_rows, tokens});
+        Tensor zero_delta(device_zero.data(), DType::BF16, {profile.gate_up_rows, tokens});
+        Tensor delta(device_delta.data(), DType::BF16, {profile.gate_up_rows, tokens});
+        bool took_zero = false, took_shifted = false;
+        try {
+            workspace.reset();
+            ops::linear_swiglu(x, weight, out_plain, ops::LinearPolicy::A16Only, workspace, nullptr);
+            took_zero = ops::linear_swiglu_preactivation_delta(x, weight, zero_delta, out_zero,
+                                                               ops::LinearPolicy::A16Only, nullptr);
+            took_shifted = ops::linear_swiglu_preactivation_delta(x, weight, delta, out_shifted,
+                                                                  ops::LinearPolicy::A16Only, nullptr);
+            test::cuda_check(cudaDeviceSynchronize(), "synchronize preactivation delta");
+        } catch (const std::exception& error) {
+            std::cerr << case_label << ": unexpected exception: " << error.what() << '\n';
+            ++failures;
+            continue;
+        }
+        if (took_zero != expect_route || took_shifted != expect_route) {
+            std::cerr << case_label << ": delta route " << (took_zero ? "taken" : "refused") << ", expected "
+                      << (expect_route ? "taken" : "refused") << '\n';
+            ++failures;
+            continue;
+        }
+        if (!expect_route) { continue; }
+        std::vector<std::uint16_t> a(elements), b(elements);
+        test::cuda_check(cudaMemcpy(a.data(), plain.data(), elements * 2, cudaMemcpyDeviceToHost), "copy plain");
+        test::cuda_check(cudaMemcpy(b.data(), zero.data(), elements * 2, cudaMemcpyDeviceToHost), "copy zero");
+        std::size_t differ = 0;
+        for (std::size_t i = 0; i < elements; ++i) { differ += a[i] != b[i]; }
+        if (differ != 0) {
+            std::cerr << case_label << ": zero delta differs from linear_swiglu in " << differ << " of " << elements
+                      << " outputs\n";
+            ++failures;
+        }
+        failures += plain.verify_guards(case_label + " plain") + zero.verify_guards(case_label + " zero") +
+                    shifted.verify_guards(case_label + " shifted");
+        // The oracle holds every column of the largest case; a case's outputs are its first `tokens` columns.
+        failures += compare_output(case_label + " delta", read_bf16_output(shifted, elements), reference.data(),
+                                   ActivationCompute::A16);
+    }
+    failures += verify_unchanged(std::string(label) + " delta", device_delta, host_delta.data(),
+                                 host_delta.size() * sizeof(std::uint16_t));
     return failures;
 }
 

@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "family/impl/runtime/residual_policy.h"
+#include "family/impl/runtime/visit_round.h"
 
 namespace sinfer::family::detail {
 class PrefillGraphFamily;
@@ -410,8 +411,15 @@ struct StageSpan {
     std::size_t column_bytes = 0;
     std::size_t residual_bytes = 0;
     Tensor* features = nullptr; // compact DFlash feature columns carried beside the residual
-
+    // DSpark on a pipeline (dspark_round.h; ENGINE-INKLING lane e1): on a stage that does not hold the drafter and has
+    // no import (the first), the drafter stage's verify ids [width * batch] I32 then, at kDSparkDraftImportStride, their
+    // cache positions -- the two fields the boundary packet carries to the later stages. Null for every other target.
+    const void* draft_import_pinned = nullptr;
 };
+
+/// Offset (I32 elements) of the positions in a DSpark draft import / export buffer (StageSpan::draft_import_pinned).
+inline constexpr std::size_t kDSparkDraftImportStride =
+    static_cast<std::size_t>(kMaximumBatchColumns) * kDFlashDecodeMaximumWidth;
 
 struct DFlashFeatureSink {
     static constexpr bool enabled = true;
@@ -739,6 +747,11 @@ private:
     void run_layers(Tensor& x, Phase phase, Tap& tap, const Tensor* deepstack = nullptr,
                     std::span<const std::int32_t> visual_indices = {},
                     int first_layer = -1, int last_layer = -1);
+    /// A visit-schedule target's round (family/impl/runtime/visit_round.h): what `run_layers` and the mixed
+    /// bodies hand `Variant::run_visits` in place of the family layer loop. A no-op for every other target.
+    template <class Tap>
+    void run_visit_round(Tensor& x, Tap& tap, std::span<const family::VisitSegment> segments,
+                         const family::VisitBlock* block, bool single_sequence, const Tensor& positions);
     template <class Tap>
     void target_verify_batch_impl(const Tensor& ids, const Tensor& cache_positions,
                                   const Tensor& rope_positions, const Tensor& valid_columns,

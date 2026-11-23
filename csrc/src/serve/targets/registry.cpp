@@ -1,5 +1,6 @@
 #include "api/family/rope_scaling.h"
 #include "runtime/engine/pipeline_partition.h"
+#include "runtime/engine/pipeline_kv_share.h"
 #include <algorithm>
 #include <optional>
 #include <api/family/text_geometry.h>
@@ -15,6 +16,7 @@
 #include "core/engine_context.h"
 #include "core/elastic_kv_region.h"
 #include "core/memory_trace.h"
+#include "core/paged_kv_cache.h"
 #include "core/unified_memory.h"
 #include "ops/linear/ggml/ggml_dispatch.h"
 #include "ops/linear/marlin/marlin_plane.h"
@@ -244,6 +246,19 @@ constexpr ops::LinearPolicy target_linear_policy() {
     }
 }
 
+/// Device bytes a target derives at load beside its materialized weights that projected_derived_residency_bytes cannot
+/// see (inkling2: the DSpark drafter's derived buffers under --speculative dflash; M7 review). 0 for a target that
+/// declares nothing -- every other target's sizing is unchanged.
+template <class Target>
+std::size_t target_extra_derived_bytes(const EngineOptions& options) {
+    if constexpr (requires { Target::extra_derived_residency_bytes(options); }) {
+        return Target::extra_derived_residency_bytes(options);
+    } else {
+        (void)options;
+        return 0;
+    }
+}
+
 } // namespace
 
 namespace {
@@ -398,7 +413,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
                     runtime_bytes_after_planned_weights(plan.materialization().device_capacity_bytes),
                     projected_derived_residency_bytes(probe, plan.materialization(),
                                                        target_linear_policy<Target>()) +
-                        family::ExpertCache::pool_floor());
+                        target_extra_derived_bytes<Target>(candidate) + family::ExpertCache::pool_floor());
                 if (candidate.max_context == 0) {
                     candidate.max_context = std::min<std::uint32_t>(geometry.max_context,
                         candidate.kv_capacity.mode == KvCapacityMode::Explicit
@@ -426,6 +441,10 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     const std::size_t derived_residency_bytes =
         projected_derived_residency_bytes(binder, load_plan.materialization(),
                                           target_linear_policy<Target>());
+    // A target's own load-time derived buffers (target_extra_derived_bytes) exist once the model is constructed, so the
+    // final sizing's free-memory reading already holds them: they are booked in the PREFLIGHT only (auto context, the
+    // host-MoE probe), never subtracted again from the final reading.
+    const std::size_t preflight_extra_derived_bytes = target_extra_derived_bytes<Target>(options);
     const std::size_t startup_host_bytes = startup_host_growth_bytes(device.device, options.kv_capacity);
     if (startup_host_bytes != 0) {
         std::fprintf(stderr,
@@ -436,7 +455,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     const std::size_t preflight_runtime_bytes = subtract_saturating(
         runtime_bytes_after_planned_weights(options.borrowed_weights.empty()
             ? load_plan.materialization().device_capacity_bytes : 0),
-        derived_residency_bytes + startup_host_bytes);
+        derived_residency_bytes + preflight_extra_derived_bytes + startup_host_bytes);
     if (const std::size_t limit = device_memory_limit(device.device); limit != 0) {
         // The load also holds staging for the objects it rearranges; under a limit it must fit
         // beside the weights, or the limit is exceeded before serving even starts.
@@ -617,6 +636,7 @@ ConstructedTarget construct_target(const EngineOptions& requested, DeviceContext
     dispatch.template operator()<Qwen3_5Moe, LoadedQwen3_5Moe, Qwen3_5MoeInstance>(constructed);
     dispatch.template operator()<Qwen38FlashNext, LoadedQwen38FlashNext,
                                  Qwen38FlashNextInstance>(constructed);
+    dispatch.template operator()<Inkling2, LoadedInkling2, Inkling2Instance>(constructed);
     if (constructed.has_value()) { return std::move(*constructed); }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
                              "' has no registered target for this device");
@@ -698,7 +718,10 @@ std::vector<int> balanced_stage_bounds(const EngineOptions& options, artifact::R
 template <class Target>
 struct StagePreflight {
     std::uint32_t max_context = 0;
+    /// Lane f1: the real KV tokens every stage holds with every lane charged (the shared pool), and
+    /// each stage's own capacity: that pool plus its lanes' window charge (pipeline_kv_share.h).
     std::uint32_t kv_tokens   = 0;
+    std::vector<std::uint32_t> stage_kv_tokens;
     /// Mixture layers each stage moves to host memory. Preserve explicit counts; under
     /// `auto`, select the least each stage needs because the stages are not equally tight.
     std::vector<std::uint32_t> host_moe;
@@ -708,6 +731,13 @@ struct StagePreflight {
 struct StageFit {
     std::size_t budget_bytes = 0;
     std::uint32_t kv_tokens  = 0;
+    /// Lane f1: the curve the stage resolved (pages, its minimum) and its per-lane window charge.
+    runtime::PipelineStageKvFit pages{};
+    /// What this stage counts against the run's need (runtime::pipeline_stage_held_tokens): the tokens left for KV when
+    /// every lane holds its window charge, or the capacity itself when it is explicit.
+    [[nodiscard]] std::uint64_t held_tokens(std::uint32_t lanes, bool explicit_capacity) const noexcept {
+        return runtime::pipeline_stage_held_tokens(kv_tokens, pages, lanes, explicit_capacity);
+    }
 };
 
 template <class Target>
@@ -720,10 +750,13 @@ StageFit stage_fit(artifact::Reader& reader, const EngineOptions& stage,
     artifact::Binder binder(reader);
     auto plan = Target::plan_load(binder, sized, weights_profile);
     StageFit fit{};
+    // + the target's own load-time derived buffers on this stage (inkling2: the DSpark drafter on the stage holding the
+    // last visit; 0 elsewhere and for every target that declares none -- M8b review)
     fit.budget_bytes = subtract_saturating(
         runtime_bytes_after_planned_weights(plan.materialization().device_capacity_bytes),
         projected_derived_residency_bytes(binder, plan.materialization(),
-                                          target_linear_policy<Target>()));
+                                          target_linear_policy<Target>()) +
+            target_extra_derived_bytes<Target>(stage));
     // A stage that banks experts needs a pool beside its KV, and the pool sizes itself from
     // what the weights and the runtime leave: a fit that ignored it offloaded one layer,
     // fit the KV exactly, and left the bank a pool of nothing (which a Q4 bank refuses).
@@ -743,6 +776,12 @@ StageFit stage_fit(artifact::Reader& reader, const EngineOptions& stage,
                         subtract_saturating(fit.budget_bytes,
                                             elastic_kv_unmapped_commitment(probe.device)))
                         .resolved_tokens;
+    fit.pages = runtime::PipelineStageKvFit{
+        .resolved_pages = fit.kv_tokens / curve.main_page_tokens,
+        .minimum_pages  = curve.minimum_main_page_groups,
+        .charge_pages   = curve.window_lane_charge_pages,
+        .page_tokens    = curve.main_page_tokens,
+    };
     return fit;
 }
 
@@ -788,6 +827,8 @@ preflight_pipeline(const EngineOptions& options, artifact::Reader& reader,
         options.kv_capacity.mode == KvCapacityMode::Explicit
             ? static_cast<std::uint64_t>(options.kv_capacity.explicit_tokens)
             : std::numeric_limits<std::uint64_t>::max());
+    std::vector<runtime::PipelineStageKvFit> fits;
+    fits.reserve(count);
     for (std::size_t s = 0; s < count; ++s) {
         DeviceContext probe(stage_options[s].device);
         EngineOptions stage = stage_options[s];
@@ -824,7 +865,11 @@ preflight_pipeline(const EngineOptions& options, artifact::Reader& reader,
         if (automatic) {
             const auto layers = static_cast<std::uint32_t>(stage.pipeline_stage_last -
                                                            stage.pipeline_stage_first);
-            while (fit.kv_tokens < wanted && stage.host_moe_layers < layers) {
+            // Real KV (lane f1): a window class's per-lane charge holds no tokens of the context. An
+            // explicit capacity is compared as it stands (pipeline_stage_held_tokens).
+            const bool explicit_capacity = options.kv_capacity.mode == KvCapacityMode::Explicit;
+            while (fit.held_tokens(options.max_concurrency, explicit_capacity) < wanted &&
+                   stage.host_moe_layers < layers) {
                 ++stage.host_moe_layers;
                 fit = fit_or_zero(stage);
             }
@@ -843,7 +888,13 @@ preflight_pipeline(const EngineOptions& options, artifact::Reader& reader,
                              static_cast<unsigned long long>(wanted));
             }
         }
-        out.kv_tokens = out.kv_tokens == 0 ? fit.kv_tokens : std::min(out.kv_tokens, fit.kv_tokens);
+        fits.push_back(fit.pages);
+    }
+    // Lane f1: the stages share real KV, and each holds that plus its own lanes' window charge.
+    const runtime::PipelineKvShare share = runtime::share_pipeline_kv(fits, options.max_concurrency);
+    out.kv_tokens = share.shared_pages * share.page_tokens;
+    for (const std::uint32_t pages : share.stage_pages) {
+        out.stage_kv_tokens.push_back(pages * share.page_tokens);
     }
     return out;
 }
@@ -859,9 +910,16 @@ ConstructedTarget construct_pipeline(const EngineOptions& options, artifact::Rea
     LoadSummary summary;
     ModelSamplingDefaults sampling_defaults{};
     std::uint32_t resolved_kv      = 0;
+    std::vector<std::uint32_t> resolved_stage_kv; ///< lane f1: each stage's own share (pipeline_kv_share.h)
     std::uint32_t resolved_context = 0;
-    const std::vector<int> bounds =
-        balanced_stage_bounds<Target>(options, reader, layers, stage_count);
+    const std::vector<int> bounds = [&] {
+        // A target whose layers are not additive per stage (Inkling-2's looped core) names its own cut.
+        if constexpr (requires { Target::pipeline_stage_bounds(stage_count); }) {
+            return Target::pipeline_stage_bounds(stage_count);
+        } else {
+            return balanced_stage_bounds<Target>(options, reader, layers, stage_count);
+        }
+    }();
     std::vector<std::uint32_t> stage_host_moe;
     const auto vision_metadata = reader.vision_geometry();
     const auto image_tokens =
@@ -887,8 +945,13 @@ ConstructedTarget construct_pipeline(const EngineOptions& options, artifact::Rea
                          128);
         // Zero until the preflight below has run, and then the shared values every stage --
         // stage 0 included -- is built with.
-        if (resolved_kv != 0) {
-            stage_options.kv_capacity   = KvCapacityPolicy::explicit_capacity(resolved_kv);
+        if (!resolved_stage_kv.empty()) {
+            // Lane f1: the preflight sized the shared pool under auto (elastic window class);
+            // the stage keeps that planning (EngineOptions::kv_capacity_resolved_automatically).
+            stage_options.kv_capacity_resolved_automatically =
+                options.kv_capacity.mode == KvCapacityMode::Automatic;
+            stage_options.kv_capacity   = KvCapacityPolicy::explicit_capacity(
+                resolved_stage_kv[static_cast<std::size_t>(s)]);
             stage_options.max_context   = resolved_context;
             stage_options.prefill_chunk   = context_prefill(pipeline_prefill, resolved_context);
             stage_options.host_moe_layers = stage_host_moe.empty()
@@ -905,12 +968,17 @@ ConstructedTarget construct_pipeline(const EngineOptions& options, artifact::Rea
         const StagePreflight<Target> shared =
             preflight_pipeline<Target>(options, reader, probe_options);
         resolved_context = shared.max_context;
-        resolved_kv      = shared.kv_tokens;
-        stage_host_moe   = shared.host_moe;
+        resolved_kv       = shared.kv_tokens;
+        resolved_stage_kv = shared.stage_kv_tokens;
+        stage_host_moe    = shared.host_moe;
+        std::string per_stage;
+        for (const std::uint32_t tokens : resolved_stage_kv) {
+            per_stage += (per_stage.empty() ? "" : " / ") + std::to_string(tokens);
+        }
         std::fprintf(stderr,
                      "pipeline: %d stages, max context %u tokens, KV pool %u tokens "
-                     "(the tightest stage's)\n",
-                     stage_count, resolved_context, resolved_kv);
+                     "(the tightest stage's; stage capacities with their window charges %s)\n",
+                     stage_count, resolved_context, resolved_kv, per_stage.c_str());
     }
 
     // Stage 0 first, alone: the concurrent constructions below inherit whatever globals it
@@ -1031,6 +1099,8 @@ ConstructedTarget construct_pipeline_target(const EngineOptions& requested) {
                                  Qwen38FlashNextInstance>(constructed);
     dispatch.template operator()<Qwen3_5, LoadedQwen3_5, Qwen3_5Instance>(constructed);
     dispatch.template operator()<Qwen3_5Moe, LoadedQwen3_5Moe, Qwen3_5MoeInstance>(constructed);
+    // Inkling-2: the stages split the 48 visits (lanes/e1/DESIGN-2card.md).
+    dispatch.template operator()<Inkling2, LoadedInkling2, Inkling2Instance>(constructed);
     if (constructed.has_value()) { return std::move(*constructed); }
     throw std::runtime_error("pipeline parallelism is not wired for artifact '" + identity.model_id + "'");
 }

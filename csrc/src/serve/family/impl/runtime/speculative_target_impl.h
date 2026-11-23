@@ -4,6 +4,7 @@
 #include "api/ops/scatter.h"
 #include "api/ops/lora_store.h"
 #include "api/ops/speculative_round.h"
+#include "family/impl/runtime/dspark_round.h"
 
 namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS::schedule {
 
@@ -42,7 +43,10 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
         frame.target_tokens, frame.target_logits, frame.drafts, frame.current_extents,
         frame.frontiers, frame.anchors, frame.licensed_tokens, frame.licensed_counts,
         frame.accepted_drafts, execution.model.geometry.token_domain, frame.sampling,
-        execution.work, execution.device.stream, frame.ids.ne[0] == 1);
+        execution.work, execution.device.stream, frame.ids.ne[0] == 1,
+        // the split routes of untruncated sampled rows (exact split / coupled): DSpark targets only; every other
+        // target runs M7's accept launches exactly
+        family::dspark_drafter<Variant>());
     ops::speculative_select_accepted_hidden(frame.target_hidden, frame.accepted_drafts,
                                             frame.selected_hidden, execution.device.stream);
     ops::scatter(frame.selected_hidden, frame.lanes, continuation_hidden_store,

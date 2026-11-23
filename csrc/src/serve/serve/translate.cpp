@@ -260,6 +260,17 @@ sinfer::PromptInput to_prompt_input(const GenerationRequest& request,
     input.options.preserve_thinking     = semantics.preserve_thinking;
     input.options.add_vision_id         = false;
     input.options.tool_jsons            = effective_tool_jsons(request);
+    input.options.raw_chat_request      = request.raw_chat_body;
+    if (request.raw_chat_body && !request.raw_chat_images.empty()) {
+        if (!acquire_media) { throw std::logic_error("media acquisition callback is not configured"); }
+        input.raw_chat_media.reserve(request.raw_chat_images.size());
+        for (const ContentPart& part : request.raw_chat_images) {
+            if (part.kind != ContentKind::Image) {  // a URL the chat parser could not take (collect_raw_chat_images)
+                throw ApiException(ApiError{.status = 400, .message = part.text, .param = "messages", .code = "invalid_media"});
+            }
+            input.raw_chat_media.push_back(acquire_media(part));
+        }
+    }
     return input;
 }
 

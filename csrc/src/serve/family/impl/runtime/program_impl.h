@@ -23,6 +23,10 @@
 #include "ops/linear/nvfp4/nvfp4_cublaslt.h"
 #include "api/ops/scatter.h"
 #include "api/ops/speculative_round.h"
+#include "api/ops/inkling_mix.h"
+#include "family/impl/runtime/visit_round.h"
+#include "family/impl/runtime/dspark_round.h"
+#include "runtime/engine/kv_admission_policy.h"
 #include "ops/linear/ggml/ggml_dispatch.h"
 
 #include <cuda_runtime.h>
@@ -90,6 +94,89 @@ void round_trace_state(const Pool& pool, cudaStream_t stream, const char* when) 
 
 namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS {
 namespace {
+
+/// DSpark under --spec-adaptive: the k policy (SUROGATE_SERVE_DSPARK_K_POLICY). 1 (DEFAULT, "static"): each lane's
+/// cap per content kind (tool JSON / structure 7, thinking 3, text 2; lanes/e2/k_policy.py); 2 ("lane", opt-in): the cap
+/// from the content kind AND this request's own acceptance on it (family::DSparkLaneStats, the Variant's
+/// dspark_draft_cap; priced with 1-stream round times, so slower at 8 streams -- rows2: -4 % T0, -8 % T1 -- and its
+/// statistics are not yet carried across a KV preemption, so a sampled rollout that is preempted may not reproduce);
+/// 0 ("measured"): the measured AdaptiveDFlash choice per batch size and context band, no caps. Under 1 / 2 a lane's
+/// extent is its own cap whatever the batch (the window is the smallest captured one holding every cap), so its
+/// drafts, and its sampled tokens, do not depend on the other lanes or on timing.
+[[nodiscard]] int dspark_k_policy() {
+    if constexpr (family::dspark_drafter<Variant>()) {
+        static const int mode = [] {
+            const char* raw = std::getenv("SUROGATE_SERVE_DSPARK_K_POLICY");
+            if (raw != nullptr && std::string_view(raw) == "measured") { return 0; }
+            if (raw != nullptr && std::string_view(raw) == "lane") { return 2; }
+            return 1;
+        }();
+        return mode;
+    } else {
+        return 0;
+    }
+}
+
+[[nodiscard]] bool dspark_kind_policy() { return dspark_k_policy() != 0; }
+
+/// Decay of a lane's acceptance counts per round of the same content kind (window ~10 rounds).
+inline constexpr float kDSparkStatsDecay = 0.9f;
+
+template <class V, class Sequence>
+[[nodiscard]] std::uint32_t dspark_lane_cap_if(const Sequence& sequence) {
+    if constexpr (family::dspark_drafter<V>()) {
+        return V::dspark_draft_cap(std::span<const TokenId>(sequence.ledger.data(), sequence.ledger.size()),
+                                   dspark_k_policy() == 2 ? &sequence.dspark_stats : nullptr);
+    } else {
+        (void)sequence;
+        return std::numeric_limits<std::uint32_t>::max();
+    }
+}
+
+/// The round's content kind and extent of a lane, kept for the acceptance update after the round (policy "lane").
+template <class V, class Sequence>
+void dspark_note_round_if(Sequence& sequence, std::uint32_t extent) {
+    if constexpr (family::dspark_drafter<V>()) {
+        sequence.dspark_stats.kind   = V::dspark_content_kind(std::span<const TokenId>(sequence.ledger.data(), sequence.ledger.size()));
+        sequence.dspark_stats.extent = extent;
+        sequence.dspark_stats.noted  = true;
+    } else {
+        (void)sequence;
+        (void)extent;
+    }
+}
+
+/// DSpark targets only (reviews R6 finding 4 = R7 minor 3): how many consecutive draws may share one staged stop
+/// barrier. While produced < min_tokens the stop ids are barred for draws produced + 1 .. min_tokens and allowed from
+/// the next one; a verify round or a chained ordinary burst stages the barrier once, so it must end at min_tokens and
+/// the next round is staged without it. Verify column j is draw produced + 1 + j: extent <= draws - 1. A burst of n
+/// rounds: n <= draws. MTP on and off then lift the barrier at the same token, at any load. Other targets: no limit,
+/// their rounds keep the per-round barrier (rule 7: W4g stays token-identical; its fix is the owner's call).
+template <class V, class Request, class Sequence>
+[[nodiscard]] std::uint32_t dspark_barrier_draws_if(const Request& request, const Sequence& sequence) {
+    if constexpr (family::dspark_drafter<V>()) {
+        if (request.stop_barrier_count == 0) { return std::numeric_limits<std::uint32_t>::max(); }
+        const std::size_t ledger   = sequence.ledger.size();
+        const std::size_t produced = ledger > request.prompt_tokens ? ledger - request.prompt_tokens : 0;
+        if (produced >= request.min_tokens) { return std::numeric_limits<std::uint32_t>::max(); }
+        return static_cast<std::uint32_t>(request.min_tokens - produced);
+    } else {
+        (void)request;
+        (void)sequence;
+        return std::numeric_limits<std::uint32_t>::max();
+    }
+}
+
+/// The block-table row a lane's draft KV is addressed with: DFlash's own pool row, or -- for a DSpark target, whose
+/// draft planes are text-pool planes (family/impl/runtime/dspark_round.h) -- the text pool's row.
+template <class Sequence>
+[[nodiscard]] std::int32_t draft_kv_row(const Sequence& sequence) {
+    if constexpr (family::dspark_drafter<Variant>()) {
+        return sequence.kv->text.bound_row();
+    } else {
+        return sequence.kv->backend ? sequence.kv->backend->bound_row() : 0;
+    }
+}
 
 using Clock = std::chrono::steady_clock;
 
@@ -310,6 +397,19 @@ void ProgramImplCore::configure_stage(const SequencePlanImpl& plan) {
     }
     if (stage_import.data) { std::memset(stage_import.data, 0, stage_boundary_bytes_); }
     if (stage_export.data) { std::memset(stage_export.data, 0, stage_boundary_bytes_); }
+    if (family::dspark_drafter<Variant>() && plan.features.dflash()) {
+        // DSpark on a pipeline (ENGINE-INKLING lane e1): the stage with the head holds the drafter and proposes each
+        // round's drafts before the first stage launches; the first stage verifies them from its draft import.
+        const std::size_t bytes = 2 * schedule::kDSparkDraftImportStride * sizeof(std::int32_t);
+        if (stage.last >= layers) {
+            CUDA_CHECK(cudaHostAlloc(&dspark_draft_export.data, bytes, cudaHostAllocPortable));
+            std::memset(dspark_draft_export.data, 0, bytes);
+        } else if (stage.first == 0) {
+            CUDA_CHECK(cudaHostAlloc(&dspark_draft_import.data, bytes, cudaHostAllocPortable));
+            std::memset(dspark_draft_import.data, 0, bytes);
+            stage.draft_import_pinned = dspark_draft_import.data;
+        }
+    }
     std::fprintf(stderr, "pipeline stage: layers [%d, %d) of %d, boundary %u columns%s%s\n", stage.first,
                  stage.last, layers, plan.pipeline_boundary_columns, stage.first > 0 ? ", imports" : "",
                  stage.last < layers ? ", exports" : "");
@@ -321,7 +421,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       kv_capacity(plan.kv_capacity), max_concurrency(plan.max_concurrency),
       batch_capacity(decode_batch_capacity(plan.max_concurrency, plan.speculative_backend)),
       prefill_chunk(plan.prefill_chunk), draft_window(plan.draft_window),
-      adaptive_dflash(plan.adaptive_dflash ? std::make_optional<AdaptiveDFlash>(plan.draft_window)
+      adaptive_dflash(plan.adaptive_dflash ? std::make_optional<AdaptiveDFlash>(plan.draft_window, family::dspark_drafter<Variant>())
                                            : std::nullopt),
       active_dflash_window(plan.draft_window), speculative_max_lanes(plan.speculative_max_lanes),
       speculative_backend(plan.speculative_backend), kv_dtype(plan.kv_dtype),
@@ -398,6 +498,14 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     };
     decoder = std::make_unique<family::DecoderState>(backing, plan.persistent.decoder, &elastic_kv);
     decoder->configure_checkpoints(plan.persistent.checkpoints, elastic_kv);
+    // Lane f1 M3-C: the capacity curve counted this charge per lane (layouts_impl.h); the pool
+    // must book the same, or a context-length request could fit the curve and not the ledger.
+    if (plan.persistent.kv_window_lane_charge_pages != decoder->text_kv.pool().window_lane_charge_pages()) {
+        throw std::logic_error("planned KV window lane charge " +
+                               std::to_string(plan.persistent.kv_window_lane_charge_pages) +
+                               " differs from the pool's " +
+                               std::to_string(decoder->text_kv.pool().window_lane_charge_pages()));
+    }
     if (plan.persistent.replay_records) {
         replay_records.emplace(backing, *plan.persistent.replay_records);
         if (speculative_backend == SpeculativeBackend::DFlash) {
@@ -419,6 +527,18 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     if (plan.persistent.dflash) {
         dflash.emplace(backing, *plan.persistent.dflash, *decoder);
         if (pipeline_stage()) { stage.features = &dflash->prefill_features; }
+        if (family::dspark_drafter<Variant>()) {
+            // Review R5 minor 3: the split routes carry the coupled verify, so switching them off leaves the row on the
+            // one-hot rule even though SUROGATE_SPEC_COUPLED still reads 1. Debug knob: say so at startup.
+            const char* coupled_raw = std::getenv("SUROGATE_SPEC_COUPLED");
+            const char* split_raw   = std::getenv("SUROGATE_SPEC_EXACT_SPLIT");
+            const bool coupled_on = coupled_raw == nullptr || coupled_raw[0] == '\0' || std::atoi(coupled_raw) != 0;
+            const bool split_on   = split_raw == nullptr || split_raw[0] == '\0' || std::atoi(split_raw) != 0;
+            if (coupled_on && !split_on) {
+                std::fprintf(stderr, "engine: WARNING SUROGATE_SPEC_EXACT_SPLIT=0 disables coupled verification: untruncated "
+                                     "sampled rows use the one-hot rule, so MTP on != MTP off at temperature > 0\n");
+            }
+        }
     }
     if (dflash.has_value() != plan.features.dflash()) {
         throw std::logic_error("DFlash state does not match the frozen sequence plan");
@@ -532,6 +652,32 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     // graphs it captures for them. The plan decided it from the options, and sized the graph
     // allowance for those graphs; an engine whose store bound nothing has no second flavor.
     base_rounds_ = plan.base_rounds && ops::lora_enabled();
+    // A visit-schedule target's verify records: the per-visit conv state before a speculative round
+    // and the round's conv inputs, which the resolve folds (family/impl/runtime/visit_round.h).
+    if (family::visit_schedule<Variant>() && speculative_backend != SpeculativeBackend::None) {
+        const auto channels = static_cast<std::size_t>(decoder->linear_attention.spec.conv_channels);
+        const auto visits   = static_cast<std::size_t>(decoder->linear_attention.layer_count());
+        const auto width    = static_cast<std::size_t>(speculative_round_width());
+        const auto rows     = static_cast<std::size_t>(batch_capacity);
+        const std::size_t old_bytes = (channels * 3 * visits * rows * 2 + 255) & ~std::size_t{255};
+        if (!plan.persistent.visit_records ||
+            plan.persistent.visit_records->bytes < old_bytes + channels * width * visits * rows * 2) {
+            throw std::logic_error("visit records: the persistent layout planned no (or a smaller) region");
+        }
+        const DeviceSpan records = plan.persistent.visit_records->bind(backing);
+        io.visit_records_old    = records.data;
+        io.visit_records_inputs = static_cast<std::byte*>(records.data) + old_bytes;
+        io.visit_records_visits = static_cast<std::int32_t>(visits);
+        io.visit_records_width  = static_cast<std::int32_t>(width);
+        io.visit_records_batch  = static_cast<std::int32_t>(rows);
+    }
+    // A visit-schedule target's persistent state for the compute stream (lane d's MoE counters): zeroed once here,
+    // then owned by the target's kernels (they leave it zeroed at the end of every call).
+    if (plan.persistent.visit_target_state) {
+        const DeviceSpan state = plan.persistent.visit_target_state->bind(backing);
+        CUDA_CHECK(cudaMemsetAsync(state.data, 0, state.bytes, device.stream));
+        io.visit_target_state = state.data;
+    }
     // Rollout Routing Replay: when the engine runs with SUROGATE_SERVE_CAPTURE_ROUTING=1 every
     // main-model forward copies each layer's selected expert ids into a fixed buffer, which the
     // graphs captured below record. Allocated before prepare_graphs() so they bake its address.
@@ -581,6 +727,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     // The shared-prefix cache cuts a capturing prompt at the prefix boundary, which a fixed
     // batch-invariant cut schedule forbids. An MTP head's KV and the boundary's hidden go with
     // the prefix (PATCHES #150); a DFlash drafter keeps context it does not copy.
+    // A visit-schedule target takes the shared prefixes and the host tier like every other target: its per-visit
+    // conv state travels in the prefix images (lane f1's prefix_state_tensors, merge M2).
     if ((speculative_backend == SpeculativeBackend::None || speculative_backend == SpeculativeBackend::Mtp) &&
         !pipeline_stage() && !ops::batch_invariant()) {
         const char* raw = std::getenv("SUROGATE_SERVE_SHARED_PREFIX_SLOTS");
@@ -635,12 +783,15 @@ bool ProgramImplCore::can_admit_lane(std::uint32_t lane, const RequestPlan& plan
     // The pool's own test: the page arithmetic, and for an overcommitting elastic pool the
     // device gate — a refusal there must keep the request pending, not fail its reservation.
     const auto can_replace = [](const PagedKVPool& pool, std::uint32_t old_pages,
-                                std::uint32_t new_pages) {
-        return pool.can_replace_entitlement(old_pages, new_pages);
+                                std::uint32_t new_pages, std::uint32_t extra = 0) {
+        return pool.can_replace_entitlement(old_pages, new_pages, extra);
     };
     const std::uint32_t old_text = sequence.kv ? sequence.kv->text.owned_entitlement() : 0;
-    if (!can_replace(decoder->text_kv.pool(), old_text, plan.summary().admission.main_kv_pages) ||
-        !leaves_kv_watermark(lane, old_text, 0, plan.summary().admission.main_kv_pages)) {
+    // Lane f1 M3-C: a lane without an allocation gets one, and an elastic window class books its
+    // window pages with it (0 for every model without one). A lane that has one keeps its charge.
+    const std::uint32_t window_charge = sequence.kv ? 0U : decoder->text_kv.pool().window_lane_charge_pages();
+    if (!can_replace(decoder->text_kv.pool(), old_text, plan.summary().admission.main_kv_pages, window_charge) ||
+        !leaves_kv_watermark(lane, old_text, 0, plan.summary().admission.main_kv_pages + window_charge)) {
         return false;
     }
     const family::PagedKVCache* backend = backend_kv_cache();
@@ -711,7 +862,10 @@ bool ProgramImplCore::can_admit_lane_after_retained_eviction(
             if (entry.second) { keep(entry.second->pages.get()); }
         }
         std::uint32_t pages = 0;
-        for (const PagedKVAllocation* allocation : kept) { pages += allocation->owned_entitlement(); }
+        // (+ the window pages an elastic window class booked for them, M3-C; 0 otherwise)
+        for (const PagedKVAllocation* allocation : kept) {
+            pages += allocation->owned_entitlement() + allocation->window_charge();
+        }
         return pages;
     };
     const auto reclaimable = [&](const PagedKVPool& pool, bool backend_pool) {
@@ -723,20 +877,23 @@ bool ProgramImplCore::can_admit_lane_after_retained_eviction(
     // The retained lanes' entitlements go back before the new one is taken: the pool's test
     // with them folded into the pages being replaced (device gate included).
     const auto can_replace = [](const PagedKVPool& pool, std::uint32_t old_pages,
-                                std::uint32_t reclaimable_pages, std::uint32_t new_pages) {
+                                std::uint32_t reclaimable_pages, std::uint32_t new_pages,
+                                std::uint32_t extra = 0) {
         if (old_pages > pool.entitled_pages() ||
             reclaimable_pages > pool.entitled_pages() - old_pages) {
             return false;
         }
-        return pool.can_replace_entitlement(old_pages + reclaimable_pages, new_pages);
+        return pool.can_replace_entitlement(old_pages + reclaimable_pages, new_pages, extra);
     };
 
     const SequenceState& sequence = sequences[lane];
     const std::uint32_t old_text  = sequence.kv ? sequence.kv->text.owned_entitlement() : 0;
+    // Lane f1 M3-C: as in can_admit_lane, a new allocation's window charge (0 without one).
+    const std::uint32_t window_charge = sequence.kv ? 0U : decoder->text_kv.pool().window_lane_charge_pages();
     if (!can_replace(decoder->text_kv.pool(), old_text, reclaimable_text,
-                     plan.summary().admission.main_kv_pages) ||
+                     plan.summary().admission.main_kv_pages, window_charge) ||
         !leaves_kv_watermark(lane, old_text, reclaimable_text,
-                             plan.summary().admission.main_kv_pages)) {
+                             plan.summary().admission.main_kv_pages + window_charge)) {
         return false;
     }
 
@@ -839,10 +996,13 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
     request.save_gpu_prefix = request_plan.save_gpu_prefix;
     request.gpu_storage = request_plan.gpu_storage;
     sequence.cacheable = request_plan.retain_prefix;
+    // The adapter bytes this request's rounds run under; its plan was made against the same
+    // (a swap moves the KV generation clock, and the executor re-plans on it).
+    const std::uint64_t lora_generation = adapter_kv_generation(request_plan.lora_slot);
     if (request_plan.reuse != ReusePath::FullReset &&
         (!sequence.retained ||
          !family::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
-                                          request_plan.reuse_base, request_plan.lora_slot))) {
+                                          request_plan.reuse_base, request_plan.lora_slot, lora_generation))) {
         throw std::logic_error("planned resident prefix is no longer reusable");
     }
     if (is_rewrite_checkpoint_restore(request_plan.reuse) &&
@@ -858,7 +1018,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
          request_plan.reuse == ReusePath::FullReset ||
          !family::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
                                           sequence.rewrite_checkpoint.frontier,
-                                          request_plan.lora_slot))) {
+                                          request_plan.lora_slot, lora_generation))) {
         throw std::logic_error("planned rewrite checkpoint retention is unavailable");
     }
     if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::ReclassifyExisting &&
@@ -868,7 +1028,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
          request_plan.reuse == ReusePath::FullReset ||
          !family::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
                                           sequence.rewrite_checkpoint.frontier,
-                                          request_plan.lora_slot))) {
+                                          request_plan.lora_slot, lora_generation))) {
         throw std::logic_error("planned rewrite checkpoint reclassification is unavailable");
     }
     if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::CaptureNew &&
@@ -1078,9 +1238,10 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         request.timings            = {};
         request.pending            = {};
         sequence.mtp_draft_count   = 0;
+        sequence.dspark_stats      = {};
         sequence.tail_hidden_valid = base == prompt_tokens && sequence.tail_hidden_valid;
         sequence.ledger.assign(prompt.token_ids.begin(), prompt.token_ids.end());
-        sequence.prefix_identity.assign(prompt, request_plan.lora_slot);
+        sequence.prefix_identity.assign(prompt, request_plan.lora_slot, lora_generation);
 
 
 
@@ -1326,6 +1487,30 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
                                   device.stream);
         }
         if (defer) { flush_deferred_fold_counts(); }
+        // A visit-schedule target's conv state: every row that ran a verify (not a narrow, in-place
+        // round) becomes the last 3 of [state before the round | its committed inputs].
+        if (io.visit_records_old != nullptr) {
+            std::array<ops::InklingConvFoldRow, kMaximumBatchColumns> visit_rows{};
+            std::size_t visit_count = 0;
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                if (requests[lanes[row]].pending.in_place_state) { continue; }
+                visit_rows[visit_count++] = ops::InklingConvFoldRow{
+                    .row = static_cast<std::int32_t>(row), .slot = fold_rows[row].linear_state_slot,
+                    .committed = static_cast<std::int32_t>(cancelled[row] ? 0U : accepted_tokens[row])};
+            }
+            const auto& conv = decoder->linear_attention.conv;
+            const ops::InklingConvPool pool{
+                conv.front().data,
+                conv.size() > 1 ? (static_cast<const std::byte*>(conv[1].data) -
+                                   static_cast<const std::byte*>(conv[0].data)) / 2 : 0,
+                decoder->linear_attention.conv_slot_stride_elements(),
+                static_cast<std::int32_t>(conv.size())};
+            ops::inkling_conv_fold(pool, std::span<const ops::InklingConvFoldRow>(visit_rows.data(), visit_count),
+                                   ops::InklingConvRecords{io.visit_records_old, io.visit_records_inputs,
+                                                           io.visit_records_visits, io.visit_records_width,
+                                                           io.visit_records_batch},
+                                   device.stream);
+        }
         // The n-gram PLE layer wrote its state from the round's last column, rejected drafts
         // included; its snapshots hold the state after each column, and the committed prefix's
         // last one is what the next round must start from.
@@ -1437,6 +1622,11 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
 
             const PendingCandidate pending = request.pending;
             const std::uint32_t committed  = accepted_tokens[row];
+            if constexpr (family::dspark_drafter<Variant>()) {
+                if (adaptive_dflash && dspark_k_policy() == 2 && speculative_backend == SpeculativeBackend::DFlash) {
+                    sequence.dspark_stats.observe(committed, kDSparkStatsDecay);
+                }
+            }
             // Each lane keeps its decision; another round may already be copying into
             // the shared egress.
             const TokenId* token_base = request.outcome.licensed_tokens.data();
@@ -1959,6 +2149,7 @@ void ProgramImplCore::materialize_sequence_kv(SequenceState& sequence, std::uint
     if (backend_tokens != 0 && backend_tokens > sequence.kv->backend->mapped_token_capacity()) {
         sequence.kv->backend->materialize_tokens(backend_tokens, device.stream);
     }
+    if (window_paging()) { prepare_window_kv(sequence, main_tokens); }
 }
 
 void ProgramImplCore::materialize_graph_chunk_window(SequenceState& sequence, std::uint32_t cursor,
@@ -2043,7 +2234,8 @@ void ProgramImplCore::prepare_graphs() {
         }
         allocations.reserve(batch_capacity);
         for (std::uint32_t row = 0; row < batch_capacity; ++row) {
-            allocations.push_back(pool.reserve(1));
+            // One page, and one window page where the pool has a window class (window_capture_fill).
+            allocations.push_back(pool.reserve(1, pool.has_window_class() ? 1U : 0U));
             PagedKVAllocation& allocation = allocations.back();
             allocation.bind_row(static_cast<std::int32_t>(row), device.stream);
             allocation.materialize_pages(1, device.stream);
@@ -2056,6 +2248,8 @@ void ProgramImplCore::prepare_graphs() {
             Tensor table = pool.block_table_row(static_cast<std::int32_t>(row));
             CUDA_CHECK(cudaMemcpyAsync(table.data, repeated.data(), table.bytes(),
                                        cudaMemcpyHostToDevice, device.stream));
+            // The window class's table the same way: a private window page, never the sentinel.
+            if (pool.has_window_class()) { allocation.window_capture_fill(device.stream); }
         }
     };
     reserve_capture_rows(decoder->text_kv, text_capture_allocations, "target KV cache");
@@ -2076,6 +2270,7 @@ void ProgramImplCore::prepare_graphs() {
         const auto settle = [](family::PagedKVCache* cache) {
             if (cache == nullptr) { return; }
             if (ElasticKvRegion* region = cache->pool().elastic_region()) { region->wait_idle(); }
+            if (ElasticKvRegion* region = cache->pool().window_elastic_region()) { region->wait_idle(); }
         };
         settle(&decoder->text_kv);
         // The draft caches have a region only if they are ever built elastic.
@@ -2457,7 +2652,7 @@ void ProgramImplCore::prepare_graphs() {
         }
     }
     if (speculative_backend == SpeculativeBackend::DFlash) {
-        for (auto window : dflash_draft_windows(draft_window, adaptive_dflash.has_value())) {
+        for (auto window : dflash_draft_windows(draft_window, adaptive_dflash.has_value(), family::dspark_drafter<Variant>())) {
             bind_dflash_window(window);
             const auto batch_one_profiles = dflash_graph_profiles(capacity, window, 1);
             validate_graph_profiles(batch_one_profiles, capacity - 1, "DFlash");
@@ -2550,7 +2745,7 @@ void ProgramImplCore::prepare_graphs() {
         }
     }
     if (speculative_backend == SpeculativeBackend::DFlash) {
-        for (auto window : dflash_draft_windows(draft_window, adaptive_dflash.has_value())) {
+        for (auto window : dflash_draft_windows(draft_window, adaptive_dflash.has_value(), family::dspark_drafter<Variant>())) {
             bind_dflash_window(window);
             for (std::size_t flavor = 0; flavor < round_flavors; ++flavor) {
                 instantiate_graph_family(dflash_graphs[window].of(kRoundFlavors[flavor]),
@@ -2636,7 +2831,9 @@ void ProgramImplCore::prepare_graphs() {
     }();
     // DFlash engines also serve target-only decision readouts. Capture the ordinary
     // target prefill body for those requests; reasoning prefills keep their feature sink.
-    if (!prefill_graph_vetoed && (speculative_backend == SpeculativeBackend::None ||
+    // A visit-schedule target's prefill / mixed graph bodies are not wired yet (lanes/e1 NOTES).
+    if (!prefill_graph_vetoed && !family::visit_schedule<Variant>() &&
+        (speculative_backend == SpeculativeBackend::None ||
                                  speculative_backend == SpeculativeBackend::DFlash)) {
         // The fp4 cutlass epilogue's device alpha scalar initializes lazily
         // with a synchronous copy; force it now so no captured body ever
@@ -2787,6 +2984,17 @@ void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& 
                         .view({cfg.token_domain});
     CUDA_CHECK(cudaMemsetAsync(counts.data, 0, counts.bytes(), device.stream));
     request.sampling_host     = config;
+    if constexpr (family::dspark_drafter<Variant>()) {
+        // DSpark (lane e2): coupled verification of untruncated sampled rows (ops/kernel/speculative_round.cuh) --
+        // MTP on commits the tokens MTP-off decoding samples. SUROGATE_SPEC_COUPLED=0: the one-hot rejection rule.
+        // SUROGATE_SPEC_EXACT_SPLIT=0 has the same effect whatever this flag says (the coupled verify is a split route;
+        // the engine warns at startup).
+        static const bool coupled = [] {
+            const char* raw = std::getenv("SUROGATE_SPEC_COUPLED");
+            return raw == nullptr || raw[0] == '\0' || std::atoi(raw) != 0;
+        }();
+        request.sampling_host.speculative_coupled = coupled ? 1 : 0;
+    }
     update_constraint(sequence, request);
     const auto request_backend = request.target_only ? SpeculativeBackend::None : speculative_backend;
     const auto request_window = request.target_only ? 0U : draft_window;
@@ -2843,6 +3051,8 @@ void ProgramImplCore::enqueue_dflash_context_append(std::span<const std::uint32_
         counts.size() != lanes.size()) {
         throw std::logic_error("DFlash context append has invalid membership");
     }
+    // DSpark on a pipeline: only the stage with the head holds the drafter (and its context); the others skip it.
+    if (family::dspark_drafter<Variant>() && pipeline_stage() && !stage_holds_head()) { return; }
 
     std::uint32_t minimum_count = draft_window + 1U;
     std::uint32_t maximum_count = 0;
@@ -2866,7 +3076,7 @@ void ProgramImplCore::enqueue_dflash_context_append(std::span<const std::uint32_
             checked_i32(start, "DFlash append context frontier");
         dflash_host_ingress->execution_frontiers[row] =
             checked_i32(end, "DFlash append target frontier");
-        dflash_host_ingress->dflash_kv_table_rows[row] = sequence.kv->backend ? sequence.kv->backend->bound_row() : 0;
+        dflash_host_ingress->dflash_kv_table_rows[row] = draft_kv_row(sequence);
         dflash_host_ingress->lanes[row]                = static_cast<std::int32_t>(lane);
         materialize_sequence_kv(sequence, std::max(sequence.text_kv_valid, end), end);
         minimum_count = std::min(minimum_count, counts[row]);
@@ -2993,7 +3203,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             Tensor lane                                  = io.dflash_decode->lanes.slice(0, 0, 1);
             Tensor row = io.dflash_decode->dflash_kv_table_rows.slice(0, 0, 1);
             set_device_i32(lane, static_cast<std::int32_t>(sequence.lane));
-            set_device_i32(row, sequence.kv->backend ? sequence.kv->backend->bound_row() : 0);
+            set_device_i32(row, draft_kv_row(sequence));
         }
 
         if (staged.mtp_bridge == MtpBridgeMode::BeforeSuffix) {
@@ -3061,6 +3271,12 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 staged.rewrite_checkpoint_capture
                     ? std::optional<std::uint32_t>(staged.rewrite_checkpoint_capture->frontier)
                     : std::nullopt;
+            // Window-bounded KV maps each chunk's window pages as the chunk runs (admission mapped
+            // only the full-context planes of the whole prompt). On the graph path too: near capacity
+            // the graph window above maps nothing and the eager body runs (prepare is idempotent).
+            if (window_paging()) {
+                materialize_sequence_kv(sequence, staged.cursor + nominal, 0);
+            }
             if (staged.vision) {
                 mark_workspace_usage(workspace_plan.vision_encode);
                 result = schedule::prefill_multimodal_chunk(
@@ -3111,6 +3327,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             }
             staged.cursor += result.processed_tokens;
             sequence.text_kv_valid = staged.cursor;
+            if (window_paging()) { settle_window_kv(sequence); }
             if (staged.prepare_mtp) { sequence.mtp_kv_valid = staged.cursor; }
             if (staged.shared_capture && staged.cursor == *staged.shared_capture) {
                 // The chunk's last column, which the chunk left in place.
@@ -3344,6 +3561,9 @@ ProgramImplCore::launch_ordinary_round(std::span<const std::uint32_t> lanes,
             burst = std::min(burst, budget.generated_tokens_remaining);
         }
         burst = std::min(burst, capacity - maximum_frontier);
+        for (const auto lane : lanes) {
+            burst = std::min(burst, dspark_barrier_draws_if<Variant>(requests[lane], sequences[lane]));
+        }
         if (burst == 0 || pipeline_stage() || std::any_of(lanes.begin(), lanes.end(),
             [&](auto lane) { return requests[lane].constraint != nullptr; })) { burst = 1; }
 
@@ -4392,7 +4612,7 @@ runtime::MixedRoundResult ProgramImplCore::consume_mixed_round(runtime::RoundHan
                     Tensor lane = io.rope_pos;
                     Tensor row = io.backend_kv_table_row;
                     set_device_i32(lane, lane_id);
-                    set_device_i32(row, sequence.kv->backend ? sequence.kv->backend->bound_row() : 0);
+                    set_device_i32(row, draft_kv_row(sequence));
                     schedule::DFlashAppendContext context{{device, model, work, decoder->linear_attention,
                         replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
                         proposal_head, &decoder->ple, stage}, *dflash};
@@ -4433,6 +4653,7 @@ runtime::MixedRoundResult ProgramImplCore::consume_mixed_round(runtime::RoundHan
             entry.cursor += processed;
             if (entry.vision) { entry.vision->release_encoded_media_payloads(); }
             sequence.text_kv_valid = entry.cursor;
+            if (window_paging()) { settle_window_kv(sequence); }
             // The head's KV followed the trunk's through the segment (on the stage that
             // holds the head; the others keep the count, as the lone chunk does) -- to the
             // column before the prompt's last, whose pairing waits for the sampled token: the
@@ -4858,6 +5079,8 @@ void ProgramImplCore::adopt_speculative_outcome(std::span<const std::uint32_t> l
 void ProgramImplCore::adopt_pipeline_prefill_features(std::uint32_t lane,
     std::span<const std::byte> packet, std::uint32_t tokens, std::int32_t mixed_base) {
     if (!stage.features || tokens == 0) { return; }
+    // DSpark on a pipeline: only the stage with the head holds the drafter, and it appended these columns itself.
+    if (family::dspark_drafter<Variant>()) { return; }
     // Classifier frontiers contain only target-model state. Pipeline packets
     // keep the model's fixed stride, but their draft feature columns are unused.
     if (lane < max_concurrency && requests[lane].target_only) { return; }
@@ -4883,7 +5106,7 @@ void ProgramImplCore::adopt_pipeline_prefill_features(std::uint32_t lane,
     Tensor row = io.backend_kv_table_row;
     set_device_i32(count, static_cast<std::int32_t>(tokens));
     set_device_i32(lane_tensor, static_cast<std::int32_t>(lane));
-    set_device_i32(row, sequence.kv->backend ? sequence.kv->backend->bound_row() : 0);
+    set_device_i32(row, draft_kv_row(sequence));
     schedule::DFlashAppendContext state{{device, model, work, decoder->linear_attention,
         replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
         proposal_head, &decoder->ple, stage}, *dflash};
@@ -4907,6 +5130,8 @@ void ProgramImplCore::adopt_pipeline_prefill_features(std::uint32_t lane,
 void ProgramImplCore::adopt_pipeline_decode_features(std::span<const std::uint32_t> lanes,
     std::span<const std::byte> packet) {
     if (!stage.features || lanes.empty()) { return; }
+    // DSpark on a pipeline: the drafter stage keeps its own pending features (the first stage proposes nothing).
+    if (family::dspark_drafter<Variant>()) { return; }
     const auto width   = active_dflash_window + 1U;
     const auto columns = width * lanes.size();
     if (lanes.size() > batch_capacity || columns > static_cast<std::size_t>(dflash->prefill_features.ne[1]) ||
@@ -4968,11 +5193,44 @@ void ProgramImplCore::bind_dflash_window(std::uint32_t drafts) {
 
 std::uint32_t ProgramImplCore::select_dflash_draft_window(std::span<const std::uint32_t> lanes) {
     if (!adaptive_dflash || lanes.empty()) { return draft_window; }
+    if (dspark_kind_policy()) {
+        // DSpark (static per content kind): the smallest captured window that holds every lane's cap.
+        std::uint32_t cap = 0;
+        for (auto lane : lanes) { cap = std::max(cap, std::min(draft_window, dspark_lane_cap_if<Variant>(sequences.at(lane)))); }
+        for (auto window : dflash_draft_windows(draft_window, true, true)) {
+            if (window >= cap) { return window; }
+        }
+        return draft_window;
+    }
     std::uint32_t frontier = 0;
     for (auto lane : lanes) {
         frontier = std::max(frontier, sequences.at(lane).execution_frontier);
     }
     return adaptive_dflash->choose(static_cast<std::uint32_t>(lanes.size()), frontier);
+}
+
+void ProgramImplCore::check_dflash_row(std::span<const std::uint32_t> lanes, std::size_t row,
+                                       const runtime::RoundBudget& budget, const char* what) const {
+    const std::uint32_t lane = lanes[row];
+    if (lane >= max_concurrency ||
+        std::find(lanes.begin(), lanes.begin() + static_cast<std::ptrdiff_t>(row), lane) !=
+            lanes.begin() + static_cast<std::ptrdiff_t>(row)) {
+        throw std::invalid_argument(std::string(what) + " contains an invalid or duplicate lane");
+    }
+    const SequenceState& sequence = sequences[lane];
+    const RequestControl& request = requests[lane];
+    if (request.lifecycle != Lifecycle::Active ||
+        budget.generated_tokens_remaining == 0 || !sequence.kv || sequence.kv->text.bound_row() < 0 ||
+        (dflash->full && (!sequence.kv->backend || sequence.kv->backend->bound_row() < 0)) ||
+        sequence.execution_frontier >= capacity ||
+        sequence.text_kv_valid != sequence.execution_frontier ||
+        sequence.dflash_context_frontier > sequence.execution_frontier ||
+        sequence.execution_frontier - sequence.dflash_context_frontier > draft_window + 1U ||
+        sequence.ledger_frontier != sequence.execution_frontier + 1 ||
+        sequence.ledger.size() != sequence.ledger_frontier ||
+        sequence.prefix_identity.size() != sequence.ledger_frontier) {
+        throw std::logic_error(std::string(what) + " row is not decode-ready");
+    }
 }
 
 runtime::RoundHandle
@@ -4994,30 +5252,17 @@ ProgramImplCore::launch_dflash_round(std::span<const std::uint32_t> lanes,
     std::uint32_t maximum_target_tokens = 1;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         const std::uint32_t lane = lanes[row];
-        if (lane >= max_concurrency ||
-            std::find(lanes.begin(), lanes.begin() + static_cast<std::ptrdiff_t>(row), lane) !=
-                lanes.begin() + static_cast<std::ptrdiff_t>(row)) {
-            throw std::invalid_argument("DFlash batch contains an invalid or duplicate lane");
-        }
+        check_dflash_row(lanes, row, budgets[row], "DFlash batch");
         const SequenceState& sequence = sequences[lane];
-        const RequestControl& request = requests[lane];
-        if (request.lifecycle != Lifecycle::Active ||
-            budgets[row].generated_tokens_remaining == 0 || !sequence.kv || sequence.kv->text.bound_row() < 0 ||
-            (dflash->full && (!sequence.kv->backend || sequence.kv->backend->bound_row() < 0)) ||
-            sequence.execution_frontier >= capacity ||
-            sequence.text_kv_valid != sequence.execution_frontier ||
-            sequence.dflash_context_frontier > sequence.execution_frontier ||
-            sequence.execution_frontier - sequence.dflash_context_frontier > draft_window + 1U ||
-            sequence.ledger_frontier != sequence.execution_frontier + 1 ||
-            sequence.ledger.size() != sequence.ledger_frontier ||
-            sequence.prefix_identity.size() != sequence.ledger_frontier) {
-            throw std::logic_error("DFlash batch row is not decode-ready");
-        }
         const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
                                                 ? budgets[row].generated_tokens_remaining - 1U
                                                 : 0U;
+        const std::uint32_t lane_cap      = adaptive_dflash && dspark_kind_policy()
+                                                ? dspark_lane_cap_if<Variant>(sequence)
+                                                : std::numeric_limits<std::uint32_t>::max();
+        const std::uint32_t barrier_cap   = dspark_barrier_draws_if<Variant>(requests[lane], sequence) - 1U;
         const std::uint32_t extent        = std::min(
-            {active_dflash_window, max_by_budget, capacity - sequence.execution_frontier - 1U});
+            {active_dflash_window, max_by_budget, capacity - sequence.execution_frontier - 1U, lane_cap, barrier_cap});
         maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
         maximum_target_tokens =
             std::max(maximum_target_tokens, sequence.execution_frontier + extent + 1U);
@@ -5062,8 +5307,13 @@ ProgramImplCore::launch_dflash_round(std::span<const std::uint32_t> lanes,
             const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
                                                     ? budgets[row].generated_tokens_remaining - 1U
                                                     : 0U;
+            const std::uint32_t lane_cap = adaptive_dflash && dspark_kind_policy()
+                                               ? dspark_lane_cap_if<Variant>(sequence)
+                                               : std::numeric_limits<std::uint32_t>::max();
+            const std::uint32_t barrier_cap = dspark_barrier_draws_if<Variant>(request, sequence) - 1U;
             const std::uint32_t extent =
-                std::min({active_dflash_window, max_by_budget, capacity - frontier - 1U});
+                std::min({active_dflash_window, max_by_budget, capacity - frontier - 1U, lane_cap, barrier_cap});
+            if (adaptive_dflash && dspark_k_policy() == 2) { dspark_note_round_if<Variant>(sequence, extent); }
             dflash_host_ingress->anchors[row] = sequence.ledger.back();
             dflash_host_ingress->execution_frontiers[row] =
                 checked_i32(frontier, "DFlash batch frontier");
@@ -5077,12 +5327,19 @@ ProgramImplCore::launch_dflash_round(std::span<const std::uint32_t> lanes,
                     checked_i32(position, "DFlash batch RoPE position") + sequence.rope_delta;
             }
             dflash_host_ingress->text_kv_table_rows[row]   = sequence.kv->text.bound_row();
-            dflash_host_ingress->dflash_kv_table_rows[row] = sequence.kv->backend ? sequence.kv->backend->bound_row() : 0;
+            dflash_host_ingress->dflash_kv_table_rows[row] = draft_kv_row(sequence);
             dflash_host_ingress->lanes[row]    = static_cast<std::int32_t>(sequence.lane);
             dflash_host_ingress->sampling[row] = staged_sampling(request, sequence);
             dflash_host_ingress->lora_slots[row] = request.lora_slot;
             speculative_constraints->stage(row, request.constraint.get(), dflash_host_ingress->sampling[row]);
-            materialize_sequence_kv(sequence, frontier + extent + 1U, frontier);
+            // DSpark writes its block's own K / V at [frontier, frontier + 8) of the draft planes whatever k is
+            // (dspark_round.h): those pages are mapped too (capped at the sequence capacity).
+            const std::uint32_t verify_end = frontier + extent + 1U;
+            materialize_sequence_kv(sequence,
+                                    family::dspark_drafter<Variant>()
+                                        ? std::min(capacity, std::max(verify_end, frontier + 8U))
+                                        : verify_end,
+                                    frontier);
         }
 
         schedule::DFlashBatchContext schedule_state{{device, model, work, decoder->linear_attention,
@@ -5122,6 +5379,96 @@ ProgramImplCore::launch_dflash_round(std::span<const std::uint32_t> lanes,
         }
         throw;
     }
+}
+
+bool ProgramImplCore::pipeline_drafts_on_head() const noexcept {
+    return family::dspark_drafter<Variant>() && speculative_backend == SpeculativeBackend::DFlash && pipeline_stage() &&
+           stage_holds_head() && dspark_draft_export.data != nullptr;
+}
+
+std::span<const std::byte> ProgramImplCore::prepare_pipeline_drafts(std::span<const std::uint32_t> lanes,
+                                                                    std::span<const runtime::RoundBudget> budgets,
+                                                                    std::uint32_t window) {
+    // DSpark on a pipeline (ENGINE-INKLING lane e1): the first half of launch_dflash_round's round on the drafter stage
+    // -- the same ingress for the same lanes / budgets / window, the context append and the proposal -- ahead of the
+    // first stage's launch. The round's own launch here later stages the same ingress again and verifies only.
+    if (!pipeline_drafts_on_head() || !io.dflash_decode || !dflash) {
+        throw std::logic_error("only the DSpark drafter stage of a pipeline proposes ahead of a round");
+    }
+    if (lanes.empty() || lanes.size() > batch_capacity || budgets.size() != lanes.size()) {
+        throw std::invalid_argument("DSpark pipeline proposal membership is invalid");
+    }
+    // launch_dflash_round's row check, for every row before anything is written (M8b review): a lane at capacity
+    // (frontier >= capacity) would underflow `capacity - frontier - 1U` below
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        check_dflash_row(lanes, row, budgets[row], "DSpark pipeline proposal");
+    }
+    bind_dflash_window(window);
+    const std::uint32_t width      = active_dflash_window + 1U;
+    std::uint32_t maximum_frontier = 0;
+    try {
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        const std::uint32_t lane = lanes[row];
+        SequenceState& sequence = sequences[lane];
+        RequestControl& request = requests[lane];
+        const std::uint32_t frontier      = sequence.execution_frontier;
+        const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
+                                                ? budgets[row].generated_tokens_remaining - 1U
+                                                : 0U;
+        const std::uint32_t lane_cap = adaptive_dflash && dspark_kind_policy()
+                                           ? dspark_lane_cap_if<Variant>(sequence)
+                                           : std::numeric_limits<std::uint32_t>::max();
+        const std::uint32_t barrier_cap = dspark_barrier_draws_if<Variant>(request, sequence) - 1U;
+        const std::uint32_t extent =
+            std::min({active_dflash_window, max_by_budget, capacity - frontier - 1U, lane_cap, barrier_cap});
+        maximum_frontier = std::max(maximum_frontier, frontier);
+        dflash_host_ingress->anchors[row] = sequence.ledger.back();
+        dflash_host_ingress->execution_frontiers[row] = checked_i32(frontier, "DFlash batch frontier");
+        dflash_host_ingress->context_frontiers[row] =
+            checked_i32(sequence.dflash_context_frontier, "DFlash context frontier");
+        dflash_host_ingress->proposal_extents[row]     = static_cast<std::int32_t>(extent);
+        dflash_host_ingress->target_valid_columns[row] = static_cast<std::int32_t>(extent + 1U);
+        for (std::uint32_t j = 0; j <= active_dflash_window; ++j) {
+            const auto position = frontier + std::min(j, extent);
+            dflash_host_ingress->target_rope_positions[row * width + j] =
+                checked_i32(position, "DFlash batch RoPE position") + sequence.rope_delta;
+        }
+        dflash_host_ingress->text_kv_table_rows[row]   = sequence.kv->text.bound_row();
+        dflash_host_ingress->dflash_kv_table_rows[row] = draft_kv_row(sequence);
+        dflash_host_ingress->lanes[row]                = static_cast<std::int32_t>(sequence.lane);
+        dflash_host_ingress->sampling[row]             = staged_sampling(request, sequence);
+        dflash_host_ingress->lora_slots[row]           = request.lora_slot;
+        // The proposal writes the block's own K / V at [frontier, frontier + 8) of the draft planes (dspark_round.h).
+        materialize_sequence_kv(sequence, std::min(capacity, std::max(frontier + extent + 1U, frontier + 8U)), frontier);
+    }
+    schedule::DFlashBatchContext schedule_state{{device, model, work, decoder->linear_attention,
+                                                 replay_records ? &*replay_records : nullptr,
+                                                 io, prefill_hidden, prefill_chunk,
+                                                 proposal_head, &decoder->ple, stage},
+                                                decoder->text_kv,
+                                                *dflash,
+                                                *io.dflash_decode,
+                                                *dflash_host_ingress,
+                                                *dflash_host_egress,
+                                                tail_hidden_store};
+    mark_workspace_usage(workspace_plan.dflash_round);
+    schedule::dflash_pipeline_propose(schedule_state, static_cast<std::int32_t>(lanes.size()), active_dflash_window,
+                                      dflash_envelopes(0, maximum_frontier, active_dflash_window),
+                                      dspark_draft_export.data);
+    device.synchronize();
+    } catch (...) {
+        // as launch_dflash_round: a failed proposal clears its lanes (M8b review)
+        try {
+            device.synchronize();
+        } catch (...) {}
+        work.reset();
+        for (const std::uint32_t lane : lanes) {
+            if (lane < max_concurrency) { clear_lane(sequences[lane], requests[lane]); }
+        }
+        throw;
+    }
+    return std::span<const std::byte>(static_cast<const std::byte*>(dspark_draft_export.data),
+                                      2 * schedule::kDSparkDraftImportStride * sizeof(std::int32_t));
 }
 
 runtime::BatchedGeneratedRound ProgramImplCore::consume_dflash_round(runtime::RoundHandle handle) {
@@ -5412,7 +5759,22 @@ bool ProgramImplCore::kv_service_pressure() noexcept {
     if (ElasticKvRegion* region = decoder->text_kv.pool().elastic_region()) {
         region->flush_reserve_release();
     }
+    // Lane f1 M3-C: an elastic window class flushes too, and compacts at this round boundary.
+    if (ElasticKvRegion* region = decoder->text_kv.pool().window_elastic_region()) {
+        region->flush_reserve_release();
+        compact_window_kv();
+    }
     return kv_under_pressure();
+}
+
+void ProgramImplCore::kv_round_boundary() noexcept {
+    // The pipelined executor has no kv_service_pressure: the main region's releases (a limit lowered
+    // by window charges, set_foreign_bytes; a reserve given back) happen here (lanes/OOM review).
+    if (ElasticKvRegion* region = decoder->text_kv.pool().elastic_region()) { region->flush_reserve_release(); }
+    if (ElasticKvRegion* region = decoder->text_kv.pool().window_elastic_region()) {
+        region->flush_reserve_release();
+        compact_window_kv();
+    }
 }
 
 bool ProgramImplCore::kv_under_pressure() const noexcept {
@@ -5427,12 +5789,20 @@ void ProgramImplCore::kv_settle() noexcept {
             region->wait_idle();
         } catch (...) {}
     }
+    if (ElasticKvRegion* region = decoder->text_kv.pool().window_elastic_region()) {
+        try {
+            region->wait_idle();
+        } catch (...) {}
+    }
 }
 
 void ProgramImplCore::configure_kv_admission(const runtime::KvAdmissionOptions& options) noexcept {
     kv_admission  = options;
-    kv_on_demand_ = options.mode == KvAdmission::OnDemand && !pipeline_stage() &&
-                    speculative_backend != SpeculativeBackend::DFlash;
+    // DFlash keeps the reservation. A DSpark drafter (lane f1, review R6 finding 1) keeps its draft KV in the text pool's own
+    // pages, so a lane's whole state can grow and be recomputed with its text allocation: opt-in, explicit flag only.
+    kv_on_demand_ = runtime::kv_engine_on_demand(options.mode == KvAdmission::OnDemand, pipeline_stage(),
+                                                 speculative_backend == SpeculativeBackend::DFlash,
+                                                 family::dspark_drafter<Variant>(), options.explicit_on_demand);
     const double fraction = std::clamp(static_cast<double>(options.watermark), 0.0, 0.5);
     kv_watermark_pages    = kv_on_demand_
                                 ? static_cast<std::uint32_t>(
@@ -5452,7 +5822,12 @@ bool ProgramImplCore::grow_lane_kv(std::uint32_t lane) {
     };
     // The most one unit writes past the frontier: an ordinary burst of kChainBurstLimit rounds,
     // or a verify round's anchor and drafts (whose head writes draft_window further).
-    const std::uint64_t reach = std::max<std::uint32_t>(kChainBurstLimit, draft_window + 1U) + 1U;
+    // A DSpark round also writes its draft block at [frontier, frontier + block) (dspark_round.h).
+    const std::uint32_t draft_block =
+        family::dspark_drafter<Variant>() && speculative_backend == SpeculativeBackend::DFlash
+            ? static_cast<std::uint32_t>(cfg.dflash.block_size)
+            : 0U;
+    const std::uint64_t reach = runtime::kv_round_reach(kChainBurstLimit, draft_window, draft_block);
     const std::uint64_t frontier = sequence.execution_frontier;
     PagedKVAllocation& text = sequence.kv->text;
     const std::uint32_t text_pages = std::max(

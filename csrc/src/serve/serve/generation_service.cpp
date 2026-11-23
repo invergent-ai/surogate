@@ -3,6 +3,7 @@
 #include "api/ops/sparse_moe.h"
 #include "serve/vllm_max_tokens.h"
 #include "serve/vllm_qwen3_parser.h"
+#include "family/impl/frontend/inkling_parse.h"
 #include <set>
 
 #include "product/media_acquire/acquire.h"
@@ -27,6 +28,7 @@
 #include <fstream>
 #include <limits>
 #include <optional>
+#include <span>
 #include <string_view>
 #include <thread>
 #include <cstddef>
@@ -192,6 +194,11 @@ void validate_routing_request(const GenerationRequest& request) {
             .param = "return_routed_experts"});
     }
 }
+
+// Inkling-2 images: the per-prompt count the serving layer checks before fetching any image (vLLM's default for
+// --limit-mm-per-prompt). The frontend enforces its configured limit (FrontendOptions::image_limit_per_prompt) with
+// vLLM's words; this bound only keeps an over-limit request from being fetched first.
+constexpr std::uint64_t kInklingServiceImageLimit = 999;
 
 [[noreturn]] void throw_preparation_cancelled();
 
@@ -364,6 +371,12 @@ public:
           tool_filter_(json_tools, muse_tools, gemma_tools, qwen3_coder) {}
 
     void publish(sinfer::OutputDelta delta) override {
+        if (inkling_) {
+            // Inkling-2 reads its reply from the ids (OutputOptions::report_token_ids), as vLLM's parser does; the
+            // engine's own channel text is not the reading and is not sent.
+            if (!delta.token_ids.empty()) { send_inkling(inkling_->feed(engine_->token_texts(delta.token_ids))); }
+            return;
+        }
         if (delta.text.empty()) { return; }
         if (delta.channel == sinfer::OutputChannel::Reasoning) {
             if (sink_->on_reasoning) { sink_->on_reasoning(delta.text); }
@@ -395,6 +408,32 @@ public:
     /// The content published so far.
     [[nodiscard]] const std::string& streamed_content() const noexcept { return streamed_; }
 
+    /// Inkling-2: the reply streams as it is read (inkling::StreamParser over the generated ids): reasoning, content
+    /// and tool calls go out as soon as the final reading of the whole reply can no longer change them, so the stream
+    /// adds up to exactly the non-streamed message. finish_inkling() sends the rest of that reading and gives the
+    /// calls the ids they were streamed with.
+    void stream_inkling(const sinfer::family::frontend_internal::inkling::ChatRequest& request,
+                        const sinfer::family::frontend_internal::inkling::ParserVocabulary& vocabulary,
+                        std::vector<std::string> stop_strings) {
+        inkling_ = std::make_unique<sinfer::family::frontend_internal::inkling::StreamParser>(request, vocabulary,
+                                                                                            std::move(stop_strings));
+    }
+    /// Returns whether the calls went out through the stream (StreamSink::on_tool_call_delta).
+    bool finish_inkling(const sinfer::family::frontend_internal::inkling::ParsedOutput& final,
+                        std::vector<ToolCall>& calls) {
+        if (!inkling_) { return false; }
+        bool consistent = true;
+        send_inkling(inkling_->finish(final, &consistent));
+        if (!consistent) {
+            write_console_log(ConsoleLogLevel::Error,
+                              "inkling stream: a streamed piece is not part of the final reading of the reply");
+        }
+        for (std::size_t i = 0; i < calls.size(); ++i) {
+            if (i < inkling_call_ids_.size() && !inkling_call_ids_[i].empty()) { calls[i].id = inkling_call_ids_[i]; }
+        }
+        return static_cast<bool>(sink_->on_tool_call_delta);
+    }
+
     /// Ends the stream with `tail` as the rest of the content, instead of what the filter held back.
     std::size_t finish_with(const std::string& tail) {
         if (filter_tool_calls_) { tool_filter_.discard(); }
@@ -410,9 +449,31 @@ private:
         streamed_ += text;
     }
 
+    void send_inkling(const sinfer::family::frontend_internal::inkling::StreamDelta& delta) {
+        if (!delta.reasoning.empty() && sink_->on_reasoning) { sink_->on_reasoning(delta.reasoning); }
+        publish_content(delta.content);
+        if (delta.tool_calls.empty() || !sink_->on_tool_call_delta) { return; }
+        std::vector<ToolCallDelta> calls;
+        calls.reserve(delta.tool_calls.size());
+        for (const auto& piece : delta.tool_calls) {
+            ToolCallDelta call{.index = piece.index, .opens = piece.opens, .arguments = piece.arguments};
+            if (piece.opens) {
+                const auto at = static_cast<std::size_t>(piece.index);
+                if (inkling_call_ids_.size() <= at) { inkling_call_ids_.resize(at + 1); }
+                inkling_call_ids_[at] = new_tool_call_id();
+                call.id   = inkling_call_ids_[at];
+                call.name = piece.name;
+            }
+            calls.push_back(std::move(call));
+        }
+        sink_->on_tool_call_delta(calls);
+    }
+
     Engine* engine_ = nullptr;
     const StreamSink* sink_ = nullptr;
     bool filter_tool_calls_ = false;
+    std::unique_ptr<sinfer::family::frontend_internal::inkling::StreamParser> inkling_;
+    std::vector<std::string> inkling_call_ids_;
     bool muse_tools_ = false;
     ToolCallStreamFilter tool_filter_;
     std::size_t content_bytes_ = 0;
@@ -506,6 +567,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
         engine_options.lora_enable   = true;
         engine_options.lora_slots    = options_.max_loras;
         engine_options.lora_max_rank = options_.max_lora_rank;
+        engine_options.lora_max_expert_rank = options_.max_expert_lora_rank;
         if (!options_.lora_modules.empty()) {
             LoraRegistry registry;
             std::vector<std::pair<std::string, std::string>> modules;
@@ -587,6 +649,17 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
         for (const auto& special : engine_->named_special_tokens()) { vocabulary.special_tokens.push_back(special.second); }
         qwen3_vocabulary_ = std::move(vocabulary);
     }
+    // Inkling-2 renders from the request body and every reply is read back with vLLM's Inkling parser.
+    if (prompt_capabilities_.inkling2_chat) {
+        namespace ink = sinfer::family::frontend_internal::inkling;
+        const ink::SpecialTokens tokens = ink::SpecialTokens::resolve([this](std::string_view spelling) {
+            const std::optional<sinfer::TokenId> id = engine_->token_id(spelling);
+            return id ? std::optional<int>(static_cast<int>(*id)) : std::nullopt;
+        });
+        std::vector<std::string> named;
+        for (const auto& special : engine_->named_special_tokens()) { named.push_back(special.second); }
+        inkling_vocabulary_ = ink::ParserVocabulary::from(tokens, named);
+    }
     // --thinking-loop-guard / --thinking-answer-reserve: a thought the guard ends is closed the way Qwen3's thinking
     // budget closes one (Qwen3 Technical Report, 2025, "thinking budget"), with the model's own close token and, for
     // </think>, the blank line its answers start after. A model with no single close token is served without it.
@@ -603,6 +676,11 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
             if (close_text == "</think>") {
                 const std::vector<sinfer::TokenId> separator = engine_->encode_fragment("\n\n");
                 thinking_guard_close_.insert(thinking_guard_close_.end(), separator.begin(), separator.end());
+            } else if (inkling_vocabulary_ && close_text == "<|end_message|>") {
+                // Inkling-2 opens every block after a thought with <|message_model|>: in agent-IK's 24,609 real
+                // replies with a thinking block the model never ended right after it, and vLLM's own token counts
+                // match that header before every block (rl/engine-inkling-2026-11-21/lanes/f2/guard/).
+                thinking_guard_close_.push_back(inkling_vocabulary_->tokens.message_model);
             }
         } else {
             std::fprintf(stderr, "thinking-guard: this model has no single reasoning close token; the guard is off\n");
@@ -686,7 +764,33 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& original,
         throw ApiException(std::move(error));
     }
     PreparedRequest prepared;
+    if (inkling_vocabulary_ && !request.raw_prompt.has_value()) {
+        if (!request.raw_chat_body) {
+            throw ApiException(ApiError{
+                .status  = 400,
+                .message = "this model renders its prompt from the chat-completions request itself; ask it through "
+                           "/v1/chat/completions",
+                .code    = "endpoint_not_supported"});
+        }
+        try {
+            prepared.inkling_request = std::make_shared<const sinfer::family::frontend_internal::inkling::ChatRequest>(
+                sinfer::family::frontend_internal::inkling::parse_chat_request(
+                    *request.raw_chat_body,
+                    // Vision on: the frontend enforces the configured per-prompt count with vLLM's words; off: vLLM at
+                    // image limit 0 ("At most 0 image(s) may be provided in one prompt.").
+                    options_.enable_vision ? kInklingServiceImageLimit : 0));
+        } catch (const std::invalid_argument& error) {
+            throw ApiException(ApiError{.status = 400, .message = error.what()});
+        }
+    }
     sinfer::RequestOptions request_options = to_request_options(request, options_);
+    if (prepared.inkling_request && request.stream) {
+        // Inkling-2 streams by reading the generated ids as they come (ServiceOutputSink::stream_inkling).
+        request_options.output.report_token_ids = true;
+        for (const sinfer::StopString& stop : request_options.stop.strings) {
+            prepared.inkling_stop_strings.push_back(stop.text);
+        }
+    }
     // A minimum length is honoured by barring the stop ids until it is reached, and
     // the round only knows numbers -- so resolve which ids those are here, where
     // the model's own stops and the request's are both in reach.
@@ -1037,6 +1141,16 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& request,
                                            std::function<bool()> is_cancelled,
                                            const PreparationGate& before_prepare) const {
     validate_token_media(request);
+    if (inkling_vocabulary_ && request.raw_chat_body && !request.raw_chat_images.empty()) {
+        // As prepare(): vLLM's renderer refuses an image request at image limit 0 in its own words, before the
+        // vision gate below and before any image is fetched.
+        try {
+            (void)sinfer::family::frontend_internal::inkling::parse_chat_request(
+                *request.raw_chat_body, options_.enable_vision ? kInklingServiceImageLimit : 0);
+        } catch (const std::invalid_argument& error) {
+            throw ApiException(ApiError{.status = 400, .message = error.what()});
+        }
+    }
     const bool request_has_media = request.media_item_count() != 0;
     if (request_has_media && !options_.enable_vision) {
         const std::invalid_argument error("Vision is disabled for this server");
@@ -1133,6 +1247,9 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
             options_.tool_call_format == ToolCallFormat::MuseAtem,
             options_.tool_call_format == ToolCallFormat::Gemma4,
             options_.tool_call_format == ToolCallFormat::Qwen3Coder);
+        if (prepared.inkling_request && inkling_vocabulary_) {
+            output_sink->stream_inkling(*prepared.inkling_request, *inkling_vocabulary_, prepared.inkling_stop_strings);
+        }
     }
     sinfer::OutputSink* public_sink = output_sink.get();
     sinfer::CancellationView cancellation;
@@ -1211,6 +1328,40 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.metrics.speculative_accepted_per_position =
         std::move(result.speculative.accepted_per_position);
 
+    // Inkling-2: vLLM's Inkling parser, exactly, on the generated token ids (family/impl/frontend/inkling_parse.h).
+    if (prepared.inkling_request && inkling_vocabulary_ && outcome.finish_reason != sinfer::FinishReason::Cancelled) {
+        namespace ink = sinfer::family::frontend_internal::inkling;
+        const std::vector<std::string> bytes = engine_->token_texts(result.generated_token_ids);
+        std::string text = ink::detokenize_output(std::span<const std::string>(bytes),
+                                                  result.finish_reason == sinfer::FinishReason::StopToken);
+        if (result.finish_reason == sinfer::FinishReason::StopString && !result.stop_sequence.empty()) {
+            if (const std::size_t at = text.find(result.stop_sequence); at != std::string::npos) { text.resize(at); }
+        }
+        const char* engine_finish = "stop";
+        switch (result.finish_reason) {
+        case sinfer::FinishReason::OutputLimit:
+        case sinfer::FinishReason::ContextCapacity:
+        case sinfer::FinishReason::ThinkingGuard: engine_finish = "length"; break;
+        default: break;
+        }
+        const ink::ParsedOutput parsed =
+            ink::parse_output(text, *prepared.inkling_request, engine_finish, *inkling_vocabulary_);
+        std::vector<ToolCall> calls;
+        for (const ink::ParsedToolCall& call : parsed.tool_calls) {
+            calls.push_back({.id = new_tool_call_id(), .name = call.name, .arguments_json = call.arguments});
+        }
+        std::vector<int> ids(result.generated_token_ids.begin(), result.generated_token_ids.end());
+        outcome.reasoning_tokens      = ink::count_reasoning_tokens(ids, inkling_vocabulary_->tokens);
+        outcome.tool_calls            = std::move(calls);
+        outcome.content_null_if_empty = true;
+        outcome.reasoning             = parsed.reasoning.value_or("");
+        outcome.text                  = parsed.content.value_or("");
+        outcome.finish_reason_wire    = parsed.finish_reason;
+        outcome.report_reasoning_tokens = true;
+        outcome.unstreamed_content.clear();
+        if (output_sink) { outcome.tool_calls_streamed = output_sink->finish_inkling(parsed, outcome.tool_calls); }
+        return outcome;
+    }
     // vLLM 0.31's qwen3_coder parser, exactly, on the generated token ids (serve/vllm_qwen3_parser.h): every request
     // with tools, except calls the tool grammar wrote (tool_choice required / named, strict tools), which keep the
     // reading below.
@@ -1321,6 +1472,10 @@ void GenerationService::answer_after_thinking_guard(PreparedRequest& prepared, s
     }
     if (sink != nullptr) {
         sink->publish(sinfer::OutputDelta{.channel = sinfer::OutputChannel::Reasoning, .text = thinking_guard_note_});
+        if (prepared.inkling_request) {
+            // An Inkling-2 stream reads ids: the close the guard inserted is part of the reply it reads.
+            sink->publish(sinfer::OutputDelta{.token_ids = thinking_guard_close_});
+        }
     }
     std::optional<ContinuationOutputSink> stream;
     if (sink != nullptr) { stream.emplace(*sink); }
@@ -2281,8 +2436,11 @@ std::string GenerationService::load_lora_adapter(const std::string& name, const 
                 store->set_slot_version(slot, version);
             }
         });
-        // Conversations kept on the GPU stay reusable: like the requests in flight, they carry on
-        // under the new adapter. Host-tier snapshots are keyed by the old identity and stop matching.
+        // Requests in flight carry on under the new adapter (lora_versions records where). No
+        // prefix computed before the swap is reused: commit_staged moved the slot's KV
+        // generation, and the prefix caches key resident, archived, shared and host-tier state by
+        // (slot, generation). They used to key it by the slot alone, so a prompt seen under the
+        // old version was served the old version's KV and prompt scores after the swap.
         char line[256];
         std::snprintf(line, sizeof(line),
                       "swapped in place: version %u, engine paused %.1f ms, %.1f MiB staged in %.2f s",

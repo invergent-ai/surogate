@@ -18,6 +18,7 @@
 #include <api/targets/qwen3_moe/package.h>
 #include <api/targets/qwen3_5_moe/package.h>
 #include <api/targets/qwen4exp/package.h>
+#include <api/targets/inkling2/package.h>
 
 #include <memory>
 #include <variant>
@@ -49,6 +50,8 @@ using Qwen3Moe        = qwen3_moe::Package;
 using Qwen3_5     = qwen3_5::Package;
 using Qwen3_5Moe  = qwen3_5_moe::Package;
 using Qwen38FlashNext = qwen4exp::Package;
+/// Inkling-2-Mini: the looped 24-layer stack served as 48 layer visits (ENGINE-INKLING).
+using Inkling2        = inkling2::Package;
 
 // One loaded model and one live instance, per target.
 //
@@ -123,6 +126,8 @@ using LoadedQwen3_5Moe = LoadedTarget<Qwen3_5Moe>;
 using Qwen3_5MoeInstance = TargetInstance<Qwen3_5Moe>;
 using LoadedQwen38FlashNext = LoadedTarget<Qwen38FlashNext>;
 using Qwen38FlashNextInstance = TargetInstance<Qwen38FlashNext>;
+using LoadedInkling2 = LoadedTarget<Inkling2>;
+using Inkling2Instance = TargetInstance<Inkling2>;
 
 
 using Gemma3Pipeline = runtime::PipelineInstance<Gemma3Instance>;
@@ -140,6 +145,7 @@ using Glm5NextPipeline   = runtime::PipelineInstance<Glm5NextInstance>;
 using Qwen38FlashNextPipeline = runtime::PipelineInstance<Qwen38FlashNextInstance>;
 using Qwen3_5Pipeline    = runtime::PipelineInstance<Qwen3_5Instance>;
 using Qwen3_5MoePipeline = runtime::PipelineInstance<Qwen3_5MoeInstance>;
+using Inkling2Pipeline   = runtime::PipelineInstance<Inkling2Instance>; // the 2-card visit split
 
 using ActiveTarget =
     std::variant<std::unique_ptr<MuseGlimmerInstance>, std::unique_ptr<MuseGlimmerPipeline>,
@@ -153,6 +159,7 @@ using ActiveTarget =
                  std::unique_ptr<Qwen3_5Instance>,
                  std::unique_ptr<Qwen3_5MoeInstance>,
                  std::unique_ptr<Qwen38FlashNextInstance>,
+                 std::unique_ptr<Inkling2Instance>,
                  std::unique_ptr<Gemma3Pipeline>,
                  std::unique_ptr<Gemma4Pipeline>,
                  std::unique_ptr<Gemma4EPipeline>,
@@ -164,7 +171,8 @@ using ActiveTarget =
                  std::unique_ptr<Qwen3MoePipeline>,
                  std::unique_ptr<Glm5NextPipeline>,
                  std::unique_ptr<Qwen38FlashNextPipeline>, std::unique_ptr<Qwen3_5Pipeline>,
-                 std::unique_ptr<Qwen3_5MoePipeline>>;
+                 std::unique_ptr<Qwen3_5MoePipeline>,
+                 std::unique_ptr<Inkling2Pipeline>>;
 
 struct ConstructedTarget {
     ActiveTarget active;

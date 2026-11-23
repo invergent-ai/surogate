@@ -33,6 +33,7 @@
 #include <utility>
 #include <cuda_runtime.h>
 #include <cstdlib>
+#include <malloc.h>
 #include <sstream>
 
 // The listen backlog. cpp-httplib's own default is 5, and this server closes every connection
@@ -378,6 +379,20 @@ void HttpServer::restore_retained_thinking(const httplib::Request& http, Generat
     if (thinking_retention_ == nullptr) { return; }
     const std::string tenant = thinking_tenant(http.get_header_value("Authorization"), http.get_header_value("x-api-key"));
     restore_thinking(request, *thinking_retention_, options_.thinking_retention, thinking_scope(tenant, request.model));
+}
+
+bool HttpServer::renders_raw_chat(const nlohmann::ordered_json& body) const {
+    if (service_ == nullptr || !body.is_object() || !body.contains("model") || !body.at("model").is_string()) {
+        return false;
+    }
+    const std::string model = body.at("model").get<std::string>();
+    if (model == public_model_id_ || service_->lora_slot(model) >= 0) { return service_->renders_raw_chat(); }
+    const auto extra = extra_services_.find(model);
+    if (extra != extra_services_.end()) { return extra->second->renders_raw_chat(); }
+    for (const auto& [name, service] : extra_services_) {
+        if (service->lora_slot(model) >= 0) { return service->renders_raw_chat(); }
+    }
+    return false;
 }
 
 void HttpServer::retain_answer_thinking(const ThinkingRetentionState& retention, const GenerationOutcome& outcome) {
@@ -761,6 +776,12 @@ void HttpServer::register_routes() {
             return;
         }
         std::string report;
+        // A load parses ~60k small A/B buffers on this handler thread; freed, they stay in whichever
+        // malloc arena the thread used, so every load (an RL step's in-place swap) would grow the
+        // process by an adapter's size. Hand them back once the load is over, loaded or not.
+        struct TrimOnExit {
+            ~TrimOnExit() { malloc_trim(0); }
+        } trim_on_exit;
         try {
             const std::vector<GenerationService*> targets = routed_management_services(req);
             GenerationService& target = *targets.front();
@@ -890,6 +911,12 @@ void HttpServer::handle_kv_stats(const httplib::Request&, httplib::Response& res
             {"pages_in_use", stats.kv_pages_in_use},
             {"pages_resident_at_granule", stats.kv_pages_resident_at_granule},
             {"pages_mapped", stats.kv_pages_mapped},
+            {"window",
+             nlohmann::json{{"pages_mapped", stats.kv_window_mapped_pages},
+                            {"pages_charged", stats.kv_window_charged_pages},
+                            {"floor_pages", stats.kv_window_floor_pages},
+                            {"granule_pages", stats.kv_window_granule_pages},
+                            {"page_bytes", stats.kv_window_page_bytes}}},
             {"admission_unblocked_heads", stats.admission_unblocked_heads},
             {"kv_admission", stats.kv_on_demand != 0 ? "ondemand" : "reserve"},
             {"capacity_pages", stats.kv_capacity_pages},
@@ -1312,10 +1339,12 @@ void HttpServer::handle_tokenize(const httplib::Request& req, httplib::Response&
             write_error(res, error);
             return;
         }
+        limits.raw_chat = completed.contains("messages") && renders_raw_chat(completed);
         GenerationRequest request =
             completed.contains("messages")
                 ? parse_chat_completion_request(completed, limits)
                 : parse_completion_request(completed, limits);
+        if (limits.raw_chat) { request.raw_chat_body = std::make_shared<const std::string>(req.body); }
         t_routed_service = &route_model(request.model, &request.lora_adapter, &req,
                                         conversation_routing_key(request));
         const std::vector<sinfer::TokenId> ids =
@@ -1356,9 +1385,16 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
         limits.vllm_max_tokens    = options_.overlong_max_tokens == OverlongMaxTokens::Reject;
+        limits.raw_chat           = renders_raw_chat(body);
         request                   = parse_chat_completion_request(body, limits);
         request.client_request_id = request_id_of(req);
-        restore_retained_thinking(req, request);
+        if (limits.raw_chat) {
+            // The renderer reads the body as sent (vLLM's request model, kwargs and all); --thinking-retention does
+            // not apply: what the client sent back is what vLLM would have rendered.
+            request.raw_chat_body = std::make_shared<const std::string>(req.body);
+        } else {
+            restore_retained_thinking(req, request);
+        }
         // `model` selects a served model or one of the primary's adapters.
         t_routed_service = &route_model(request.model, &request.lora_adapter, &req,
                                         conversation_routing_key(request));
@@ -1429,11 +1465,14 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             std::string response_body;
             if (!outcome.tool_calls.empty()) {
                 response_body = make_chat_completion_tool_response(
-                    id, model, created, outcome.text, outcome.reasoning, outcome.tool_calls, usage, detail);
+                    id, model, created, outcome.text, outcome.reasoning, outcome.tool_calls, usage, detail,
+                    outcome.finish_reason_wire.empty() ? "tool_calls" : outcome.finish_reason_wire.c_str());
             } else {
                 response_body = make_chat_completion_response(
                     id, model, created, outcome.text, outcome.reasoning,
-                    finish_reason_wire(outcome.finish_reason), usage, detail);
+                    outcome.finish_reason_wire.empty() ? finish_reason_wire(outcome.finish_reason)
+                                                       : outcome.finish_reason_wire.c_str(),
+                    usage, detail);
             }
             if (!outcome.parallel_decoding_details.empty()) {
                 auto payload = nlohmann::json::parse(response_body);
@@ -1494,6 +1533,14 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                         sink, *stream,
                         make_chat_chunk_reasoning(id, model, created, text, include_usage));
                 };
+                if (stream->prepared.inkling_request) {
+                    // Inkling-2 streams its calls as they are read (GenerationService, inkling::StreamParser).
+                    output.on_tool_call_delta = [&](const std::vector<ToolCallDelta>& deltas) {
+                        ensure_role();
+                        offer_stream_item(sink, *stream,
+                                          make_chat_chunk_tool_call_deltas(id, model, created, deltas, include_usage));
+                    };
+                }
                 output.on_scores = [&](const GenerationOutcome& scored) {
                     ensure_role();
                     TokenDetail detail;
@@ -1542,12 +1589,18 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                                                                   std::string(remaining),
                                                                   include_usage));
                     }
-                    write_stream_item(sink, *stream,
-                                      make_chat_chunk_tool_calls(
-                                          id, model, created, outcome.tool_calls, include_usage));
+                    if (!outcome.tool_calls_streamed) {
+                        write_stream_item(sink, *stream,
+                                          make_chat_chunk_tool_calls(
+                                              id, model, created, outcome.tool_calls, include_usage));
+                    }
                     write_stream_item(
                         sink, *stream,
-                        make_chat_chunk_final(id, model, created, "tool_calls", include_usage));
+                        make_chat_chunk_final(id, model, created,
+                                              outcome.finish_reason_wire.empty()
+                                                  ? "tool_calls"
+                                                  : outcome.finish_reason_wire.c_str(),
+                                              include_usage));
                 } else {
                     if (tool_capable && !remaining.empty()) {
                         write_stream_item(sink, *stream,
@@ -1558,7 +1611,9 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                     write_stream_item(
                         sink, *stream,
                         make_chat_chunk_final(id, model, created,
-                                              finish_reason_wire(outcome.finish_reason),
+                                              outcome.finish_reason_wire.empty()
+                                                  ? finish_reason_wire(outcome.finish_reason)
+                                                  : outcome.finish_reason_wire.c_str(),
                                               include_usage, outcome.parallel_decoding_details));
                 }
                 if (include_usage) {
@@ -2370,7 +2425,7 @@ void HttpServer::attach(GenerationService& service) {
     device_                            = memory.device;
     attached_memory_.emplace(&service, memory);
     request_jsonl_.write_server_start(options_, service.sampling_defaults(), public_model_id_, load,
-                                      service.memory_summary());
+                                      service.memory_summary(), service.runtime_stats().kv_on_demand != 0);
 }
 
 bool HttpServer::listen() {

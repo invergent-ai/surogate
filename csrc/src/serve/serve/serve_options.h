@@ -215,6 +215,10 @@ struct ServeOptions {
     /// flag the caller had no reason to expect. Raising it costs bank memory in
     /// proportion, and only for an engine started with --enable-lora.
     std::uint32_t max_lora_rank = 32;
+    /// --max-expert-lora-rank: the rank of the routed-expert banks, where a target supports a separate one
+    /// (Inkling-2-Mini only). 0 (default) = --max-lora-rank, the behaviour before the flag. SkyRL's preset
+    /// serves attention at rank 64 and experts at rank 16: without it every expert bank pads to 64.
+    std::uint32_t max_expert_lora_rank = 0;
     // Process-level explicit overrides layered between registered model/mode defaults and request
     // fields. An omitted seed is replaced per request with a fresh random seed.
     SamplingOverrides sampling_overrides;
