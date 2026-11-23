@@ -74,6 +74,39 @@ def main():
         except ValueError:
             pass
     TS.validate_config(TS.T8Config(head="plain", attn_rank=64, train_keys=TS.param_keys(64), segment_keys=("B13", "B2")))
+    # the combined adapter file (S5): round trip, names, config
+    import json
+    import tempfile
+
+    import t8_adapter as TA
+    gg = np.random.default_rng(0)
+    layers = []
+    for _ in range(24):
+        d = {k: gg.standard_normal(v).astype(np.float32) * 0.01 for k, v in TW.param_shapes(64)[0].items()}
+        layers.append(d)
+    out = tempfile.mkdtemp(dir=os.environ.get("TMPDIR"))
+    TA.export_combined(layers, out, 64, 32.0, 16)
+    cfg = json.load(open(os.path.join(out, "adapter_config.json")))
+    assert cfg["r"] == 64 and cfg["lora_alpha"] == 32.0 and list(cfg["rank_pattern"].values()) == [16] and "alpha_pattern" not in cfg
+    back, _ = TA.import_combined(out)
+    from surogate.inkling_rl import adapter as AD
+    for L in (0, 11, 23):
+        for k in layers[L]:
+            assert np.array_equal(back[L][k], AD.round_bf16(layers[L][k])), (L, k)
+    names = AD.read_safetensors(os.path.join(out, "adapter_model.safetensors"))
+    assert f"{AD.PREFIX}.5.attn.attn_sink_proj.lora_B.weight" in names and names[f"{AD.PREFIX}.5.attn.wo_ud.lora_A.weight"][1].shape == (64, 3072)
+    assert len(names) == 24 * (14 + 128 * 4)
+    print("combined adapter round trip: PASS")
+    # the gate's one-ulp helper
+    sys.path.insert(0, HERE)
+    import t8_gate_s3 as G3
+    w = torch.tensor([1.0, -2.0, 0.3, -0.75], dtype=BF).float()
+    up1 = torch.nextafter(w.to(BF), torch.full_like(w.to(BF), float("inf"))).float()
+    eq, within = G3.ulp_cmp(up1, w)
+    assert eq == 0.0 and within
+    eq, within = G3.ulp_cmp(w + (up1 - w) * 2.5, w)
+    assert not within
+    print("ulp helper: PASS")
     print("T8 ATTN CPU TEST: PASS")
     return 0
 

@@ -253,10 +253,7 @@ def backward_row(eng, W, ids, vals: dict, lora_host: list, scale: float, v_first
                     ins = [torch.zeros(1, dtype=F32, device=dev).expand(T, D) for _ in ps]
                     leaves = [t.detach().requires_grad_(j in train_idx) for j, t in enumerate(lt)]  # keys not trained: no vjp
                     want = [t for t in leaves if t.requires_grad]
-                    lora = dict(zip(keys, leaves)) | {"scale": scale}
-                    if attn_scale is not None:
-                        lora["attn"] = {s: (lora[f"{s}A"], lora[f"{s}B"]) for s in TV.ATTN_SLICES}
-                        lora["attn_scale"] = attn_scale
+                    lora = TV.lora_dict(keys, leaves, scale, attn_scale)
                     LG.SINK_DUMMIES.clear()
                     out = TV.visit_torch_t8(W, vi, ins[:n], ins[n], (ins[n + 1], ins[n + 2]) if vi.looped else None,
                                               vals["routing"][v], lora, act_vals=[host_vals[p] for p in ps], act_sinks=sinks)

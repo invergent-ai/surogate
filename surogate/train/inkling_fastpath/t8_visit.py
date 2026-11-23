@@ -22,6 +22,30 @@ ATTN_SLICES = QKVR_SLICES + ("o",)                     # + wo_ud
 SLICE_DIMS = {"q": (3072, 2304), "r": (384, 2304), "g": (3072, 2304), "s": (24, 2304), "k": (1024, 2304), "v": (1024, 2304), "o": (2304, 3072)}
 
 
+def qkvr_raw(L, xq, xk, xv, lw, att_scale):
+    """The six qkvr outputs before the clips (bf16 values): base projection, then the S10 delta of each slice from its own input stream."""
+    def proj(x, w, s):
+        y = RA.inkling_attn_linear(x, w)
+        return y if lw is None else lora_add(y, x, lw[s][0], lw[s][1], att_scale)
+
+    return proj(xq, L.wq, "q"), proj(xq, L.wr, "r"), proj(xq, L.wg, "g"), proj(xq, L.ws, "s"), proj(xk, L.wk, "k"), proj(xv, L.wv, "v")
+
+
+def wo_raw(L, gated, lo, att_scale):
+    """wo_ud's output (bf16 values) from the gated attention output, + the S10 delta of slice o when lo = (A_o, B_o)."""
+    y = RA.rb(RA.mm(gated, L.wo))
+    return y if lo is None else lora_add(y, gated, lo[0], lo[1], att_scale)
+
+
+def lora_dict(keys, leaves, scale, attn_scale):
+    """The per-visit `lora` argument of visit_torch_t8 from the layer's keys and tensors (the ONE place the attention keys map to slices)."""
+    lora = dict(zip(keys, leaves)) | {"scale": scale}
+    if attn_scale is not None:
+        lora["attn"] = {s: (lora[f"{s}A"], lora[f"{s}B"]) for s in ATTN_SLICES}
+        lora["attn_scale"] = attn_scale
+    return lora
+
+
 def lora_add(y, x, A, Bm, scale):
     """bf16(y + delta), delta = (x . (A x scale)^T) . B^T in fp32 (A, B: the work values = bf16(master); scale a power of two, so A x scale is the
     store's bf16 fold exactly)."""
@@ -81,17 +105,8 @@ def visit_torch_t8(W: B.EngineWeights, vi, stack, partial, bank, ids, lora, chun
         xk = ain[:, 1] if QS == 3 else xq
         xv = ain[:, 2] if QS == 3 else xq
         t = xq.shape[0]
-
-        def proj(x, w, s):  # base projection, then the S10 delta: bf16(bf16(base) + delta), delta = fp32 (x . a_folded) . b
-            y = RA.inkling_attn_linear(x, w)
-            return y if lw is None else lora_add(y, x, lw[s][0], lw[s][1], att_scale)
-
-        q = proj(xq, L.wq, "q").reshape(t, 24, 128)
-        r = proj(xq, L.wr, "r").reshape(t, 24, 16)
-        gate = proj(xq, L.wg, "g")
-        sink = proj(xq, L.ws, "s")
-        k = proj(xk, L.wk, "k")
-        v = proj(xv, L.wv, "v")
+        q, r, gate, sink, k, v = qkvr_raw(L, xq, xk, xv, lw, att_scale)
+        q, r = q.reshape(t, 24, 128), r.reshape(t, 24, 16)
         qc = RA.l2_clip(q, L.q_scale, 22.627416997969522, EPS)
         rc = RA.l2_clip(r, L.r_scale, 8.0, EPS)
         if tau_:
@@ -136,9 +151,7 @@ def visit_torch_t8(W: B.EngineWeights, vi, stack, partial, bank, ids, lora, chun
     # 5. gate / sink + wo_ud (per token)
 
     def f_gw(o, l, gt, sk, *lo):
-        gated = RA.inkling_gate_sink(o, l, gt, sk)
-        y = RA.rb(RA.mm(gated, L.wo))
-        return y if not lo else lora_add(y, gated, lo[0], lo[1], att_scale)
+        return wo_raw(L, RA.inkling_gate_sink(o, l, gt, sk), lo if lo else None, att_scale)
 
     with B._tick("fwd.wo"):
         attn_partial = tc(f_gw, [out, lse, gate, sink], [0, 0, 0, 0], [0], params=op, store_bf16=[False, False, True, True],

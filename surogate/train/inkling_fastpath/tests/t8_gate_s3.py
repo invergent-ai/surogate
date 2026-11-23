@@ -1,12 +1,19 @@
 """Lane T8, S3 card gate (PLAN-SKYRL.md): attention LoRA r64 / alpha 32 (scale 0.5) on the seven S10 slices. PASS LINES, written before any run (also in
-lanes/T8/NOTES.md). Nothing is trained; no adapter is kept. Adapter: attention A = the trainer's kaiming init, B = N(0, 1e-3) (seed 13); experts at the
-zero adapter. Row: the first 4,096 tokens of gate_rows.npz row 1.
+lanes/T8/NOTES.md; REVISED 12:3x after the Opus review, still before any run). Nothing is trained; no adapter is kept. Adapter: attention A = the
+trainer's kaiming init, B = N(0, 0.2) (seed 13; large, so that each delta is far above one bf16 ulp of the base); experts at the zero adapter.
+Row: the first 4,096 tokens of gate_rows.npz row 1.
   G13 forward wiring, every one of the 48 visits, on the SAME visit inputs: (a) run with no attention adapter, (b) qkvr adapter only, (c) qkvr + wo_ud.
       qkvr(b) == bf16(qkvr(a) + (x . a^T) . b^T) per slice from that slice's own input stream (x_q for q / r / gate / sink, x_k for k, x_v for v);
       attn_partial(c) == bf16(attn_partial(b) + (gated(b) . a_o^T) . b_o^T). Line: >= 99.9 % of elements bitwise equal and every element within one bf16
-      ulp (the engine sums in fp32 fma chains, torch in another order); the deltas are non-zero; (a) == the T shim's base forward bitwise (the copy changed nothing else).
-  G14 gradients of the attention keys through the lean K = 48 backward: finite, non-zero for every slice of every layer; TokenChunked in chunks of 1,024
-      == the same recompute in one chunk (rel <= 1e-5) for visits 47, 41 (global), 30 (looped core), 5; A/A bitwise on one card.
+      ulp (the engine sums in fp32 fma chains, torch in another order); the deltas are non-zero; and the T8 shim's base forward (no adapter) gives
+      the ROLLOUT's recorded log-probs bitwise at the loss tokens of the 4,096-token prefix (the copy changed nothing else; review M2).
+  G15 the TRAINER's own pieces against the engine (review M1), visits 0, 5, 18, 30, 41, 47: t8_visit.qkvr_raw / wo_raw on the engine's own visit inputs
+      (attn_in tap of run (a); gated tap of run (b)), with the slices taken from the trainer's WORK values through t8_visit.lora_dict (the one key-to-slice
+      map the backward uses) and the trainer's scale: (torch with adapter - torch without) vs (engine (b) - engine (a)) per qkvr slice and
+      (torch wo with - without) vs (engine (c) - engine (b)): every slice cos >= 0.9999, rel err <= 1 %.
+  G14 gradients of the attention keys through the lean K = 48 backward: finite, non-zero for every slice of every layer; A/A bitwise on one card;
+      TokenChunked in chunks of 1,024 vs the same recompute in one chunk for visits 47, 41 (global), 30 (looped core), 5: cos >= 0.9999, rel <= 1 %
+      (not 1e-5: a different chunk width may pick other GEMM kernels and flip bf16 roundings; review M3).
   G14c (diagnostic, no line): the engine's change of the masked log-prob sum along -grad of layer 23's attention B (L2 1e-3) against the first-order prediction.
 """
 from __future__ import annotations
@@ -37,8 +44,10 @@ def ulp_cmp(got, want):
     """got / want bf16-valued fp32: fraction bitwise equal, and whether every element is within one bf16 ulp of `want`."""
     eq = float((got == want).float().mean())
     w = want.to(BF)
-    up = torch.nextafter(w.float(), torch.full_like(w.float(), float("inf"))).to(BF).float()
-    ulp = (up - w.float()).abs().clamp(min=2 ** -133)
+    wf = w.float()
+    up = (wf + (torch.nextafter(w, torch.full_like(w, float("inf"))).float() - wf).abs())
+    dn = (wf - torch.nextafter(w, torch.full_like(w, float("-inf"))).float()).abs()
+    ulp = torch.maximum((up - wf).abs(), dn).clamp(min=2 ** -133)
     within = bool(((got - want).abs() <= ulp * 1.0001).all())
     return eq, within
 
@@ -79,7 +88,7 @@ def main():
         for s in TS.ATTN_SLICES:
             A = d[f"{s}A"]
             A.copy_(((torch.rand(A.shape, generator=gA) * 2 - 1) / A.shape[1] ** 0.5).to(BF).float())
-            d[f"{s}B"].copy_((torch.randn(d[f"{s}B"].shape, generator=gB) * 1e-3).to(BF).float())
+            d[f"{s}B"].copy_((torch.randn(d[f"{s}B"].shape, generator=gB) * 0.2).to(BF).float())
     banks = B.EngineBanks([{k: v.to(dev) if torch.is_tensor(v) else v for k, v in d.items()} for d in lora], dev)
     attn = TW.AttnBanks([{k: v.to(dev) if torch.is_tensor(v) else v for k, v in d.items()} for d in lora], dev, 64, 32.0)
     T = ids_full.shape[0]
@@ -98,6 +107,10 @@ def main():
         qkvr_only.append(q)
     sl = {"q": (0, 3072), "r": (3072, 384), "g": (3456, 3072), "s": (6528, 24), "k": (6552, 1024), "v": (7576, 1024)}
     ok = True
+    import t8_visit as TV
+    keys = TS.param_keys(64)
+    rep["G15"] = []
+    ok15 = True
     for v in range(48):
         vi = eng.visits[v]
         Q = 3 if (vi.global_ or vi.looped) else 1
@@ -132,24 +145,50 @@ def main():
         row["o"] = (eq, within, nz)
         ok = ok and eq >= 0.999 and within and nz > 0
         rep["G13"].append(row)
+        if v in (0, 5, 18, 30, 41, 47):                      # G15: the trainer's own pieces (work values, key map, scale, streams)
+            Lw = W.layers[vi.layer]
+            ld = TV.lora_dict(keys, [lora[vi.layer][k].to(dev) for k in keys], B.ALPHA / B.RANK, 0.5)
+            xq_, xk_, xv_ = ain[0], (ain[1] if Q == 3 else ain[0]), (ain[2] if Q == 3 else ain[0])
+            with torch.no_grad():
+                t0_ = TV.qkvr_raw(Lw, xq_, xk_, xv_, None, None)
+                t1_ = TV.qkvr_raw(Lw, xq_, xk_, xv_, ld["attn"], 0.5)
+                w0_ = TV.wo_raw(Lw, tb["gated"], None, None)
+                w1_ = TV.wo_raw(Lw, tb["gated"], ld["attn"]["o"], 0.5)
+            r15 = {"v": v}
+            for (s, (r0, n)), a0, a1 in zip(sl.items(), t0_, t1_):
+                c = GT.compare({0: (a1 - a0).float().reshape(T, -1).cpu()}, {0: (tb["qkvr"][:, r0:r0 + n] - ta["qkvr"][:, r0:r0 + n]).cpu()})
+                r15[s] = (c["worst_cos"], c["worst_rel"])
+                ok15 = ok15 and c["pass"]
+            c = GT.compare({0: (w1_ - w0_).float().cpu()}, {0: (tc_["attn_partial"] - tb["attn_partial"]).cpu()})
+            r15["o"] = (c["worst_cos"], c["worst_rel"])
+            ok15 = ok15 and c["pass"]
+            rep["G15"].append(r15)
+            log(f"G15 visit {v}: {r15}")
         if v in (0, 5, 18, 41, 47):
             log(f"G13 visit {v}: {row}")
     del x, seg, ws
     eng._ws = None
     # (a) == the T shim's base forward: compare the base log-probs of the T8 engine (no adapters) with lane T's engine
-    import ift_engine as IE
     with torch.no_grad():
         r8 = F.forward(eng, ids, save=False)
         lp8 = F.logprobs(eng, r8["hidden"], ids).cpu()
     del r8
     eng._ws = None
     torch.cuda.empty_cache()
-    rep["G13_pass"] = bool(ok)
+    m1 = mask[1:]
+    want_lp = np.asarray(rows[1].engine_lp[1:4096], dtype=np.float32)
+    got_lp = lp8.numpy().astype(np.float32)
+    base_bad = int((got_lp[m1].view(np.int32) != want_lp[m1].view(np.int32)).sum())
+    rep["G13_base_vs_rollout"] = {"loss_tokens": int(m1.sum()), "mismatches": base_bad}
+    log(f"G13 base forward of the T8 shim vs the rollout: {base_bad} mismatches of {int(m1.sum())}")
+    rep["G13_pass"] = bool(ok and base_bad == 0 and int(m1.sum()) > 0)
+    rep["G15_pass"] = bool(ok15 and len(rep["G15"]) == 6)
     # ---------------------------------------------------------------- G14: gradients of the attention keys
     eng.attn_layers = attn.adapters
     host = [{k: v for k, v in d.items()} for d in lora]
     mask_t = torch.as_tensor(mask[1:].astype(np.float32), device=dev)
     grads = {}
+    ALL = tuple(range(len(TS.param_keys(64))))             # every key trained (review B1: the default trains the 4 expert keys only)
 
     def run_bw():
         out = {}
@@ -161,7 +200,7 @@ def main():
             c = gj.float().cpu()
             out[k] = c if k not in out else out[k].add_(c)
 
-        TL.backward_row(eng, W, ids, vals, host, B.ALPHA / B.RANK, 0, mask_t, buf, on, q_block=128, attn_scale=0.5)
+        TL.backward_row(eng, W, ids, vals, host, B.ALPHA / B.RANK, 0, mask_t, buf, on, q_block=128, attn_scale=0.5, train_idx=ALL)
         buf.close()
         return out
 
@@ -188,10 +227,10 @@ def main():
                 if vis == v:
                     o[(layer, j)] = gj.float().cpu()
 
-            TL.backward_row(eng, W, ids, vals, host, B.ALPHA / B.RANK, v, mask_t, buf, on, q_block=128, attn_scale=0.5)
+            TL.backward_row(eng, W, ids, vals, host, B.ALPHA / B.RANK, v, mask_t, buf, on, q_block=128, attn_scale=0.5, train_idx=ALL)
             buf.close()
             per[ch] = {k: t for k, t in o.items() if k[1] in att_idx}
-        c = GT.compare(per[1024], per[T], rel_line=1e-5)
+        c = GT.compare(per[1024], per[T])
         chunk_cmp[v] = c
         log(f"G14 visit {v}: chunk 1024 vs one chunk: {c}")
     LG.CHUNK = real
@@ -217,7 +256,7 @@ def main():
     except Exception as e:  # diagnostic only
         rep["G14c"] = {"error": str(e)[:300]}
     rep["base_lp_sum_t8"] = float(lp8.double().sum())
-    rep["pass"] = bool(rep["G13_pass"] and rep["G14_pass"])
+    rep["pass"] = bool(rep["G13_pass"] and rep["G14_pass"] and rep["G15_pass"])
     json.dump(rep, open(a.out, "w"), indent=1, default=float)
     eng.close()
     print(f"T8 GATE S3: {'PASS' if rep['pass'] else 'FAIL'}", flush=True)

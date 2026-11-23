@@ -93,6 +93,8 @@ def validate_config(cfg: T8Config) -> None:
         raise ValueError(f"attn_rank {cfg.attn_rank}: the engine's S10 kernels take ranks 1..64")
     if cfg.attn_rank and cfg.attn_alpha / cfg.attn_rank not in (0.125, 0.25, 0.5, 1.0, 2.0, 4.0):
         raise ValueError("attn_alpha / attn_rank must be a power of two (the store's bf16 fold is then exact)")
+    if cfg.attn_rank and not set(cfg.train_keys) & set(ATTN_KEYS):
+        raise ValueError("attn_rank > 0 but no attention key in train_keys: the attention adapter would run at B = 0 for the whole run")
     if not cfg.train_keys or set(cfg.train_keys) - set(param_keys(cfg.attn_rank)):
         raise ValueError(f"train_keys {cfg.train_keys!r}")
     if set(cfg.segment_keys) - set(cfg.train_keys):
@@ -682,6 +684,10 @@ class T8Trainer:
         return out
 
     def set_masters(self, layers: list) -> None:
+        for L, d in enumerate(layers):
+            miss = [k for k in self.keys if k not in d]
+            if miss:
+                raise ValueError(f"set_masters: layer {L} lacks {miss[:4]} (this trainer's keys: {len(self.keys)} per layer; an expert-only adapter at attn_rank > 0?)")
         i = 0
         with torch.no_grad():
             for d in layers:
@@ -692,9 +698,15 @@ class T8Trainer:
         self._refresh()
 
     def export_adapter(self, out_dir: str, dtype: str = "BF16", meta: dict | None = None) -> str:
+        """The engine's adapter file. Expert-only: the kit's writer (unchanged). With attention LoRA: t8_adapter's combined PEFT-native file
+        (r = attn_rank, lora_alpha = attn_alpha, rank_pattern 16 for the experts; agent-ELORA's served form)."""
+        layers = [{k: v.numpy() for k, v in d.items()} for d in self.masters()]
+        if self.cfg.attn_rank:
+            import t8_adapter as TA
+
+            return TA.export_combined(layers, out_dir, self.cfg.attn_rank, self.cfg.attn_alpha, self.B.RANK, dtype, metadata=meta)
         from surogate.inkling_rl import adapter as AD
 
-        layers = [{k: v.numpy() for k, v in d.items()} for d in self.masters()]
         return AD.export_adapter(layers, out_dir, self.B.RANK, int(self.B.ALPHA), dtype, metadata=meta)
 
     # ------------------------------------------------------------------ gates and reads

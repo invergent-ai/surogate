@@ -554,6 +554,7 @@ void run_visit(Round& rd, int v, const VisitTaps& taps) {
         gemm_bf16(rd.work, L.output, 0, D, gated.data, T, attn_partial.data, D, s);
     }
     if (rd.attn != nullptr && rd.attn->wo_table != nullptr) {  // T8: S10 on wo_ud (forward.cpp step 4)
+        if (rd.attn->rank <= 0 || rd.attn->rank > 64) { throw std::invalid_argument("T8: attention LoRA rank must be 1..64"); }
         const ops::InklingLoraSlice wo[] = {{0, D, gated.data, C::attn_width, attn_partial.data, D}};
         apply_attn_lora_t8(rd.work, rd.attn->wo_table, rd.attn->uniform_slot, rd.attn->rank, wo, 1, T, s);
     }
@@ -742,7 +743,7 @@ int ift_run_visit(void* handle, int v, void* x, std::int32_t T, const std::int32
         if (v < 0 || v >= C::layers) { throw std::out_of_range("visit"); }
         if (ops::lora_active()) {
             throw std::logic_error("ift_run_visit: an engine LoRA store is active in this process; the trainer passes "
-                                   "its expert adapters explicitly and trains no attention LoRA");
+                                   "its expert and attention adapters explicitly (T8)");
         }
         WorkspaceArena work(DeviceSpan{ws, ws_bytes});
         if (h->data->model.queries == nullptr) { throw std::logic_error("ift_run_visit: no derived queries"); }
