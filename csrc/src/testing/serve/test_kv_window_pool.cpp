@@ -3,6 +3,7 @@
 // recycling, images and forks, window page up/download. Exits 77 without a usable device.
 
 #include "core/device.h"
+#include "core/elastic_kv_region.h"
 #include "core/paged_kv_cache.h"
 
 #include <cuda_runtime.h>
@@ -274,6 +275,95 @@ void check_elastic(const sinfer::DeviceContext& device) {
                pool.window_occupancy().lane_in_use == 0, tag + ": everything returned");
 }
 
+/// lanes/OOM F1 (2026-11-23): the window pages charged in the main ledger are mapped by the window
+/// region, so the main region must not map those bytes too. Before the fix the main region could
+/// map its whole cap while the window region mapped the charged pages beside it: on a W5 card both
+/// filled together, 4 MiB were left and the engine aborted. At a round boundary the main region's
+/// limit is its cap less the charged window bytes (rounded up to a granule), and what it maps
+/// stays inside that limit.
+void check_elastic_physical_bound(const sinfer::DeviceContext& device) {
+    const std::string tag = "elastic bound";
+    cudaStream_t stream = device.stream;
+    constexpr std::int32_t kWindow = 128;
+    // The shape of check_elastic: 256 KiB pages in both classes (one window page = one main page),
+    // 16 pages = 4 MiB per granule; main cap 64 pages = 4 granules; a lane is charged 12 pages.
+    sinfer::LayoutBuilder builder;
+    sinfer::PagedKVPoolSpec spec{.page_group_count      = 64,
+                                 .logical_page_capacity = 16,
+                                 .table_rows            = 3,
+                                 .plane_order           = sinfer::PagedKVPlaneOrder::PageMajor,
+                                 .elastic               = true,
+                                 .physical_page_cap     = 64,
+                                 .planes = {{sinfer::DType::BF16, 128, 8, 256, 0},
+                                            {sinfer::DType::BF16, 128, 8, 256, 0},
+                                            {sinfer::DType::BF16, 128, 8, 256, kWindow},
+                                            {sinfer::DType::BF16, 128, 8, 256, kWindow}},
+                                 .window_lane_pages     = 40,
+                                 .window_image_pages    = 8,
+                                 .window_forward_tokens = 1024,
+                                 .window_elastic        = true,
+                                 .window_floor_pages    = 10,
+                                 .window_lane_charge    = 12};
+    const auto layout = sinfer::plan_paged_kv_pool(builder, spec);
+    sinfer::DeviceArena arena(builder.finish(256));
+    // The engine's default reserve of four granules: before the fix it kept the whole cap mapped.
+    const sinfer::PagedKVElasticOptions options{.device = device.device, .fence_stream = stream, .reserve_granules = 4};
+    sinfer::PagedKVPool pool({arena.base(), arena.capacity()}, layout, &options);
+    sinfer::ElasticKvRegion* main_region   = pool.elastic_region();
+    sinfer::ElasticKvRegion* window_region = pool.window_elastic_region();
+    expect(main_region != nullptr && window_region != nullptr, tag + ": both classes are demand-mapped");
+    if (main_region == nullptr || window_region == nullptr) { return; }
+    main_region->wait_idle();
+    auto a = pool.reserve(8);
+    auto b = pool.reserve(8);
+    auto c = pool.reserve(8);
+    const auto charged = pool.window_occupancy();
+    expect(charged.charged_pages == 36 && pool.entitled_pages() == 60, tag + ": three lanes charged 12 window pages each");
+    const std::size_t granule       = main_region->granule_bytes();
+    const std::size_t cap_bytes     = 4 * granule;
+    const std::size_t charged_bytes = std::size_t{charged.charged_pages} * charged.page_bytes;
+    const auto allowed = static_cast<std::uint32_t>((cap_bytes - charged_bytes + granule - 1) / granule);
+    expect(main_region->granule_limit() == allowed,
+           tag + ": the main limit leaves the charged window bytes out (limit " +
+               std::to_string(main_region->granule_limit()) + " granules, " + std::to_string(allowed) + " allowed)");
+    // A round boundary, then the lanes take their pages and the long forwards their window pages.
+    main_region->flush_reserve_release();
+    main_region->wait_idle();
+    a.materialize_tokens(512, stream);
+    b.materialize_tokens(512, stream);
+    c.materialize_tokens(512, stream);
+    a.bind_row(0, stream);
+    b.bind_row(1, stream);
+    c.bind_row(2, stream);
+    a.window_prepare(0, 1024, {}, stream);
+    b.window_prepare(0, 1024, {}, stream);
+    c.window_prepare(0, 128, {}, stream);
+    cudaStreamSynchronize(stream);
+    main_region->flush_reserve_release();
+    main_region->wait_idle();
+    window_region->wait_idle();
+    const std::size_t main_mapped = main_region->mapped_bytes(), window_mapped = window_region->mapped_bytes();
+    expect(main_mapped <= allowed * granule,
+           tag + ": main mapped " + std::to_string(main_mapped >> 20) + " MiB, at most " +
+               std::to_string((allowed * granule) >> 20) + " MiB (cap less the charged window bytes)");
+    // The plan in whole granules: main cap + window floor, + one window granule of rounding.
+    const std::size_t floor_bytes = std::size_t{layout.spec.window_floor_pages} * charged.page_bytes;
+    const std::size_t window_granule = std::size_t{layout.window_granule_pages} * charged.page_bytes;
+    expect(main_mapped + window_mapped <= cap_bytes + floor_bytes + window_granule,
+           tag + ": main + window mapped " + std::to_string((main_mapped + window_mapped) >> 20) + " MiB within the plan");
+    // Two holders leave: the main limit rises at once, so the window region must give its emptied
+    // granules back down to its own (lower) limit at the next boundary (review of 75204b7d, MEDIUM 1).
+    a.release();
+    b.release();
+    window_region->flush_reserve_release();
+    window_region->wait_idle();
+    main_region->wait_idle();
+    expect(window_region->mapped_granules() <= window_region->granule_limit(),
+           tag + ": after holders leave the window region maps " + std::to_string(window_region->mapped_granules()) +
+               " granules, its limit is " + std::to_string(window_region->granule_limit()));
+    c.release();
+}
+
 } // namespace
 
 int main() {
@@ -289,6 +379,7 @@ int main() {
         check(sinfer::PagedKVPlaneOrder::HeadMajor, ctx.stream);
         check_without_windows(ctx.stream);
         check_elastic(ctx);
+        check_elastic_physical_bound(ctx);
     } catch (const std::exception& error) {
         std::cerr << "FAIL (exception): " << error.what() << '\n';
         return 1;

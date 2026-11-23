@@ -212,6 +212,44 @@ static void test_mapping_stays_within_the_cap(sinfer::DeviceContext& device) {
     require(live_handles == baseline, "the cap cases leaked an allocation handle");
 }
 
+// lanes/OOM F2 (2026-11-23): the reserve is mapped ahead of demand only while the device keeps the
+// headroom free. Before the fix the worker refilled it until cuMemCreate failed: after an
+// on-demand reclaim on a W5 card it mapped the device down to 4 MiB, and the next
+// cudaMallocAsync aborted the engine. On-demand maps are unchanged (the executor needs them).
+static void test_reserve_keeps_the_headroom(sinfer::DeviceContext& device) {
+    constexpr std::size_t quantum = 2ULL << 20;
+    const int baseline = live_handles;
+    g_probe_free = std::size_t{1} << 40;
+    {
+        sinfer::ElasticKvRegion region({
+            .device = device.device, .fence_stream = device.stream, .bytes = 6 * quantum,
+            .page_count = 6, .granule_pages = 1, .reserve_granules = 2,
+            .headroom_bytes = 8 * quantum, .free_bytes_probe = &probe_free,
+            .planes = {{0, quantum}}});
+        region.wait_idle();
+        require(region.mapped_granules() == 2, "with memory to spare the reserve is mapped ahead");
+        region.acquire_page(0);
+        region.acquire_page(1);
+        region.wait_idle();
+        require(region.mapped_granules() == 4, "the reserve refills while the headroom is free");
+        // Short of the headroom plus a granule: no reserve map.
+        g_probe_free = 8 * quantum + quantum / 2;
+        region.acquire_page(2); // inside the reserve: no map
+        region.acquire_page(3);
+        region.wait_idle();
+        require(region.mapped_granules() == 4, "the reserve was refilled into the device's headroom");
+        // Demand itself still maps (the executor recovers if the device really is full).
+        region.acquire_page(4);
+        region.wait_idle();
+        require(region.mapped_granules() == 5, "an on-demand map was refused below the cap");
+        g_probe_free = std::size_t{1} << 40;
+        for (const int page : {0, 1, 2, 3, 4}) { region.release_page(page); }
+        region.wait_idle();
+    }
+    g_probe_free = std::size_t{1} << 40;
+    require(live_handles == baseline, "the headroom cases leaked an allocation handle");
+}
+
 int main() {
     int count = 0;
     if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) { return 77; }
@@ -220,6 +258,7 @@ int main() {
         test_wake_retry(device);
         test_out_of_memory_on_demand(device);
         test_mapping_stays_within_the_cap(device);
+        test_reserve_keeps_the_headroom(device);
         constexpr std::size_t quantum = 2ULL << 20;
         for (const bool retry : {false, true}) {
             for (int plane = 0; plane < 3; ++plane) {

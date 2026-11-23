@@ -557,6 +557,11 @@ private:
         snapshot.kv_pages_resident_at_granule = kv.resident_pages_at_granule;
         snapshot.kv_pages_mapped            = kv.mapped_pages;
         snapshot.kv_page_bytes              = kv.page_bytes;
+        snapshot.kv_window_mapped_pages     = kv.window_mapped_pages;
+        snapshot.kv_window_charged_pages    = kv.window_charged_pages;
+        snapshot.kv_window_floor_pages      = kv.window_floor_pages;
+        snapshot.kv_window_granule_pages    = kv.window_granule_pages;
+        snapshot.kv_window_page_bytes       = kv.window_page_bytes;
         snapshot.device_oom_rounds          = device_oom_rounds_;
         snapshot.kv_capacity_pages          = kv.capacity_pages;
         snapshot.kv_on_demand               = kv_on_demand_ ? 1U : 0U;

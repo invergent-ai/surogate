@@ -1076,6 +1076,12 @@ struct RuntimeStats {
     std::uint32_t kv_granule_pages             = 0;
     std::uint32_t kv_pages_resident_at_granule = 0;
     std::size_t kv_page_bytes                  = 0;
+    // Elastic window class (M3-C) of the main pool; zero without one (see PagedKVOccupancy).
+    std::uint32_t kv_window_mapped_pages       = 0;
+    std::uint32_t kv_window_charged_pages      = 0;
+    std::uint32_t kv_window_floor_pages        = 0;
+    std::uint32_t kv_window_granule_pages      = 0;
+    std::size_t kv_window_page_bytes           = 0;
     // Times the queue head could not be given a lane although the admission ledger found it
     // unblocked -- it is waiting on pages the ledger cannot attribute, most often KV still
     // committed to a retained GPU prefix. A benign retry, but a rising count means admission
