@@ -67,7 +67,7 @@ def load_plan(plan_dir: str, cap: int = CAP):
     if "rows.npz" in want and want["rows.npz"] != sha256(path):
         raise ValueError("rows.npz does not match its manifest sha256")
     z = np.load(path, allow_pickle=False)
-    R = sum(1 for k in z.files if k.startswith("ids_"))
+    R = sum(1 for k in z.files if k.startswith("ids_") and k[4:].isdigit())   # not ids_crc32
     adv, trial, group, Tv, crc = (z[k] for k in ("advantage", "trial_idx", "group_idx", "T", "ids_crc32"))
     if not all(len(x) == R for x in (adv, trial, group, Tv, crc)):
         raise ValueError("per-row vectors and row count differ")

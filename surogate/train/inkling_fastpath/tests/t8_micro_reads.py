@@ -56,7 +56,7 @@ def main():
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     z = np.load(os.path.join(a.plan, "rows.npz"), allow_pickle=False)
-    R = sum(1 for k in z.files if k.startswith("ids_"))
+    R = sum(1 for k in z.files if k.startswith("ids_") and k[4:].isdigit())
     Ts = {n: int(z["T"][n]) for n in range(R)}
     mine = split(Ts, a.parts)[a.part]
     subset = {}
