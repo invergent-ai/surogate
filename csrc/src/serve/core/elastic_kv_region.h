@@ -107,6 +107,11 @@ public:
     /// is mapped, the free granules go back at the next round boundary (flush_reserve_release; the
     /// pipelined executor flushes at its idle boundaries, kv_round_boundary).
     void set_foreign_bytes(std::size_t bytes) noexcept;
+    /// The region that maps the foreign bytes. Whatever it maps past its own limit is left out
+    /// of this region's limit too, so the two stay inside the plan while its emptied or
+    /// partly used granules wait to go back. Both regions must outlive each other's use: the
+    /// pool that owns them both sets this once.
+    void set_foreign_region(const ElasticKvRegion& other) noexcept;
     /// Mapped past the granule limit (its entitlement fell, e.g. a window class whose holders left):
     /// the free granules go back at the next round boundary. A worker unmap otherwise keeps up to
     /// the trim threshold of emptied granules, past the entitlement the plan counted.

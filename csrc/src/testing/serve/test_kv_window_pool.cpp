@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -364,6 +365,109 @@ void check_elastic_physical_bound(const sinfer::DeviceContext& device) {
     c.release();
 }
 
+/// Holders leave while the window region still maps granules past its lowered limit: granules that
+/// still hold another holder's pages (a lane the compaction may not move this round, an image,
+/// which never moves). Before the fix the main region's limit rose by the whole charge at once, so
+/// the two limits together promised more than the plan. Now the main limit also leaves out what
+/// the window region maps past its own limit, and the sum stays inside main cap + window floor
+/// (+ one window granule of rounding, as check_elastic_physical_bound allows).
+void check_elastic_overshoot(const sinfer::DeviceContext& device) {
+    const std::string tag = "elastic overshoot";
+    cudaStream_t stream = device.stream;
+    constexpr std::int32_t kWindow = 128;
+    // check_elastic_physical_bound's shape: 256 KiB pages in both classes, 16 pages a granule,
+    // main cap 64 pages; window pages: sentinel 0, lanes 1..40, images 41..48 (granules 0..3).
+    sinfer::LayoutBuilder builder;
+    sinfer::PagedKVPoolSpec spec{.page_group_count      = 64,
+                                 .logical_page_capacity = 16,
+                                 .table_rows            = 3,
+                                 .plane_order           = sinfer::PagedKVPlaneOrder::PageMajor,
+                                 .elastic               = true,
+                                 .physical_page_cap     = 64,
+                                 .planes = {{sinfer::DType::BF16, 128, 8, 256, 0},
+                                            {sinfer::DType::BF16, 128, 8, 256, 0},
+                                            {sinfer::DType::BF16, 128, 8, 256, kWindow},
+                                            {sinfer::DType::BF16, 128, 8, 256, kWindow}},
+                                 .window_lane_pages     = 40,
+                                 .window_image_pages    = 8,
+                                 .window_forward_tokens = 1024,
+                                 .window_elastic        = true,
+                                 .window_floor_pages    = 10,
+                                 .window_lane_charge    = 12};
+    const auto layout = sinfer::plan_paged_kv_pool(builder, spec);
+    sinfer::DeviceArena arena(builder.finish(256));
+    const sinfer::PagedKVElasticOptions options{.device = device.device, .fence_stream = stream, .reserve_granules = 4};
+    sinfer::PagedKVPool pool({arena.base(), arena.capacity()}, layout, &options);
+    sinfer::ElasticKvRegion* main_region   = pool.elastic_region();
+    sinfer::ElasticKvRegion* window_region = pool.window_elastic_region();
+    expect(main_region != nullptr && window_region != nullptr, tag + ": both classes are demand-mapped");
+    if (main_region == nullptr || window_region == nullptr) { return; }
+    const auto pages_of = [](const sinfer::PagedKVAllocation& allocation) {
+        std::vector<std::int32_t> out;
+        for (const auto& slot : allocation.window_slots()) { out.push_back(slot.physical); }
+        return out;
+    };
+    auto a = pool.reserve(4);
+    auto b = pool.reserve(4);
+    auto c = pool.reserve(4);
+    a.bind_row(0, stream);
+    b.bind_row(1, stream);
+    c.bind_row(2, stream);
+    // a: pages 1..16, c: 17..32, b: 33, 34 (before the settles give 1..14 and 17..30 back); a and c
+    // keep their window (a: 15, 16; c: 31, 32).
+    a.window_prepare(0, 1024, {}, stream);
+    c.window_prepare(0, 1024, {}, stream);
+    b.window_prepare(0, 128, {}, stream);
+    a.window_settle(1024, {}, stream);
+    c.window_settle(1024, {}, stream);
+    expect(pages_of(c) == std::vector<std::int32_t>({31, 32}) && pages_of(b) == std::vector<std::int32_t>({33, 34}),
+           tag + ": c keeps 31, 32 (granules 1, 2); b holds 33, 34 (granule 2)");
+    // Four images of c's window: 41-42, 43-44, 45-46, 47-48; the last one straddles granules 2 and 3.
+    std::vector<std::shared_ptr<const sinfer::PagedKVWindowImage>> images;
+    for (int i = 0; i < 4; ++i) { images.push_back(pool.capture_window_image(c, 1024, stream)); }
+    expect(images.back() != nullptr, tag + ": four images captured");
+    cudaStreamSynchronize(stream);
+    // a, b and the first three images leave; c (not compacted this round) and the last image stay.
+    std::shared_ptr<const sinfer::PagedKVWindowImage> last_image = images.back();
+    images.clear();
+    a.release();
+    b.release();
+    expect(pool.window_occupancy().charged_pages == 14, tag + ": c (12) and one image (2) stay charged");
+    // The next round boundary: both regions give back what they may.
+    main_region->flush_reserve_release();
+    window_region->flush_reserve_release();
+    window_region->wait_idle();
+    main_region->wait_idle();
+    // Granules 0 (sentinel), 1 (c), 2 (c, image), 3 (image) hold pages; the window limit is
+    // ceil((floor 32 + charged 14) / 16) = 3 granules.
+    const std::uint32_t window_granules = window_region->mapped_granules();
+    expect(window_granules == 4 && window_region->granule_limit() == 3,
+           tag + ": the window region maps " + std::to_string(window_granules) + " granules past its limit of " +
+               std::to_string(window_region->granule_limit()));
+    const std::size_t granule        = main_region->granule_bytes();
+    const std::size_t page_bytes     = pool.window_occupancy().page_bytes;
+    const std::size_t cap_bytes      = 4 * granule;
+    const std::size_t floor_bytes    = std::size_t{layout.spec.window_floor_pages} * page_bytes;
+    const std::size_t window_granule = std::size_t{layout.window_granule_pages} * page_bytes;
+    const std::size_t promised       = std::size_t{main_region->granule_limit()} * granule + window_region->mapped_bytes();
+    expect(promised <= cap_bytes + floor_bytes + window_granule,
+           tag + ": main limit + window mapped " + std::to_string(promised >> 20) + " MiB within the plan " +
+               std::to_string((cap_bytes + floor_bytes + window_granule) >> 20) + " MiB (main limit " +
+               std::to_string(main_region->granule_limit()) + " granules)");
+    // The overshoot gone (c compacts into granule 0's holes, granule 1 goes back), the limit comes back.
+    expect(pool.compact_window_class({}, stream) == 2, tag + ": c's two pages move into granule 0");
+    cudaStreamSynchronize(stream);
+    window_region->flush_reserve_release();
+    window_region->wait_idle();
+    const auto restored = static_cast<std::uint32_t>((cap_bytes - 14 * page_bytes + granule - 1) / granule);
+    expect(window_region->mapped_granules() == 3 && main_region->granule_limit() == restored,
+           tag + ": window back at its limit (" + std::to_string(window_region->mapped_granules()) +
+               " granules), main limit " + std::to_string(main_region->granule_limit()) + " = cap less the charge (" +
+               std::to_string(restored) + ")");
+    last_image.reset();
+    c.release();
+}
+
 } // namespace
 
 int main() {
@@ -380,6 +484,7 @@ int main() {
         check_without_windows(ctx.stream);
         check_elastic(ctx);
         check_elastic_physical_bound(ctx);
+        check_elastic_overshoot(ctx);
     } catch (const std::exception& error) {
         std::cerr << "FAIL (exception): " << error.what() << '\n';
         return 1;

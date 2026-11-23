@@ -282,6 +282,9 @@ PagedKVPool::PagedKVPool(DeviceSpan backing, const PagedKVPoolLayout& layout,
         }
         window_elastic_ = std::make_unique<ElasticKvRegion>(std::move(region));
         window_backing  = DeviceSpan{window_elastic_->base(), window_elastic_->bytes()};
+        // The main region's limit leaves out what this region maps past its own (holders left,
+        // their granules not yet given back): set_foreign_bytes alone rose at once.
+        if (elastic_) { elastic_->set_foreign_region(*window_elastic_); }
     }
     planes_.reserve(layout.planes.size());
     for (std::size_t index = 0; index < layout.planes.size(); ++index) {
@@ -1574,6 +1577,9 @@ std::uint32_t PagedKVPool::compact_window_class(std::span<const PagedKVAllocatio
         ++moved;
     }
     window_moved_pages_ += moved;
+    // Granules the moves emptied go back at the next round boundary while the region maps past its
+    // limit; the worker's unmap job alone keeps them up to the trim threshold.
+    if (moved != 0) { window_elastic_->release_above_limit(); }
     static const bool trace = std::getenv("SUROGATE_SERVE_KV_WINDOW_TRACE") != nullptr;
     if (trace && moved != 0) {
         std::fprintf(stderr, "kv-window: compaction moved %u pages (%u in use, %u granules before)\n", moved, in_use,
