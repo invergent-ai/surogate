@@ -47,6 +47,9 @@ class FakeTrainer:
         self.opt = MasterAdamW(self.work, lr=LR, weight_decay=0.0, max_grad_norm=1.0)
         self._sync()
 
+    def _refresh(self):                                     # T8Trainer._refresh: every worker sees the work values (here: copies)
+        self._sync()
+
     def _sync(self):
         with torch.no_grad():
             for w in self.workers[1:]:
