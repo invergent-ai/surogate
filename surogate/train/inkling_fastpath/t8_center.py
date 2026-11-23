@@ -1,4 +1,4 @@
-"""Score centering for truncated sampling (copied from the census worker's rx_center.py; only this docstring line differs).
+"""Score centering for truncated sampling (copied from the reference gradient worker; only this docstring line differs).
 The rollouts sample from pi^S: the model's distribution cut to the support S_t (top_k 20, then top_p 0.95 on the top-20 mass, T = 1) and
 renormalised. The score of what was sampled is grad log pi^S(x_t) = grad [log pi(x_t) - log sum_{v in S_t} pi(v)], S_t fixed; at the base
 point its seed on the logits is e_{x_t} - q_t, q_t = pi renormalised on S_t (at most 20 non-zeros). Its mean under q_t is zero; the

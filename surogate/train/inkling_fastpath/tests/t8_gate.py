@@ -8,10 +8,10 @@ Phase "trainer" (two cards; four real rows of 16k / 28k / 47k / 57k; K = 18, cen
   G5  the hard gates hold on real rows: replay 0 mismatches, support gate, zero-adapter check.
   G6  host peak per worker <= 20 GiB with the 57k row; no row out of memory at query block 8.
 Phase "g7" (one card; rows of 16k / 28k / 47k; centred head, seeds "weights", B keys):
-  G7  the step's gradient at K = 48 and K = 18 == the FROZEN census worker's gradient on the same rows (g7pack/g7_ref.py: snapshot a7ddf69e + rx_coda2 + rx_center, fp32 A): per tensor,
-      per segment (A, B, C, D1, D0; at K = 18: A, B) and for the per-layer totals. Line as G1-G3. IF G7 FAILS THE STEP IS NOT CLEARED FOR THE LOOP. No census statistic is read.
+  G7  the step's gradient at K = 48 and K = 18 == the FROZEN reference gradient worker's gradient on the same rows (an external reference script on a frozen snapshot, fp32 A): per tensor,
+      per segment (A, B, C, D1, D0; at K = 18: A, B) and for the per-layer totals. Line as G1-G3. IF G7 FAILS THE STEP IS NOT CLEARED FOR THE LOOP. No other statistic is read.
   G7c = the same line and comparison on the 57k row (--g7-rows 3), run inside the 8-card gate.
-  G7b (diagnostic, no line): the same lean path with the census worker's fp32 A at K = 18 on the 16k and 28k rows against the reference: is A's bf16 rounding the only difference?
+  G7b (diagnostic, no line): the same lean path with the reference gradient worker's fp32 A at K = 18 on the 16k and 28k rows against the reference: is A's bf16 rounding the only difference?
 Line for G1-G3 and G7: every tensor cos >= 0.9999 and relative error <= 1 % (G4: 1e-5), all finite. Whether a comparison is BITWISE is reported beside it; bitwise is expected for G1-G3.
 No adapter is saved; nothing is trained.
 """
@@ -324,7 +324,7 @@ def phase_g7(a, rows):
     if not {0, 1} <= set(which):                              # the G7b diagnostic reads rows 0 and 1
         rep["pass"] = rep["G7"]
         return rep
-    # G7b: the census worker's fp32 A through the lean path (diagnostic)
+    # G7b: the reference gradient worker's fp32 A through the lean path (diagnostic)
     eng = E.InklingEngine(a.bin, a.artifact, 0)
     W = B.EngineWeights(eng)
     lora = B.make_lora(eng.dev, seed=0, b_std=0.0)

@@ -16,6 +16,12 @@ a gradient. Real rows of 16,009 / 28,002 / 47,014 / 57,431 tokens (gate_rows.npz
   G17 (2 cards; the 4 gate rows 16k / 28k / 47k / 57k; written 2026-11-23 before any run): S4 (a) + (b), `lean_host`: one `compute`
       (seeds "weights", K = 48, four expert keys, segment sums off) with lean_host off and on: gradients BITWISE equal on every tensor; host peak per
       worker (VmHWM, the 57k row's worker) reported for both; tok/s for both (the per-visit pinned-pool emptying costs time).
+  G19 (6 cards, one box; written 2026-11-23 before any run): the first training run's layout measured. One `ppo_batch` (2 mini-batches, lr 2e-5, plain head) with
+      the FULL adapter (attention r64 / alpha 32 + experts r16, A and B, all keys trained), K = 48, 6 workers, lean_host (a) on, (b) off, sketches on
+      (visits 3, 12, 36, 45; expert stride 64), on 12 real rows (gate8_rows.npz: its 8 longest batch rows, up to 57,431 tokens, + 4 of its shortest),
+      4 groups of 3 attempts with synthetic scores (one attempt per group with advantage 0). PASS iff: replay 0 mismatches on every row, stale gate on
+      every row of mini-batch 1, every gradient finite, a sketch file for every attempt with a non-zero advantage (and the zero-advantage ones counted,
+      not sketched). Reported, no line: host peak per worker, their sum, lowest box MemAvailable (against the 60 GB floor), tok/s per card per mini-batch.
 """
 from __future__ import annotations
 
@@ -238,9 +244,70 @@ def phase_g17(a, rows):
     return rep
 
 
+def phase_g19(a, rows_unused):
+    from surogate.inkling_rl.step import StepConfig
+    import t8_gate8 as G8
+    import t8_skyrl as KS
+    import t8_step as TS
+
+    rows_all, groups = G8.load(a.rows)
+    batch = sorted(groups["batch"], key=lambda i: rows_all[i].T)
+    pick = batch[-8:] + batch[:4]                            # 8 longest + 4 shortest
+    pick = [pick[k] for k in (0, 8, 1, 2, 9, 3, 4, 10, 5, 6, 11, 7)]  # 4 groups of 3, long and short rows mixed
+    rows = [rows_all[i] for i in pick]
+    for k, r in enumerate(rows):
+        r.trial_idx, r.group_idx = k, k // 3
+    scores = {k: [1.0, 0.0, 0.5][k % 3] for k in range(len(rows))}   # (1, 0, 0.5): the 0.5 attempt has advantage exactly 0 in its group
+    KS.grpo_advantages_rows(rows, scores)
+    cards = tuple(int(x) for x in a.cards.split(","))
+    sk = os.path.join(a.run_dir, "sketches")
+    rep = {"rows": [r.T for r in rows], "advantages": [r.advantage for r in rows]}
+    tr = TS.T8Trainer(TS.T8Config(bin_dir=a.bin, artifact=a.artifact, cards=cards, K=48, head="plain", attn_rank=64, attn_alpha=32.0,
+                                  train_keys=TS.param_keys(64), segment_keys=(), run_dir=a.run_dir, lean_host=True, max_row_tokens=58010,
+                                  sketch_visits=(3, 12, 36, 45), sketch_expert_stride=64, sketch_dir=sk))
+    try:
+        with G8.MemWatch() as mw:
+            res = TS.ppo_batch(tr, rows, 0, 2e-5, 2, StepConfig(max_policy_lag=None))
+        rep["min_mem_available_gb"] = mw.low
+    finally:
+        tr.close()
+    rep["minibatches"] = []
+    files = []
+    for k, (o, n) in enumerate(res):
+        w = o.metrics["workers"]
+        rep["minibatches"].append({"rows": [x["T"] for x in o.rows], "grad_norm": n, "finite": all(bool(torch.isfinite(g).all()) for g in o.grads),
+                                   "replay_checked_rows": o.metrics["replay_checked_rows"], "replay_skipped_rows": o.metrics["replay_skipped_rows"],
+                                   "stale_checked_rows": o.metrics["stale_checked_rows"], "tok_per_s_per_card": o.metrics["tok_per_s_per_card"],
+                                   "wall_s": o.metrics["wall_s"], "clip_ratio": o.metrics.get("ppo_clip_ratio"), "ratio_max": o.metrics.get("ppo_ratio_max"),
+                                   "workers": [{"card": x["card"], "VmHWM_gib": x["VmHWM_gib"], "card_peak_torch_gib": x["card_peak_torch_gib"]} for x in w]})
+        files += o.metrics.get("sketch_files", [])
+        log(f"G19 mini-batch {k}: {rep['minibatches'][-1]}")
+    sketched = set()
+    zero_counted = 0
+    for f in files:
+        d = torch.load(f, map_location="cpu", weights_only=False)
+        if d["rows"] > 0 and d["tensors"]:
+            sketched.add(d["trial"])
+        zero_counted += d["rows_skipped_zero_factor"]
+    want = {r.trial_idx for r in rows if r.advantage != 0.0}
+    rep["sketch_files"] = len(files)
+    rep["sketched_trials"] = sorted(sketched)
+    rep["zero_advantage_rows_counted"] = zero_counted
+    rep["host_peak_per_worker_gib"] = max(x["VmHWM_gib"] for m in rep["minibatches"] for x in m["workers"])
+    rep["host_peak_sum_gib"] = sum(max(x["VmHWM_gib"] for m in rep["minibatches"] for x in m["workers"] if x["card"] == c) for c in cards)
+    mb0 = rep["minibatches"][0]
+    rep["pass"] = bool(all(m["finite"] for m in rep["minibatches"]) and all(m["replay_skipped_rows"] == 0 for m in rep["minibatches"])
+                       and mb0["stale_checked_rows"] == len(mb0["rows"]) and want <= sketched
+                       and zero_counted == sum(1 for r in rows if r.advantage == 0.0))
+    import shutil
+    rep["sketch_bytes"] = sum(os.path.getsize(f) for f in files)
+    shutil.rmtree(sk, ignore_errors=True)                    # measured, not kept
+    return rep
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--phase", required=True, choices=("g10", "g12", "g16", "g17"))
+    ap.add_argument("--phase", required=True, choices=("g10", "g12", "g16", "g17", "g19"))
     ap.add_argument("--bin", required=True)
     ap.add_argument("--artifact", required=True)
     ap.add_argument("--rows", required=True)
@@ -249,7 +316,8 @@ def main():
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     rows = GT.gate_rows(a.rows)
-    rep = {"g10": phase_g10, "g12": phase_g12, "g16": phase_g16, "g17": phase_g17}[a.phase](a, rows)
+    rows = None if a.phase == "g19" else rows
+    rep = {"g10": phase_g10, "g12": phase_g12, "g16": phase_g16, "g17": phase_g17, "g19": phase_g19}[a.phase](a, rows)
     json.dump(rep, open(a.out, "w"), indent=1, default=float)
     print(f"T8 GATE S1 {a.phase}: {'PASS' if rep['pass'] else 'FAIL'}", flush=True)
     return 0 if rep["pass"] else 4

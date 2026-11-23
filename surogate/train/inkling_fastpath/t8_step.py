@@ -4,7 +4,7 @@ The per-row arithmetic is `inkling_rl.step.run_step`'s, split in two so that it 
  - plan_rows (coordinator): off-policy drop, refusals, R3 counters, the loss scale. Same order and rules as run_step, lines 126-167 and 193-196.
  - WorkerCore.process_row (worker): ONE forward per row (run_step's score pass and update pass run at the same weights, so their log-probs are the
    same bits), mismatch metric, TIS weights, seeds from the deployed loss, backward, row gradient added to the worker's sum.
-Hard gates (STEP-API): replay (bitwise at every loss token of an on-policy row), routing where the rollout captured it, support (centred head),
+Hard gates: replay (bitwise at every loss token of an on-policy row), routing where the rollout captured it, support (centred head),
 finite gradients. A failed gate raises T8GateError in the coordinator and writes <run_dir>/STOP.
 """
 from __future__ import annotations
@@ -724,7 +724,7 @@ def compute_step(handles: list, layout: ParamLayout, flats: list, shapes: list, 
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# the trainer object the RL loop holds (STEP-API)
+# the trainer object the RL loop holds
 # ---------------------------------------------------------------------------------------------------------------------
 class T8Trainer:
     """One spawned worker per card. A script using it must guard its entry point with `if __name__ == "__main__"` (spawn re-imports it)."""
@@ -885,7 +885,7 @@ class T8Trainer:
         return compute_step(self.handles, self.layout, self.flats, self.shapes, self.cfg, rows, version, step_cfg, seeds, minibatch_index)
 
     def ppo_batch(self, rows: list, version, lr: float, n_minibatches: int = 1, step_cfg: StepConfig | None = None) -> list:
-        """SkyRL's update on one batch (PLAN-SKYRL.md S2): old log-probs recomputed by the trainer at the start weights, then n_minibatches optimizer steps,
+        """SkyRL's update on one batch: old log-probs recomputed by the trainer at the start weights, then n_minibatches optimizer steps,
         each on a contiguous part of `rows` that never splits a group (row.group_idx). row.advantage must already hold the GRPO advantage
         (t8_skyrl.grpo_advantages). Returns [(StepOut, grad norm)] per mini-batch."""
         return ppo_batch(self, rows, version, lr, n_minibatches, step_cfg)
