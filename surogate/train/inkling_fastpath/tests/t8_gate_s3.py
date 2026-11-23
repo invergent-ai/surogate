@@ -12,6 +12,10 @@ Row: the first 4,096 tokens of gate_rows.npz row 1.
       export's zeros: invalid by construction); (ii) "every element within one bf16 ulp" is replaced by "every element within one bf16 ulp OR within
       1e-5 x the slice's largest |delta|": where base + delta nearly cancels, the result's ulp is far below the fp32 rounding of a 64-term delta
       (s3-1: >= 99.98 % of elements bitwise in every slice, 243 of 288 slices had some element beyond one ulp).
+      APPROVED by the coordinator 13:1x with conditions, fixed here BEFORE the rerun: per slice the worst element's distance in ulps and the share of
+      elements beyond one ulp are reported; the cancellation explanation is checked on the elements beyond one ulp: it HOLDS iff, in every slice
+      that has such elements, the median of |want| / max(|base|, |delta|) over them is <= 0.25 (|base + delta| small against its parts); if it does not
+      hold, G13 FAILS whatever the amended line says.
   G15 the TRAINER's own pieces against the engine (review M1), visits 0, 5, 18, 30, 41, 47: t8_visit.qkvr_raw / wo_raw on the engine's own visit inputs
       (attn_in tap of run (a); gated tap of run (b)), with the slices taken from the trainer's WORK values through t8_visit.lora_dict (the one key-to-slice
       map the backward uses) and the trainer's scale: (torch with adapter - torch without) vs (engine (b) - engine (a)) per qkvr slice and
@@ -43,6 +47,24 @@ D = 2304
 
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def ulp_stats(got, want, base, delta):
+    """per slice: worst distance in ulps of `want`, share of elements beyond one ulp, and the cancellation ratio median |want| / max(|base|, |delta|)
+    over those elements (None when there are none)."""
+    w = want.to(BF)
+    wf = w.float()
+    up = (torch.nextafter(w, torch.full_like(w, float("inf"))).float() - wf).abs()
+    dn = (wf - torch.nextafter(w, torch.full_like(w, float("-inf"))).float()).abs()
+    ulp = torch.maximum(up, dn).clamp(min=2 ** -133)
+    d = (got - want).abs() / ulp
+    beyond = d > 1.0001
+    share = float(beyond.float().mean())
+    ratio = None
+    if bool(beyond.any()):
+        den = torch.maximum(base.abs(), delta.abs()).clamp(min=1e-30)
+        ratio = float((want.abs() / den)[beyond].median())
+    return {"worst_ulps": float(d.max()), "share_beyond_one_ulp": share, "cancel_ratio_median": ratio}
 
 
 def ulp_cmp(got, want, delta=None):
@@ -117,6 +139,7 @@ def main():
     sl = {"q": (0, 3072), "r": (3072, 384), "g": (3456, 3072), "s": (6528, 24), "k": (6552, 1024), "v": (7576, 1024)}
     ok = True
     ok2 = True
+    cancel_ok = True
     import t8_visit as TV
     keys = TS.param_keys(64)
     rep["G15"] = []
@@ -145,17 +168,25 @@ def main():
             af, bf = st[s][0].float(), st[s][1].float()
             want = ((ta["qkvr"][:, r0:r0 + n] + (xin @ af.T) @ bf.T).to(BF)).float()
             eq, within = ulp_cmp(tb["qkvr"][:, r0:r0 + n], want)
-            _, within2 = ulp_cmp(tb["qkvr"][:, r0:r0 + n], want, (xin @ af.T) @ bf.T)
+            dl = (xin @ af.T) @ bf.T
+            _, within2 = ulp_cmp(tb["qkvr"][:, r0:r0 + n], want, dl)
+            us = ulp_stats(tb["qkvr"][:, r0:r0 + n], want, ta["qkvr"][:, r0:r0 + n], dl)
+            if us["cancel_ratio_median"] is not None and us["cancel_ratio_median"] > 0.25:
+                cancel_ok = False
             nz = float((tb["qkvr"][:, r0:r0 + n] != ta["qkvr"][:, r0:r0 + n]).float().mean())
-            row[s] = (eq, within, nz, within2)
+            row[s] = (eq, within, nz, within2, us)
             ok = ok and eq >= 0.999 and within and nz > 0
             ok2 = ok2 and eq >= 0.999 and within2 and nz > 0
         af, bf = st["o"][0].float(), st["o"][1].float()
         want = ((tb["attn_partial"] + (tb["gated"] @ af.T) @ bf.T).to(BF)).float()
         eq, within = ulp_cmp(tc_["attn_partial"], want)
-        _, within2 = ulp_cmp(tc_["attn_partial"], want, (tb["gated"] @ af.T) @ bf.T)
+        dl = (tb["gated"] @ af.T) @ bf.T
+        _, within2 = ulp_cmp(tc_["attn_partial"], want, dl)
+        us = ulp_stats(tc_["attn_partial"], want, tb["attn_partial"], dl)
+        if us["cancel_ratio_median"] is not None and us["cancel_ratio_median"] > 0.25:
+            cancel_ok = False
         nz = float((tc_["attn_partial"] != tb["attn_partial"]).float().mean())
-        row["o"] = (eq, within, nz, within2)
+        row["o"] = (eq, within, nz, within2, us)
         ok = ok and eq >= 0.999 and within and nz > 0
         ok2 = ok2 and eq >= 0.999 and within2 and nz > 0
         rep["G13"].append(row)
@@ -198,7 +229,9 @@ def main():
     rep["G13_base_vs_rollout"] = {"loss_tokens": int(m1.sum()), "mismatches": base_bad}
     log(f"G13 base forward of the T8 shim vs the rollout: {base_bad} mismatches of {int(m1.sum())}")
     rep["G13_pass_as_registered"] = bool(ok and base_bad == 0 and int(m1.sum()) > 0)
-    rep["G13_pass"] = bool(ok2 and base_bad == 0 and int(m1.sum()) > 0)   # the amended line (pending approval)
+    rep["G13_cancellation_explanation_holds"] = bool(cancel_ok)
+    rep["G13_pass"] = bool(ok2 and cancel_ok and base_bad == 0 and int(m1.sum()) > 0)   # the amended line (approved 13:1x) + the cancellation check
+    log(f"G13: registered line {rep['G13_pass_as_registered']}; amended line + cancellation check {rep['G13_pass']} (cancellation holds: {cancel_ok}); base {base_bad} of {int(m1.sum())}")
     rep["G15_pass"] = bool(ok15 and len(rep["G15"]) == 6)
     # ---------------------------------------------------------------- G14: gradients of the attention keys
     eng.attn_layers = attn.adapters
