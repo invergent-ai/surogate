@@ -216,6 +216,11 @@ def phase_g17(a, rows):
                                       train_keys=("A13", "B13", "A2", "B2"), run_dir=a.run_dir, lean_host=lean))
         try:
             tr.set_masters(nonzero_masters())
+            if not lean:  # the rows' log-probs were sampled at the zero adapter: the gate's replay reads the trainer's own at its adapter (as G12)
+                for r, x in zip(rows, tr.logprobs(rows)):
+                    e = np.zeros(r.T, dtype=np.float64)
+                    e[1:] = x.astype(np.float64)
+                    r.engine_lp = e * r.loss_mask
             o = tr.compute(rows, None, StepConfig(max_policy_lag=None), seeds="weights")
         finally:
             tr.close()
