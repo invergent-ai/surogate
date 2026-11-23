@@ -1,7 +1,7 @@
 """Lane T8, S0: SkyRL's policy loss, advantage and reduction for the W5 trainer (lanes/T8/PLAN-SKYRL.md; SkyRL faae9039, preset `lora`).
 
 Written from SkyRL's code, line for line, in fp64 on the host (the per-row seeds of our step):
-- GRPO advantage (`ppo_utils.py:1411-1460`, `compute_grpo_outcome_advantage`): per group, mean of the scores and torch.std (unbiased); a group of
+- GRPO advantage (`ppo_utils.py:1411-1460`, `compute_grpo_outcome_advantage`): per group, mean of the scores and torch.std (unbiased), both in fp32 as SkyRL's calls give them; a group of
   ONE gets mean 0, std 1; advantage = (score - mean) / (std + eps), eps 1e-6, with `grpo_norm_by_std=True` (`mini:105`); without it, score - mean.
 - dual-clip PPO (`ppo_utils.py:566-597`): ratio = exp(clamp(logp - old, -20, 20)) (`torch_utils.py:188-193`, computed in fp32 there),
   surr1 = ratio A, surr2 = clamp(ratio, 1 - eps_low, 1 + eps_high) A, loss = -min(surr1, surr2); where A < 0: min(-A c, loss).
@@ -37,10 +37,11 @@ def grpo_advantages(scores, groups, cfg: SkyRLLoss = SkyRLLoss()) -> np.ndarray:
     out = torch.empty_like(s)
     for g, idx in by.items():
         v = s[idx]
+        lst = [s[i] for i in idx]
         if len(idx) == 1:
-            mean, std = torch.tensor(0.0, dtype=s.dtype), torch.tensor(1.0, dtype=s.dtype)
-        else:
-            mean, std = v.mean(), v.std()
+            mean, std = torch.tensor(0.0), torch.tensor(1.0)
+        else:  # SkyRL's exact calls: torch.tensor over a list of 0-d tensors gives torch's DEFAULT dtype (fp32) for the mean and std
+            mean, std = torch.mean(torch.tensor(lst)), torch.std(torch.tensor([lst]))
         out[idx] = (v - mean) / (std + cfg.grpo_eps) if cfg.grpo_norm_by_std else v - mean
     return out.numpy()
 
