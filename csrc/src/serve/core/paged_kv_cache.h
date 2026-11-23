@@ -229,6 +229,13 @@ struct PagedKVOccupancy {
     std::uint32_t mapped_pages              = 0;
     std::uint32_t capacity_pages            = 0; ///< pages admission may commit (see PagedKVPoolSpec)
     std::size_t page_bytes                  = 0; ///< bytes one page occupies across every plane
+    // Elastic window class (M3-C); zero without one. Window pages are counted in window pages of
+    // `window_page_bytes` each (all window planes), not in main pages.
+    std::uint32_t window_mapped_pages       = 0; ///< window pages whose granule is mapped
+    std::uint32_t window_charged_pages      = 0; ///< window pages charged to holders in the main ledger
+    std::uint32_t window_floor_pages        = 0; ///< the class's guaranteed (planned) pages
+    std::uint32_t window_granule_pages      = 0; ///< window pages per mapping granule
+    std::size_t window_page_bytes           = 0;
 };
 
 class PagedKVPool : private KvWindowPageSource {

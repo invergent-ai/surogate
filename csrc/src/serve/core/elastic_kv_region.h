@@ -97,6 +97,15 @@ public:
     /// within it, demand at the limit trades a free granule for the one it needs, and the pool
     /// chooses pages so that the granules holding pages fit inside it.
     [[nodiscard]] std::uint32_t granule_limit() const noexcept;
+    /// Bytes of this region's limit that another region maps on its behalf: an elastic window
+    /// class (M3-C) books its holders' window pages in this pool's page ledger, but maps them in
+    /// its own region, so automatic sizing planned them once, inside this region's cap. The
+    /// granule limit leaves them out, so the two regions together stay inside the plan. Before
+    /// this, both could fill at once: on 2026-11-23 a W5 engine mapped the main pool towards its
+    /// cap while eight lanes held window pages, left 4 MiB free and aborted
+    /// (rl/engine-inkling-2026-11-21/lanes/OOM/DIAGNOSIS.md). When the new limit is below what
+    /// is mapped, the free granules go back at the next round boundary (flush_reserve_release).
+    void set_foreign_bytes(std::size_t bytes) noexcept;
     /// Which granules are mapped right now (one entry per granule, nonzero when mapped). A
     /// snapshot: the worker may map or unmap a free granule a moment later.
     [[nodiscard]] std::vector<std::uint8_t> mapped_granule_mask() const;

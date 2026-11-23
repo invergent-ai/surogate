@@ -439,7 +439,15 @@ std::uint32_t PagedKVPool::window_charge_for(std::uint32_t window_pages) const n
 
 void PagedKVPool::charge_window_pages(std::int64_t delta) noexcept {
     window_charged_pages_ = static_cast<std::uint32_t>(static_cast<std::int64_t>(window_charged_pages_) + delta);
-    if (window_elastic_) { window_elastic_->set_entitled_pages(window_floor_pages_ + window_charged_pages_); }
+    if (window_elastic_) {
+        window_elastic_->set_entitled_pages(window_floor_pages_ + window_charged_pages_);
+        // The charged window pages are paid out of the main pages (the ledger above), but the
+        // window region maps them: the main region's physical limit leaves their bytes out, or
+        // both regions fill the same planned bytes (lanes/OOM/DIAGNOSIS.md, F1).
+        if (elastic_) {
+            elastic_->set_foreign_bytes(static_cast<std::size_t>(window_charged_pages_) * window_page_bytes_);
+        }
+    }
 }
 
 void PagedKVPool::replace_window_holder(PagedKVAllocation* from, PagedKVAllocation* to) noexcept {
@@ -562,6 +570,16 @@ PagedKVOccupancy PagedKVPool::occupancy(std::size_t granule_bytes) const noexcep
     out.mapped_pages     = elastic_ ? std::min(spec_.page_group_count,
                                                elastic_->mapped_granules() * elastic_->granule_pages())
                                     : spec_.page_group_count;
+    // M3-C: the elastic window class's physical side, for /kv_stats (main + window mapped bytes
+    // must stay within the main cap's bytes + the window floor; lanes/OOM/DIAGNOSIS.md).
+    if (window_elastic_) {
+        out.window_page_bytes    = window_page_bytes_;
+        out.window_floor_pages   = window_floor_pages_;
+        out.window_granule_pages = window_elastic_->granule_pages();
+        out.window_charged_pages = window_charged_pages_;
+        out.window_mapped_pages  = std::min(window_page_count_,
+                                            window_elastic_->mapped_granules() * window_elastic_->granule_pages());
+    }
 
     // A page's bytes are contiguous per plane only under PageMajor; a HeadMajor plane scatters
     // one page across its heads, so no page-granular mapping scheme applies to it.

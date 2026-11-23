@@ -135,6 +135,8 @@ struct ElasticKvRegion::Impl {
     bool busy     = false;
     bool release_requested = false; ///< another region on the device is short
     std::thread worker;
+    /// Bytes of the limit another region maps instead (set_foreign_bytes).
+    std::atomic<std::size_t> foreign_bytes{0};
 
     // ---- device mapping (caller holds mutex) ----
 
@@ -197,6 +199,10 @@ struct ElasticKvRegion::Impl {
             if (it == ledger().end()) { return granules; }
             bytes = std::max(it->second.cap, it->second.entitled);
         }
+        // What another region maps out of this one's plan (an elastic window class's charged
+        // pages) is not this region's to map.
+        const std::size_t foreign = foreign_bytes.load(std::memory_order_relaxed);
+        bytes = bytes > foreign ? bytes - foreign : 0;
         if (granule_bytes == 0) { return granules; }
         return static_cast<std::uint32_t>(
             std::min<std::size_t>(granules, (bytes + granule_bytes - 1) / granule_bytes));
@@ -350,6 +356,13 @@ struct ElasticKvRegion::Impl {
                                               mapped_granule_count() < limit;
                          ++g) {
                         if (!state[g].mapped) {
+                            // The reserve only saves the round loop a driver call. It never maps
+                            // into the headroom the device keeps free for lazily captured graphs,
+                            // workspaces and stream-ordered allocations -- the same line an
+                            // on-demand map at the limit respects (make_room_for_demand). Without
+                            // it, after an on-demand reclaim this loop mapped the device down to
+                            // 4 MiB and the next cudaMallocAsync aborted the engine (2026-11-23).
+                            if (device_free_bytes() < spec.headroom_bytes + granule_bytes) { break; }
                             try {
                                 map_granule(g);
                             } catch (const std::exception& error) {
@@ -538,6 +551,15 @@ std::size_t ElasticKvRegion::mapped_bytes() const noexcept {
 }
 
 std::uint32_t ElasticKvRegion::granule_limit() const noexcept { return impl_->mapped_granule_limit(); }
+
+void ElasticKvRegion::set_foreign_bytes(std::size_t bytes) noexcept {
+    Impl& impl = *impl_;
+    const std::lock_guard<std::mutex> lock(impl.mutex);
+    impl.foreign_bytes.store(bytes, std::memory_order_relaxed);
+    // Mapped past the lower limit: the free granules go back at the next round boundary. Granules
+    // holding pages stay; the pool's page choice packs new pages into them first.
+    if (impl.mapped_granule_count() > impl.mapped_granule_limit()) { impl.release_requested = true; }
+}
 
 std::vector<std::uint8_t> ElasticKvRegion::mapped_granule_mask() const {
     const std::lock_guard<std::mutex> lock(impl_->mutex);
