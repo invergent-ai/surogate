@@ -16,7 +16,7 @@ a gradient. Real rows of 16,009 / 28,002 / 47,014 / 57,431 tokens (gate_rows.npz
   G17 (2 cards; the 4 gate rows 16k / 28k / 47k / 57k; written 2026-11-23 before any run): S4 (a) + (b), `lean_host`: one `compute`
       (seeds "weights", K = 48, four expert keys, segment sums off) with lean_host off and on: gradients BITWISE equal on every tensor; host peak per
       worker (VmHWM, the 57k row's worker) reported for both; tok/s for both (the per-visit pinned-pool emptying costs time).
-  G19 (6 cards, one box; written 2026-11-23 before any run): rung 1b's layout measured. One `ppo_batch` (2 mini-batches, lr 2e-5, plain head) with
+  G19 (6 cards, one box; written 2026-11-23 before any run): the first training run's layout measured. One `ppo_batch` (2 mini-batches, lr 2e-5, plain head) with
       the FULL adapter (attention r64 / alpha 32 + experts r16, A and B, all keys trained), K = 48, 6 workers, lean_host (a) on, (b) off, sketches on
       (visits 3, 12, 36, 45; expert stride 64), on 12 real rows (gate8_rows.npz: its 8 longest batch rows, up to 57,431 tokens, + 4 of its shortest),
       4 groups of 3 attempts with synthetic scores (one attempt per group with advantage 0). PASS iff: replay 0 mismatches on every row, stale gate on

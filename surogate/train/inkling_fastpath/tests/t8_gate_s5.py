@@ -1,6 +1,6 @@
 """S5: the adapter round trip of SkyRL's LoRA shape (attention r64 / alpha 32 on the seven slices + experts r16 / alpha 32, A and B) through the
 SERVING engine that loads the trainer's exported file. PASS LINES, written before any run (also in the design notes):
-  G18a the trainer (T8 shim, release m8) at the ZERO adapter == the engine's BASE model (requests to "inkling", no adapter slot) on 3 real rows of about
+  G18a the trainer (T8 shim) at the ZERO adapter == the engine's BASE model (requests to "inkling", no adapter slot) on 3 real rows of about
        14k tokens: bitwise at every position.
   G18b a test adapter (A = the trainer's kaiming init, B = N(0, 0.02), seed 21, every key of every layer) exported by T8Trainer.export_adapter (the
        PEFT-native form) and loaded fresh by the engine (--enable-lora --max-lora-rank 64 --max-expert-lora-rank 16): the trainer's log-probs with
