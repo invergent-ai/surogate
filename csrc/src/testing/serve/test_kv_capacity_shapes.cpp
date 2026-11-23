@@ -13,6 +13,7 @@
 //   - the explicit-capacity path at the same shapes (a pipeline stage builds with one) plans too.
 // Planning only: a device context for DeviceContext, no weights, no KV allocation.
 // Plus the 2-card visit split (check_stages): each stage under auto, then built with the shared explicit capacity.
+// Plus an operator's explicit capacity (check_operator_explicit): the same reservation as auto at the same tokens.
 // Usage: sinfer_kv_capacity_shapes_test [--inkling <artifact>] [--gemma3 <artifact>]; 77 without a device or
 // without any artifact.
 #include <api/targets/gemma3/package.h>
@@ -282,6 +283,122 @@ void check_stages(const char* name, const std::filesystem::path& artifact, Devic
     }
 }
 
+// An operator's explicit capacity plans as auto does (an elastic window class, its charges in the Main
+// pages), so the same token count reserves the same memory. Before, it kept a static window class beside
+// the full Main count: Inkling-2-Mini with DFlash at 262,144 x 8 reserved 2,074 MiB more for 558,592 tokens
+// than auto did and was refused at startup. Asserted per shape, with and without DFlash: the explicit curve
+// has auto's maximum and stride; its minimum is auto's or, with a window class, every lane holding one page
+// and its charge, whichever is larger; at every page count from that minimum the reservations are equal,
+// the plan finalizes at auto's middle and maximum, and one page past the maximum is refused.
+template <class Target>
+void check_operator_explicit(const char* name, const std::filesystem::path& artifact, DeviceContext& device,
+                             Totals& totals) {
+    artifact::Reader reader(artifact);
+    const family::TextGeometry geometry = Target::declared_geometry(reader);
+    const auto profile                  = Target::resolve_weights(reader.identity());
+    const auto native                   = static_cast<std::uint32_t>(geometry.max_context);
+    for (const bool dspark : {false, true}) {
+        if (dspark && geometry.dflash.layers == 0) { continue; }
+        for (const std::uint32_t context : {8192U, 32768U, 131072U, 262144U}) {
+            if (native != 0 && context > native) { continue; }
+            for (const std::uint32_t lanes : {1U, 4U, 8U, 16U}) {
+                for (const std::uint32_t chunk : {4096U, 8192U}) {
+                    ++totals.shapes;
+                    const std::string shape = std::string(name) + (dspark ? " dflash" : "") + " operator-explicit " +
+                                              std::to_string(context) + " x " + std::to_string(lanes) + " chunk " +
+                                              std::to_string(chunk);
+                    const auto options_with = [&](const KvCapacityPolicy& policy) {
+                        EngineOptions options;
+                        options.artifact_path   = artifact;
+                        options.max_context     = context;
+                        options.max_concurrency = lanes;
+                        options.prefill_chunk   = std::min(chunk, context);
+                        options.use_cuda_graph  = true;
+                        options.kv_capacity     = policy;
+                        if (dspark) {
+                            options.speculative.backend      = SpeculativeBackend::DFlash;
+                            options.speculative.draft_tokens = 7;
+                            options.speculative.adaptive     = true;
+                        }
+                        return options;
+                    };
+                    try {
+                        const runtime::SequenceCapacityCurve automatic =
+                            Target::make_sequence_planner(device, options_with(KvCapacityPolicy::automatic(0)), profile,
+                                                          geometry)
+                                .capacity_curve();
+                        const std::uint32_t middle =
+                            automatic.minimum_main_page_groups +
+                            (automatic.maximum_main_page_groups - automatic.minimum_main_page_groups) / 2;
+                        const auto explicit_at = [&](std::uint32_t pages) {
+                            return options_with(KvCapacityPolicy::explicit_capacity(pages * automatic.main_page_tokens));
+                        };
+                        const runtime::SequenceCapacityCurve operator_curve =
+                            Target::make_sequence_planner(device, explicit_at(middle), profile, geometry).capacity_curve();
+                        const std::uint64_t lane_floor =
+                            automatic.window_lane_charge_pages != 0
+                                ? static_cast<std::uint64_t>(lanes) * (1ULL + automatic.window_lane_charge_pages)
+                                : 0ULL;
+                        const auto expected_minimum = static_cast<std::uint32_t>(
+                            std::max<std::uint64_t>(automatic.minimum_main_page_groups, lane_floor));
+                        bool ok = operator_curve.maximum_main_page_groups == automatic.maximum_main_page_groups &&
+                                  operator_curve.minimum_main_page_groups == expected_minimum &&
+                                  operator_curve.window_lane_charge_pages == automatic.window_lane_charge_pages;
+                        if (!ok) {
+                            std::printf("FAIL %s: explicit curve %u..%u (charge %u) vs auto %u..%u (charge %u), "
+                                        "expected minimum %u\n",
+                                        shape.c_str(), operator_curve.minimum_main_page_groups,
+                                        operator_curve.maximum_main_page_groups, operator_curve.window_lane_charge_pages,
+                                        automatic.minimum_main_page_groups, automatic.maximum_main_page_groups,
+                                        automatic.window_lane_charge_pages, expected_minimum);
+                            ++totals.failed;
+                            continue;
+                        }
+                        std::set<std::uint32_t> pages{operator_curve.minimum_main_page_groups,
+                                                      automatic.maximum_main_page_groups};
+                        if (middle >= operator_curve.minimum_main_page_groups) { pages.insert(middle); }
+                        for (const std::uint32_t p : pages) {
+                            const std::size_t want = automatic.reservation_bytes(p);
+                            auto planner = Target::make_sequence_planner(device, explicit_at(p), profile, geometry);
+                            const runtime::KvCapacityResolution resolution = runtime::resolve_kv_capacity(
+                                explicit_at(p).kv_capacity, planner.capacity_curve(), ~std::size_t{0});
+                            auto plan = std::move(planner).finalize(resolution.main_page_groups);
+                            ++totals.plans;
+                            if (resolution.main_page_groups != p || resolution.runtime_reservation_bytes != want ||
+                                plan.device_reservation_bytes() != want) {
+                                std::printf("FAIL %s: explicit %u pages -> %u pages, reservation %zu / plan %zu, auto %zu\n",
+                                            shape.c_str(), p, resolution.main_page_groups,
+                                            resolution.runtime_reservation_bytes, plan.device_reservation_bytes(), want);
+                                ++totals.failed;
+                                ok = false;
+                            }
+                        }
+                        bool refused = false;
+                        try {
+                            (void)Target::make_sequence_planner(device, explicit_at(automatic.maximum_main_page_groups + 1),
+                                                                profile, geometry);
+                        } catch (const std::invalid_argument&) { refused = true; }
+                        if (!refused) {
+                            std::printf("FAIL %s: one page past the maximum was not refused\n", shape.c_str());
+                            ++totals.failed;
+                            ok = false;
+                        }
+                        if (ok && (context == 262144 || context == 8192)) {
+                            std::printf("ok   %s: explicit == auto from %u to %u pages (auto minimum %u, charge %u)\n",
+                                        shape.c_str(), operator_curve.minimum_main_page_groups,
+                                        automatic.maximum_main_page_groups, automatic.minimum_main_page_groups,
+                                        automatic.window_lane_charge_pages);
+                        }
+                    } catch (const std::exception& error) {
+                        std::printf("FAIL %s: %s\n", shape.c_str(), error.what());
+                        ++totals.failed;
+                    }
+                }
+            }
+        }
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -306,10 +423,12 @@ int main(int argc, char** argv) {
     if (!inkling.empty()) {
         check_target<targets::inkling2::Package>("inkling2", inkling, device, true, totals);
         check_stages<targets::inkling2::Package>("inkling2", inkling, device, totals);
+        check_operator_explicit<targets::inkling2::Package>("inkling2", inkling, device, totals);
     }
     if (!gemma3.empty()) {
         check_target<targets::gemma3_270m::Package>("gemma3", gemma3, device, true, totals);
         check_stages<targets::gemma3_270m::Package>("gemma3", gemma3, device, totals);
+        check_operator_explicit<targets::gemma3_270m::Package>("gemma3", gemma3, device, totals);
     }
     std::printf("%s: %d shapes, %d plans, %d failures (%.1f s)\n", totals.failed == 0 ? "PASS" : "FAIL",
                 totals.shapes, totals.plans, totals.failed,

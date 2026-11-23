@@ -137,6 +137,8 @@ struct ElasticKvRegion::Impl {
     std::thread worker;
     /// Bytes of the limit another region maps instead (set_foreign_bytes).
     std::atomic<std::size_t> foreign_bytes{0};
+    /// The region that maps those bytes (set_foreign_region): its ledger key, or null.
+    std::atomic<const void*> foreign_region{nullptr};
 
     // ---- device mapping (caller holds mutex) ----
 
@@ -193,15 +195,27 @@ struct ElasticKvRegion::Impl {
     /// 1,010, and the next map failed.
     std::uint32_t mapped_granule_limit() const noexcept {
         std::size_t bytes = 0;
+        std::size_t overshoot = 0;
         {
             const std::lock_guard<std::mutex> ledger_lock(ledger_mutex());
             const auto it = ledger().find(this);
             if (it == ledger().end()) { return granules; }
             bytes = std::max(it->second.cap, it->second.entitled);
+            // The foreign region mapped past its own limit (its holders left and their granules
+            // still hold other pages, or wait for the next round boundary's release): those bytes
+            // are not free yet either. Without this the limit rose by the whole charge as soon as
+            // the holders left, while the other region still held the memory.
+            if (const void* other = foreign_region.load(std::memory_order_relaxed); other != nullptr) {
+                const auto at = ledger().find(other);
+                if (at != ledger().end()) {
+                    const std::size_t other_limit = std::max(at->second.cap, at->second.entitled);
+                    overshoot = at->second.mapped > other_limit ? at->second.mapped - other_limit : 0;
+                }
+            }
         }
         // What another region maps out of this one's plan (an elastic window class's charged
         // pages) is not this region's to map.
-        const std::size_t foreign = foreign_bytes.load(std::memory_order_relaxed);
+        const std::size_t foreign = foreign_bytes.load(std::memory_order_relaxed) + overshoot;
         bytes = bytes > foreign ? bytes - foreign : 0;
         if (granule_bytes == 0) { return granules; }
         return static_cast<std::uint32_t>(
@@ -561,6 +575,10 @@ void ElasticKvRegion::set_foreign_bytes(std::size_t bytes) noexcept {
     if (impl.mapped_granule_count() > impl.mapped_granule_limit()) { impl.release_requested = true; }
 }
 
+void ElasticKvRegion::set_foreign_region(const ElasticKvRegion& other) noexcept {
+    impl_->foreign_region.store(other.impl_.get(), std::memory_order_relaxed);
+}
+
 void ElasticKvRegion::release_above_limit() noexcept {
     Impl& impl = *impl_;
     const std::lock_guard<std::mutex> lock(impl.mutex);
@@ -640,7 +658,18 @@ void ElasticKvRegion::flush_reserve_release() noexcept try {
     Impl& impl = *impl_;
     const ScopedDevice selected(impl.spec.device);
     const std::lock_guard<std::mutex> lock(impl.mutex);
-    if (!impl.release_requested || impl.asleep || impl.stopping) { return; }
+    if (impl.asleep || impl.stopping) { return; }
+    // A foreign region's overshoot lowers the limit without telling this one: past it, the free
+    // granules above the limit go back, highest first (only those: the overshoot is usually
+    // transient, and giving back the whole reserve would only map it again a round later).
+    std::uint32_t at_most = ~std::uint32_t{0};
+    if (!impl.release_requested) {
+        if (impl.foreign_region.load(std::memory_order_relaxed) == nullptr) { return; }
+        const std::uint32_t count = impl.mapped_granule_count();
+        const std::uint32_t limit = impl.mapped_granule_limit();
+        if (count <= limit) { return; }
+        at_most = count - limit;
+    }
     // Only the engine's own thread may fence its stream: a record from anywhere else lands
     // inside whatever that thread is capturing and invalidates the capture. Same rule as
     // release_page: while a capture is in flight, leave it for the next boundary.
@@ -651,7 +680,8 @@ void ElasticKvRegion::flush_reserve_release() noexcept try {
         return;
     }
     impl.release_requested = false;
-    for (std::uint32_t g = 0; g < impl.granules; ++g) {
+    std::uint32_t posted = 0;
+    for (std::uint32_t g = impl.granules; g-- > 0 && posted < at_most;) {
         Impl::Granule& granule = impl.state[g];
         if (!granule.mapped || granule.used_pages != 0) { continue; }
         cudaEvent_t fence = nullptr;
@@ -663,6 +693,7 @@ void ElasticKvRegion::flush_reserve_release() noexcept try {
             }
         }
         impl.post(Impl::Job{Impl::Job::Kind::Unmap, g, granule.generation, fence, /*forced=*/true});
+        ++posted;
     }
 } catch (...) {
     // Keep the region mapped if its device cannot be bound for retirement.
