@@ -229,11 +229,22 @@ class WorkerCore:
         lp = np.zeros(T, dtype=np.float64)
         lp[1:] = lp32.astype(np.float64)
         out = {"i": i, "T": T, "loss_tokens": int(mask.sum())}
-        # REPLAY GATE: on-policy rows only (a lagged row was sampled by another adapter version)
+        # REPLAY GATE: on-policy rows only (a lagged row was sampled by another adapter version). In "ppo" mode it is read on the OLD log-probs (the
+        # trainer's forward at the batch's start weights, recomputed as SkyRL does): after a mini-batch's optimizer step the current forward differs by design.
         on_policy = not lagged(row, version)
+        old32 = None
+        if mode == "ppo":
+            old32 = np.asarray(row.notes["old_lp"], dtype=np.float32)
+            if old32.shape != lp32.shape:
+                raise T8GateError(f"row {i}: old_lp has {old32.shape[0]} entries for {lp32.shape[0]} targets")
+            if job.get("minibatch_index", 0) == 0:
+                bad0 = int((lp32[mask[1:]].view(np.int32) != old32[mask[1:]].view(np.int32)).sum())
+                if bad0:  # the first mini-batch runs at the start weights: its forward must be the old log-probs, bit for bit
+                    raise T8GateError(f"STALE GATE: row {i} (T {T}): {bad0} loss tokens differ from the recomputed old log-probs at unchanged weights")
         if on_policy:
             want = row.engine_lp[1:].astype(np.float32)
-            bad = int((lp32[mask[1:]] != want[mask[1:]]).sum())
+            have = old32 if old32 is not None else lp32
+            bad = int((have[mask[1:]] != want[mask[1:]]).sum())
             if bad:
                 raise T8GateError(f"REPLAY GATE: row {i} (T {T}): {bad} of {int(mask.sum())} loss tokens differ from the rollout's log-probs")
         out["replay_checked"] = bool(on_policy)
@@ -241,7 +252,14 @@ class WorkerCore:
             miss = self._check_routing(ctx, rp)
             if miss:
                 raise T8GateError(f"ROUTING GATE: row {i} (T {T}): {miss} covered positions differ from the rollout's capture")
-        mm = mismatch(lp, row.engine_lp, mask)
+        if old32 is not None:
+            old = np.zeros(T, dtype=np.float64)
+            old[1:] = old32.astype(np.float64)
+            mm = mismatch(old, row.engine_lp, mask)              # trainer (old) vs rollout: what SkyRL logs as rollout_train_logprobs_abs_diff
+            dd = np.abs(old[mask] - row.engine_lp[mask]) if mask.any() else np.zeros(0)
+            out["rollout_train_abs_diff"] = (float(dd.sum()), float(dd.max()) if dd.size else 0.0)
+        else:
+            mm = mismatch(lp, row.engine_lp, mask)
         out["mm"] = mm
         w = None
         out["bw"] = None
@@ -261,6 +279,15 @@ class WorkerCore:
             # the coefficient autograd gives lp in run_step's loss = -(seeds * lp).sum() / scale
             g = (-(torch.tensor(1.0, dtype=torch.float32) / torch.tensor(scale, dtype=torch.float32))) * seeds_t
             out["met"] = {k: float(met[k]) for k in ("policy_loss", "mismatch_kl", "is_masked")}
+        elif mode == "ppo":
+            import t8_skyrl as KS
+
+            adv = np.full(T, row.advantage, dtype=np.float64)
+            seeds, rloss, met = KS.dual_clip_seeds(lp, old, adv, mask, int(scale), job.get("skyrl", KS.SkyRLLoss()))
+            g = torch.as_tensor(seeds, dtype=torch.float32)   # d loss / d logp, the 1 / mini-batch-tokens already inside (token mean)
+            n_ = max(int(mask.sum()), 1)
+            out["met"] = {"policy_loss": rloss * scale / n_, "mismatch_kl": 0.0, "is_masked": met["clipped_tokens"] / n_}
+            out["ppo"] = met
         elif mode == "weights":
             g = torch.as_tensor(float(row.notes["weight"]) * mask.astype(np.float32), dtype=torch.float32)
             out["met"] = {"policy_loss": 0.0, "mismatch_kl": 0.0, "is_masked": 0.0}
@@ -472,15 +499,17 @@ def write_stop(run_dir: str, why: str) -> None:
 
 
 def compute_step(handles: list, layout: ParamLayout, flats: list, shapes: list, cfg: T8Config, rows: list, version, step_cfg: StepConfig,
-                 seeds: str = "gspo") -> StepOut:
+                 seeds: str = "gspo", minibatch_index: int = 0) -> StepOut:
     """One step over `rows` with the given workers (each already holds the current adapter)."""
-    if seeds not in ("gspo", "weights"):
+    if seeds not in ("gspo", "weights", "ppo"):
         raise ValueError(seeds)
     validate_config(cfg)
     step_cfg = StepConfig(**{**asdict(step_cfg), "max_row_tokens": cfg.max_row_tokens})
     live, m, r3, scale = plan_rows(rows, version, step_cfg, cfg.visits, cfg.top_k)
     t0 = time.time()
-    job = {"step_cfg": step_cfg, "version": version, "seeds": seeds, "scale": scale}
+    job = {"step_cfg": step_cfg, "version": version, "seeds": seeds, "scale": scale, "minibatch_index": int(minibatch_index)}
+    if seeds == "ppo" and step_cfg.aggregation != "token":
+        raise ValueError("SkyRL's token mean needs aggregation 'token' (scale = the mini-batch's loss tokens)")
     try:
         check_rows(rows, live, version, cfg)
         for h in handles:
@@ -515,13 +544,21 @@ def compute_step(handles: list, layout: ParamLayout, flats: list, shapes: list, 
         write_stop(cfg.run_dir, "replay gate skipped on a row")
         raise T8GateError(f"VERSION GATE: the replay gate was skipped on {m['replay_skipped_rows']} rows")
     m["stack"] = cfg.stack
+    dd = [r["rollout_train_abs_diff"] for r in results if "rollout_train_abs_diff" in r]
+    if dd:  # SkyRL's logged statistic, reported beside the bitwise replay gate
+        m["rollout_train_logprobs_abs_diff_mean"] = sum(x[0] for x in dd) / max(m["total_tokens"], 1)
+        m["rollout_train_logprobs_abs_diff_max"] = max(x[1] for x in dd)
+    pp = [r["ppo"] for r in results if "ppo" in r]
+    if pp:
+        m["ppo_clip_ratio"] = sum(x["clipped_tokens"] for x in pp) / max(sum(x["loss_tokens"] for x in pp), 1.0)
+        m["ppo_ratio_max"] = max(x["ratio_max"] for x in pp)
     tokens = sum(r["T"] for r in results)
     m["row_tokens"] = tokens
     m["wall_s"] = wall
     m["tok_per_s_per_card"] = tokens / max(wall, 1e-9) / len(handles)
     m["workers"] = [f["stats"] for f in fin]
     return StepOut(grads=grads, segments=segments, metrics=m, rows=sorted(results, key=lambda r: r["i"]),
-                   sense="descent" if seeds == "gspo" else "ascent")
+                   sense="ascent" if seeds == "weights" else "descent")
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -664,8 +701,14 @@ class T8Trainer:
         return out
 
     # ------------------------------------------------------------------ the step
-    def compute(self, rows: list, version, step_cfg: StepConfig, seeds: str = "gspo") -> StepOut:
-        return compute_step(self.handles, self.layout, self.flats, self.shapes, self.cfg, rows, version, step_cfg, seeds)
+    def compute(self, rows: list, version, step_cfg: StepConfig, seeds: str = "gspo", minibatch_index: int = 0) -> StepOut:
+        return compute_step(self.handles, self.layout, self.flats, self.shapes, self.cfg, rows, version, step_cfg, seeds, minibatch_index)
+
+    def ppo_batch(self, rows: list, version, lr: float, n_minibatches: int = 1, step_cfg: StepConfig | None = None) -> list:
+        """SkyRL's update on one batch (PLAN-SKYRL.md S2): old log-probs recomputed by the trainer at the start weights, then n_minibatches optimizer steps,
+        each on a contiguous part of `rows` that never splits a group (row.group_idx). row.advantage must already hold the GRPO advantage
+        (t8_skyrl.grpo_advantages). Returns [(StepOut, grad norm)] per mini-batch."""
+        return ppo_batch(self, rows, version, lr, n_minibatches, step_cfg)
 
     def apply(self, out: StepOut, lr: float) -> float:
         """The kit's fp32 AdamW on the masters. AdamW descends, so only a "descent" gradient is accepted (the sign cannot slip at the hand-over)."""
@@ -686,6 +729,39 @@ class T8Trainer:
             except Exception:
                 pass
         self.handles = []
+
+
+def split_minibatches(rows: list, n: int) -> list:
+    """n contiguous parts of the row indices, cut only where row.group_idx changes (SkyRL cuts by prompts); each cut is the group start nearest to
+    an even split in rows that still leaves one group start for every later cut."""
+    if n < 1:
+        raise ValueError(n)
+    starts = [0] + [i for i in range(1, len(rows)) if rows[i].group_idx != rows[i - 1].group_idx]
+    if n > len(starts):
+        raise ValueError(f"{n} mini-batches for {len(starts)} groups")
+    cut_idx = [0]                                             # indices into `starts`
+    for j in range(1, n):
+        lo, hi = cut_idx[-1] + 1, len(starts) - (n - j)
+        target = j * len(rows) / n
+        cut_idx.append(min(range(lo, hi + 1), key=lambda k: (abs(starts[k] - target), k)))
+    bounds = [starts[k] for k in cut_idx] + [len(rows)]
+    return [list(range(bounds[j], bounds[j + 1])) for j in range(n)]
+
+
+def ppo_batch(tr, rows: list, version, lr: float, n_minibatches: int, step_cfg: StepConfig | None):
+    from dataclasses import replace
+
+    step_cfg = step_cfg or StepConfig(max_policy_lag=None)
+    if step_cfg.aggregation != "token":
+        raise ValueError("token mean")
+    olds = tr.logprobs(rows)                                  # the start weights; the replay gate reads them in compute
+    for r, o in zip(rows, olds):
+        r.notes["old_lp"] = o
+    out = []
+    for k, part in enumerate(split_minibatches(rows, n_minibatches)):
+        o = tr.compute([rows[i] for i in part], version, replace(step_cfg), seeds="ppo", minibatch_index=k)
+        out.append((o, tr.apply(o, lr)))
+    return out
 
 
 class SimpleVisit:
