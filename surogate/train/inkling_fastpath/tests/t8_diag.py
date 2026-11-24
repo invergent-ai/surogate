@@ -789,7 +789,7 @@ def variant_patches(name: str) -> list:
 
 def phase_sum(a):
     """diag-5 (agent-RX's design; lines written before any data). Plan row 3, routing frozen at theta0's, theta0.
-    A THE SUMMING, no finite differences: on the first 2,048 tokens of row 3 (S = sum of log pi over every position; rounding ON, so every
+    A THE SUMMING, no finite differences: on the first --prefix tokens (512; 2,048 ran out of card memory next to the engine) of row 3 (S = sum of log pi over every position; rounding ON, so every
       stored state is a bf16 value and TokenChunked's bf16 storage is exact in both), the frozen chain under plain autograd (real tensors,
       act_vals None, dS/d(output of visit v) by retain_grad, the six tensors as leaves) against backward_row fed exactly the chain's states
       (its outputs, x0, the chain's final hidden, theta0's routing), with an exact fp32 head gradient in both. LINE: cos >= 0.999 and norm
@@ -806,7 +806,9 @@ def phase_sum(a):
       variant's gradient on the engine's states (x4, x16 where the x4 prediction is under 3 nats). LINE: engine follow of 12.B13 in
       [0.7, 1.3] = a backward truncated at that depth gives a gradient the engine follows at a looped layer; < 0.5 = it does not. 21.B13 at
       x1 once as control. Patch variants: a candidate PER LAYER (12.B13 cos > 0.8 -> follow 12.B13; 3.B13 cos > 0.8 -> follow 3.B13).
-      An error in A is recorded and B / C go on (flagged "A did not run"); only a measured fail of A's line stops the session.
+      An error in A is recorded and B / C go on (flagged "A did not run"); only a measured fail of A's line stops the session. A runs in its
+      own process (--parts A, diag5A.json), B / C in a second one (--parts BC) unless A wrote a measured fail (exit 3). Truncation records
+      also the share of the full gradient's norm kept (12.B13, 12.qB) and the engine follow of 12.qB (same rung rule).
       Order: A; chains and G_S / G_F; K18, K24, K30; Q; M; D; QD; C (the deadline cuts from the tail).
     C trend only, last: the smooth chain along G_S (full gradient, chain states), 12.B13 at x1/4, x1/16, x1/64, S+ and S- printed.
     Recorded once: relative L2 distance smooth vs frozen chain outputs per visit; cos of G_F (frozen chain states, rounding on) against G_S."""
@@ -852,89 +854,105 @@ def phase_sum(a):
     with torch.no_grad():
         x0 = F.forward(eng, ids, save=True, adapters_per_layer=rig.w._adapters())["x0"].float()
 
-    # ---------------------------------------------------------------- A
-    Tp = 2048
-    ids_p = ids[:Tp].contiguous()
-    rout_p = routing0[:, :Tp].contiguous()
-    x0_p = x0[:Tp].clone().requires_grad_(True)              # a leaf, so every visit output carries a graph (its gradient is not used)
-    g_p = torch.ones(Tp - 1, dtype=torch.float32, device=dev)
-    RA.ROUND["on"] = True
-    t0 = time.time()
-    try:
-        with torch.device(dev):
-            leaves = {}
-            lora = []
-            for L, d in enumerate(rig.work):
-                keys = [k for k in d if k != "scale"]
-                ts = []
-                for j, k in enumerate(keys):
-                    t = d[k].to(dev)
-                    if (L, j) in TT:
-                        t = t.detach().requires_grad_(True)
-                        leaves[TT[(L, j)]] = t
-                    ts.append(t)
-                lora.append(TV.lora_dict(keys, ts, scale, attn_scale))
-            slots = {0: x0_p}
-            outs_p = []
-            for v, vi in enumerate(eng.visits):
-                bank = (slots[vi.bank[0]], slots[vi.bank[1]]) if vi.looped else None
-                o = TV.visit_torch_t8(W, vi, [slots[s] for s in vi.stack], slots[vi.partial], bank, rout_p[v], lora[vi.layer])
-                o.retain_grad()
-                outs_p.append(o)
-                slots[vi.next_partial] = o
-            hid = RA.inkling_attn_res([slots[0], slots[1], slots[2], slots[3]], slots[6], None, W.q_out, W.final_norm.reshape(1, B.D), B.EPS)[0]
-            headf = W.head.float()
-            tgt = ids_p[1:].long()
-            parts = []
-            for c0 in range(0, Tp - 1, 128):
-                c1 = min(Tp - 1, c0 + 128)
-                z = torch.tanh((hid[c0:c1] @ headf.T) / 30.0) * 30.0
-                parts.append((z.gather(1, tgt[c0:c1, None])[:, 0] - torch.logsumexp(z, -1)).sum())
-            total = torch.stack(parts).sum()
-            total.backward()                                  # one backward through the whole chain
-            S = float(total)
-            del headf, parts, total
-        g_auto = {v: o.grad.detach().float().cpu() for v, o in enumerate(outs_p) if o.grad is not None}
-        G_auto = {nm: t.grad.detach().float().cpu() for nm, t in leaves.items() if t.grad is not None}
-        host_p = {-1: x0_p.detach()}
-        for v, o in enumerate(outs_p):
-            host_p[v] = o.detach().float()
-        hid_d = hid.detach().float()
-        del outs_p, slots, leaves, lora, o
+    # ---------------------------------------------------------------- A (inside a function: its locals die on return)
+    def part_A():
+        resA = {}
+        Tp = int(a.prefix)
+        ids_p = ids[:Tp].contiguous()
+        rout_p = routing0[:, :Tp].contiguous()
+        x0_p = x0[:Tp].clone().requires_grad_(True)              # a leaf, so every visit output carries a graph (its gradient is not used)
+        g_p = torch.ones(Tp - 1, dtype=torch.float32, device=dev)
+        RA.ROUND["on"] = True
+        t0 = time.time()
+        try:
+            with torch.device(dev):
+                leaves = {}
+                lora = []
+                for L, d in enumerate(rig.work):
+                    keys = [k for k in d if k != "scale"]
+                    ts = []
+                    for j, k in enumerate(keys):
+                        t = d[k].to(dev)
+                        if (L, j) in TT:
+                            t = t.detach().requires_grad_(True)
+                            leaves[TT[(L, j)]] = t
+                        ts.append(t)
+                    lora.append(TV.lora_dict(keys, ts, scale, attn_scale))
+                slots = {0: x0_p}
+                outs_p = []
+                for v, vi in enumerate(eng.visits):
+                    bank = (slots[vi.bank[0]], slots[vi.bank[1]]) if vi.looped else None
+                    o = TV.visit_torch_t8(W, vi, [slots[s] for s in vi.stack], slots[vi.partial], bank, rout_p[v], lora[vi.layer])
+                    o.retain_grad()
+                    outs_p.append(o)
+                    slots[vi.next_partial] = o
+                hid = RA.inkling_attn_res([slots[0], slots[1], slots[2], slots[3]], slots[6], None, W.q_out, W.final_norm.reshape(1, B.D), B.EPS)[0]
+                headf = W.head.float()
+                tgt = ids_p[1:].long()
+                parts = []
+                for c0 in range(0, Tp - 1, 128):
+                    c1 = min(Tp - 1, c0 + 128)
+                    z = torch.tanh((hid[c0:c1] @ headf.T) / 30.0) * 30.0
+                    parts.append((z.gather(1, tgt[c0:c1, None])[:, 0] - torch.logsumexp(z, -1)).sum())
+                total = torch.stack(parts).sum()
+                total.backward()                                  # one backward through the whole chain
+                S = float(total)
+                del headf, parts, total
+            g_auto = {v: o.grad.detach().float().cpu() for v, o in enumerate(outs_p) if o.grad is not None}
+            G_auto = {nm: t.grad.detach().float().cpu() for nm, t in leaves.items() if t.grad is not None}
+            host_p = {-1: x0_p.detach()}
+            for v, o in enumerate(outs_p):
+                host_p[v] = o.detach().float()
+            hid_d = hid.detach().float()
+            del outs_p, slots, leaves, lora, o
 
-        def head_exact(W_, hidden, targets, gg):
-            """the exact fp32 head gradient (the same arithmetic as the chain's head above)"""
-            h = hidden.detach().float()
-            hf = W_.head.float()
-            out = torch.zeros_like(h)
-            with torch.enable_grad():
-                for c0 in range(0, h.shape[0], 128):
-                    hh = h[c0:c0 + 128].clone().requires_grad_(True)
-                    z = torch.tanh((hh @ hf.T) / 30.0) * 30.0
-                    val = ((z.gather(1, targets[c0:c0 + 128].long()[:, None])[:, 0] - torch.logsumexp(z, -1)) * gg[c0:c0 + 128]).sum()
-                    out[c0:c0 + 128] = torch.autograd.grad(val, hh)[0]
-            del hf
-            return out
+            def head_exact(W_, hidden, targets, gg):
+                """the exact fp32 head gradient (the same arithmetic as the chain's head above)"""
+                h = hidden.detach().float()
+                hf = W_.head.float()
+                out = torch.zeros_like(h)
+                with torch.enable_grad():
+                    for c0 in range(0, h.shape[0], 128):
+                        hh = h[c0:c0 + 128].clone().requires_grad_(True)
+                        z = torch.tanh((hh @ hf.T) / 30.0) * 30.0
+                        val = ((z.gather(1, targets[c0:c0 + 128].long()[:, None])[:, 0] - torch.logsumexp(z, -1)) * gg[c0:c0 + 128]).sum()
+                        out[c0:c0 + 128] = torch.autograd.grad(val, hh)[0]
+                del hf
+                return out
 
-        G_row, g_row = run_backward({"host": host_p, "routing": rout_p, "hidden": hid_d, "lp": None}, ids_p, g_p, TL.qb_for(Tp),
-                                    head_grad=head_exact)
-        rep["A"] = {"T": Tp, "S": S, "seconds": time.time() - t0,
-                    "per_visit": {str(v): cmp(g_row[v], g_auto[v]) for v in sorted(g_row) if v in g_auto},
-                    "tensors": {nm: cmp(G_row[nm], G_auto[nm]) for nm in G_auto if nm in G_row}}
-        bad = [v for v, x in rep["A"]["per_visit"].items() if x["cos"] < 0.999 or not 0.99 <= x["norm_ratio"] <= 1.01]
-        badt = [nm for nm, x in rep["A"]["tensors"].items() if x["cos"] < 0.999 or not 0.99 <= x["norm_ratio"] <= 1.01]
-        rep["A"]["pass"] = not bad and not badt
-        rep["A"]["outside"] = {"visits": bad, "tensors": badt}
-        log(f"A: {'PASS' if rep['A']['pass'] else 'FAIL'}; outside visits {bad}, tensors {badt}; per visit cos min "
-            f"{min(x['cos'] for x in rep['A']['per_visit'].values()):.6f}; {rep['A']['seconds']:.0f} s")
-        del host_p, hid_d, g_auto, G_auto
-    except Exception as e:
-        import traceback
-        rep["A"] = {"error": traceback.format_exc()[-2000:], "pass": None, "flag": "A did not run"}
-        log(f"A ERROR (A did not run; B and C go on): {type(e).__name__}: {e}")
+            G_row, g_row = run_backward({"host": host_p, "routing": rout_p, "hidden": hid_d, "lp": None}, ids_p, g_p, TL.qb_for(Tp),
+                                        head_grad=head_exact)
+            resA = {"T": Tp, "S": S, "seconds": time.time() - t0,
+                        "per_visit": {str(v): cmp(g_row[v], g_auto[v]) for v in sorted(g_row) if v in g_auto},
+                        "tensors": {nm: cmp(G_row[nm], G_auto[nm]) for nm in G_auto if nm in G_row}}
+            bad = [v for v, x in resA["per_visit"].items() if x["cos"] < 0.999 or not 0.99 <= x["norm_ratio"] <= 1.01]
+            badt = [nm for nm, x in resA["tensors"].items() if x["cos"] < 0.999 or not 0.99 <= x["norm_ratio"] <= 1.01]
+            resA["pass"] = not bad and not badt
+            resA["outside"] = {"visits": bad, "tensors": badt}
+            log(f"A: {'PASS' if rep['A']['pass'] else 'FAIL'}; outside visits {bad}, tensors {badt}; per visit cos min "
+                f"{min(x['cos'] for x in rep['A']['per_visit'].values()):.6f}; {rep['A']['seconds']:.0f} s")
+            del host_p, hid_d, g_auto, G_auto
+        except Exception as e:
+            import traceback
+            resA = {"error": traceback.format_exc()[-2000:], "pass": None, "flag": "A did not run"}
+            log(f"A ERROR (A did not run; B and C go on): {type(e).__name__}: {e}")
+        return resA
+
+    if "A" in a.parts:
+        rep["A"] = part_A()
+        import gc
+
+        gc.collect()
+        torch.cuda.empty_cache()
+    else:
+        rep["A"] = {"pass": None, "flag": "A runs in its own process (diag5A.json)"}
     RA.ROUND["on"] = False
     torch.cuda.empty_cache()
     save()
+    if a.parts == "A":
+        rig.w._release(ctx)
+        rig.w.close()
+        return 3 if rep["A"].get("pass") is False else 0
     if rep["A"].get("pass") is False:
         rep["dropped"].append("B and C (A's line failed)")
         save()
@@ -944,11 +962,20 @@ def phase_sum(a):
 
     # ---------------------------------------------------------------- the chains' states (full row)
     outs_s, hid_s, outs_f, hid_f = [], [], [], []
-    chain_S(rig, ids, x0, routing0, mask_t, keep_outs=outs_s, keep_hidden=hid_s)
-    RA.ROUND["on"] = True
-    chain_S(rig, ids, x0, routing0, mask_t, keep_outs=outs_f, keep_hidden=hid_f)
-    RA.ROUND["on"] = False
-    rep["smooth_vs_frozen_states"] = [float((outs_s[v].double() - outs_f[v].double()).norm() / outs_f[v].double().norm()) for v in range(len(outs_s))]
+    try:
+        chain_S(rig, ids, x0, routing0, mask_t, keep_outs=outs_s, keep_hidden=hid_s)
+        RA.ROUND["on"] = True
+        chain_S(rig, ids, x0, routing0, mask_t, keep_outs=outs_f, keep_hidden=hid_f)
+        RA.ROUND["on"] = False
+        rep["smooth_vs_frozen_states"] = [float((outs_s[v].double() - outs_f[v].double()).norm() / outs_f[v].double().norm())
+                                          for v in range(len(outs_s))]
+    except Exception as e:
+        rep["chains_error"] = f"{type(e).__name__}: {e}"[:1500]
+        log(f"chains ERROR: {rep['chains_error'][:200]}")
+        save()
+        rig.w._release(ctx)
+        rig.w.close()
+        return 4
 
     def chain_vals(outs, hid):
         h = {-1: x0}
@@ -956,6 +983,8 @@ def phase_sum(a):
             h[v] = o
         return {"host": h, "routing": routing0, "hidden": hid[0], "lp": None}
 
+    G_full_E, _ = run_backward(ctx["res"], ids, g_full, qb)
+    rep["norms_full_engine"] = {nm: float(t.norm()) for nm, t in G_full_E.items()}
     G_S, g_S = run_backward(chain_vals(outs_s, hid_s), ids, g_full, qb)
     RA.ROUND["on"] = True
     G_F, _ = run_backward(chain_vals(outs_f, hid_f), ids, g_full, qb)
@@ -996,8 +1025,9 @@ def phase_sum(a):
             Gc, gc = run_backward(chain_vals(outs_s, hid_s), ids, g_full, qb, v_first=vf)
             r = {"v_first": vf, "engine_vs_chain": {nm: cmp(Ge[nm], Gc[nm]) for nm in ("12.B13", "12.qB", "21.B13") if nm in Ge and nm in Gc},
                  "per_visit": {str(v): cmp(ge[v], gc[v]) for v in sorted(ge) if v in gc},
-                 "norm_12B13_engine": float(Ge["12.B13"].norm()) if "12.B13" in Ge else None}
-            r["engine_follow"] = [engine_follow(Ge["12.B13"], "12.B13", 4.0)]
+                 "norm_12B13_engine": float(Ge["12.B13"].norm()) if "12.B13" in Ge else None,
+                 "share_of_full_norm": {nm: float(Ge[nm].norm()) / rep["norms_full_engine"][nm] for nm in ("12.B13", "12.qB") if nm in Ge}}
+            r["engine_follow"] = [engine_follow(Ge["12.B13"], "12.B13", 4.0), engine_follow(Ge["12.qB"], "12.qB", 4.0)]
             if K == 18:
                 r["engine_follow"].append(engine_follow(Ge["21.B13"], "21.B13", 1.0))
             rep["B"][f"K{K}"] = r
@@ -1075,6 +1105,8 @@ def main():
     ap.add_argument("--run-dir", required=True)
     ap.add_argument("--out", default="")
     ap.add_argument("--budget-s", type=float, default=1500.0)
+    ap.add_argument("--parts", default="ABC", help="phase sum: A (its own process) or BC")
+    ap.add_argument("--prefix", type=int, default=512, help="phase sum part A: prefix tokens")
     a = ap.parse_args()
     return {"grad": phase_grad, "fd": phase_fd, "inject": phase_inject, "local": phase_local, "lin": phase_lin, "sum": phase_sum}[a.phase](a)
 
