@@ -367,7 +367,7 @@ def main():
     rc4, run4, tr4, s4, _ = session(tmp, "v2_STOP", plan_dir, ["GO", "STOP"], panels=panels)
     stp = json.load(open(os.path.join(run4, "STOPPED.json")))
     assert rc4 == 20 and stp["at_update"] == 2 and stp["v_2"] == "not kept" and stp["last_adapter_above_line"] == 1 and stp["resume_from"] == "updates/1/ckpt"
-    rc4, run4, tr4, s4, _ = session(tmp, "v2_NONE", plan_dir, ["GO", "NONE"], panels=panels, verdict_timeout_s=1.0)
+    rc4, run4, tr4, s4, _ = session(tmp, "v2_NONE", plan_dir, ["GO", "NONE"], panels=panels, verdict_timeout_s=12.0)
     stp = json.load(open(os.path.join(run4, "STOPPED.json")))
     assert rc4 == 20 and stp["at_update"] == 2 and stp["v_2"] == "not judged" and "READS_DONE" in stp["reason"]
     # check_verdict on the complete run's files
@@ -402,6 +402,10 @@ def main():
         assert json.load(open(os.path.join(run5, "STOPPED.json")))["v_1"] == "not judged"
     rc5, run5, tr5, s5, pt5 = session(tmp, "reader_dies", plan_dir, ["GO", "GO"], engines=FakeEngines(die_at=8), panels=panels)
     assert rc5 == SS.EXIT_READS and pt5.reader_rc == RD.EXIT_READS and not os.path.isdir(os.path.join(run5, "updates", "2", "ckpt")), (rc5, pt5.reader_rc)
+    rc5, run5, tr5, s5, pt5 = session(tmp, "reader_dies_at_start", plan_dir, ["GO", "GO"], engines=FakeEngines(die_at=1), panels=panels)
+    stp = json.load(open(os.path.join(run5, "STOPPED.json")))
+    assert rc5 == SS.EXIT_READS and stp["at_update"] == 1 and stp["v_1"] == "not applied" and stp["last_adapter_above_line"] == 0, stp
+    assert not os.path.isdir(os.path.join(run5, "updates", "1", "ckpt")), "an update was applied although the read side had failed"
     # rows whose records are not the base model's (one value changed): the base identity fails before any update is read
     rb = base_rows()
     t = int(np.flatnonzero(rb[0].loss_mask)[-1])

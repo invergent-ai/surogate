@@ -259,7 +259,7 @@ class Watch:
         self.s, self.n, self.ev, self.t = session, n, threading.Event(), None
 
     def __enter__(self):
-        if self.n is not None and self.s.o["early_stop"] and threading.current_thread() is threading.main_thread():
+        if self.s.o["early_stop"] and threading.current_thread() is threading.main_thread():
             self.s.armed = True
             self.t = threading.Thread(target=self.run, daemon=True)
             self.t.start()
@@ -440,6 +440,10 @@ class Session:
                 out = tr.compute(sub, self.version, StepConfig(max_policy_lag=None), seeds="ppo", minibatch_index=j)
         except EarlyStop:
             self.abort_trainer()
+            if self.pending is None:                          # the read side failed before any hand-over: nothing was applied by this session
+                rs = self.reader_state(None) or (EXIT_READS, "the gradient was interrupted but the read side shows no failure")
+                self.phase(f"update {n}: gradient interrupted, the read side has failed")
+                raise SessionStop(rs[0], n, rs[1], "not applied")
             self.phase(f"update {n}: gradient interrupted, update {self.pending} cannot get a GO")
             self.await_verdict(self.pending, time.time(), last=False)
             raise SessionStop(EXIT_READS, self.pending, "the gradient was interrupted but the previous update shows no stop", "not judged")
@@ -473,6 +477,10 @@ class Session:
         step["attempts"] = self.take_sketches(n, sub, out)
         if self.pending is not None:                          # nothing is applied before the previous update has its GO
             self.await_verdict(self.pending, time.time(), last=False)
+        else:                                                 # nor when the read side has already failed (no later read could be judged)
+            rs = self.reader_state(None)
+            if rs:
+                raise SessionStop(rs[0], n, rs[1], "not applied")
         prev = self.cur if self.cur is not None else self.theta0
         first_ever = self.cur is None
         step["grad_norm"] = tr.apply(out, self.o["lr"])
@@ -598,29 +606,32 @@ class Session:
                    round_trip_rows=len(rt), seconds=round(time.time() - t0, 1))
 
     # ------------------------------------------------------------------ the wait
-    def reader_state(self, n: int):
-        """-> None, or (code, reason) when the read side can no longer deliver update n."""
+    def reader_state(self, n):
+        """-> None, or (code, reason) when the read side can no longer deliver update n (n None: when it has failed at all)."""
+        ident = os.path.join(self.run, "base", "roundtrip", "identity.json")
+        if os.path.exists(ident) and read_json(ident).get("result") != "equal":
+            return EXIT_ROUNDTRIP, "the engines' base read of the round-trip rows differs from the rows' recorded log-probs"
+        ex = os.path.join(self.run, "reader.exit")
+        code = open(ex).read().strip() if os.path.exists(ex) else None
+        if n is None:
+            return (EXIT_READS, f"the read side ended early (exit {code})") if code not in (None, "0") else None
         ud = self.ud(n)
         res = os.path.join(ud, "roundtrip", "result.json")
         if os.path.exists(res):
             r = read_json(res)
             if r.get("result") != "equal":
                 return EXIT_ROUNDTRIP, f"round trip of update {n}: {r.get('result')!r}"
-        ident = os.path.join(self.run, "base", "roundtrip", "identity.json")
-        if os.path.exists(ident) and read_json(ident).get("result") != "equal":
-            return EXIT_ROUNDTRIP, "the engines' base read of the round-trip rows differs from the rows' recorded log-probs"
-        ex = os.path.join(self.run, "reader.exit")
-        if os.path.exists(ex) and not os.path.exists(os.path.join(ud, "READS_DONE")):
-            code = open(ex).read().strip()
+        if code is not None and not os.path.exists(os.path.join(ud, "READS_DONE")):
             return EXIT_READS, f"the read side ended (exit {code}) without the reads of update {n}"
         return None
 
-    def bad_news(self, n: int):
-        """What the watcher looks for while the next gradient runs: anything that already rules out a GO for update n."""
+    def bad_news(self, n):
+        """What the watcher looks for while a gradient runs: anything that already rules out a GO for update n (n None: a read side
+        that has failed before the first hand-over)."""
         rs = self.reader_state(n)
         if rs:
             return rs[1]
-        if os.path.exists(os.path.join(self.ud(n), "VERDICT.json")):
+        if n is not None and os.path.exists(os.path.join(self.ud(n), "VERDICT.json")):
             outcome, problem = check_verdict(self.run, n, self.sid)
             if problem or outcome != "GO":
                 return problem or outcome
