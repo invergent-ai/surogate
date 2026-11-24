@@ -11,7 +11,7 @@ serve (while the trainer runs), on the read engines:
     ROUND TRIP (bitwise, at every loss token of the round-trip rows): engine(X) == the trainer's log-probs at X for v, R and R2, and the base
     re-read == the base read of the same rows at the start; BOTH reads of the rows under each adapter. The last requests under one adapter and
     the first under the next are then the same prompts on the same engine: a state carried over from one adapter into the next request
-    (slot or prefix cache) would show here, whatever the panel reads in between did to the cache. -> roundtrip/engine_<X>.npz, roundtrip/result.json ("result": "equal" |
+    (slot or prefix cache) would show here, whatever the panel reads in between did to the cache. -> roundtrip/engine_<X>.npz (first read), engine_<X>_last.npz (last read), engine_base2.npz, result.json ("result": "equal" |
     "differ"). On "differ" nothing more is written for the update and the process ends with exit 21.
     Panels -> reads_dmg/<panel>/{v,R,R2,base2}.npz: lp_<row> float32 [T] = the value at the panel's mask, 0 elsewhere, + ids_crc32 [R] of the ids
     sent; <X>.json {"adapter_sha256", "head", "engine_sha", "source", "session_id", "panel_rows_sha256"}. A read that is not complete is not written.
@@ -314,18 +314,22 @@ class Reader:
         checks["engine_base_reread_vs_start_base"] = {"rows": len(rt.rows), "loss_tokens": checks["trainer_vs_engine_v"]["loss_tokens"], "differ": d}
         differ_total += d
         save_npz(os.path.join(rd, "engine_base2.npz"), **{f"lp_{r}": res[("rt", "base2")][r] for r in rt.rows})
-        second = {}                                           # the rows' second read under each adapter (after the panels)
-        for name in NAMES + ("base2",):
-            ref = base0 if name == "base2" else np.load(os.path.join(rd, f"trainer_{name}.npz"))
-            d = sum(bits_differ(res[("rt2", name)][r], ref[r] if name == "base2" else ref[f"lp_{r}"], rt.mask(r)) for r in rt.rows)
-            second[name] = {"rows": len(rt.rows), "differ": d}
+        second = {}                                           # the rows' LAST read under each adapter (after the panels): a file of its own
+        for name in NAMES:
+            tz = np.load(os.path.join(rd, f"trainer_{name}.npz"))
+            d = sum(bits_differ(res[("rt2", name)][r], tz[f"lp_{r}"], rt.mask(r)) for r in rt.rows)
+            second[name] = {"rows": len(rt.rows), "loss_tokens": checks[f"trainer_vs_engine_{name}"]["loss_tokens"], "differ": d}
             differ_total += d
+            save_npz(os.path.join(rd, f"engine_{name}_last.npz"), **{f"lp_{r}": res[("rt2", name)][r] for r in rt.rows})
+        d = sum(bits_differ(res[("rt2", "base2")][r], base0[r], rt.mask(r)) for r in rt.rows)
+        base_second = {"rows": len(rt.rows), "loss_tokens": checks["trainer_vs_engine_v"]["loss_tokens"], "differ": d}
+        differ_total += d
         moved = sum(bits_differ(res[("rt", "v")][r], res[("rt", "base2")][r], rt.mask(r)) for r in rt.rows)
         per_engine = {str(e): rt.share(e, len(self.urls)) for e in range(len(self.urls))}
         result = "equal" if differ_total == 0 and checks["trainer_vs_engine_v"]["loss_tokens"] > 0 else "differ"
         write_json(os.path.join(rd, "result.json"), {"result": result, "update": n, "session_id": sid, "checks": checks,
                                                     "v_vs_base_positions_differing": moved,   # reported: an adapter that moves nothing
-                                                    "second_read": second,
+                                                    "second_read": second, "base_second_read": base_second,
                                                     "round_trip_rows_per_engine": per_engine,
                                                     "order": "on each engine: v, R, R2, no adapter; under each: round-trip rows, panels, round-trip rows",
                                                     "adapters": {k: ads[k]["sha256"] for k in NAMES}})
