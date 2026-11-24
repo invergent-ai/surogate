@@ -1,14 +1,15 @@
 """Update rules for the step session: what is added to the masters for one update, given the update's gradient and the optimizer's own step.
 
-The optimizer (the kit's fp32 AdamW on the masters, global clip first) always runs; its step d_A and its moments are the reference. A rule
-keeps d_A's size and changes its direction:
-  A  the optimizer's step itself (today's rule).
-  P  gradient-proportional:            d = -k g,  k such that |d|_2 = |d_A|_2 over all tensors together.
-  T  proportional inside each tensor:  d[t] = -g[t] |d_A[t]|_2 / |g[t]|_2 for every tensor t with |g[t]|_2 > 0, zero elsewhere
-     (the optimizer's norms across tensors, the gradient's direction inside each).
-  E  Adam's direction at a larger eps: d = -k u,  u = m_hat / (sqrt(v_hat) + eps) from the optimizer's moments AFTER its step (at the first
-     step u = g / (|g| + eps)),  k such that |d|_2 = |d_A|_2.
-g is the gradient the optimizer saw: the update's gradient times the clip coefficient. Every norm and product is taken in float64; the result is
+The optimizer (the kit's fp32 AdamW on the masters, global clip first) always runs; its step d_A and its moments are the reference. Every
+rule is Adam's own formula  m_hat / (sqrt(v_hat) + eps)  with one constant changed, at the SIZE of the optimizer's step at that update:
+  A  eps 1e-8: the optimizer's step itself.
+  E  a larger eps:                     d = -k u,  u = m_hat / (sqrt(v_hat) + eps),  k such that |d|_2 = |d_A|_2 over all tensors together.
+  P  eps -> infinity (proportional):   d = -k m_hat,  k such that |d|_2 = |d_A|_2 over all tensors together.
+  T  proportional inside each tensor:  d[t] = -m_hat[t] |d_A[t]|_2 / |m_hat[t]|_2 for every tensor t with |m_hat[t]|_2 > 0, zero elsewhere
+     (the optimizer's norms across tensors, the averaged gradient's direction inside each).
+m_hat, v_hat are the optimizer's bias-corrected moments AFTER its step at that update. At the FIRST step m_hat is the gradient the optimizer
+saw, g (the update's gradient times the clip coefficient): P and T take it from the gradient itself there, which keeps first-step results
+independent of the moments' fp32 storage. Every norm and product is taken in float64; the result is
 rounded once to fp32 when it is added to the masters. A rule's size s multiplies d (s = 1: the rule itself).
 The optimizer's moments depend on the gradients only, so they are the same under every rule: a checkpoint's optimizer state stays valid when its
 masters are rebuilt under another rule (rebuild_checkpoint).
@@ -50,25 +51,31 @@ def adam_direction(m: list, v: list, step: float, betas=(0.9, 0.999), eps: float
 
 def rule_delta(rule: str, grads: list, coef: float, d_adam: list, size: float = 1.0, eps: float | None = None, moments=None) -> list:
     """The rule's delta (float64 tensors, one per master). grads: the update's gradient before the clip; coef: the clip coefficient;
-    d_adam: the optimizer's own step (masters after - before); moments = (m, v, step, betas) for rule E.
+    d_adam: the optimizer's own step (masters after - before); moments = (m, v, step, betas) AFTER that step (needed by E always, by P and T
+    from the second step on; without moments P and T take the gradient, which is right at the first step only).
     One tensor at a time: beside the result only one tensor's float64 copies exist at any moment (the full set is several GB)."""
     if rule not in RULES:
         raise ValueError(f"rule {rule!r}")
     s = float(size)
     if rule == "A":
         return [d.double() * s for d in d_adam]
-    if rule == "T":
-        out = []
-        for x, d in zip(grads, d_adam):
-            gx = x.double() * coef
-            ng = float(gx.norm())
-            out.append(gx.mul_(-s * float(d.double().norm()) / ng) if ng > 0 else gx.zero_())
-        return out
-    na = _norm(d_adam)                                        # the size both P and E are matched to
-    if rule == "P":
-        ng = float(np.sqrt(sum(float((x.double() * coef).pow(2).sum()) for x in grads)))
-        k = na / ng if ng > 0 else 0.0
-        return [(x.double() * coef).mul_(-k * s) for x in grads]
+    if rule in ("P", "T"):
+        # the direction: m_hat. At the first step it IS the clipped gradient (taken from the gradient); later the bias-corrected first moment
+        if moments is None or float(moments[2]) == 1.0:
+            src, f = grads, float(coef)
+        else:
+            src, f = moments[0], 1.0 / (1.0 - float(moments[3][0]) ** float(moments[2]))
+        if rule == "T":
+            out = []
+            for x, d in zip(src, d_adam):
+                gx = x.double() * f
+                ng = float(gx.norm())
+                out.append(gx.mul_(-s * float(d.double().norm()) / ng) if ng > 0 else gx.zero_())
+            return out
+        ng = float(np.sqrt(sum(float((x.double() * f).pow(2).sum()) for x in src)))
+        k = _norm(d_adam) / ng if ng > 0 else 0.0
+        return [(x.double() * f).mul_(-k * s) for x in src]
+    na = _norm(d_adam)                                        # the size E is matched to
     if moments is None or eps is None:
         raise ValueError("rule E needs the optimizer's moments and an eps")
     m, v, step, betas = moments

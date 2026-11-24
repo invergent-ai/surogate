@@ -665,6 +665,28 @@ def main():
         except ValueError:
             pass
 
+    # the rules at a LATER step against formulas written here from the definition (not the module's code): direction m_hat for P and T
+    g1 = [x.clone() for x in gr]
+    g2 = [torch.randn(x.shape, generator=gq) * 1e-3 if bool(x.any()) else torch.zeros_like(x) for x in gr]
+    m2 = [0.9 * (0.1 * a) + 0.1 * b for a, b in zip(g1, g2)]
+    v2 = [0.999 * (0.001 * a * a) + 0.001 * b * b for a, b in zip(g1, g2)]
+    mh = [x.double() / (1 - 0.9 ** 2) for x in m2]
+    vh = [x.double() / (1 - 0.999 ** 2) for x in v2]
+    dA2 = [(-2e-5 * a / (b.sqrt() + 1e-8)).float() for a, b in zip(mh, vh)]
+    mom2 = (m2, v2, 2.0, (0.9, 0.999))
+    relerr = lambda a, b: max(float((x - y).abs().max()) / max(float(y.abs().max()), 1e-300) for x, y in zip(a, b))  # noqa: E731
+    kP = nrm(dA2) / nrm(mh)
+    assert relerr(RU.rule_delta("P", g2, 1.0, dA2, moments=mom2), [-kP * x for x in mh]) <= 1e-12, "P at step 2 is not -k m_hat"
+    wantT = [(-x * (float(d.double().norm()) / float(x.norm())) if float(x.norm()) > 0 else torch.zeros_like(x)) for x, d in zip(mh, dA2)]
+    assert relerr(RU.rule_delta("T", g2, 1.0, dA2, moments=mom2), wantT) <= 1e-12, "T at step 2 is not m_hat inside each tensor"
+    uE = [a / (b.sqrt() + 1e-6) for a, b in zip(mh, vh)]
+    assert relerr(RU.rule_delta("E", g2, 1.0, dA2, eps=1e-6, moments=mom2), [-(nrm(dA2) / nrm(uE)) * x for x in uE]) <= 1e-12
+    assert cosv(RU.rule_delta("P", g2, 1.0, dA2, moments=mom2), g2) > -1 + 1e-6, "P at step 2 still points along the current gradient alone"
+    # at the FIRST step P and T take the gradient itself, with or without the moments at hand: bit for bit the first-step definition
+    for rule_ in ("P", "T"):
+        assert all(torch.equal(a, b) for a, b in zip(RU.rule_delta(rule_, gr, 1.0, dA, moments=mom), RU.rule_delta(rule_, gr, 1.0, dA)))
+    assert all(torch.equal(a, b) for a, b in zip(RU.rule_delta("P", gr, 1.0, dA), [(x.double() * 1.0).mul_(-(nrm(dA) / nrm(gr)) * 1.0) for x in gr]))
+
     def by_hand(rule, eps=None, updates_=(0, 1)):             # the reference: the optimizer steps, then the masters are set to prev + rule
         t = P.FakeTrainer(cfg_for(tmp), 2)
         rr = load(plan_dir).rows

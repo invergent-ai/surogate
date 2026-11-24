@@ -594,14 +594,13 @@ class Session:
         step["update_rule"] = self.rule
         if self.rule["rule"] != "A" or self.rule["size"] != 1.0:   # another rule: the optimizer's step replaced by the rule's (t8_rules)
             d_adam = [m.detach() - p_ for m, p_ in zip(tr.opt.masters, prev)]
-            moments = None
-            if self.rule["rule"] == "E":
-                arr, grp = tr.opt.state_arrays(), tr.opt.opt.param_groups[0]
-                moments = ([torch.from_numpy(np.array(arr[f"{i}.exp_avg"])) for i in range(len(self.nm))],
-                           [torch.from_numpy(np.array(arr[f"{i}.exp_avg_sq"])) for i in range(len(self.nm))],
-                           float(arr["0.step"][0]), tuple(float(b) for b in grp["betas"]))
+            arr, grp = tr.opt.state_arrays(), tr.opt.opt.param_groups[0]      # the moments AFTER this step: views, only read here
+            moments = ([torch.from_numpy(arr[f"{i}.exp_avg"]) for i in range(len(self.nm))],
+                       [torch.from_numpy(arr[f"{i}.exp_avg_sq"]) for i in range(len(self.nm))],
+                       float(arr["0.step"][0]), tuple(float(b) for b in grp["betas"]))
+            step["update_rule_optimizer_step"] = moments[2]
             d_rule = RU.rule_delta(self.rule["rule"], out.grads, step["clip_coefficient"], d_adam, self.rule["size"], self.rule["eps"], moments)
-            del moments
+            del moments, arr
             step["update_rule_table"] = RU.table_row(f"{self.rule['rule']}:{self.rule['size']:g}", d_rule, d_adam, self.nm, self.blocks)
             put_masters(tr, RU.add_delta(prev, d_rule))
             del d_adam, d_rule
