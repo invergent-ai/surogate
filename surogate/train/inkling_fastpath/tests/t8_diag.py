@@ -588,7 +588,8 @@ def phase_lin(a):
       trajectory (the micro-step's failure is the linearisation point); f < 0.9 at layer 12 or 3 while layer 21 passes = the accumulation
       across visits is wrong after all.
     4 FOLLOW OF G_S IN THE ENGINE (routing free): central differences along G_S at x1 and x4 for 12.B13 and 3.B13. LINE: at x4 f in
-      [0.7, 1.3] = a remedy exists (linearise on the fp32 chain); f < 0.5 = it does not transfer to the engine.
+      [0.7, 1.3] = a remedy exists (linearise on the fp32 chain); f < 0.5 = it does not transfer to the engine. The engine line is read at
+      x4; where the prediction at x4 is below 3 nats it is read at x16 instead (the engine's routing scatter is 0.6-0.8 nats per side).
     5 (budget allowing) 2-3 on the FROZEN chain's states (rounding on): G_F, its follow on the frozen chain for the same three B13 tensors.
     The head's backward reads the hidden as bf16 (B.HeadLogprob), as in production; the smooth chain's hidden is rounded there."""
     deadline = time.time() + a.budget_s
@@ -707,7 +708,7 @@ def phase_lin(a):
     # 3 and 4
     rep["follow_GS_smooth"], rep["follow_GS_engine"] = [], []
     tasks = [("c", "12.B13"), ("c", "3.B13"), ("c", "21.B13"), ("e", "12.B13", 1.0), ("e", "12.B13", 4.0), ("e", "3.B13", 1.0),
-             ("e", "3.B13", 4.0), ("c", "12.qB")]
+             ("e", "3.B13", 4.0), ("e", "3.B13", 16.0), ("c", "12.qB")]
     for t in tasks:
         if time.time() > deadline:
             rep["dropped"].append(list(t))
