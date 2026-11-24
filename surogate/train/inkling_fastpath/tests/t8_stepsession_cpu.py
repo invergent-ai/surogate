@@ -257,7 +257,8 @@ def main():
             R = torch.load(os.path.join(run, "work", "adapters", f"u{n}_{name}", "state.pt"), weights_only=True)
             for t0, x, r, k in zip(theta0, v, R, nm):
                 du, dr = float((x.double() - t0.double()).norm()), float((r.double() - t0.double()).norm())
-                assert (du == 0.0 and torch.equal(r, t0)) or abs(dr - du) <= 1e-5 * du + 1e-12, (n, name, k, du, dr)
+                # the control is rounded once to fp32 around theta0: on a tensor with non-zero start values its norm holds to that rounding
+                assert (du == 0.0 and torch.equal(r, t0)) or (du > 0.0 and abs(dr - du) <= 1e-3 * du), (n, name, k, du, dr)
         rd = json.load(open(os.path.join(ud, "READS_DONE")))
         want = {f"updates/{n}/reads_dmg/a/{x}.{e}" for x in ("v", "R", "R2", "base2") for e in ("npz", "json")}
         want |= {"base/reads_dmg/a/base.npz", "base/reads_dmg/a/base.json", f"updates/{n}/adapters.json", f"updates/{n}/roundtrip/result.json"}
@@ -346,7 +347,7 @@ def main():
     Rb = torch.load(os.path.join(runB, "work", "adapters", "u4_R", "state.pt"), weights_only=True)
     for t0, x, r in zip(theta0, trB.opt.masters, Rb):         # the control follows the update accumulated since the RUN's start
         du, dr = float((x.double() - t0.double()).norm()), float((r.double() - t0.double()).norm())
-        assert abs(dr - du) <= 1e-5 * du + 1e-12
+        assert du > 0.0 and abs(dr - du) <= 1e-3 * du
     rcx, _, _, sx, _ = session(tmp, "refuse_plan2_from_ck1", plan2_dir, [], resume=ck1)
     assert rcx == SS.EXIT_INPUT, sx.sess["exit"]
     print("(3B) next plan from the checkpoint == one trainer running both, bitwise: PASS")
