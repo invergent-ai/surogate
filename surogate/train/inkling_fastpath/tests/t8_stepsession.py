@@ -514,10 +514,6 @@ class Session:
         first_ever = self.cur is None
         step["grad_norm"] = tr.apply(out, self.o["lr"])
         self.cur = masters_list(tr)
-        if sketch_files:                                      # the sketches of an update that was applied (an unapplied one leaves none)
-            os.makedirs(os.path.join(ud, "sketches"), exist_ok=True)
-            for f in sketch_files:
-                shutil.move(f, os.path.join(ud, "sketches", os.path.basename(f)))
         delta = [c - p for c, p in zip(self.cur, prev)]
         fo = MI.first_order(out.grads, N, delta, self.keys, self.blocks)
         a_keys = [i for i, x in enumerate(self.nm) if x.split(".", 1)[1].endswith("A") or x.split(".", 1)[1] in ("A13", "A2")]
@@ -539,6 +535,13 @@ class Session:
         self.phase(f"update {n}: applied", grad_norm=step["grad_norm"], clip_share=step["clip_share"], first_order=fo["by_block"]["all"])
         self.post_state(n, j, step=step)
         self.pending = n
+        if sketch_files:                                      # the sketches of an update that was applied (an unapplied one files none);
+            try:                                              # after the checkpoint and the hand-over: a full disk here must not cost the update
+                os.makedirs(os.path.join(ud, "sketches"), exist_ok=True)
+                for f in sketch_files:
+                    shutil.move(f, os.path.join(ud, "sketches", os.path.basename(f)))
+            except OSError as e:
+                self.phase(f"update {n}: sketches NOT filed ({type(e).__name__}: {e}); they stay where the workers wrote them")
 
     def read_sketches(self, n: int, sub: list, out):
         """Per attempt what the signal read needs to know about the update's sketches (the files stay where the workers wrote them until the
@@ -644,8 +647,13 @@ class Session:
             return EXIT_ROUNDTRIP, "the engines' base read of the round-trip rows differs from the rows' recorded log-probs"
         ex = os.path.join(self.run, "reader.exit")
         code = open(ex).read().strip() if os.path.exists(ex) else None
+        jx = os.path.join(self.run, "judge.exit")             # written when the judge's process has ended: it writes no verdict after that
         if n is None:
-            return (EXIT_READS, f"the read side ended early (exit {code})") if code not in (None, "0") else None
+            if code not in (None, "0"):
+                return EXIT_READS, f"the read side ended early (exit {code})"
+            if os.path.exists(jx):                            # nothing is waiting for a verdict yet, and none can come any more
+                return EXIT_STOPPED, f"the judge ended (exit {open(jx).read().strip()}) before any update was handed over"
+            return None
         ud = self.ud(n)
         res = os.path.join(ud, "roundtrip", "result.json")
         if os.path.exists(res):
@@ -654,7 +662,6 @@ class Session:
                 return EXIT_ROUNDTRIP, f"round trip of update {n}: {r.get('result')!r}"
         if code is not None and not os.path.exists(os.path.join(ud, "READS_DONE")):
             return EXIT_READS, f"the read side ended (exit {code}) without the reads of update {n}"
-        jx = os.path.join(self.run, "judge.exit")             # written when the judge's process has ended: it writes no verdict after that
         if os.path.exists(jx) and not os.path.exists(os.path.join(ud, "VERDICT.json")):
             return EXIT_STOPPED, f"the judge ended (exit {open(jx).read().strip()}) without a verdict for update {n}"
         return None
@@ -758,7 +765,8 @@ class Session:
         except BaseException as e:
             self.abort_trainer()
             gate = type(e).__name__ == "T8GateError"
-            self.failed(EXIT_GATE if gate else 1, f"{type(e).__name__}: {e}")
+            code = e.code if isinstance(e, SystemExit) and isinstance(e.code, int) else 1
+            self.failed(EXIT_GATE if gate else code, f"{type(e).__name__}: {e}")
             if gate:
                 return EXIT_GATE
             raise

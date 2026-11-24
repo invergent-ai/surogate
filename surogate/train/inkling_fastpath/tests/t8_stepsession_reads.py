@@ -195,6 +195,9 @@ class Reader:
     def __init__(self, client, urls, run_dir, plan_dir, panels: dict, transfer_dir="", engine_sha="", poll_s=2.0):
         self.c, self.urls, self.run, self.poll = client, list(urls), run_dir, poll_s
         self.plan = RowSet("plan", plan_dir)
+        bad = [name for name in panels if name in ("rt", "rt2", "plan", "transfer", "base") or not name or "/" in name]
+        if bad:                                               # these names are row sets of the read side itself
+            raise ValueError(f"panel names {bad} are not allowed")
         self.panels = {name: RowSet(name, d) for name, d in panels.items()}
         self.transfer = RowSet("transfer", transfer_dir) if transfer_dir else None
         self.engine_sha = engine_sha

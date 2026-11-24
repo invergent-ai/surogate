@@ -414,6 +414,17 @@ def main():
     stp = json.load(open(os.path.join(run4, "STOPPED.json")))
     assert rc4 == 20 and stp["at_update"] == 1 and stp["v_1"] == "not judged" and "judge ended" in stp["reason"] and time.time() - t0 < 60, stp
     assert not os.path.isdir(os.path.join(run4, "updates", "2", "ckpt"))
+    os.makedirs(os.path.join(tmp, "judge_dead"))              # a judge that ended before anything was handed over: nothing is applied
+    open(os.path.join(tmp, "judge_dead", "judge.exit"), "w").write("4")
+    rc4, run4, tr4, s4, _ = session(tmp, "judge_dead", plan_dir, ["GO", "GO"], panels=panels)
+    stp = json.load(open(os.path.join(run4, "STOPPED.json")))
+    assert rc4 == 20 and stp["at_update"] == 1 and stp["v_1"] == "not applied" and "judge ended" in stp["reason"], stp
+    assert not os.path.isdir(os.path.join(run4, "updates", "1", "ckpt")) and SS.state_sha(tr4.opt.masters, nm) == s4.sess["theta0_sha256"]
+    try:
+        RD.Reader(FakeEngines(), ["e0"], run, plan_dir, {"rt2": panel_dir})
+        raise AssertionError("a panel named like the read side's own row sets was accepted")
+    except ValueError:
+        pass
     # check_verdict on the complete run's files
     sid = "cpu-test-full"
     assert SS.check_verdict(run, 1, sid) == ("GO", None)
@@ -431,6 +442,17 @@ def main():
         assert SS.check_verdict(run, 1, sid)[0] is None, what
     json.dump(good, open(vp, "w"))
     assert SS.check_verdict(run, 1, sid) == ("GO", None)
+    rdp = os.path.join(run, "updates", "1", "READS_DONE")     # a READS_DONE that lists a file outside the results directory
+    keep_rd = open(rdp).read()
+    for evil in ("../full/updates/1/adapters.json", os.path.join(run, "updates", "1", "adapters.json")):
+        rdj, vj = json.loads(keep_rd), copy.deepcopy(good)
+        rdj["files"][evil] = vj["judged"][evil] = MI.sha256(os.path.join(run, "updates", "1", "adapters.json"))
+        json.dump(rdj, open(rdp, "w"))
+        json.dump(vj, open(vp, "w"))
+        assert SS.check_verdict(run, 1, sid)[0] is None, evil
+    open(rdp, "w").write(keep_rd)
+    json.dump(good, open(vp, "w"))
+    assert SS.check_verdict(run, 1, sid) == ("GO", None)
     fp = os.path.join(run, "updates", "1", "reads_dmg", "a", "v.json")
     keep = open(fp).read()
     open(fp, "w").write(keep + " ")
@@ -444,6 +466,8 @@ def main():
         rc5, run5, tr5, s5, pt5 = session(tmp, "rt_" + what.replace(" ", "_"), plan_dir, ["GO", "GO"], engines=eng, panels=panels)
         rr = json.load(open(os.path.join(run5, "updates", "1", "roundtrip", "result.json")))
         assert rc5 == code and pt5.reader_rc == 21 and rr["result"] == "differ", (what, rc5, pt5.reader_rc)
+        if what == "second read of R2":                       # the first read is clean: only the read after the panels shows it
+            assert rr["second_read"]["R2"]["differ"] > 0 and rr["checks"]["trainer_vs_engine_R2"]["differ"] == 0, rr
         assert not os.path.exists(os.path.join(run5, "updates", "1", "READS_DONE")) and not os.path.isdir(os.path.join(run5, "updates", "2", "ckpt"))
         assert json.load(open(os.path.join(run5, "STOPPED.json")))["v_1"] == "not judged"
     rc5, run5, tr5, s5, pt5 = session(tmp, "reader_dies", plan_dir, ["GO", "GO"], engines=FakeEngines(die_at=8), panels=panels)
