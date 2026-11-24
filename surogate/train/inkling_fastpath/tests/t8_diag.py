@@ -801,6 +801,13 @@ def phase_sum(a):
       LINE: cos > 0.8 at layers 12 and 3 = a candidate; otherwise discarded without finite differences. For candidates: follow in the ENGINE
       along the variant's gradient taken on the engine's states: 12.B13 and 3.B13 at x4 (x16 where the x4 prediction is under 3 nats),
       21.B13 at x1. LINE: [0.7, 1.3] at layers 12 and 3 = a usable gradient exists; < 0.5 = it does not.
+    B first (agent-RX, before data): TRUNCATION K = 18 / 24 / 30 (backward_row with v_first 30 / 24 / 18), on the engine's and the chain's
+      states: cos and norm ratio for 12.B13, 12.qB, 21.B13 and per visit; the norm of 12.B13; always the engine follow of 12.B13 along the
+      variant's gradient on the engine's states (x4, x16 where the x4 prediction is under 3 nats). LINE: engine follow of 12.B13 in
+      [0.7, 1.3] = a backward truncated at that depth gives a gradient the engine follows at a looped layer; < 0.5 = it does not. 21.B13 at
+      x1 once as control. Patch variants: a candidate PER LAYER (12.B13 cos > 0.8 -> follow 12.B13; 3.B13 cos > 0.8 -> follow 3.B13).
+      An error in A is recorded and B / C go on (flagged "A did not run"); only a measured fail of A's line stops the session.
+      Order: A; chains and G_S / G_F; K18, K24, K30; Q; M; D; QD; C (the deadline cuts from the tail).
     C trend only, last: the smooth chain along G_S (full gradient, chain states), 12.B13 at x1/4, x1/16, x1/64, S+ and S- printed.
     Recorded once: relative L2 distance smooth vs frozen chain outputs per visit; cos of G_F (frozen chain states, rounding on) against G_S."""
     deadline = time.time() + a.budget_s
@@ -822,7 +829,7 @@ def phase_sum(a):
         x, y = x.double().reshape(-1), y.double().reshape(-1)
         return {"cos": float((x * y).sum() / (x.norm() * y.norm()).clamp(min=1e-300)), "norm_ratio": float(x.norm() / y.norm().clamp(min=1e-300))}
 
-    def run_backward(vals, ids_, g_, qb_, head_grad=None):
+    def run_backward(vals, ids_, g_, qb_, head_grad=None, v_first=None):
         Gs, gv = {}, {}
 
         def ong(v, layer, j, gj):
@@ -831,7 +838,8 @@ def phase_sum(a):
                 c = gj.detach().float().cpu()
                 Gs[nm] = c if nm not in Gs else Gs[nm].add_(c)
 
-        TL.backward_row(eng, W, ids_, vals, rig.w.lora, scale, rig.w.v_first, g_, rig.w.buffers, ong, head_grad=head_grad, q_block=qb_,
+        TL.backward_row(eng, W, ids_, vals, rig.w.lora, scale, rig.w.v_first if v_first is None else v_first, g_, rig.w.buffers, ong,
+                        head_grad=head_grad, q_block=qb_,
                         train_idx=rig.w.train_idx, attn_scale=attn_scale,
                         on_visit_grad=lambda v, go: gv.__setitem__(v, go.detach().float().cpu()))
         return Gs, gv
@@ -922,13 +930,13 @@ def phase_sum(a):
         del host_p, hid_d, g_auto, G_auto
     except Exception as e:
         import traceback
-        rep["A"] = {"error": traceback.format_exc()[-2000:], "pass": False}
-        log(f"A ERROR: {type(e).__name__}: {e}")
+        rep["A"] = {"error": traceback.format_exc()[-2000:], "pass": None, "flag": "A did not run"}
+        log(f"A ERROR (A did not run; B and C go on): {type(e).__name__}: {e}")
     RA.ROUND["on"] = False
     torch.cuda.empty_cache()
     save()
-    if not rep["A"].get("pass"):
-        rep["dropped"].append("B and C (A did not pass)")
+    if rep["A"].get("pass") is False:
+        rep["dropped"].append("B and C (A's line failed)")
         save()
         rig.w._release(ctx)
         rig.w.close()
@@ -956,9 +964,51 @@ def phase_sum(a):
     log("G_F vs G_S: " + ", ".join(f"{nm} {x['cos']:.3f}" for nm, x in rep["G_F_vs_G_S"].items()))
     save()
 
-    # ---------------------------------------------------------------- B
+    def engine_follow(Gt, nm, mult):
+        L, k = nm.split(".")
+        gC = Gt.double()
+        m_ = mult
+        if nm != "21.B13" and float(gC.norm()) * BASE_E * m_ * gC.numel() ** 0.5 < 3.0:
+            m_ = 16.0
+        step = (gC / gC.norm() * BASE_E * m_ * gC.numel() ** 0.5).float()
+        pred = float((gC * step.double()).sum())
+        sv = {}
+        for sg in (1, -1):
+            rig.set_one(int(L), k, sg * step)
+            with torch.no_grad():
+                res = F.forward(eng, ids, save=False, adapters_per_layer=rig.w._adapters())
+                lpx = F.logprobs(eng, res["hidden"], ids)
+            sv[sg] = float(lpx.double()[mask_t[1:]].sum())
+            del res, lpx
+            eng._ws = None
+        rig.set_one(int(L), k, None)
+        return {"tensor": nm, "mult": m_, "pred": pred, "S+": sv[1], "S-": sv[-1], "f": (sv[1] - sv[-1]) / (2 * pred)}
+
+    # ---------------------------------------------------------------- B, truncation first
     rep["B"] = {}
-    for var in ("Q", "D", "QD", "M"):
+    for K in (18, 24, 30):
+        if time.time() > deadline - 60:
+            rep["dropped"].append(f"B K{K}")
+            continue
+        vf = 48 - K
+        try:
+            Ge, ge = run_backward(ctx["res"], ids, g_full, qb, v_first=vf)
+            Gc, gc = run_backward(chain_vals(outs_s, hid_s), ids, g_full, qb, v_first=vf)
+            r = {"v_first": vf, "engine_vs_chain": {nm: cmp(Ge[nm], Gc[nm]) for nm in ("12.B13", "12.qB", "21.B13") if nm in Ge and nm in Gc},
+                 "per_visit": {str(v): cmp(ge[v], gc[v]) for v in sorted(ge) if v in gc},
+                 "norm_12B13_engine": float(Ge["12.B13"].norm()) if "12.B13" in Ge else None}
+            r["engine_follow"] = [engine_follow(Ge["12.B13"], "12.B13", 4.0)]
+            if K == 18:
+                r["engine_follow"].append(engine_follow(Ge["21.B13"], "21.B13", 1.0))
+            rep["B"][f"K{K}"] = r
+            log(f"B K{K}: cos engine vs chain 12.B13 {r['engine_vs_chain'].get('12.B13', {}).get('cos')}, |12.B13| {r['norm_12B13_engine']}; "
+                + "; ".join(f"engine follow {x['tensor']} x{x['mult']:g} pred {x['pred']:.4g} f {x['f']:.4f}" for x in r["engine_follow"]))
+        except Exception as e:
+            import traceback
+            rep["B"][f"K{K}"] = {"error": traceback.format_exc()[-1500:]}
+            log(f"B K{K} ERROR: {type(e).__name__}: {e}")
+        save()
+    for var in ("Q", "M", "D", "QD"):
         if time.time() > deadline - 120:
             rep["dropped"].append(f"B {var}")
             continue
@@ -978,37 +1028,18 @@ def phase_sum(a):
         r = {"engine_vs_chain": {nm: cmp(Ge[nm], Gc[nm]) for nm in ("12.B13", "3.B13", "21.B13", "12.qB", "3.qB", "21.qB") if nm in Ge},
              "per_visit": {str(v): cmp(ge[v], gc[v]) for v in sorted(ge) if v in gc},
              "norms_engine": {nm: float(t.norm()) for nm, t in Ge.items()}}
-        cand = r["engine_vs_chain"]["12.B13"]["cos"] > 0.8 and r["engine_vs_chain"]["3.B13"]["cos"] > 0.8
-        r["candidate"] = bool(cand)
+        cands = [nm for nm in ("12.B13", "3.B13") if r["engine_vs_chain"][nm]["cos"] > 0.8]
+        r["candidate_layers"] = cands
         log(f"B {var}: cos engine vs chain 12.B13 {r['engine_vs_chain']['12.B13']['cos']:.3f}, 3.B13 {r['engine_vs_chain']['3.B13']['cos']:.3f}, "
-            f"21.B13 {r['engine_vs_chain']['21.B13']['cos']:.3f}; candidate {cand}")
-        if cand:
-            r["engine_follow"] = []
-            for nm, mult in (("12.B13", 4.0), ("3.B13", 4.0), ("21.B13", 1.0)):
-                if time.time() > deadline:
-                    rep["dropped"].append(f"B {var} follow {nm}")
-                    continue
-                L, k = nm.split(".")
-                gC = Ge[nm].double()
-                m_ = mult
-                pred = float(gC.norm()) * BASE_E * m_ * gC.numel() ** 0.5
-                if nm != "21.B13" and pred < 3.0:
-                    m_ = 16.0
-                step = (gC / gC.norm() * BASE_E * m_ * gC.numel() ** 0.5).float()
-                pred = float((gC * step.double()).sum())
-                sv = {}
-                for sg in (1, -1):
-                    rig.set_one(int(L), k, sg * step)
-                    with torch.no_grad():
-                        res = F.forward(eng, ids, save=False, adapters_per_layer=rig.w._adapters())
-                        lpx = F.logprobs(eng, res["hidden"], ids)
-                    sv[sg] = float(lpx.double()[mask_t[1:]].sum())
-                    del res, lpx
-                    eng._ws = None
-                rig.set_one(int(L), k, None)
-                f = (sv[1] - sv[-1]) / (2 * pred)
-                r["engine_follow"].append({"tensor": nm, "mult": m_, "pred": pred, "S+": sv[1], "S-": sv[-1], "f": f})
-                log(f"B {var} engine follow {nm} x{m_:g}: pred {pred:.4g}, f {f:.4f}")
+            f"21.B13 {r['engine_vs_chain']['21.B13']['cos']:.3f}; candidate layers {cands}")
+        r["engine_follow"] = []
+        for nm in cands:
+            if time.time() > deadline:
+                rep["dropped"].append(f"B {var} follow {nm}")
+                continue
+            x = engine_follow(Ge[nm], nm, 4.0)
+            r["engine_follow"].append(x)
+            log(f"B {var} engine follow {nm} x{x['mult']:g}: pred {x['pred']:.4g}, f {x['f']:.4f}")
         rep["B"][var] = r
         save()
 
