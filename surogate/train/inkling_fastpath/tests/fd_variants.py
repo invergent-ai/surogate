@@ -84,17 +84,65 @@ def run(C, tt, vals, head, round_on, kw):
 
 
 def gate_verdict(rep, var, labels=("12.B13", "3.B13", "21.B13")):
-    """PASS = every label's last reading (the repeat at twice the step when there was one) is readable and inside [0.7, 1.3]."""
-    out = {}
+    """The finite-difference gate of a backward form on one real row. PASS =
+    (1) follow: every label's last reading (the repeat at twice the step when there was one) is readable, predicts at least 3 nats and is
+        inside [0.7, 1.3]: one tensor inside the loop, one before it, the control after it;
+    (2) cos: the form's gradient on the engine's stored states against the recompute chain's own states is >= 0.9 for the two gating tensors;
+    (3) when the trainer path was run: the step's gradient through the trainer's configuration equals the direct row backward's
+        (cos >= 0.99999, norm within 0.1 %) on the tensors compared."""
+    out, ok = {}, True
     for lab in labels:
         rs = [r for r in rep["follow"] if r["variant"] == var and r["what"] == lab]
         if not rs:
             out[lab] = "missing"
-        elif not rs[-1]["readable"]:
+        elif not rs[-1]["readable"] or abs(rs[-1]["pred+"]) < 3.0:
             out[lab] = f"not readable ({rs[-1]['f']:.3f})"
         else:
             out[lab] = f"{'in band' if 0.7 <= rs[-1]['f'] <= 1.3 else 'outside'} ({rs[-1]['f']:.3f})"
-    return {"variant": var, "readings": out, "pass": all(v.startswith("in band") for v in out.values())}
+        ok = ok and out[lab].startswith("in band")
+    cos = rep.get("cos", {}).get(var, {})
+    for lab in labels[:2]:
+        c = cos.get(lab)
+        out[f"cos {lab}"] = "missing" if c is None else f"{'ok' if c['cos'] >= 0.9 else 'low'} ({c['cos']:.3f})"
+        ok = ok and c is not None and c["cos"] >= 0.9
+    tp = rep.get("trainer_path_vs_direct")
+    if tp is not None:
+        good = all(x["cos"] >= 0.99999 and abs(x["norm_ratio"] - 1.0) <= 1e-3 for x in tp.values())
+        out["trainer path"] = f"{'equal' if good else 'DIFFERS'} (min cos {min(x['cos'] for x in tp.values()):.7f})"
+        ok = ok and good
+    return {"variant": var, "readings": out, "pass": bool(ok)}
+
+
+def trainer_path_check(C, var, G, keys):
+    """The same row's gradient through the trainer's own path (configuration -> worker -> row backward), against the direct call's."""
+    import t8_step as TS
+    from surogate.inkling_rl.step import StepConfig
+
+    cfg, rig = C.rig.cfg, C.rig
+    old_opts = {k: getattr(cfg, k) for k in ("pattern_grad_from", "gate_grad_from", "bank_grad_from")}
+    try:
+        for k_, v_ in VARIANTS[var].items():
+            setattr(cfg, k_, v_)
+        TS.validate_config(cfg)
+        row = C.row
+        row.advantage = 1.0
+        row.notes["old_lp"] = rig.h.call("logprobs_row", row)
+        out = TS.compute_step([rig.h], rig.layout, [rig.flat], rig.shapes, cfg, [row], 0, StepConfig(max_policy_lag=None), seeds="ppo")
+        N = float(out.metrics["total_tokens"])
+        nk = len(keys)
+        res = {}
+        for nm in sorted(G):
+            L, k = nm.split(".")
+            gt = (-N * out.grads[int(L) * nk + keys.index(k)].double()).float().cpu()
+            if float(G[nm].double().norm()) > 0:
+                res[nm] = FS.cmp(gt, G[nm])
+            else:
+                res[nm] = {"cos": 1.0 if float(gt.double().norm()) == 0 else 0.0, "norm_ratio": 1.0 if float(gt.double().norm()) == 0 else float("inf"),
+                           "rel_diff": float(gt.double().norm())}
+        return res
+    finally:
+        for k_, v_ in old_opts.items():
+            setattr(cfg, k_, v_)
 
 
 def main():
@@ -259,6 +307,17 @@ def main():
     rep["seconds"] = a.budget_s - left()
     rc = 0
     if a.gate:
+        if order[0] in GE and left() > 60:
+            try:
+                rep["trainer_path_vs_direct"] = trainer_path_check(C, order[0], GE[order[0]], keys)
+                log("trainer path vs direct: " + " ".join(f"{nm} {x['cos']:.7f}/{x['norm_ratio']:.5f}" for nm, x in rep["trainer_path_vs_direct"].items()
+                                                         if nm.endswith("B13") or nm.endswith("vB")))
+            except Exception:
+                import traceback
+
+                rep["trainer_path_error"] = traceback.format_exc()[-2000:]
+                rep["trainer_path_vs_direct"] = {"error": {"cos": 0.0, "norm_ratio": 0.0, "rel_diff": 0.0}}
+                log("trainer path ERROR " + rep["trainer_path_error"][-500:])
         rep["gate"] = gate_verdict(rep, order[0])
         log(f"FINITE-DIFFERENCE GATE ({order[0]}): {'PASS' if rep['gate']['pass'] else 'FAIL'} {rep['gate']['readings']}")
         rc = 0 if rep["gate"]["pass"] else 3
