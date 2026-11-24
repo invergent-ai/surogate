@@ -401,9 +401,133 @@ def phase_inject(a):
     return 0
 
 
+def phase_local(a):
+    """diag-3: per-visit LOCAL Jacobian check on plan row 3, rounding OFF, routing frozen at theta0's, at the smooth chain's own slot values (forward
+    and backward share the point). For visit v: cotangent c = the backward's g_out(v); the vjp into every input slot (stack..., partial, bank...)
+    computed EXACTLY as backward_row does it (placeholders + act_vals + act_sinks, autograd.grad over SINK_DUMMIES, then the manual residual add
+    when not `first`), and into the layer's qB and B13; then for each slot i: u = vjp_i / |vjp_i|, eps = 0.5 / |vjp_i|, the single visit
+    recomputed with visit_torch_t8 on real tensors with slot i at +- eps u: f_local = <c, o(+) - o(-)> / (2 eps |vjp_i|). Same for qB / B13.
+    PASS LINE (written before any data): a correct visit gives f_local in [0.98, 1.02] for every slot and tensor. The first (visit, slot) outside
+    it names the operation path; all inside means the fault is in how the per-visit gradients are accumulated across visits (then the chain under
+    plain autograd against backward_row is the next check)."""
+    deadline = time.time() + a.budget_s
+    RA.ROUND["on"] = False
+    rig = Rig(a)
+    row, _ = load_row(a.plan)
+    dev = rig.w.dev
+    eng, W = rig.w.eng, rig.w.W
+    T = row.T
+    mask_t = torch.as_tensor(row.loss_mask.copy(), device=dev)
+    lp, ctx = rig.w._forward(row)
+    g = torch.as_tensor(row.loss_mask[1:].astype(np.float32), device=dev)
+    gouts = {}
+    TL.backward_row(eng, W, ctx["ids"], ctx["res"], rig.w.lora, B.ALPHA / B.RANK, rig.w.v_first, g, rig.w.buffers, lambda *x: None,
+                    q_block=ctx["qb"], train_idx=rig.w.train_idx, attn_scale=0.5,
+                    on_visit_grad=lambda v, go: gouts.__setitem__(v, go.detach().float().cpu()))
+    routing0 = ctx["res"]["routing"].clone()
+    ids = ctx["ids"]
+    rig.w._release(ctx)
+    with torch.no_grad():
+        x0 = F.forward(eng, ids, save=True, adapters_per_layer=rig.w._adapters())["x0"].float()
+    outs = []
+    S0, _ = chain_S(rig, ids, x0, routing0, mask_t, keep_outs=outs)
+    prod, _ = TL.producers(eng.visits)
+    scale, attn_scale = B.ALPHA / B.RANK, rig.cfg.attn_alpha / rig.cfg.attn_rank
+    rep = {"row": ROW, "round": False, "S0_smooth": S0, "local": [], "dropped": [],
+           "visits": [{"v": vi.v, "layer": vi.layer, "pass": vi.pass_, "first": vi.first, "global": vi.global_, "looped": vi.looped,
+                       "producers": prod[vi.v]} for vi in eng.visits]}
+    json.dump(rep, open(a.out, "w"), indent=1)
+    log(f"setup done: S0 smooth {S0:.6f}")
+
+    def val(p):
+        return x0 if p == -1 else outs[p].to(dev)
+
+    def one(v):
+        vi = eng.visits[v]
+        ps = prod[v]
+        n = len(vi.stack)
+        c = gouts[v].to(dev)
+        vals = [val(p) for p in ps]
+        sinks = [torch.zeros(T, B.D, dtype=torch.float32, device=dev) for _ in ps]
+        lo = rig.w.lora[vi.layer]
+        keys = [k for k in lo if k != "scale"]
+        lt = [lo[k].to(dev) for k in keys]
+        with torch.enable_grad(), torch.device(dev):
+            ins = [torch.zeros(1, dtype=torch.float32, device=dev).expand(T, B.D) for _ in ps]
+            leaves = [t.detach().requires_grad_(k in ("qB", "B13")) for k, t in zip(keys, lt)]
+            want = [t for t in leaves if t.requires_grad]
+            lora = TV.lora_dict(keys, leaves, scale, attn_scale)
+            LG.SINK_DUMMIES.clear()
+            out = TV.visit_torch_t8(W, vi, ins[:n], ins[n], (ins[n + 1], ins[n + 2]) if vi.looped else None, routing0[v], lora,
+                                    act_vals=vals, act_sinks=sinks)
+            got = torch.autograd.grad(out, want + list(LG.SINK_DUMMIES), c, allow_unused=True)
+            LG.SINK_DUMMIES.clear()
+        pk = [k for k, t in zip(keys, leaves) if t.requires_grad]
+        pgr = {k: (x.detach() if x is not None else None) for k, x in zip(pk, got[:len(want)])}
+        del out, got, leaves, want, lora
+        if not vi.first:
+            LG.sink_add(sinks[n], c)                          # the MLP-output conv's residual, as backward_row
+        base_lora = TV.lora_dict(keys, lt, scale, attn_scale)
+
+        def fwd(vs, lo_):
+            with torch.no_grad(), torch.device(dev):
+                return TV.visit_torch_t8(W, vi, vs[:n], vs[n], (vs[n + 1], vs[n + 2]) if vi.looped else None, routing0[v], lo_).float()
+
+        res = {"visit": v, "layer": vi.layer, "pass": vi.pass_, "first": vi.first, "looped": vi.looped, "slots": [], "lora": {}}
+        names = [f"stack{j}" for j in range(n)] + ["partial"] + (["bank0", "bank1"] if vi.looped else [])
+        for i, (nm, p) in enumerate(zip(names, ps)):
+            nv = float(sinks[i].double().norm())
+            if nv == 0.0:
+                res["slots"].append({"slot": nm, "producer": p, "vjp_norm": 0.0, "f": None})
+                continue
+            u = sinks[i] / nv
+            eps = 0.5 / nv
+            vp, vm = list(vals), list(vals)
+            vp[i], vm[i] = vals[i] + eps * u, vals[i] - eps * u
+            d = float((c.double() * (fwd(vp, base_lora).double() - fwd(vm, base_lora).double())).sum())
+            res["slots"].append({"slot": nm, "producer": p, "vjp_norm": nv, "f": d / (2 * eps * nv)})
+        for k in ("qB", "B13"):
+            gk = pgr.get(k)
+            if gk is None or float(gk.norm()) == 0.0:
+                res["lora"][k] = None
+                continue
+            nk = float(gk.double().norm())
+            u = gk / nk
+            eps = 0.5 / nk
+            j = keys.index(k)
+            lp_, lm_ = list(lt), list(lt)
+            lp_[j], lm_[j] = lt[j] + eps * u, lt[j] - eps * u
+            d = float((c.double() * (fwd(vals, TV.lora_dict(keys, lp_, scale, attn_scale)).double()
+                                     - fwd(vals, TV.lora_dict(keys, lm_, scale, attn_scale)).double())).sum())
+            res["lora"][k] = {"grad_norm": nk, "f": d / (2 * eps * nk)}
+        del sinks, vals, c
+        torch.cuda.empty_cache()
+        return res
+
+    order = [37, 38, 39, 40, 41, 31, 32, 33, 34, 35, 30, 36, 43, 25, 26, 27, 28, 29, 19, 20, 21, 22, 23, 13, 14, 15, 16, 17,
+             7, 8, 9, 10, 11, 6, 12, 18, 24, 1, 2, 3, 4, 5]
+    order += [v for v in range(48) if v not in order]
+    for v in order:
+        if time.time() > deadline:
+            rep["dropped"].append(v)
+            continue
+        t0 = time.time()
+        r = one(v)
+        rep["local"].append(r)
+        bad = [s["slot"] for s in r["slots"] if s["f"] is not None and not 0.98 <= s["f"] <= 1.02] + \
+              [k for k, x in r["lora"].items() if x is not None and not 0.98 <= x["f"] <= 1.02]
+        log(f"visit {v} (layer {r['layer']}, pass {r['pass']}): " + ", ".join(f"{s['slot']} {s['f']:.4f}" if s["f"] is not None else f"{s['slot']} -"
+                                                                         for s in r["slots"])
+            + "; " + ", ".join(f"{k} {x['f']:.4f}" for k, x in r["lora"].items() if x is not None)
+            + (f"  OUTSIDE: {bad}" if bad else "") + f"  ({time.time() - t0:.1f} s)")
+        json.dump(rep, open(a.out, "w"), indent=1)
+    rig.w.close()
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--phase", required=True, choices=("grad", "fd", "inject"))
+    ap.add_argument("--phase", required=True, choices=("grad", "fd", "inject", "local"))
     ap.add_argument("--plan", required=True)
     ap.add_argument("--bin", required=True)
     ap.add_argument("--artifact", required=True)
@@ -411,7 +535,7 @@ def main():
     ap.add_argument("--out", default="")
     ap.add_argument("--budget-s", type=float, default=1500.0)
     a = ap.parse_args()
-    return {"grad": phase_grad, "fd": phase_fd, "inject": phase_inject}[a.phase](a)
+    return {"grad": phase_grad, "fd": phase_fd, "inject": phase_inject, "local": phase_local}[a.phase](a)
 
 
 if __name__ == "__main__":
