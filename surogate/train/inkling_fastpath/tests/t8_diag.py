@@ -147,7 +147,7 @@ def phase_grad(a):
 
 
 # ------------------------------------------------------------------------------------------------------------------------------- fd
-def chain_S(rig, ids, x0, routing, mask_t, keep_outs=None, cmp_outs=None, inject=None):
+def chain_S(rig, ids, x0, routing, mask_t, keep_outs=None, cmp_outs=None, inject=None, keep_hidden=None):
     """S of the trainer's recompute run as a forward with the given routing (fp32; RA.ROUND as set). keep_outs: list to append each visit's output
     (cpu fp32). cmp_outs: per visit fp32 outputs at theta0 (cpu) -> per visit (share changed, share of changes below half an ulp)."""
     eng, W = rig.w.eng, rig.w.W
@@ -177,6 +177,8 @@ def chain_S(rig, ids, x0, routing, mask_t, keep_outs=None, cmp_outs=None, inject
                 stats.append((float(ch.float().mean()), float(((dlt < half) & ch).float().sum() / ch.float().sum().clamp(min=1))))
                 del ref, dlt, st, half, ch
         hid = RA.inkling_attn_res([slots[0], slots[1], slots[2], slots[3]], slots[6], None, W.q_out, W.final_norm.reshape(1, B.D), B.EPS)[0]
+        if keep_hidden is not None:
+            keep_hidden.append(hid.detach().float().clone())
         tgt = ids[1:].long()
         headf = W.head.float()
         S = 0.0
@@ -574,9 +576,177 @@ def phase_local(a):
     return 0
 
 
+def phase_lin(a):
+    """diag-4: the linearisation point. Plan row 3, routing frozen at theta0's, theta0. Lines written before any data:
+    1 STATES: per visit, relative L2 distance of the engine's stored output to the smooth chain's (rounding off) and to the frozen chain's
+      (rounding on) output. Recorded, no line.
+    2 BACKWARD AT THE CHAIN'S OWN STATES: backward_row with vals = the smooth chain's outputs (fp32), its final hidden and theta0's routing,
+      rounding off -> G_S (six tensors) and g_S(v); against G_E / g_E(v) = backward_row at the engine's states, rounding off, same session:
+      cos and norm ratio per tensor and per visit. Recorded, no line.
+    3 FOLLOW OF G_S ON THE SMOOTH CHAIN: central differences along G_S at x1 (e = 2.4e-4, direction G_S / |G_S| x e sqrt(n)) for 12.B13,
+      3.B13, 21.B13, then 12.qB. LINE: f in [0.9, 1.1] at layers 12, 3 and 21 = the backward is right when linearised on the chain's own
+      trajectory (the micro-step's failure is the linearisation point); f < 0.9 at layer 12 or 3 while layer 21 passes = the accumulation
+      across visits is wrong after all.
+    4 FOLLOW OF G_S IN THE ENGINE (routing free): central differences along G_S at x1 and x4 for 12.B13 and 3.B13. LINE: at x4 f in
+      [0.7, 1.3] = a remedy exists (linearise on the fp32 chain); f < 0.5 = it does not transfer to the engine.
+    5 (budget allowing) 2-3 on the FROZEN chain's states (rounding on): G_F, its follow on the frozen chain for the same three B13 tensors.
+    The head's backward reads the hidden as bf16 (B.HeadLogprob), as in production; the smooth chain's hidden is rounded there."""
+    deadline = time.time() + a.budget_s
+    rig = Rig(a)
+    row, _ = load_row(a.plan)
+    dev = rig.w.dev
+    eng, W = rig.w.eng, rig.w.W
+    mask_t = torch.as_tensor(row.loss_mask.copy(), device=dev)
+    g = torch.as_tensor(row.loss_mask[1:].astype(np.float32), device=dev)
+    J_QB, J_B13 = rig.keys.index("qB"), rig.keys.index("B13")
+    TT = {(12, J_B13): "12.B13", (3, J_B13): "3.B13", (21, J_B13): "21.B13", (12, J_QB): "12.qB", (3, J_QB): "3.qB", (21, J_QB): "21.qB"}
+    rep = {"row": ROW, "dropped": []}
+
+    def save():
+        json.dump(rep, open(a.out, "w"), indent=1)
+
+    def run_backward(vals):
+        Gs, gv = {}, {}
+
+        def ong(v, layer, j, gj):
+            nm = TT.get((layer, j))
+            if nm is not None:
+                c = gj.detach().float().cpu()
+                Gs[nm] = c if nm not in Gs else Gs[nm].add_(c)
+
+        TL.backward_row(eng, W, ids, vals, rig.w.lora, B.ALPHA / B.RANK, rig.w.v_first, g, rig.w.buffers, ong, q_block=qb,
+                        train_idx=rig.w.train_idx, attn_scale=0.5, on_visit_grad=lambda v, go: gv.__setitem__(v, go.detach().float().cpu()))
+        return Gs, gv
+
+    def cmp(x, y):
+        x, y = x.double(), y.double()
+        return {"cos": float((x * y).sum() / (x.norm() * y.norm()).clamp(min=1e-300)), "norm_ratio": float(x.norm() / y.norm().clamp(min=1e-300))}
+
+    # the engine's states and G_E (rounding off, as diag-2 / diag-3)
+    RA.ROUND["on"] = False
+    lp, ctx = rig.w._forward(row)
+    ids, qb = ctx["ids"], ctx["qb"]
+    routing0 = ctx["res"]["routing"].clone()
+    host = ctx["res"]["host"]
+    t0 = time.time()
+    G_E, g_E = run_backward(ctx["res"])
+    rep["backward_engine_s"] = time.time() - t0
+    with torch.no_grad():
+        x0 = F.forward(eng, ids, save=True, adapters_per_layer=rig.w._adapters())["x0"].float()
+    # the smooth chain's and the frozen chain's states
+    outs_s, hid_s = [], []
+    S_s, _ = chain_S(rig, ids, x0, routing0, mask_t, keep_outs=outs_s, keep_hidden=hid_s)
+    RA.ROUND["on"] = True
+    outs_f, hid_f = [], []
+    S_f, _ = chain_S(rig, ids, x0, routing0, mask_t, keep_outs=outs_f, keep_hidden=hid_f)
+    RA.ROUND["on"] = False
+    rep["S"] = {"smooth": S_s, "frozen": S_f}
+    # 1 STATES
+    rep["states"] = []
+    for v in range(len(eng.visits)):
+        if v not in host:
+            rep["states"].append(None)
+            continue
+        e = host[v].to(dev).double()
+        rep["states"].append({"v": v, "engine_vs_smooth": float((e - outs_s[v].to(dev).double()).norm() / e.norm()),
+                              "engine_vs_frozen": float((e - outs_f[v].to(dev).double()).norm() / e.norm())})
+        del e
+    log("states: " + " ".join(f"{x['v']}:{x['engine_vs_smooth']:.3f}/{x['engine_vs_frozen']:.3f}" for x in rep["states"] if x))
+    save()
+    rig.w._release(ctx)
+    del ctx, host
+
+    def chain_vals(outs, hid):
+        h = {-1: x0}
+        for v, o in enumerate(outs):
+            h[v] = o                                          # host fp32; TokenChunked moves each chunk to the card
+        return {"host": h, "routing": routing0, "hidden": hid[0], "lp": None}
+
+    # 2 BACKWARD AT THE SMOOTH CHAIN'S STATES
+    t0 = time.time()
+    G_S, g_S = run_backward(chain_vals(outs_s, hid_s))
+    rep["backward_chain_s"] = time.time() - t0
+    rep["G_S_vs_G_E"] = {nm: cmp(G_S[nm], G_E[nm]) for nm in G_S}
+    rep["gS_vs_gE_per_visit"] = {str(v): cmp(g_S[v], g_E[v]) for v in sorted(g_S) if v in g_E}
+    rep["norms"] = {"G_S": {nm: float(t.norm()) for nm, t in G_S.items()}, "G_E": {nm: float(t.norm()) for nm, t in G_E.items()},
+                    "g_S": {str(v): float(t.norm()) for v, t in sorted(g_S.items())}}
+    log("G_S vs G_E: " + ", ".join(f"{nm} cos {x['cos']:.3f} ratio {x['norm_ratio']:.3f}" for nm, x in rep["G_S_vs_G_E"].items()))
+    save()
+
+    def fd_chain(G, nm, round_on):
+        L, k = nm.split(".")
+        gC = G[nm].double()
+        step = (gC / gC.norm() * BASE_E * gC.numel() ** 0.5).float()
+        pred = float((gC * step.double()).sum())
+        RA.ROUND["on"] = round_on
+        rig.set_one(int(L), k, step)
+        sp = chain_S(rig, ids, x0, routing0, mask_t)[0]
+        rig.set_one(int(L), k, -step)
+        sm = chain_S(rig, ids, x0, routing0, mask_t)[0]
+        rig.set_one(int(L), k, None)
+        RA.ROUND["on"] = False
+        return {"tensor": nm, "pred": pred, "S+": sp, "S-": sm, "f": (sp - sm) / (2 * pred)}
+
+    def fd_engine(G, nm, mult):
+        L, k = nm.split(".")
+        gC = G[nm].double()
+        step = (gC / gC.norm() * BASE_E * mult * gC.numel() ** 0.5).float()
+        pred = float((gC * step.double()).sum())
+        r = {}
+        for sg in (1, -1):
+            rig.set_one(int(L), k, sg * step)
+            with torch.no_grad():
+                res = F.forward(eng, ids, save=False, adapters_per_layer=rig.w._adapters())
+                lpx = F.logprobs(eng, res["hidden"], ids)
+            r[sg] = float(lpx.double()[mask_t[1:]].sum())
+            del res, lpx
+            eng._ws = None
+        rig.set_one(int(L), k, None)
+        return {"tensor": nm, "mult": mult, "pred": pred, "S+": r[1], "S-": r[-1], "f": (r[1] - r[-1]) / (2 * pred)}
+
+    # 3 and 4
+    rep["follow_GS_smooth"], rep["follow_GS_engine"] = [], []
+    tasks = [("c", "12.B13"), ("c", "3.B13"), ("c", "21.B13"), ("e", "12.B13", 1.0), ("e", "12.B13", 4.0), ("e", "3.B13", 1.0),
+             ("e", "3.B13", 4.0), ("c", "12.qB")]
+    for t in tasks:
+        if time.time() > deadline:
+            rep["dropped"].append(list(t))
+            continue
+        if t[0] == "c":
+            r = fd_chain(G_S, t[1], False)
+            rep["follow_GS_smooth"].append(r)
+            log(f"smooth chain along G_S {t[1]}: pred {r['pred']:.4g}, f {r['f']:.4f}")
+        else:
+            r = fd_engine(G_S, t[1], t[2])
+            rep["follow_GS_engine"].append(r)
+            log(f"engine along G_S {t[1]} x{t[2]:g}: pred {r['pred']:.4g}, f {r['f']:.4f}")
+        save()
+    # 5 the frozen chain's states (rounding on)
+    if time.time() < deadline - 150:
+        RA.ROUND["on"] = True
+        G_F, g_F = run_backward(chain_vals(outs_f, hid_f))
+        RA.ROUND["on"] = False
+        rep["G_F_vs_G_E"] = {nm: cmp(G_F[nm], G_E[nm]) for nm in G_F}
+        rep["follow_GF_frozen"] = []
+        save()
+        for nm in ("12.B13", "3.B13", "21.B13"):
+            if time.time() > deadline:
+                rep["dropped"].append(["frozen", nm])
+                continue
+            r = fd_chain(G_F, nm, True)
+            rep["follow_GF_frozen"].append(r)
+            log(f"frozen chain along G_F {nm}: pred {r['pred']:.4g}, f {r['f']:.4f}")
+            save()
+    else:
+        rep["dropped"].append("part 5")
+    save()
+    rig.w.close()
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--phase", required=True, choices=("grad", "fd", "inject", "local"))
+    ap.add_argument("--phase", required=True, choices=("grad", "fd", "inject", "local", "lin"))
     ap.add_argument("--plan", required=True)
     ap.add_argument("--bin", required=True)
     ap.add_argument("--artifact", required=True)
@@ -584,7 +754,7 @@ def main():
     ap.add_argument("--out", default="")
     ap.add_argument("--budget-s", type=float, default=1500.0)
     a = ap.parse_args()
-    return {"grad": phase_grad, "fd": phase_fd, "inject": phase_inject, "local": phase_local}[a.phase](a)
+    return {"grad": phase_grad, "fd": phase_fd, "inject": phase_inject, "local": phase_local, "lin": phase_lin}[a.phase](a)
 
 
 if __name__ == "__main__":
