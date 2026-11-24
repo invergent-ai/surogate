@@ -2,13 +2,15 @@
 meet only through files of the run directory (tests/t8_stepsession.py holds the layout and the handshake).
 
 serve (while the trainer runs), on the read engines:
-  start:  base reads (no adapter) of every panel -> base/reads_dmg/<panel>/base.npz (+ .json), then of the transfer plan -> base/transfer/base.npz.
+  start:  base reads (no adapter) of every panel -> base/reads_dmg/<panel>/base.npz (+ .json); of every update's round-trip rows ->
+          base/roundtrip/base_g<group>.npz (when the plan's rows were sampled by the base model, i.e. its first update is number 1, this read
+          must equal the rows' recorded log-probs bitwise, else exit 21); then of the transfer plan -> base/transfer/base.npz.
   per update n, when updates/<n>/TRAINER_READY.json appears: on EVERY engine, in this order,
       for X in v, R, R2:  load X; its share of the round-trip rows; its share of every panel; unload X
       base again:         its share of the round-trip rows; its share of every panel (-> base2)
     ROUND TRIP (bitwise, at every loss token of the round-trip rows): engine(X) == the trainer's log-probs at X for v, R and R2, and the base
-    re-read == the rows' recorded log-probs. The same rows are asked under v, then R, then R2, then no adapter, on the same engine: a state that
-    leaked from one adapter into the next request would show here. -> roundtrip/engine_<X>.npz, roundtrip/result.json ("result": "equal" |
+    re-read == the base read of the same rows at the start. The same rows are asked under v, then R, then R2, then no adapter, on the same
+    engine: a state that leaked from one adapter into the next request would show here. -> roundtrip/engine_<X>.npz, roundtrip/result.json ("result": "equal" |
     "differ"). On "differ" nothing more is written for the update and the process ends with exit 21.
     Panels -> reads_dmg/<panel>/{v,R,R2,base2}.npz: lp_<row> float32 [T] = the value at the panel's mask, 0 elsewhere, + ids_crc32 [R] of the ids
     sent; <X>.json {"adapter_sha256", "head", "engine_sha", "source", "session_id", "panel_rows_sha256"}. A read that is not complete is not written.
@@ -197,6 +199,13 @@ class Reader:
         self.engine_sha = engine_sha
         self.base_files = {}
         self.sid = None
+        meta = json.load(open(os.path.join(plan_dir, "rows.json")))
+        ups = meta["updates"]
+        self.rt_groups = [int(g) for g in (meta.get("round_trip_group") or [u[0] for u in ups])]
+        self.sampled_by_base = int(meta.get("first_update_number", 1)) == 1   # else: by the adapter the session resumes from
+        gi = self.plan.z["group_idx"]
+        self.rt_sets = {g: self.plan.subset("rt", [n for n in range(self.plan.R) if int(gi[n]) == g]) for g in sorted(set(self.rt_groups))}
+        self.rt_base = {}
 
     def rel(self, p):
         return os.path.relpath(p, self.run)
@@ -232,6 +241,27 @@ class Reader:
             for rs in sets:
                 self.write_read(os.path.join(self.run, "base", "reads_dmg", rs.tag), "base", rs, res[(rs.tag, "base")], None, self.base_files)
             log(f"base reads of the panels {[rs.tag for rs in sets]}: {time.time() - t0:.0f} s")
+        ident = {}
+        for g, rt in self.rt_sets.items():                    # each update's round-trip rows, with the split their later reads use
+            if len(rt.rows) < len(self.urls):
+                raise ValueError(f"round-trip group {g}: {len(rt.rows)} rows for {len(self.urls)} engines (every engine must read at least one)")
+            got = run_pass(self.c, self.urls, [("base", None, None)], [rt])[("rt", "base")]
+            self.rt_base[g] = got
+            p = os.path.join(self.run, "base", "roundtrip", f"base_g{g}.npz")
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            save_npz(p, **{f"lp_{r}": got[r] for r in rt.rows})
+            self.base_files[self.rel(p)] = sha256(p)
+            ident[str(g)] = {"rows": len(rt.rows), "loss_tokens": int(sum(int(rt.mask(r).sum()) for r in rt.rows)),
+                             "differ_from_recorded": sum(bits_differ(got[r], rt.recorded(r), rt.mask(r)) for r in rt.rows) if self.sampled_by_base else None}
+        if ident:
+            bad = self.sampled_by_base and any(v["differ_from_recorded"] or not v["loss_tokens"] for v in ident.values())
+            write_json(os.path.join(self.run, "base", "roundtrip", "identity.json"),
+                       {"result": "differ" if bad else "equal", "sampled_by_base": self.sampled_by_base, "groups": ident,
+                        "check": "the engines' base read of the round-trip rows == the rows' recorded log-probs, bitwise"
+                                 if self.sampled_by_base else "not applicable: the rows were sampled under an adapter"})
+            log(f"base read of the round-trip rows: {ident}")
+            if bad:
+                return EXIT_ROUNDTRIP
         if self.transfer is not None:
             t0 = time.time()
             res = run_pass(self.c, self.urls, [("base", None, None)], [self.transfer])
@@ -242,6 +272,7 @@ class Reader:
             write_json(os.path.join(self.run, "base", "transfer", "identity.json"),
                        {"base_read_vs_recorded": {"loss_tokens": tokens, "differ": differ}, "note": "recorded, not gated here"})
             log(f"base read of the transfer plan: {len(self.transfer.rows)} rows, {differ} of {tokens} loss tokens differ from the records, {time.time() - t0:.0f} s")
+        return 0
 
     # ------------------------------------------------------------------ one update
     def update(self, n: int) -> int:
@@ -260,9 +291,10 @@ class Reader:
             st = os.path.join(ads[name]["path"], "adapter_model.safetensors")
             if sha256(st) != ads[name]["sha256"]:
                 raise ValueError(f"update {n}: adapter {name} on disk is not the exported file")
-        rt = self.plan.subset("rt", tr["round_trip_rows"])
-        if len(rt.rows) < len(self.urls):
-            raise ValueError(f"update {n}: {len(rt.rows)} round-trip rows for {len(self.urls)} engines (every engine must read at least one)")
+        g = int(tr["round_trip_group"])
+        if g not in self.rt_sets or self.rt_sets[g].rows != sorted(int(x) for x in tr["round_trip_rows"]):
+            raise ValueError(f"update {n}: the round-trip rows handed over are not group {g}'s rows of the plan")
+        rt, base0 = self.rt_sets[g], self.rt_base[g]
         adapters = [(name, ads[name]["lora_name"], ads[name]["path"]) for name in NAMES] + [("base2", None, None)]
         t0 = time.time()
         res = run_pass(self.c, self.urls, adapters, [rt] + list(self.panels.values()))
@@ -277,8 +309,8 @@ class Reader:
             checks[f"trainer_vs_engine_{name}"] = {"rows": len(rt.rows), "loss_tokens": int(sum(int(rt.mask(r).sum()) for r in rt.rows)), "differ": d}
             differ_total += d
             save_npz(os.path.join(rd, f"engine_{name}.npz"), **{f"lp_{r}": res[("rt", name)][r] for r in rt.rows})
-        d = sum(bits_differ(res[("rt", "base2")][r], rt.recorded(r), rt.mask(r)) for r in rt.rows)
-        checks["engine_base_reread_vs_recorded"] = {"rows": len(rt.rows), "loss_tokens": checks["trainer_vs_engine_v"]["loss_tokens"], "differ": d}
+        d = sum(bits_differ(res[("rt", "base2")][r], base0[r], rt.mask(r)) for r in rt.rows)
+        checks["engine_base_reread_vs_start_base"] = {"rows": len(rt.rows), "loss_tokens": checks["trainer_vs_engine_v"]["loss_tokens"], "differ": d}
         differ_total += d
         save_npz(os.path.join(rd, "engine_base2.npz"), **{f"lp_{r}": res[("rt", "base2")][r] for r in rt.rows})
         moved = sum(bits_differ(res[("rt", "v")][r], res[("rt", "base2")][r], rt.mask(r)) for r in rt.rows)
@@ -304,7 +336,9 @@ class Reader:
         return 0
 
     def serve(self) -> int:
-        self.base_reads()
+        rc = self.base_reads()
+        if rc:
+            return rc
         done = set()
         while True:
             root = os.path.join(self.run, "updates")

@@ -606,6 +606,9 @@ class Session:
             r = read_json(res)
             if r.get("result") != "equal":
                 return EXIT_ROUNDTRIP, f"round trip of update {n}: {r.get('result')!r}"
+        ident = os.path.join(self.run, "base", "roundtrip", "identity.json")
+        if os.path.exists(ident) and read_json(ident).get("result") != "equal":
+            return EXIT_ROUNDTRIP, "the engines' base read of the round-trip rows differs from the rows' recorded log-probs"
         ex = os.path.join(self.run, "reader.exit")
         if os.path.exists(ex) and not os.path.exists(os.path.join(ud, "READS_DONE")):
             code = open(ex).read().strip()

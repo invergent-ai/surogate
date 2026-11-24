@@ -263,7 +263,7 @@ def main():
         want = {f"updates/{n}/reads_dmg/a/{x}.{e}" for x in ("v", "R", "R2", "base2") for e in ("npz", "json")}
         want |= {"base/reads_dmg/a/base.npz", "base/reads_dmg/a/base.json", f"updates/{n}/adapters.json", f"updates/{n}/roundtrip/result.json"}
         want |= {f"updates/{n}/roundtrip/{side}_{x}.npz" for side in ("trainer", "engine") for x in ("v", "R", "R2")}
-        want |= {f"updates/{n}/roundtrip/engine_base2.npz"}
+        want |= {f"updates/{n}/roundtrip/engine_base2.npz", "base/roundtrip/base_g0.npz", "base/roundtrip/base_g2.npz"}
         assert set(rd["files"]) == want, sorted(set(rd["files"]) ^ want)
         assert all(MI.sha256(os.path.join(run, k)) == h for k, h in rd["files"].items())
         assert rd["adapters"] == {k: ad[k]["sha256"] for k in ad}
@@ -275,6 +275,8 @@ def main():
         assert all(b0[k].tobytes() == b2[k].tobytes() for k in b0.files) and any(b0[k].tobytes() != vz[k].tobytes() for k in b0.files if k != "ids_crc32")
         js = json.load(open(os.path.join(ud, "reads_dmg", "a", "v.json")))
         assert set(js) == {"adapter_sha256", "head", "engine_sha", "source", "session_id", "panel_rows_sha256"} and js["adapter_sha256"] == ad["v"]["sha256"]
+    idr = json.load(open(os.path.join(run, "base", "roundtrip", "identity.json")))
+    assert idr["result"] == "equal" and idr["sampled_by_base"] and all(v["differ_from_recorded"] == 0 for v in idr["groups"].values())
     ident = json.load(open(os.path.join(run, "base", "transfer", "identity.json")))
     assert ident["base_read_vs_recorded"]["differ"] == 0 and ident["base_read_vs_recorded"]["loss_tokens"] > 0
     rd2 = RD.Reader(FakeEngines(), ["e0", "e1", "e2"], run, plan_dir, {}, transfer_dir, engine_sha="fake")
@@ -340,6 +342,7 @@ def main():
     TS.ppo_batch(ref, ref2_rows, 0, MI.LR, 2, StepConfig(max_policy_lag=None))      # `ref` already ran plan 1: the uninterrupted trainer
     rcB, runB, trB, sB, _ = session(tmp, "resumeB", plan2_dir, ["GO", "GO", "GO"], first=2, panels=panels, resume=ck2)
     assert rcB == 0, sB.sess["exit"]
+    assert json.load(open(os.path.join(runB, "base", "roundtrip", "identity.json")))["sampled_by_base"] is False
     assert all(torch.equal(a, b) for a, b in zip(trB.opt.masters, ref.opt.masters)) and same_state(opt_state(trB), opt_state(ref))
     assert sorted(os.listdir(os.path.join(runB, "updates"))) == ["2", "3", "4"]
     st3 = json.load(open(os.path.join(runB, "updates", "3", "step.json")))
@@ -399,7 +402,25 @@ def main():
         assert json.load(open(os.path.join(run5, "STOPPED.json")))["v_1"] == "not judged"
     rc5, run5, tr5, s5, pt5 = session(tmp, "reader_dies", plan_dir, ["GO", "GO"], engines=FakeEngines(die_at=8), panels=panels)
     assert rc5 == SS.EXIT_READS and pt5.reader_rc == RD.EXIT_READS and not os.path.isdir(os.path.join(run5, "updates", "2", "ckpt")), (rc5, pt5.reader_rc)
-    print("(5) round trip: a leaked adapter state and a single changed value give 'differ' and exit 21; a dead read side exit 6: PASS")
+    # rows whose records are not the base model's (one value changed): the base identity fails before any update is read
+    rb = base_rows()
+    t = int(np.flatnonzero(rb[0].loss_mask)[-1])
+    rb[0].engine_lp[t] = float(np.nextafter(np.float32(rb[0].engine_lp[t]), np.float32(-np.inf)))
+    pb = write_step_plan(os.path.join(tmp, "plan_badrec"), rb, [[0, 1], [2, 3]])
+
+    class NoReplay(P.FakeTrainer):                            # a trainer whose own replay gate would not see it (so the read side must)
+        def logprobs(self, rows_):
+            out = super().logprobs(rows_)
+            for r, x in zip(rows_, out):
+                if r.notes.get("plan_row") == 0:
+                    x[t - 1] = np.float32(r.engine_lp[t])
+            return out
+
+    rc5, run5, tr5, s5, pt5 = session(tmp, "base_identity", pb, ["GO", "GO"], tr=NoReplay(cfg_for(tmp), 2), panels=panels, early_stop=False)
+    assert pt5.reader_rc == 21 and rc5 in (21, SS.EXIT_GATE), (rc5, pt5.reader_rc, s5.sess["exit"])
+    assert not os.path.isdir(os.path.join(run5, "updates", "2", "ckpt")) and not os.path.exists(os.path.join(run5, "updates", "1", "READS_DONE"))
+    print("(5) round trip: a leaked adapter state and a single changed value give 'differ' and exit 21; a dead read side exit 6; "
+          "records that are not the base model's stop the read side: PASS")
 
     # (6) a STOP while the next gradient runs interrupts it
     class SlowW(P.FakeW):
