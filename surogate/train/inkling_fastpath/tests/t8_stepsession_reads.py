@@ -90,7 +90,9 @@ class HttpClient:
 
 
 class RowSet:
-    """Rows to read: a plan or panel directory in the micro-step driver's on-disk form, checked against its manifest."""
+    """Rows to read: a plan or panel directory in the micro-step driver's on-disk form, checked against its manifest. Every array a read needs
+    (ids, masks, recorded log-probs) is loaded into memory HERE, by the thread that builds the set: the engine threads never touch the .npz
+    file (a zip archive read from several threads at once is not safe)."""
 
     def __init__(self, tag: str, d: str, only=None):
         self.tag, self.dir = tag, d
@@ -100,11 +102,18 @@ class RowSet:
         self.rows_sha = sha256(path)
         if want.get("rows.npz") != self.rows_sha:
             raise ValueError(f"{tag}: rows.npz does not match its manifest sha256")
-        self.z = np.load(path, allow_pickle=False)
-        self.R = sum(1 for k in self.z.files if k.startswith("ids_") and k[4:].isdigit())
-        self.T = {n: int(self.z["T"][n]) for n in range(self.R)}
-        self.crc = np.array([zlib.crc32(self.z[f"ids_{n}"].astype("<i4").tobytes()) & 0xFFFFFFFF for n in range(self.R)], dtype=np.uint32)
-        if "ids_crc32" in self.z.files and not np.array_equal(self.crc, self.z["ids_crc32"].astype(np.uint32)):
+        with np.load(path, allow_pickle=False) as z:
+            self.R = sum(1 for k in z.files if k.startswith("ids_") and k[4:].isdigit())
+            self._ids = {n: np.array(z[f"ids_{n}"]) for n in range(self.R)}
+            self._mask = {n: np.array(z[f"mask_{n}"]).astype(bool) for n in range(self.R)}
+            self._lp = {n: np.array(z[f"lp_{n}"]).astype(np.float32) for n in range(self.R) if f"lp_{n}" in z.files}
+            self.T = {n: int(z["T"][n]) for n in range(self.R)}
+            self.group = np.array(z["group_idx"]) if "group_idx" in z.files else None
+            recorded_crc = np.array(z["ids_crc32"]).astype(np.uint32) if "ids_crc32" in z.files else None
+        if any(len(self._ids[n]) != self.T[n] or len(self._mask[n]) != self.T[n] for n in range(self.R)):
+            raise ValueError(f"{tag}: a row's ids or mask do not have its length T")
+        self.crc = np.array([zlib.crc32(self._ids[n].astype("<i4").tobytes()) & 0xFFFFFFFF for n in range(self.R)], dtype=np.uint32)
+        if recorded_crc is not None and not np.array_equal(self.crc, recorded_crc):
             raise ValueError(f"{tag}: crc32 of the ids differs from the recorded ids_crc32")
         self.rows = sorted(self.T) if only is None else sorted(int(n) for n in only)
         if any(n not in self.T for n in self.rows):
@@ -125,13 +134,13 @@ class RowSet:
         return mine[::-1] if getattr(self, "reverse", False) else mine
 
     def ids(self, n):
-        return self.z[f"ids_{n}"]
+        return self._ids[n]
 
     def mask(self, n):
-        return self.z[f"mask_{n}"].astype(bool)
+        return self._mask[n]
 
     def recorded(self, n):
-        return self.z[f"lp_{n}"].astype(np.float32)
+        return self._lp[n]
 
 
 def run_pass(client, urls: list, adapters: list, rowsets: list) -> dict:
@@ -209,7 +218,7 @@ class Reader:
         ups = meta["updates"]
         self.rt_groups = [int(g) for g in (meta.get("round_trip_group") or [u[0] for u in ups])]
         self.sampled_by_base = int(meta.get("first_update_number", 1)) == 1   # else: by the adapter the session resumes from
-        gi = self.plan.z["group_idx"]
+        gi = self.plan.group
         self.rt_sets = {g: self.plan.subset("rt", [n for n in range(self.plan.R) if int(gi[n]) == g]) for g in sorted(set(self.rt_groups))}
         self.rt_base = {}
 
