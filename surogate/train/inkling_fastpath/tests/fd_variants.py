@@ -8,6 +8,8 @@ point, with the production settings on the engine's stored states:
   Q     pattern_grad_from = 48: every visit holds its pattern constant.
   QD    Q, and the router's gate weights are constants of the backward at every visit (gate_grad_from = 48).
   HD30  H30, and the gate weights are constants at visits 0-29.
+  H42 / HD42 / HD36  the same forms with the cut at visit 42 (only the visits after the loop keep the exact backward) or 36. Added
+        2026-11-24 05:5x after row 72's cos for H30 (0.64 at layer 3), before any data of theirs; same lines.
   full  the exact backward (reference).
 Measured per row and variant:
   cos     between the variant's gradient on the engine's stored states (rounding straight-through, production head) and on the fp32
@@ -53,6 +55,8 @@ KEYS = ("B13", "vB", "oB", "qB", "kB", "rB")
 N_V = 48
 VARIANTS = {"H30": {"pattern_grad_from": 30}, "H36": {"pattern_grad_from": 36}, "Q": {"pattern_grad_from": N_V},
             "QD": {"pattern_grad_from": N_V, "gate_grad_from": N_V}, "HD30": {"pattern_grad_from": 30, "gate_grad_from": 30},
+            "H42": {"pattern_grad_from": 42}, "HD42": {"pattern_grad_from": 42, "gate_grad_from": 42},
+            "HD36": {"pattern_grad_from": 36, "gate_grad_from": 36},
             "full": {}, "cut0": {"bank_grad_from": N_V}}
 
 
@@ -236,6 +240,7 @@ def main():
             follow(var, "vo", [(f"{L}.{k}", G.get(f"{L}.{k}")) for L in (3, 9, 12, 15) for k in ("vB", "oB")], p)
             if var.startswith("H") or var == "full":
                 follow(var, "qkr", [(f"{L}.{k}", G.get(f"{L}.{k}")) for L in (9, 12, 15) for k in ("qB", "kB", "rB")], p)
+                follow(var, "qkr21", [(f"21.{k}", G.get(f"21.{k}")) for k in ("qB", "kB", "rB")], p)
             if i >= 1:                     # the chain's states after the first two variants' follows: those first
                 for v2 in order[:i + 1]:
                     if v2 in GE:
