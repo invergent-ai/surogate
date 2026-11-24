@@ -15,17 +15,6 @@
 
 namespace sinfer::ops::detail {
 
-namespace {
-// SUROGATE_SERVE_TRACE_REPLY_PHASE=1: the verify-input kernel prints each reply-phase draft cut (read once).
-int reply_phase_trace() {
-    static const int on = [] {
-        const char* raw = std::getenv("SUROGATE_SERVE_TRACE_REPLY_PHASE");
-        return raw != nullptr && raw[0] != '\0' && raw[0] != '0' ? 1 : 0;
-    }();
-    return on;
-}
-} // namespace
-
 void speculative_prepare_verify_inputs_launch(const Tensor& anchors, const Tensor& drafts,
                                               const Tensor& base_positions,
                                               const Tensor& current_extents, Tensor& verify_ids,
@@ -41,8 +30,7 @@ void speculative_prepare_verify_inputs_launch(const Tensor& anchors, const Tenso
         static_cast<const std::int32_t*>(drafts.data),
         static_cast<const std::int32_t*>(base_positions.data),
         static_cast<std::int32_t*>(current_extents.data),
-        static_cast<std::int32_t*>(verify_ids.data), static_cast<std::int32_t*>(positions.data), k, configs,
-        reply_phase_trace());
+        static_cast<std::int32_t*>(verify_ids.data), static_cast<std::int32_t*>(positions.data), k, configs);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -58,7 +46,7 @@ void speculative_prepare_verify_ids_launch(const Tensor& anchors, const Tensor& 
         static_cast<const std::int32_t*>(anchors.data),
         static_cast<const std::int32_t*>(drafts.data), nullptr,
         static_cast<std::int32_t*>(current_extents.data),
-        static_cast<std::int32_t*>(verify_ids.data), nullptr, k, configs, reply_phase_trace());
+        static_cast<std::int32_t*>(verify_ids.data), nullptr, k, configs);
     CUDA_CHECK(cudaGetLastError());
 }
 

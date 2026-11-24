@@ -12,7 +12,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 
 namespace sinfer::ops {
 
@@ -37,7 +36,7 @@ __global__ void speculative_prepare_verify_inputs_kernel(const std::int32_t* anc
                                                          std::int32_t* current_extents,
                                                          std::int32_t* verify_ids,
                                                          std::int32_t* positions, std::int32_t k,
-                                                         const SamplingConfig* configs, int trace) {
+                                                         const SamplingConfig* configs) {
     // One block per row (the launcher's grid is (1, B)): the write-back below follows every thread's read.
     const int row = static_cast<int>(blockIdx.y);
     const int T   = k + 1;
@@ -53,14 +52,9 @@ __global__ void speculative_prepare_verify_inputs_kernel(const std::int32_t* anc
     }
     if (cut != extent) {
         __syncthreads();
-        if (threadIdx.x == 0) {
-            current_extents[row] = cut;
-            // SUROGATE_SERVE_TRACE_REPLY_PHASE: which drafts the cut removed (a debugging aid; off by default).
-            if (trace != 0) {
-                printf("reply-phase cut: row %d armed %d extent %d -> %d\n", row, configs[row].phase_switch_armed,
-                       extent, cut);
-            }
-        }
+        // No device printf here: a kernel that can print makes the runtime set up its printf buffer, which lands in
+        // the CUDA Graph preparation window (+52 MiB measured) and can exceed the planned graph allowance.
+        if (threadIdx.x == 0) { current_extents[row] = cut; }
     }
     for (int j = static_cast<int>(threadIdx.x); j < T; j += blockDim.x) {
         const int off = row * T + j;
