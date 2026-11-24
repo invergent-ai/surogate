@@ -147,7 +147,7 @@ def phase_grad(a):
 
 
 # ------------------------------------------------------------------------------------------------------------------------------- fd
-def chain_S(rig, ids, x0, routing, mask_t, keep_outs=None, cmp_outs=None):
+def chain_S(rig, ids, x0, routing, mask_t, keep_outs=None, cmp_outs=None, inject=None):
     """S of the trainer's recompute run as a forward with the given routing (fp32; RA.ROUND as set). keep_outs: list to append each visit's output
     (cpu fp32). cmp_outs: per visit fp32 outputs at theta0 (cpu) -> per visit (share changed, share of changes below half an ulp)."""
     eng, W = rig.w.eng, rig.w.W
@@ -163,6 +163,8 @@ def chain_S(rig, ids, x0, routing, mask_t, keep_outs=None, cmp_outs=None):
         for v, vi in enumerate(eng.visits):
             bank = (slots[vi.bank[0]], slots[vi.bank[1]]) if vi.looped else None
             o = TV.visit_torch_t8(W, vi, [slots[s] for s in vi.stack], slots[vi.partial], bank, routing[v], lora[vi.layer])
+            if inject is not None and inject[0] == v:         # diag-2: a perturbation of this visit's output
+                o = o.float() + inject[1]
             slots[vi.next_partial] = o
             if keep_outs is not None:
                 keep_outs.append(o.float().cpu())
@@ -311,9 +313,66 @@ def phase_fd(a):
     return 0
 
 
+def phase_inject(a):
+    """diag-2: per-visit Jacobian check with the rounding OFF in both the backward and the chained forward (the smooth function; routing frozen at
+    theta0's). g_out(v) = the backward's d S / d (output of visit v); the chain's S with that output perturbed by +- eps u; follow
+    f(v) = [S(+) - S(-)] / (2 eps <g_out(v), u>). A correct backward gives f(v) = 1 at every v; the first v (going back from 47) where f leaves
+    [0.9, 1.1] locates the fault between that visit and the next one checked."""
+    deadline = time.time() + a.budget_s
+    RA.ROUND["on"] = False
+    rig = Rig(a)
+    row, _ = load_row(a.plan)
+    dev = rig.w.dev
+    mask_t = torch.as_tensor(row.loss_mask.copy(), device=dev)
+    lp, ctx = rig.w._forward(row)
+    g = torch.as_tensor(row.loss_mask[1:].astype(np.float32), device=dev)
+    VIS = (45, 36, 24, 12, 3, 47, 42, 41, 30, 18, 6)
+    norms, gouts = {}, {}
+
+    def onv(v, g_out):
+        norms[v] = float(g_out.double().norm())
+        if v in VIS:
+            gouts[v] = g_out.detach().float().clone()
+
+    t0 = time.time()
+    TL.backward_row(rig.w.eng, rig.w.W, ctx["ids"], ctx["res"], rig.w.lora, B.ALPHA / B.RANK, rig.w.v_first, g, rig.w.buffers,
+                    lambda *x: None, q_block=ctx["qb"], train_idx=rig.w.train_idx, attn_scale=0.5, on_visit_grad=onv)
+    rep = {"row": ROW, "round": False, "gout_norm_per_visit": {str(k): norms[k] for k in sorted(norms)}, "backward_s": time.time() - t0,
+           "inject": [], "dropped": []}
+    routing0 = ctx["res"]["routing"].clone()
+    ids = ctx["ids"]
+    rig.w._release(ctx)
+    with torch.no_grad():
+        x0 = F.forward(rig.w.eng, ids, save=True, adapters_per_layer=rig.w._adapters())["x0"]
+    S0, _ = chain_S(rig, ids, x0, routing0, mask_t)
+    rep["S0_smooth"] = S0
+    log(f"backward {rep['backward_s']:.0f} s; |g_out| per visit {[round(norms[k], 3) for k in sorted(norms)]}")
+    json.dump(rep, open(a.out, "w"), indent=1)
+    gen = torch.Generator(device=dev).manual_seed(7)
+    for v in VIS:
+        for dname, mult in (("g", 1.0), ("r", 1.0), ("g", 4.0)):
+            if time.time() > deadline:
+                rep["dropped"].append([v, dname, mult])
+                continue
+            go = gouts[v]
+            u = go / go.norm() if dname == "g" else torch.randn(go.shape, generator=gen, device=dev)
+            u = u / u.norm()
+            ip = float((go.double() * u.double()).sum())
+            eps = mult * 0.5 / float(go.norm())               # "g": a predicted change of 0.5 nats x mult
+            sp = chain_S(rig, ids, x0, routing0, mask_t, inject=(v, eps * u))[0]
+            sm = chain_S(rig, ids, x0, routing0, mask_t, inject=(v, -eps * u))[0]
+            f = (sp - sm) / (2 * eps * ip) if ip else None
+            rep["inject"].append({"visit": v, "dir": dname, "mult": mult, "eps": eps, "pred": eps * ip, "S+": sp, "S-": sm, "f": f,
+                                  "curv": (sp + sm - 2 * S0) / 2})
+            log(f"visit {v} {dname} x{mult:g}: pred {eps * ip:.4g}, f {f}, curvature {(sp + sm - 2 * S0) / 2:.4g}")
+            json.dump(rep, open(a.out, "w"), indent=1)
+    rig.w.close()
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--phase", required=True, choices=("grad", "fd"))
+    ap.add_argument("--phase", required=True, choices=("grad", "fd", "inject"))
     ap.add_argument("--plan", required=True)
     ap.add_argument("--bin", required=True)
     ap.add_argument("--artifact", required=True)
@@ -321,7 +380,7 @@ def main():
     ap.add_argument("--out", default="")
     ap.add_argument("--budget-s", type=float, default=1500.0)
     a = ap.parse_args()
-    return phase_grad(a) if a.phase == "grad" else phase_fd(a)
+    return {"grad": phase_grad, "fd": phase_fd, "inject": phase_inject}[a.phase](a)
 
 
 if __name__ == "__main__":
