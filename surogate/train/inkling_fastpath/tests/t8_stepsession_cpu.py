@@ -54,8 +54,9 @@ def cfg_for(tmp, **kw):
 
 def base_rows(n_groups=4):
     rows = P.make(3)[: 3 * n_groups]
-    for k, r in enumerate(rows):
-        r.trial_idx = k
+    scores = ([1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0] * n_groups)[: len(rows)]   # every group has both outcomes
+    for k, (r, a) in enumerate(zip(rows, P.KS.grpo_advantages(scores, [r.group_idx for r in rows]))):
+        r.trial_idx, r.advantage = k, float(a)
     return rows
 
 
@@ -240,6 +241,7 @@ def main():
         o, _ = res[n - 1]
         assert st["N"] == o.metrics["total_tokens"] and abs(st["policy_loss"] - o.metrics["policy_loss"]) == 0.0
         assert st["clip_share"] == o.metrics["ppo_clip_ratio"] and st["ratio_max"] == o.metrics["ppo_ratio_max"]
+        assert st["grad_norm"] == res[n - 1][1] and st["grad_norm"] > 0.0
         if n == 1:
             assert st["ratio_max"] == 1.0 and st["clip_share"] == 0.0 and st["A_delta_max_abs"] == 0.0
             assert all(a["log_ratio_abs_max"] == 0.0 for a in st["attempts"].values())
@@ -449,7 +451,14 @@ def main():
     assert sum(1 for r in a_.rows if r["passes"] == 0) == 3 and all(r["passes"] == 1 for r in b_.rows)
     recs = [torch.load(f, weights_only=False) for f in a_.metrics["sketch_files"]]
     assert sorted(d["trial"] for d in recs) == [3, 4, 5] and all(d["rows_skipped_zero_factor"] == 1 and d["rows"] == 0 for d in recs)
-    print("(7) zero-seed rows: gradient bitwise with and without their backward; counted; in the sketch records: PASS")
+    z0 = base_rows()
+    for r in z0:
+        if r.group_idx == 0:
+            r.advantage = 0.0
+    zplan = write_step_plan(os.path.join(tmp, "plan_zero_update"), z0, [[0], [1, 2, 3]])
+    rc7, run7, _, s7, _ = session(tmp, "zero_update", zplan, ["GO", "GO"], panels=panels)
+    assert rc7 == SS.EXIT_GATE and "exactly zero" in s7.sess["exit"]["reason"], s7.sess["exit"]
+    print("(7) zero-seed rows: gradient bitwise with and without their backward; counted; in the sketch records; an update that moves nothing is a gate: PASS")
     print("T8 STEP SESSION CPU TEST: PASS")
     return 0
 

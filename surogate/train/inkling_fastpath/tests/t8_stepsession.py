@@ -584,8 +584,8 @@ class Session:
         again = tr.logprobs(rt[:1])[0]
         if MI.bits_equal(np.concatenate([[0.0], again]), np.concatenate([[0.0], lv[0]]), rt[0].loss_mask)[1]:
             raise GateFailure(f"update {n}: the workers' forward at v differs after the controls' round trip")
-        if len({recs[k]["sha256"] for k in recs}) != len(recs):
-            raise GateFailure(f"update {n}: two of v, R, R2 export to the same file (a zero accumulated update?)")
+        if all(torch.equal(c, t0) for c, t0 in zip(self.cur, self.theta0)):
+            raise GateFailure(f"update {n}: the accumulated update is exactly zero (v is the start adapter; its controls would be too)")
         write_json(os.path.join(ud, "adapters.json"), {k: {x: y for x, y in v.items() if x != "path"} for k, v in recs.items()})
         files[os.path.relpath(os.path.join(ud, "adapters.json"), self.run)] = MI.sha256(os.path.join(ud, "adapters.json"))
         write_json(os.path.join(ud, "TRAINER_READY.json"),
