@@ -745,9 +745,299 @@ def phase_lin(a):
     return 0
 
 
+def _patch_source(mod, func_src_name: str, edits: list, cls=None):
+    """Test-side patch: re-define a function of `mod` (or a staticmethod of `mod.cls`) from its source with text edits. Returns an undo."""
+    import inspect
+    import textwrap
+
+    obj = getattr(getattr(mod, cls), func_src_name) if cls else getattr(mod, func_src_name)
+    src = textwrap.dedent(inspect.getsource(obj))
+    src = "\n".join(ln for ln in src.splitlines() if ln.strip() != "@staticmethod") + "\n"
+    for a, b in edits:
+        if src.count(a) < 1:
+            raise RuntimeError(f"patch anchor not found in {func_src_name}: {a!r}")
+        src = src.replace(a, b)
+    ns = {}
+    exec(compile(src, f"<patched {func_src_name}>", "exec"), mod.__dict__, ns)
+    new = ns[func_src_name]
+    if cls:
+        old = getattr(mod, cls).__dict__[func_src_name]
+        setattr(getattr(mod, cls), func_src_name, staticmethod(new))
+        return lambda: setattr(getattr(mod, cls), func_src_name, old)
+    old = getattr(mod, func_src_name)
+    setattr(mod, func_src_name, new)
+    return lambda: setattr(mod, func_src_name, old)
+
+
+def variant_patches(name: str) -> list:
+    """Q: no gradient through the attention scores (ds = 0; the value path stays). D: router gate weights held constant. M: the source-mix
+    probabilities of inkling_attn_res and the tanh gates of inkling_loop_blend held constant (the normalised values keep their gradient)."""
+    undo = []
+    if "Q" in name:
+        undo.append(_patch_source(LG, "backward", [("ds = p * (dp - dterm + dlb)", "ds = torch.zeros_like(p)")], cls="RelAttentionR"))
+    if "D" in name:
+        rw = RA.route_weights
+        RA.route_weights = lambda logits, ids, *x, **k: rw(logits.detach(), ids, *x, **k)
+        undo.append(lambda: setattr(RA, "route_weights", rw))
+    if "M" in name:
+        undo.append(_patch_source(RA, "inkling_attn_res", [("probs = t_exp(logits - logits.amax(1, keepdim=True))",
+                                                            "probs = t_exp(logits - logits.amax(1, keepdim=True)).detach()")]))
+        undo.append(_patch_source(RA, "inkling_loop_blend", [("gain = t_tanh(gf[..., :d])", "gain = t_tanh(gf[..., :d]).detach()"),
+                                                             ("forget = t_tanh(gf[..., d:])", "forget = t_tanh(gf[..., d:]).detach()")]))
+    return undo
+
+
+def phase_sum(a):
+    """diag-5 (agent-RX's design; lines written before any data). Plan row 3, routing frozen at theta0's, theta0.
+    A THE SUMMING, no finite differences: on the first 2,048 tokens of row 3 (S = sum of log pi over every position; rounding ON, so every
+      stored state is a bf16 value and TokenChunked's bf16 storage is exact in both), the frozen chain under plain autograd (real tensors,
+      act_vals None, dS/d(output of visit v) by retain_grad, the six tensors as leaves) against backward_row fed exactly the chain's states
+      (its outputs, x0, the chain's final hidden, theta0's routing), with an exact fp32 head gradient in both. LINE: cos >= 0.999 and norm
+      ratio in [0.99, 1.01] at every visit and tensor = the summing across visits is right (the backward is the exact gradient at its point);
+      below at some visit = the summing is wrong, the latest such visit names where. If A fails, B and C are skipped.
+    B IS THERE A PART OF THE GRADIENT THAT HOLDS? Variants (test-side patches): Q (attention score cotangent zero), D (router gate weights
+      constant), QD, M (attn_res source-mix probabilities and loop-blend tanh gates constant). Each: backward_row on the engine's states and on
+      the smooth chain's states (rounding off, as diag-4 item 2); cos and norm ratio of the two for 12.B13, 3.B13, 21.B13 and g(v) per visit.
+      LINE: cos > 0.8 at layers 12 and 3 = a candidate; otherwise discarded without finite differences. For candidates: follow in the ENGINE
+      along the variant's gradient taken on the engine's states: 12.B13 and 3.B13 at x4 (x16 where the x4 prediction is under 3 nats),
+      21.B13 at x1. LINE: [0.7, 1.3] at layers 12 and 3 = a usable gradient exists; < 0.5 = it does not.
+    C trend only, last: the smooth chain along G_S (full gradient, chain states), 12.B13 at x1/4, x1/16, x1/64, S+ and S- printed.
+    Recorded once: relative L2 distance smooth vs frozen chain outputs per visit; cos of G_F (frozen chain states, rounding on) against G_S."""
+    deadline = time.time() + a.budget_s
+    rig = Rig(a)
+    row, _ = load_row(a.plan)
+    dev = rig.w.dev
+    eng, W = rig.w.eng, rig.w.W
+    mask_t = torch.as_tensor(row.loss_mask.copy(), device=dev)
+    g_full = torch.as_tensor(row.loss_mask[1:].astype(np.float32), device=dev)
+    J_QB, J_B13 = rig.keys.index("qB"), rig.keys.index("B13")
+    TT = {(12, J_B13): "12.B13", (3, J_B13): "3.B13", (21, J_B13): "21.B13", (12, J_QB): "12.qB", (3, J_QB): "3.qB", (21, J_QB): "21.qB"}
+    scale, attn_scale = B.ALPHA / B.RANK, rig.cfg.attn_alpha / rig.cfg.attn_rank
+    rep = {"row": ROW, "dropped": []}
+
+    def save():
+        json.dump(rep, open(a.out, "w"), indent=1)
+
+    def cmp(x, y):
+        x, y = x.double().reshape(-1), y.double().reshape(-1)
+        return {"cos": float((x * y).sum() / (x.norm() * y.norm()).clamp(min=1e-300)), "norm_ratio": float(x.norm() / y.norm().clamp(min=1e-300))}
+
+    def run_backward(vals, ids_, g_, qb_, head_grad=None):
+        Gs, gv = {}, {}
+
+        def ong(v, layer, j, gj):
+            nm = TT.get((layer, j))
+            if nm is not None:
+                c = gj.detach().float().cpu()
+                Gs[nm] = c if nm not in Gs else Gs[nm].add_(c)
+
+        TL.backward_row(eng, W, ids_, vals, rig.w.lora, scale, rig.w.v_first, g_, rig.w.buffers, ong, head_grad=head_grad, q_block=qb_,
+                        train_idx=rig.w.train_idx, attn_scale=attn_scale,
+                        on_visit_grad=lambda v, go: gv.__setitem__(v, go.detach().float().cpu()))
+        return Gs, gv
+
+    # the engine's states (kept alive for B), x0, routing
+    RA.ROUND["on"] = False
+    lp, ctx = rig.w._forward(row)
+    ids, qb = ctx["ids"], ctx["qb"]
+    routing0 = ctx["res"]["routing"].clone()
+    with torch.no_grad():
+        x0 = F.forward(eng, ids, save=True, adapters_per_layer=rig.w._adapters())["x0"].float()
+
+    # ---------------------------------------------------------------- A
+    Tp = 2048
+    ids_p = ids[:Tp].contiguous()
+    rout_p = routing0[:, :Tp].contiguous()
+    x0_p = x0[:Tp].clone().requires_grad_(True)              # a leaf, so every visit output carries a graph (its gradient is not used)
+    g_p = torch.ones(Tp - 1, dtype=torch.float32, device=dev)
+    RA.ROUND["on"] = True
+    t0 = time.time()
+    try:
+        with torch.device(dev):
+            leaves = {}
+            lora = []
+            for L, d in enumerate(rig.work):
+                keys = [k for k in d if k != "scale"]
+                ts = []
+                for j, k in enumerate(keys):
+                    t = d[k].to(dev)
+                    if (L, j) in TT:
+                        t = t.detach().requires_grad_(True)
+                        leaves[TT[(L, j)]] = t
+                    ts.append(t)
+                lora.append(TV.lora_dict(keys, ts, scale, attn_scale))
+            slots = {0: x0_p}
+            outs_p = []
+            for v, vi in enumerate(eng.visits):
+                bank = (slots[vi.bank[0]], slots[vi.bank[1]]) if vi.looped else None
+                o = TV.visit_torch_t8(W, vi, [slots[s] for s in vi.stack], slots[vi.partial], bank, rout_p[v], lora[vi.layer])
+                o.retain_grad()
+                outs_p.append(o)
+                slots[vi.next_partial] = o
+            hid = RA.inkling_attn_res([slots[0], slots[1], slots[2], slots[3]], slots[6], None, W.q_out, W.final_norm.reshape(1, B.D), B.EPS)[0]
+            headf = W.head.float()
+            tgt = ids_p[1:].long()
+            parts = []
+            for c0 in range(0, Tp - 1, 128):
+                c1 = min(Tp - 1, c0 + 128)
+                z = torch.tanh((hid[c0:c1] @ headf.T) / 30.0) * 30.0
+                parts.append((z.gather(1, tgt[c0:c1, None])[:, 0] - torch.logsumexp(z, -1)).sum())
+            total = torch.stack(parts).sum()
+            total.backward()                                  # one backward through the whole chain
+            S = float(total)
+            del headf, parts, total
+        g_auto = {v: o.grad.detach().float().cpu() for v, o in enumerate(outs_p) if o.grad is not None}
+        G_auto = {nm: t.grad.detach().float().cpu() for nm, t in leaves.items() if t.grad is not None}
+        host_p = {-1: x0_p.detach()}
+        for v, o in enumerate(outs_p):
+            host_p[v] = o.detach().float()
+        hid_d = hid.detach().float()
+        del outs_p, slots, leaves, lora, o
+
+        def head_exact(W_, hidden, targets, gg):
+            """the exact fp32 head gradient (the same arithmetic as the chain's head above)"""
+            h = hidden.detach().float()
+            hf = W_.head.float()
+            out = torch.zeros_like(h)
+            with torch.enable_grad():
+                for c0 in range(0, h.shape[0], 128):
+                    hh = h[c0:c0 + 128].clone().requires_grad_(True)
+                    z = torch.tanh((hh @ hf.T) / 30.0) * 30.0
+                    val = ((z.gather(1, targets[c0:c0 + 128].long()[:, None])[:, 0] - torch.logsumexp(z, -1)) * gg[c0:c0 + 128]).sum()
+                    out[c0:c0 + 128] = torch.autograd.grad(val, hh)[0]
+            del hf
+            return out
+
+        G_row, g_row = run_backward({"host": host_p, "routing": rout_p, "hidden": hid_d, "lp": None}, ids_p, g_p, TL.qb_for(Tp),
+                                    head_grad=head_exact)
+        rep["A"] = {"T": Tp, "S": S, "seconds": time.time() - t0,
+                    "per_visit": {str(v): cmp(g_row[v], g_auto[v]) for v in sorted(g_row) if v in g_auto},
+                    "tensors": {nm: cmp(G_row[nm], G_auto[nm]) for nm in G_auto if nm in G_row}}
+        bad = [v for v, x in rep["A"]["per_visit"].items() if x["cos"] < 0.999 or not 0.99 <= x["norm_ratio"] <= 1.01]
+        badt = [nm for nm, x in rep["A"]["tensors"].items() if x["cos"] < 0.999 or not 0.99 <= x["norm_ratio"] <= 1.01]
+        rep["A"]["pass"] = not bad and not badt
+        rep["A"]["outside"] = {"visits": bad, "tensors": badt}
+        log(f"A: {'PASS' if rep['A']['pass'] else 'FAIL'}; outside visits {bad}, tensors {badt}; per visit cos min "
+            f"{min(x['cos'] for x in rep['A']['per_visit'].values()):.6f}; {rep['A']['seconds']:.0f} s")
+        del host_p, hid_d, g_auto, G_auto
+    except Exception as e:
+        import traceback
+        rep["A"] = {"error": traceback.format_exc()[-2000:], "pass": False}
+        log(f"A ERROR: {type(e).__name__}: {e}")
+    RA.ROUND["on"] = False
+    torch.cuda.empty_cache()
+    save()
+    if not rep["A"].get("pass"):
+        rep["dropped"].append("B and C (A did not pass)")
+        save()
+        rig.w._release(ctx)
+        rig.w.close()
+        return 0
+
+    # ---------------------------------------------------------------- the chains' states (full row)
+    outs_s, hid_s, outs_f, hid_f = [], [], [], []
+    chain_S(rig, ids, x0, routing0, mask_t, keep_outs=outs_s, keep_hidden=hid_s)
+    RA.ROUND["on"] = True
+    chain_S(rig, ids, x0, routing0, mask_t, keep_outs=outs_f, keep_hidden=hid_f)
+    RA.ROUND["on"] = False
+    rep["smooth_vs_frozen_states"] = [float((outs_s[v].double() - outs_f[v].double()).norm() / outs_f[v].double().norm()) for v in range(len(outs_s))]
+
+    def chain_vals(outs, hid):
+        h = {-1: x0}
+        for v, o in enumerate(outs):
+            h[v] = o
+        return {"host": h, "routing": routing0, "hidden": hid[0], "lp": None}
+
+    G_S, g_S = run_backward(chain_vals(outs_s, hid_s), ids, g_full, qb)
+    RA.ROUND["on"] = True
+    G_F, _ = run_backward(chain_vals(outs_f, hid_f), ids, g_full, qb)
+    RA.ROUND["on"] = False
+    rep["G_F_vs_G_S"] = {nm: cmp(G_F[nm], G_S[nm]) for nm in G_S}
+    log("G_F vs G_S: " + ", ".join(f"{nm} {x['cos']:.3f}" for nm, x in rep["G_F_vs_G_S"].items()))
+    save()
+
+    # ---------------------------------------------------------------- B
+    rep["B"] = {}
+    for var in ("Q", "D", "QD", "M"):
+        if time.time() > deadline - 120:
+            rep["dropped"].append(f"B {var}")
+            continue
+        undo = []
+        try:
+            undo = variant_patches(var)
+            Ge, ge = run_backward(ctx["res"], ids, g_full, qb)
+            Gc, gc = run_backward(chain_vals(outs_s, hid_s), ids, g_full, qb)
+        except Exception as e:
+            import traceback
+            rep["B"][var] = {"error": traceback.format_exc()[-1500:]}
+            log(f"B {var} ERROR: {type(e).__name__}: {e}")
+            continue
+        finally:
+            for u in reversed(undo):
+                u()
+        r = {"engine_vs_chain": {nm: cmp(Ge[nm], Gc[nm]) for nm in ("12.B13", "3.B13", "21.B13", "12.qB", "3.qB", "21.qB") if nm in Ge},
+             "per_visit": {str(v): cmp(ge[v], gc[v]) for v in sorted(ge) if v in gc},
+             "norms_engine": {nm: float(t.norm()) for nm, t in Ge.items()}}
+        cand = r["engine_vs_chain"]["12.B13"]["cos"] > 0.8 and r["engine_vs_chain"]["3.B13"]["cos"] > 0.8
+        r["candidate"] = bool(cand)
+        log(f"B {var}: cos engine vs chain 12.B13 {r['engine_vs_chain']['12.B13']['cos']:.3f}, 3.B13 {r['engine_vs_chain']['3.B13']['cos']:.3f}, "
+            f"21.B13 {r['engine_vs_chain']['21.B13']['cos']:.3f}; candidate {cand}")
+        if cand:
+            r["engine_follow"] = []
+            for nm, mult in (("12.B13", 4.0), ("3.B13", 4.0), ("21.B13", 1.0)):
+                if time.time() > deadline:
+                    rep["dropped"].append(f"B {var} follow {nm}")
+                    continue
+                L, k = nm.split(".")
+                gC = Ge[nm].double()
+                m_ = mult
+                pred = float(gC.norm()) * BASE_E * m_ * gC.numel() ** 0.5
+                if nm != "21.B13" and pred < 3.0:
+                    m_ = 16.0
+                step = (gC / gC.norm() * BASE_E * m_ * gC.numel() ** 0.5).float()
+                pred = float((gC * step.double()).sum())
+                sv = {}
+                for sg in (1, -1):
+                    rig.set_one(int(L), k, sg * step)
+                    with torch.no_grad():
+                        res = F.forward(eng, ids, save=False, adapters_per_layer=rig.w._adapters())
+                        lpx = F.logprobs(eng, res["hidden"], ids)
+                    sv[sg] = float(lpx.double()[mask_t[1:]].sum())
+                    del res, lpx
+                    eng._ws = None
+                rig.set_one(int(L), k, None)
+                f = (sv[1] - sv[-1]) / (2 * pred)
+                r["engine_follow"].append({"tensor": nm, "mult": m_, "pred": pred, "S+": sv[1], "S-": sv[-1], "f": f})
+                log(f"B {var} engine follow {nm} x{m_:g}: pred {pred:.4g}, f {f:.4f}")
+        rep["B"][var] = r
+        save()
+
+    # ---------------------------------------------------------------- C
+    rep["C"] = []
+    for mult in (0.25, 0.0625, 0.015625):
+        if time.time() > deadline:
+            rep["dropped"].append(f"C x{mult:g}")
+            continue
+        gC = G_S["12.B13"].double()
+        step = (gC / gC.norm() * BASE_E * mult * gC.numel() ** 0.5).float()
+        pred = float((gC * step.double()).sum())
+        rig.set_one(12, "B13", step)
+        sp = chain_S(rig, ids, x0, routing0, mask_t)[0]
+        rig.set_one(12, "B13", -step)
+        sm = chain_S(rig, ids, x0, routing0, mask_t)[0]
+        rig.set_one(12, "B13", None)
+        rep["C"].append({"mult": mult, "pred": pred, "S+": sp, "S-": sm, "f": (sp - sm) / (2 * pred)})
+        log(f"C 12.B13 along G_S x{mult:g}: pred {pred:.4g}, S+ {sp:.6f}, S- {sm:.6f}, f {(sp - sm) / (2 * pred):.4f}")
+        save()
+    save()
+    rig.w._release(ctx)
+    rig.w.close()
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--phase", required=True, choices=("grad", "fd", "inject", "local", "lin"))
+    ap.add_argument("--phase", required=True, choices=("grad", "fd", "inject", "local", "lin", "sum"))
     ap.add_argument("--plan", required=True)
     ap.add_argument("--bin", required=True)
     ap.add_argument("--artifact", required=True)
@@ -755,7 +1045,7 @@ def main():
     ap.add_argument("--out", default="")
     ap.add_argument("--budget-s", type=float, default=1500.0)
     a = ap.parse_args()
-    return {"grad": phase_grad, "fd": phase_fd, "inject": phase_inject, "local": phase_local, "lin": phase_lin}[a.phase](a)
+    return {"grad": phase_grad, "fd": phase_fd, "inject": phase_inject, "local": phase_local, "lin": phase_lin, "sum": phase_sum}[a.phase](a)
 
 
 if __name__ == "__main__":
