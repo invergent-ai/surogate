@@ -280,6 +280,7 @@ def phase_pre(a):
     np.savez(os.path.join(a.run_dir, "trainer_zero.npz"), **{f"lp_{i}": x for i, x in enumerate(lz)})
     np.savez(os.path.join(a.run_dir, "trainer_adapter.npz"), **{f"lp_{i}": x for i, x in enumerate(la)})
     rep = {"plan": info, "pre_rows": pick, "pre_rows_T": [r.T for r in sub], "adapter_sha256": sha, "step_gates": step_gates,
+           "backward_options": backward_options(a),
            "replay": {"equal": eq, "differ": ne, "pass": bool(ne == 0 and eq > 0 and step_gates["replay_checked_rows"] == len(sub)
                                                              and step_gates["stale_checked_rows"] == len(sub) and step_gates["finite"])}}
     import shutil
@@ -360,6 +361,7 @@ def phase_trainer(a):
             # the files of the follow read
             fo_json = {**fo["by_block"], "N": N, "rows_used": len(out.rows), "rows_refused": len(rows) - len(out.rows), "k": 1,
                        "G": "-N x grads of mini-batch 0", "d": "theta1 - theta0", "attention": fo["attention"], "experts": fo["experts"]}
+            fo_json["backward_options"] = backward_options(a)   # the gradient behind these predictions (all 0 = the exact backward)
             json.dump(fo_json, open(os.path.join(a.run_dir, "first_order.json"), "w"), indent=1)
             os.makedirs(os.path.join(a.run_dir, "masters"), exist_ok=True)
             torch.save(dict(zip(nm, theta0)), os.path.join(a.run_dir, "masters", "theta0.pt"))
@@ -511,7 +513,7 @@ def phase_compare(a):
                               "trainer_checks": rep.get("zero_adapter", {}).get("checks"), "engine_Z_vs_base": rep["compare"]["M1_engine_Z_vs_base"]},
              "finite": s_.get("finite"), "rows_refused": s_.get("rows_refused"), "A_delta_max_abs": rep.get("A_delta_max_abs"),
              "A_delta_exactly_zero": rep.get("A_delta_max_abs") == 0.0, "plan_rows_sha256": info["rows_sha256"], "engine_sha": eng,
-             "source": "micro.json (measured values)"}
+             "backward_options": rep.get("backward_options"), "source": "micro.json (measured values)"}
     json.dump(gates, open(os.path.join(a.run_dir, "gates.json"), "w"), indent=1, default=float)
     need = ("first_order.json", "gates.json", "masters/theta0.pt", "masters/theta1.pt", "rows_used.npz", "adapters.json")
     rep["M6"] = bool(rep.get("M6_trainer") and all(os.path.exists(os.path.join(a.run_dir, f)) for f in need)
@@ -594,6 +596,9 @@ def main():
     ap.add_argument("--gate-grad-from", type=int, default=0, help="visits below it hold their router gate weights constant in the backward")
     ap.add_argument("--bank-grad-from", type=int, default=0, help="looped visits below it hold their bank inputs constant in the backward")
     a = ap.parse_args()
+    if a.bank_grad_from:
+        ap.error("--bank-grad-from cannot run in this session: its trainer runs with lean_host (the sketches), which adds a looped layer's "
+                 "gradient at the layer's last visit, and a bank cut skips visits (t8_step.validate_config refuses the pair)")
     return {"check": phase_check, "pre": phase_pre, "pre_compare": phase_pre_compare, "trainer": phase_trainer, "compare": phase_compare,
             "dmg_merge": phase_dmg_merge}[a.phase](a)
 
