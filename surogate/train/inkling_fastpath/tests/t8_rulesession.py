@@ -82,7 +82,7 @@ def build(ckpt_dir: str, grad_path: str, states: list, out_dir: str, export_fn, 
     for st in states:
         masters, d = state_masters(st, fu, eps)
         row = RU.table_row(st["name"], d, fu["d_adam"], nm, blocks)
-        row.update(kind=st["kind"], rule=st["rule"], size=st["size"], eps=eps if st["rule"] == "E" else None, sets=st["sets"],
+        row.update(name=st["name"], kind=st["kind"], rule=st["rule"], size=st["size"], eps=eps if st["rule"] == "E" else None, sets=st["sets"],
                    of=None if st["kind"] == "rule" else f"{st['rule']}{st['size']:g}", seed=SEEDS.get(st["draw"]),
                    per_tensor_l2=RU.per_tensor_norms(d, nm), masters_sha256=SS.state_sha(masters, nm))
         fo = N * sum(float((g * x).sum()) for g, x in zip(G, d))
