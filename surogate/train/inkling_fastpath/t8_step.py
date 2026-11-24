@@ -47,6 +47,10 @@ _FLAG_ATTR = {"IFT_MOE_GM": "MOE_GM", "IFT_MOE_DET": "MOE_DET", "IFT_FAST_GEMM":
 # Not applied when segment sums are kept (there a zero row still leaves its zero entries). False = always run the backward.
 SKIP_ZERO_SEED_PARTS = True
 
+# Bin edges of the per-row histogram of |log ratio| over the loss tokens ("ppo" mode): [0, 1e-6), then ten bins per decade up to 10^1.5, then
+# everything above. A report only: nothing in the step reads it.
+LOG_RATIO_EDGES = np.concatenate([[0.0], 10.0 ** (np.arange(-60, 16) / 10.0), [np.inf]])
+
 
 class T8GateError(RuntimeError):
     """A hard gate failed: the step returns no gradient."""
@@ -428,6 +432,7 @@ class WorkerCore:
             out["seq_log_ratio_ppo"] = float(np.mean(lp[mask] - old[mask])) if mask.any() else 0.0
             lr_abs = np.abs(lp[mask] - old[mask]) if mask.any() else np.zeros(0)
             out["log_ratio_abs"] = (float(lr_abs.sum()), float(lr_abs.max()) if lr_abs.size else 0.0)   # sum and max of |log ratio| over the loss tokens
+            out["log_ratio_hist"] = np.histogram(lr_abs, bins=LOG_RATIO_EDGES)[0].astype(np.int64).tolist()   # counts per LOG_RATIO_EDGES bin
         elif mode == "weights":
             g = torch.as_tensor(float(row.notes["weight"]) * mask.astype(np.float32), dtype=torch.float32)
             out["met"] = {"policy_loss": 0.0, "mismatch_kl": 0.0, "is_masked": 0.0}

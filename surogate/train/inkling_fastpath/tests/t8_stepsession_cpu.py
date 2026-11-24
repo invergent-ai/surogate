@@ -270,6 +270,14 @@ def main():
         else:
             assert any(a["log_ratio_abs_max"] > 0.0 for a in st["attempts"].values()) and st["A_delta_max_abs"] > 0.0
         assert len(st["attempts"]) == 6 and all(set(a) >= {"advantage", "clip_share", "log_ratio_abs_mean", "sketch"} for a in st["attempts"].values())
+        hh = st["log_ratio_hist"]                             # the histogram of |log ratio|: every loss token once; update 1 all in the zero bin
+        assert sum(hh["counts"]) == st["N"] == sum(sum(a["log_ratio_hist"]) for a in st["attempts"].values()) and len(hh["counts"]) == len(hh["edges"]) - 1
+        assert (hh["counts"][0] == st["N"]) == (n == 1) and all(sum(a["log_ratio_hist"]) == a["loss_tokens"] for a in st["attempts"].values())
+        if n == 2:
+            top = max(a["log_ratio_abs_max"] for a in st["attempts"].values())
+            assert hh["log_ratio_abs_p99.9_below"] >= hh["log_ratio_abs_p50_below"] > 0 and hh["log_ratio_abs_p50_below"] <= top * 10 ** 0.1 + 1e-6
+            last = max(i for i, c_ in enumerate(hh["counts"]) if c_)
+            assert float(hh["edges"][last]) <= top, "the highest filled bin starts above the largest |log ratio|"
         ad = json.load(open(os.path.join(ud, "adapters.json")))
         assert set(ad) == {"v", "R", "R2"} and len({ad[k]["sha256"] for k in ad}) == 3
         v = torch.load(os.path.join(run, "work", "adapters", f"u{n}_v", "state.pt"), weights_only=True)

@@ -196,6 +196,24 @@ def score_adapters_delta(nm: list, cur: list, theta0: list) -> float:
     return worst
 
 
+def hist_quantiles(counts, qs=(0.5, 0.9, 0.99, 0.999)) -> dict:
+    """Upper bounds of the quantiles of |log ratio| from a histogram over the step code's bin edges (a quantile lies inside the bin whose upper
+    edge is given; the last bin is open: its bound is reported as the last finite edge with "+")."""
+    import t8_step as TS
+
+    c = np.asarray(counts, dtype=np.int64)
+    edges, tot = TS.LOG_RATIO_EDGES, int(c.sum())
+    out = {}
+    if tot == 0 or len(c) != len(edges) - 1:
+        return out
+    cum = np.cumsum(c)
+    for q in qs:
+        i = int(np.searchsorted(cum, q * tot, side="left"))
+        up = float(edges[i + 1])
+        out[f"log_ratio_abs_p{str(q * 100).rstrip('0').rstrip('.')}_below"] = up if np.isfinite(up) else f">{float(edges[i]):g}"
+    return out
+
+
 def save_ckpt(tr, d: str, nm: list, meta: dict) -> dict:
     os.makedirs(d, exist_ok=True)
     mp, op = os.path.join(d, "masters.pt"), os.path.join(d, "optimizer.npz")
@@ -541,6 +559,13 @@ class Session:
             write_json(os.path.join(ud, "step.json"), dict(step, gate_failures=bad))
             raise GateFailure(f"update {n}: " + "; ".join(bad))
         step["attempts"], sketch_files = self.read_sketches(n, sub, out)
+        hs = [np.asarray(a_["log_ratio_hist"], dtype=np.int64) for a_ in step["attempts"].values() if "log_ratio_hist" in a_]
+        if hs:                                                # the update's own histogram of |log ratio| over its loss tokens, and its quantiles
+            import t8_step as TS_
+
+            tot_h = np.sum(hs, axis=0)
+            step["log_ratio_hist"] = {"edges": [float(x) if np.isfinite(x) else "inf" for x in TS_.LOG_RATIO_EDGES], "counts": [int(x) for x in tot_h],
+                                      **hist_quantiles(tot_h)}
         if self.pending is not None:                          # nothing is applied before the previous update has its GO
             self.await_verdict(self.pending, time.time(), last=False)
         else:                                                 # nor when the read side has already failed (no later read could be judged)
@@ -631,6 +656,9 @@ class Session:
             r = sub[res["i"]]
             a = att.setdefault(int(r.trial_idx), {"advantage": float(r.advantage), "group": int(r.group_idx), "rows": 0, "loss_tokens": 0,
                                                   "clipped_tokens": 0.0, "lr_sum": 0.0, "log_ratio_abs_max": 0.0, "backward_rows": 0})
+            if res.get("log_ratio_hist") is not None:         # counts of |log ratio| per bin of the step code's edges, summed over the attempt's rows
+                h = np.asarray(res["log_ratio_hist"], dtype=np.int64)
+                a["log_ratio_hist"] = h if "log_ratio_hist" not in a else a["log_ratio_hist"] + h
             a["rows"] += 1
             a["loss_tokens"] += int(res["loss_tokens"])
             a["clipped_tokens"] += float(res.get("ppo", {}).get("clipped_tokens", 0.0))
@@ -642,6 +670,9 @@ class Session:
         for t, a in att.items():
             a["clip_share"] = a["clipped_tokens"] / max(a["loss_tokens"], 1)
             a["log_ratio_abs_mean"] = a.pop("lr_sum") / max(a["loss_tokens"], 1)
+            if "log_ratio_hist" in a:
+                a.update(hist_quantiles(a["log_ratio_hist"]))
+                a["log_ratio_hist"] = [int(x) for x in a["log_ratio_hist"]]
             g = got.get(t, {"rows": 0, "tensors": 0})
             if a["advantage"] == 0.0:
                 a["sketch"] = "absent: advantage 0"
