@@ -25,6 +25,9 @@ Measured per row and variant:
           it) and its standard deviation about that mean = the scatter.
   p       = max(4 nats, 6 x scatter); recorded with S0. (Until snapshot 2d95074a the scatter was the rms about zero, which counts the
           shift as noise and made p several times larger on rows with thousands of loss tokens: AMENDED AFTER the first data of row 72.)
+          AMENDED AGAIN AFTER DATA (row 127: 97 loss tokens, S0 near 0, the 4-nat floor asked the row to rise above S = 0: + side 0.02,
+          - side 4.7): p is capped at 0.4 |S0|; a row where 6 x scatter exceeds that cap cannot be read (p_valid False), and a reading
+          predicted above 0.81 |S0| (the repeat at twice the cap) is not readable.
   repeat  a gating reading in [0.5, 0.7) or (1.3, 1.5] is read once more at twice the step; only a second reading outside [0.7, 1.3]
           counts as outside (agent-RX's rule, accepted before any data was read).
 LINES, written before any data (2026-11-24; the coordinator's): a variant MEETS THE LINES on a row when, for the experts' tensor of every
@@ -95,7 +98,7 @@ def gate_verdict(rep, var, labels=("12.B13", "3.B13", "21.B13")):
         rs = [r for r in rep["follow"] if r["variant"] == var and r["what"] == lab]
         if not rs:
             out[lab] = "missing"
-        elif not rs[-1]["readable"] or abs(rs[-1]["pred+"]) < 3.0:
+        elif not rs[-1]["readable"] or abs(rs[-1]["pred+"]) < min(3.0, 0.39 * abs(rep["S0_engine"])):
             out[lab] = f"not readable ({rs[-1]['f']:.3f})"
         else:
             out[lab] = f"{'in band' if 0.7 <= rs[-1]['f'] <= 1.3 else 'outside'} ({rs[-1]['f']:.3f})"
@@ -211,7 +214,8 @@ def main():
                 C.set_step(nm, None, None)
             r = {"variant": var, "what": label, "p": pp, "pred+": pred[1.0], "pred-": pred[-1.0], "S+": S[1.0], "S-": S[-1.0],
                  "f": (S[1.0] - S[-1.0]) / (pred[1.0] - pred[-1.0]), "f_plus": (S[1.0] - e0) / pred[1.0], "f_minus": (S[-1.0] - e0) / pred[-1.0],
-                 "even": (S[1.0] + S[-1.0] - 2 * e0) / 2, "norm": n2 ** 0.5, "readable": abs(pred[1.0]) >= 4 * rep["scatter"]}
+                 "even": (S[1.0] + S[-1.0] - 2 * e0) / 2, "norm": n2 ** 0.5,
+                 "readable": bool(abs(pred[1.0]) >= 4 * rep["scatter"] and abs(pred[1.0]) <= 0.81 * abs(e0) and rep.get("p_valid", True))}
             r["real_change_per_unit_step"] = r["f"] * r["norm"]
             r["repeat_of_p"] = rep_of
             rep["follow"].append(r)
@@ -279,8 +283,13 @@ def main():
                 rep["tiny_step_shift"] = mean
                 rep["scatter_rms_about_zero"] = (sum(d * d for d in devs) / len(devs)) ** 0.5
                 rep["scatter"] = (sum((d - mean) ** 2 for d in devs) / (len(devs) - 1)) ** 0.5
-                rep["p"] = max(4.0, 6.0 * rep["scatter"])
-                log(f"tiny-step deviations {[round(d, 3) for d in devs]}; shift {mean:.3f}; scatter (sd) {rep['scatter']:.3f}; p {rep['p']:.2f}")
+                # p: 6 x the scatter, at least 4 nats where the row allows it, and never above 0.4 |S0| (S <= 0: a step predicted near |S0|
+                # cannot be followed upward, the + side saturates). A row where 6 x scatter exceeds 0.4 |S0| cannot be read: p_valid False.
+                cap = 0.4 * abs(e0)
+                rep["p"] = min(max(4.0, 6.0 * rep["scatter"]), cap)
+                rep["p_valid"] = bool(6.0 * rep["scatter"] <= cap)
+                log(f"tiny-step deviations {[round(d, 3) for d in devs]}; shift {mean:.3f}; scatter (sd) {rep['scatter']:.3f}; p {rep['p']:.2f}; "
+                    f"0.4 |S0| {cap:.2f}; p valid {rep['p_valid']}")
                 save()
             p = rep["p"]
             for L in (12, 3, 9, 15, 21):
