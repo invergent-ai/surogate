@@ -430,7 +430,7 @@ def main():
     class SlowW(P.FakeW):
         def process_row(self, i, row, job):
             if job.get("minibatch_index", 0) >= 1:
-                time.sleep(1.0)
+                time.sleep(2.0)
             return super().process_row(i, row, job)
 
     class SlowTrainer(P.FakeTrainer):
@@ -443,17 +443,18 @@ def main():
             self.opt = P.MasterAdamW(self.work, lr=MI.LR, weight_decay=0.0, max_grad_norm=1.0)
             self._sync()
 
-    t0 = time.time()
     rc6, run6, tr6, s6, _ = session(tmp, "early", plan_dir, ["STOP"], tr=SlowTrainer(cfg_for(tmp), 1), panels=panels)
-    el = time.time() - t0
     whats = [p["what"] for p in s6.sess["phases"]]
     assert rc6 == 20 and any("gradient interrupted" in w for w in whats) and s6.aborted, (rc6, whats)
-    assert el < 5.0, f"the 6 s gradient was not interrupted ({el:.1f} s)"
+    ph = {p["what"].split(":")[-1].strip().split(",")[0]: p["t"] for p in s6.sess["phases"] if p["what"].startswith("update 2")}
+    el = ph["gradient interrupted"] - ph["gradient"]
+    assert el < 9.0, f"the 12 s gradient of update 2 was not interrupted ({el:.1f} s)"
+    assert not os.path.exists(os.path.join(run6, "updates", "2", "step.json")), "the interrupted gradient left a step record"
     assert json.load(open(os.path.join(run6, "STOPPED.json")))["v_1"] == "not kept" and not os.path.isdir(os.path.join(run6, "updates", "2", "ckpt"))
     rc6, run6, tr6, s6, _ = session(tmp, "no_early", plan_dir, ["STOP"], tr=SlowTrainer(cfg_for(tmp), 2), panels=panels, early_stop=False)
     assert rc6 == 20 and not any("gradient interrupted" in p["what"] for p in s6.sess["phases"]) and os.path.exists(os.path.join(run6, "updates", "2", "step.json"))
     assert not os.path.isdir(os.path.join(run6, "updates", "2", "ckpt"))
-    print(f"(6) a STOP during the next gradient interrupts it ({el:.1f} s instead of 6): PASS")
+    print(f"(6) a STOP during the next gradient interrupts it ({el:.1f} s into a 12 s gradient): PASS")
 
     # (7) rows whose seeds are all zero
     zrows = load(plan_dir).rows
