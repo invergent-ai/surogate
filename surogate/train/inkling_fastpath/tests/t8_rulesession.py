@@ -6,7 +6,7 @@ R<rule><size> / R2<rule><size> = theta0 + a fixed-seed random direction with tha
 
 build (CPU, no card): from a first update's checkpoint and gradient file, every state's masters -> its adapter directory and rules.json:
   per state {name, kind, rule, size, eps, of, seed, masters_sha256, adapter_sha256, l2, l2_by_block, per_tensor_l2, nonzero_entries,
-  cos_with_adam_step, first_order {at_size, at_size_1} = N x <-grad, d>, sets}; "checks": P and E have the optimizer step's overall norm
+  cos_with_adam_step, first_order {at_size, size_1} = N x <-grad, d>, sets}; "round_trip_rows" (with a plan given); "checks": P and E have the optimizer step's overall norm
   and T its per-tensor norms (largest relative difference), the score adapters (q, k, r) are untouched in every state, A<s> is
   theta0 + s x (theta1 - theta0), A at size 1 is the checkpoint's masters and exports to the checkpoint's adapter hash.
 states (trainer side, one worker): the trainer's start adapter must equal the checkpoint's by value and replay the round-trip rows' records
@@ -68,9 +68,21 @@ def state_masters(st: dict, fu: dict, eps: float) -> tuple:
     return masters, d
 
 
-def build(ckpt_dir: str, grad_path: str, states: list, out_dir: str, export_fn, blocks: dict, eps: float = 1e-6, log=MI.log) -> dict:
+def round_trip_rows_of(plan_dir: str, rt_group: int) -> list:
+    """The session's round-trip rows, from the plan's row lengths alone: the two longest and the four shortest rows of the group."""
+    with np.load(os.path.join(plan_dir, "rows.npz"), allow_pickle=False) as z:
+        T, g = np.array(z["T"]), np.array(z["group_idx"])
+    grp = {int(n): int(T[n]) for n in range(len(T)) if int(g[n]) == int(rt_group)}
+    if not grp:
+        raise ValueError(f"round-trip group {rt_group} is not in the plan")
+    return pick_round_trip_rows(grp)
+
+
+def build(ckpt_dir: str, grad_path: str, states: list, out_dir: str, export_fn, blocks: dict, eps: float = 1e-6, log=MI.log,
+          plan_dir: str = "", rt_group: int = 0) -> dict:
     """Card-free: every state's adapter directory under <out>/adapters/<name>/ and <out>/rules.json."""
     fu = RU.load_first_update(ckpt_dir, grad_path, MI.sha256, SS.state_sha)
+    rt_rows = round_trip_rows_of(plan_dir, rt_group) if plan_dir else None
     nm, meta = fu["names"], fu["meta"]
     gj = json.load(open(os.path.splitext(grad_path)[0] + ".json"))
     N = float(gj["N"])
@@ -86,7 +98,7 @@ def build(ckpt_dir: str, grad_path: str, states: list, out_dir: str, export_fn, 
                    of=None if st["kind"] == "rule" else f"{st['rule']}{st['size']:g}", seed=SEEDS.get(st["draw"]),
                    per_tensor_l2=RU.per_tensor_norms(d, nm), masters_sha256=SS.state_sha(masters, nm))
         fo = N * sum(float((g * x).sum()) for g, x in zip(G, d))
-        row["first_order"] = {"at_size": fo, "at_size_1": fo / st["size"], "N": N, "what": "N x <-grad, d>"}
+        row["first_order"] = {"at_size": fo, "size_1": fo / st["size"], "N": N, "what": "N x <-grad, d>"}
         sha = export_fn(masters, os.path.join(out_dir, "adapters", st["name"]), f"rule-test-{st['name']}")
         row["adapter_sha256"] = sha[0] if isinstance(sha, tuple) else sha
         checks["score_adapters_untouched"][st["name"]] = all(torch.equal(masters[i], fu["theta0"][i]) for i in score)
@@ -117,7 +129,8 @@ def build(ckpt_dir: str, grad_path: str, states: list, out_dir: str, export_fn, 
                           "session_id": meta.get("session_id")},
            "grad_sha256": fu["grad_sha256"], "N": N, "clip_coefficient": fu["coef"], "lr": meta.get("lr"), "rule_E_eps": eps,
            "moment_check_worst_rel": fu["moment_check_worst_rel"], "adam_step_l2": RU._norm(dA), "grad_l2": RU._norm(fu["grads"]),
-           "control_seeds": SEEDS, "states": rows, "checks": checks, "checks_pass": bool(ok)}
+           "control_seeds": SEEDS, "round_trip_group": int(rt_group) if rt_rows is not None else None, "round_trip_rows": rt_rows,
+           "states": rows, "checks": checks, "checks_pass": bool(ok)}
     SS.write_json(os.path.join(out_dir, "rules.json"), tab)
     log(f"rules.json: {len(rows)} states; checks {'PASS' if ok else 'FAIL'}: {json.dumps({k: v for k, v in checks.items() if k != 'score_adapters_untouched'}, default=float)[:600]}")
     return tab
@@ -130,6 +143,8 @@ def run_states(tr, plan, fu: dict, tab: dict, run_dir: str, adapters_dir: str, r
     grp = [r for r in plan.rows if r.group_idx == rt_group]
     pick = set(pick_round_trip_rows({int(r.notes["plan_row"]): r.T for r in grp}))
     rt = [r for r in grp if int(r.notes["plan_row"]) in pick]
+    if tab.get("round_trip_rows") is not None and (sorted(pick) != sorted(tab["round_trip_rows"]) or tab.get("round_trip_group") != rt_group):
+        raise SS.PlanError("rules.json names other round-trip rows than this plan and group give")
     start = [m.detach().clone() for m in tr.opt.masters]
     if not all(torch.equal(a, b) for a, b in zip(start, fu["theta0"])):      # by value: the zeros' sign bits are the trainer's own
         raise SS.GateFailure("the trainer's start adapter is not the checkpoint's theta0")
@@ -176,7 +191,7 @@ def phase_build(a) -> int:
     import t8_skyrl as KS
 
     try:
-        tab = build(a.resume, a.grad, parse_states(a.states), a.out, SS.real_export, KS.BLOCKS, a.rule_eps)
+        tab = build(a.resume, a.grad, parse_states(a.states), a.out, SS.real_export, KS.BLOCKS, a.rule_eps, plan_dir=a.plan, rt_group=a.rt_group)
     except (ValueError, OSError, KeyError) as e:
         print(f"REFUSED: {type(e).__name__}: {e}", flush=True)
         return SS.EXIT_INPUT

@@ -90,14 +90,15 @@ def main():
 
     # (2)
     bd = os.path.join(tmp, "build")
-    tab = RS.build(ck, grad, RS.parse_states(STATES), bd, exp, C.BLOCKS, log=lambda *_: None)
+    tab = RS.build(ck, grad, RS.parse_states(STATES), bd, exp, C.BLOCKS, log=lambda *_: None, plan_dir=plan_dir, rt_group=0)
+    assert tab["round_trip_rows"] == [0, 1, 2] and tab["round_trip_group"] == 0
     by = {r["name"]: r for r in tab["states"]}
     assert tab["checks_pass"] and tab["checks"]["A_at_size_1"]["adapter_equal_checkpoint"] and tab["checks"]["A_at_size_1"]["masters_equal_checkpoint"], tab["checks"]
     assert set(tab["checks"]["overall_norm_vs_adam_step"]) == {"A8", "P8", "E8", "A4", "P12"} and set(tab["checks"]["per_tensor_norm_vs_adam_step"]) == {"A8", "T8", "A4"}
     na = tab["adam_step_l2"]
     assert all(abs(by[k]["l2"] - s * na) <= 1e-6 * s * na for k, s in (("A8", 8), ("P8", 8), ("E8", 8), ("A4", 4), ("P12", 12))) and abs(by["A8"]["cos_with_adam_step"] - 1) <= 1e-9
-    assert 0 < by["P8"]["cos_with_adam_step"] < 1 and abs(by["P12"]["first_order"]["at_size"] - 12 * by["P12"]["first_order"]["at_size_1"]) <= 1e-9 * abs(by["P12"]["first_order"]["at_size"])
-    assert abs(by["P8"]["first_order"]["at_size_1"] - by["P12"]["first_order"]["at_size_1"]) <= 1e-9 * abs(by["P8"]["first_order"]["at_size_1"]) and by["P8"]["first_order"]["at_size"] > 0
+    assert 0 < by["P8"]["cos_with_adam_step"] < 1 and abs(by["P12"]["first_order"]["at_size"] - 12 * by["P12"]["first_order"]["size_1"]) <= 1e-9 * abs(by["P12"]["first_order"]["at_size"])
+    assert abs(by["P8"]["first_order"]["size_1"] - by["P12"]["first_order"]["size_1"]) <= 1e-9 * abs(by["P8"]["first_order"]["size_1"]) and by["P8"]["first_order"]["at_size"] > 0
     for ctl, of in (("RA8", "A8"), ("R2A8", "A8"), ("RP8", "P8")):
         assert by[ctl]["kind"] == "control" and by[ctl]["of"] == of and abs(by[ctl]["cos_with_adam_step"]) < 0.5
         for k in nm:                                          # the rule state's per-tensor norms (to fp32 rounding), zero where it is zero
@@ -134,7 +135,8 @@ def main():
         assert sorted(a_.files) == sorted(b_.files) and all(a_[k].tobytes() == b_[k].tobytes() for k in a_.files)
     rj = json.load(open(os.path.join(run, "base", "reread.json")))
     idj = json.load(open(os.path.join(run, "base", "roundtrip", "identity.json")))
-    assert rj["result"] == "equal" and idj["result"] == "equal" and idj["differ_from_recorded"] == 0 and len(idj["round_trip_rows"]) == 3
+    assert rj["result"] == "equal" and idj["result"] == "equal" and idj["differ_from_recorded"] == 0 and idj["round_trip_rows"] == tab["round_trip_rows"]
+    assert all(abs(by[c_]["first_order"]["size_1"]) < abs(by["A8"]["first_order"]["size_1"]) for c_ in ("RA8", "R2A8", "RP8"))
     assert {"rules.json", "base/reread.json", "base/a/base.npz", "base/own/base2.npz", "states/A8/READS_DONE"} <= set(done["files"])
     a8 = np.load(os.path.join(run, "states", "A8", "reads", "a", "read.npz"))
     p8 = np.load(os.path.join(run, "states", "P8", "reads", "a", "read.npz"))
