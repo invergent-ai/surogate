@@ -42,6 +42,12 @@ _FLAG_ATTR = {"IFT_MOE_GM": "MOE_GM", "IFT_MOE_DET": "MOE_DET", "IFT_FAST_GEMM":
               "IFT_MANUAL": "MANUAL", "IFT_OFFLOAD_MIN": "OFFLOAD_MIN"}
 
 
+# A part of a row whose seeds are ALL exactly zero (e.g. a row with advantage 0 in "ppo" mode) has an exactly zero gradient: its backward is
+# not run. The forward, the gates, the divisor and the sketch counters are unchanged, and so are the sums (adding zeros changes no bit).
+# Not applied when segment sums are kept (there a zero row still leaves its zero entries). False = always run the backward.
+SKIP_ZERO_SEED_PARTS = True
+
+
 class T8GateError(RuntimeError):
     """A hard gate failed: the step returns no gradient."""
 
@@ -420,6 +426,8 @@ class WorkerCore:
             out["met"] = {"policy_loss": rloss * scale / n_, "mismatch_kl": 0.0, "is_masked": met["clipped_tokens"] / n_}
             out["ppo"] = met
             out["seq_log_ratio_ppo"] = float(np.mean(lp[mask] - old[mask])) if mask.any() else 0.0
+            lr_abs = np.abs(lp[mask] - old[mask]) if mask.any() else np.zeros(0)
+            out["log_ratio_abs"] = (float(lr_abs.sum()), float(lr_abs.max()) if lr_abs.size else 0.0)   # sum and max of |log ratio| over the loss tokens
         elif mode == "weights":
             g = torch.as_tensor(float(row.notes["weight"]) * mask.astype(np.float32), dtype=torch.float32)
             out["met"] = {"policy_loss": 0.0, "mismatch_kl": 0.0, "is_masked": 0.0}
@@ -433,13 +441,16 @@ class WorkerCore:
         sup = self._support(ctx, row) if self.cfg.head == "centred" else None
         out["decision_tokens"] = None if sup is None else int((sup["size"] >= 2).sum())
         row_grad, row_seg = {}, {}
-        passes, retries, block = 0, 0, None
+        passes, retries, block, zero_parts = 0, 0, None, 0
         for pname, pm in parts:
             if not pm.any():
                 continue
             if sup is not None and not self._has_decision(sup, pm):
                 continue                                      # every centred seed of this part is exactly 0, so is its gradient
             gp = g * torch.as_tensor(pm.astype(np.float32))
+            if SKIP_ZERO_SEED_PARTS and not self.seg_keys and not bool(gp.ne(0).any()):
+                zero_parts += 1                               # every seed exactly 0: the gradient is exactly 0, no backward
+                continue
             part_grad, part_seg, r, block = self._backward_part(ctx, row, gp[1:], sup, pname)
             retries += r
             passes += 1
@@ -448,9 +459,12 @@ class WorkerCore:
             for k, t in part_seg.items():
                 row_seg[k] = t if k not in row_seg else row_seg[k].add_(t)
         rs = getattr(self, "_row_sketch", None)
+        if rs is None and zero_parts and (self.sk_visits or self.sk_stride):
+            rs = {}                                           # no backward ran: the row is still counted in its attempt's sketch record
         if rs is not None:
             self._sketch_row(row, rs, mode, scale)
             self._row_sketch = None
+        out["zero_seed_parts"] = zero_parts
         for (L, j), t in row_grad.items():
             if not bool(torch.isfinite(t).all()):
                 raise T8GateError(f"FINITE GATE: row {i} (T {T}): layer {L} {self.layout.keys[j]} holds non-finite values")
@@ -718,6 +732,7 @@ def compute_step(handles: list, layout: ParamLayout, flats: list, shapes: list, 
         raise T8GateError(f"VERSION GATE: the replay gate was skipped on {m['replay_skipped_rows']} rows")
     m["stack"] = cfg.stack
     m["stale_checked_rows"] = sum(1 for r in results if r.get("stale_checked"))
+    m["zero_seed_rows"] = sum(1 for r in results if r.get("zero_seed_parts") and not r["passes"])   # rows whose backward was not run (all seeds 0)
     m["replay_checked_final_tokens"] = sum(r.get("replay_final_tokens", 0) for r in results)
     dd = [r["rollout_train_abs_diff"] for r in results if "rollout_train_abs_diff" in r]
     if dd:  # SkyRL's logged statistic, reported beside the bitwise replay gate
