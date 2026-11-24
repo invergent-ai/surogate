@@ -200,7 +200,7 @@ def check_sets(rules: dict, rd: "StateReader") -> None:
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(allow_abbrev=False)   # an option is written in full or refused
     ap.add_argument("--urls", required=True)
     ap.add_argument("--model", default="inkling")
     ap.add_argument("--plan", required=True)

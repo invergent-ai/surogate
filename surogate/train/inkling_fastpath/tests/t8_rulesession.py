@@ -298,7 +298,7 @@ def phase_states(a) -> int:
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(allow_abbrev=False)   # an option is written in full or refused
     ap.add_argument("--phase", required=True, choices=("build", "states"))
     ap.add_argument("--resume", default="", help="build: the first update's checkpoint directory")
     ap.add_argument("--grad", default="", help="build: its grad.pt (grad.json beside it)")

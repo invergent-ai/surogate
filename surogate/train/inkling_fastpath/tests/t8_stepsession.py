@@ -1161,7 +1161,7 @@ def phase_stub_judge(a) -> int:
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(allow_abbrev=False)   # an option is written in full or refused
     ap.add_argument("--phase", required=True, choices=("check", "trainer", "finish", "stub_judge", "export_masters", "rule_table", "rebuild_ckpt"))
     ap.add_argument("--rule", default=None, choices=RU.RULES, help="trainer: the update rule (t8_rules); A = the optimizer's own step (the "
                     "default, except on a resume from a checkpoint of another rule or a rebuilt one, which must state it)")
