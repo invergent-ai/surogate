@@ -1078,12 +1078,14 @@ def rule_table(ckpt_dir: str, grad_path: str, states: list, blocks: dict, out_pa
     return tab
 
 
-def rebuild_checkpoint(ckpt_dir: str, grad_path: str, spec: str, out_dir: str, export_fn, blocks: dict) -> dict:
+def rebuild_checkpoint(ckpt_dir: str, grad_path: str, spec: str, out_dir: str, export_fn, blocks: dict, any_size: bool = False) -> dict:
     """A first update's checkpoint with its masters replaced by theta0 + the rule's delta (t8_rules). The optimizer state is copied unchanged
     (its moments are the gradient's under every rule). The meta keeps every record a resume compares (theta0, plan, old log-probs, lr,
     backward options), with the new masters' and adapter's hashes and a "rebuilt" entry. -> the new meta."""
     fu = RU.load_first_update(ckpt_dir, grad_path, MI.sha256, state_sha)
     rule, size, eps = RU.parse_state(spec, need_size=True)    # a rebuilt checkpoint states its size: no default
+    if size != 1.0 and not any_size:                          # an update is rebuilt at the optimizer's own length; another size is a test's, by name
+        raise ValueError(f"a checkpoint is rebuilt at size 1 (the optimizer's step length); {spec!r} needs --rebuild-any-size")
     d = RU.rule_delta(rule, fu["grads"], fu["coef"], fu["d_adam"], size, eps, fu["moments"])
     new = RU.add_delta(fu["theta0"], d)
     nm, meta = fu["names"], dict(fu["meta"])
@@ -1119,7 +1121,7 @@ def phase_rules(a) -> int:
         if a.phase == "rule_table":
             rule_table(a.resume, a.grad, [x for x in a.states.split(",") if x], KS.BLOCKS, a.out)
         else:
-            meta = rebuild_checkpoint(a.resume, a.grad, a.rule_state, a.out, real_export, KS.BLOCKS)
+            meta = rebuild_checkpoint(a.resume, a.grad, a.rule_state, a.out, real_export, KS.BLOCKS, any_size=a.rebuild_any_size)
             print(json.dumps({k: meta[k] for k in ("update", "masters_sha256", "adapter_sha256", "update_rule")}, indent=1), flush=True)
     except (ValueError, OSError, KeyError) as e:
         print(f"REFUSED: {type(e).__name__}: {e}", flush=True)
@@ -1167,7 +1169,8 @@ def main():
     ap.add_argument("--rule-eps", type=float, default=1e-6, help="trainer: rule E's eps")
     ap.add_argument("--grad", default="", help="rule_table / rebuild_ckpt: the first update's grad.pt (its grad.json beside it)")
     ap.add_argument("--states", default="", help="rule_table: comma list of <rule>[:<size>[:<eps>]]")
-    ap.add_argument("--rule-state", default="", help="rebuild_ckpt: <rule>[:<size>[:<eps>]]")
+    ap.add_argument("--rule-state", default="", help="rebuild_ckpt: <rule>:<size>[:<eps>]; the size must be 1 unless --rebuild-any-size")
+    ap.add_argument("--rebuild-any-size", action="store_true", help="rebuild_ckpt: allow a size other than 1")
     ap.add_argument("--out", default="", help="rule_table: the table's JSON; rebuild_ckpt: the new checkpoint directory")
     ap.add_argument("--masters", default="", help="export_masters: a checkpoint's masters.pt")
     ap.add_argument("--tag", default="X", help="export_masters: the adapter directory's name")

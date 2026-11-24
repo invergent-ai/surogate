@@ -99,7 +99,17 @@ def main():
 
     # (2)
     bd = os.path.join(tmp, "build")
-    tab = RS.build(ck, grad, RS.parse_states(STATES), bd, exp, C.BLOCKS, log=lambda *_: None, plan_dir=plan_dir, rt_group=0)
+    tab = RS.build(ck, grad, RS.parse_states(STATES), bd, exp, C.BLOCKS, log=lambda *_: None, plan_dir=plan_dir, rt_group=0,
+                   import_fn=fake_import, keep_masters=True)
+    assert set(tab["checks"]["adapter_file_is_bf16_of_masters"]) == set(by_ := [r["name"] for r in tab["states"]]) and all(tab["checks"]["adapter_file_is_bf16_of_masters"].values())
+    for r in tab["states"]:                                   # the kept masters are the state: their hash is rules.json's
+        kept = torch.load(os.path.join(bd, r["masters_file"]), weights_only=True)
+        assert SS.state_sha([kept[k] for k in nm], nm) == r["masters_sha256"] and MI.sha256(os.path.join(bd, r["masters_file"])) == r["masters_file_sha256"]
+    # a file that is not its state's (another state's adapter under its name) fails the build's own check
+    swap = lambda d: fake_import(os.path.join(os.path.dirname(d), "A8")) if os.path.basename(d) == "P8" else fake_import(d)  # noqa: E731
+    tab_bad = RS.build(ck, grad, RS.parse_states("A8=a,P8=a"), os.path.join(tmp, "build_swapped"), exp, C.BLOCKS, log=lambda *_: None, import_fn=swap)
+    assert tab_bad["checks"]["adapter_file_is_bf16_of_masters"] == {"A8": True, "P8": False} and not tab_bad["checks_pass"]
+    assert not RS.build(ck, grad, RS.parse_states("A8=a"), os.path.join(tmp, "build_noimport"), exp, C.BLOCKS, log=lambda *_: None)["checks_pass"]
     assert tab["round_trip_rows"] == [0, 1, 2] and tab["round_trip_group"] == 0
     by = {r["name"]: r for r in tab["states"]}
     assert tab["checks_pass"] and tab["checks"]["A_at_size_1"]["adapter_equal_checkpoint"] and tab["checks"]["A_at_size_1"]["masters_equal_checkpoint"], tab["checks"]
@@ -199,7 +209,8 @@ def main():
     rd_dl = RR.StateReader(C.FakeEngines(), ["e0", "e1"], os.path.join(tmp, "rules_deadline"), plan_dir, {"a": panel_dir}, [0, 1], 0, ["a"], engine_sha="fake")
     os.makedirs(os.path.join(tmp, "rules_deadline"))
     open(os.path.join(tmp, "rules_deadline", "session_id.txt"), "w").write("x")
-    assert rd_dl.serve_states(["A8"], deadline_s=1e-9) == RR.RD.EXIT_READS, "the reads' time limit did not stop the read side"
+    assert rd_dl.serve_states(["A8", "P8"], deadline_s=1e-9) == RR.RD.EXIT_READS, "the reads' time limit did not stop the read side"
+    assert json.load(open(os.path.join(tmp, "rules_deadline", "READS_STOPPED.json")))["not_read"] == ["A8", "P8"]
     print("(4) a leaked state stops the read side (exit 21, nothing listed for it); a state that does not match rules.json is not handed over; "
           "rules.json from another gradient or checkpoint, set names that do not match, too few round-trip rows are refused: PASS")
     print("T8 RULE SESSION CPU TEST: PASS")

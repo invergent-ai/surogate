@@ -752,6 +752,12 @@ def main():
             assert "own first step" in str(e), (what, str(e))
     rcx, _, _, sx, _ = session(tmp, "refuse_ruleP_ckpt_without_rule", plan_dir, [], resume=ck_p1, old_lp=os.path.join(tmp, "rule_P", "old_lp.npz"))
     assert rcx == SS.EXIT_INPUT, sx.sess["exit"]
+    try:
+        SS.rebuild_checkpoint(ck9, g9, "P:8", os.path.join(tmp, "rebuilt_P8"), exp, BLOCKS)
+        raise AssertionError("a checkpoint was rebuilt at size 8 without the named override")
+    except ValueError:
+        pass
+    assert SS.rebuild_checkpoint(ck9, g9, "P:8", os.path.join(tmp, "rebuilt_P8_named"), exp, BLOCKS, any_size=True)["update_rule"]["size"] == 8.0
     bad_exp = lambda st, dst, tag: "0" * 64                    # noqa: E731  an exporter that does not reproduce the source's adapter file
     try:
         SS.rebuild_checkpoint(ck9, g9, "P:1", os.path.join(tmp, "rebuilt_bad_exporter"), bad_exp, BLOCKS)

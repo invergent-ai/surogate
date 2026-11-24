@@ -162,7 +162,10 @@ class StateReader(RD.Reader):
             return rc
         for name in names:
             if deadline_s and time.time() - t_start > deadline_s:      # a read side that is this late is stopped before its next state
-                RD.log(f"the reads passed their limit of {deadline_s / 60:.0f} min before state {name}")
+                left = names[names.index(name):]
+                RD.log(f"the reads passed their limit of {deadline_s / 60:.0f} min before state {name}; not read: {left}")
+                RD.write_json(os.path.join(self.run, "READS_STOPPED.json"), {"reason": "the reads' time limit", "limit_min": deadline_s / 60,
+                                                                           "read": names[:names.index(name)], "not_read": left})
                 return RD.EXIT_READS
             ready = os.path.join(self.run, "states", name, "TRAINER_READY.json")
             while not os.path.exists(ready):

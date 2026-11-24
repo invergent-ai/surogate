@@ -80,9 +80,19 @@ def round_trip_rows_of(plan_dir: str, rt_group: int) -> list:
     return pick_round_trip_rows(grp)
 
 
+def bf16_values(masters: list) -> list:
+    """What an adapter file holds of a list of masters: each value rounded to bf16 (round to nearest even), as fp32."""
+    from surogate.inkling_rl import adapter as AD
+
+    return [np.ascontiguousarray(AD.round_bf16(m.detach().numpy()).reshape(tuple(m.shape)), dtype=np.float32) for m in masters]
+
+
 def build(ckpt_dir: str, grad_path: str, states: list, out_dir: str, export_fn, blocks: dict, eps: float = 1e-6, log=MI.log,
-          plan_dir: str = "", rt_group: int = 0) -> dict:
-    """Card-free: every state's adapter directory under <out>/adapters/<name>/ and <out>/rules.json."""
+          plan_dir: str = "", rt_group: int = 0, import_fn=None, keep_masters: bool = False) -> dict:
+    """Card-free: every state's adapter directory under <out>/adapters/<name>/ and <out>/rules.json.
+    import_fn(adapter dir) -> the file's values in the trainer's order: each exported file is read back and must be bf16 of its state's masters,
+    bit for bit (the check "adapter_file_is_bf16_of_masters"; without an import_fn the check is absent and checks_pass is false).
+    keep_masters: each state's masters also written as <out>/masters/<name>.pt ({tensor name: fp32}, as a checkpoint's masters.pt)."""
     fu = RU.load_first_update(ckpt_dir, grad_path, MI.sha256, SS.state_sha)
     rt_rows = round_trip_rows_of(plan_dir, rt_group) if plan_dir else None
     nm, meta = fu["names"], fu["meta"]
@@ -95,7 +105,8 @@ def build(ckpt_dir: str, grad_path: str, states: list, out_dir: str, export_fn, 
     pc = int((meta.get("backward_options") or {}).get("pattern_grad_from", 0)) >= 48
     os.makedirs(os.path.join(out_dir, "adapters"), exist_ok=True)
     rows, checks = [], {"overall_norm_vs_adam_step": {}, "per_tensor_norm_vs_adam_step": {}, "score_adapters_untouched": {}, "A_is_theta0_plus_size_x_step": {},
-                        "control_per_tensor_norm_vs_its_state": {}, "control_zero_where_its_state_is_zero": {}}
+                        "control_per_tensor_norm_vs_its_state": {}, "control_zero_where_its_state_is_zero": {},
+                        "adapter_file_is_bf16_of_masters": {}}
     rule_norms = {}
     for st in states:
         masters, d = state_masters(st, fu, eps)
@@ -107,6 +118,17 @@ def build(ckpt_dir: str, grad_path: str, states: list, out_dir: str, export_fn, 
         row["first_order"] = {"at_size": fo, "size_1": fo / st["size"], "N": N, "what": "N x <-grad, d>"}
         sha = export_fn(masters, os.path.join(out_dir, "adapters", st["name"]), f"rule-test-{st['name']}")
         row["adapter_sha256"] = sha[0] if isinstance(sha, tuple) else sha
+        if import_fn is not None:                             # the FILE is this state: read back, it is bf16 of these masters, bit for bit
+            back = import_fn(os.path.join(out_dir, "adapters", st["name"]))
+            checks["adapter_file_is_bf16_of_masters"][st["name"]] = bool(
+                len(back) == len(masters) and all(b.numpy().tobytes() == w.tobytes() for b, w in zip(back, bf16_values(masters))))
+            del back
+        if keep_masters:
+            mp = os.path.join(out_dir, "masters", st["name"] + ".pt")
+            os.makedirs(os.path.dirname(mp), exist_ok=True)
+            torch.save(dict(zip(nm, masters)), mp)
+            row["masters_file"] = os.path.relpath(mp, out_dir)
+            row["masters_file_sha256"] = MI.sha256(mp)
         if pc:
             checks["score_adapters_untouched"][st["name"]] = all(torch.equal(masters[i], fu["theta0"][i]) for i in score)
         s = st["size"]
@@ -144,12 +166,14 @@ def build(ckpt_dir: str, grad_path: str, states: list, out_dir: str, export_fn, 
           and all(checks["score_adapters_untouched"].values()) and all(checks["A_is_theta0_plus_size_x_step"].values())
           and all(v <= 1e-3 for v in checks["control_per_tensor_norm_vs_its_state"].values())      # a control is rounded once to fp32 around theta0
           and all(checks["control_zero_where_its_state_is_zero"].values())
+          and len(checks["adapter_file_is_bf16_of_masters"]) == len(states) and all(checks["adapter_file_is_bf16_of_masters"].values())
           and checks["A_at_size_1"]["masters_equal_checkpoint"] and checks["A_at_size_1"]["adapter_equal_checkpoint"])
     tab = {"checkpoint": {"update": meta["update"], "masters_sha256": meta["masters_sha256"], "adapter_sha256": meta.get("adapter_sha256"),
                           "session_id": meta.get("session_id")},
            "grad_sha256": fu["grad_sha256"], "N": N, "clip_coefficient": fu["coef"], "lr": meta.get("lr"), "rule_E_eps": eps,
            "moment_check_worst_rel": fu["moment_check_worst_rel"], "adam_step_l2": na, "grad_l2": RU._norm(fu["grads"]),
            "score_adapters_checked": pc,
+           "masters_sha256_is": "sha256 over, for each tensor in the trainer's order, its name (UTF-8) then its fp32 little-endian bytes",
            "controls_note": "every R control is the SAME fixed-seed direction per tensor (drawn from the tensor's name), rescaled to its state's "
                             "per-tensor norms; only R2 is a second draw; a control is zero where a whole tensor of its state is zero",
            "control_seeds": SEEDS, "round_trip_group": int(rt_group) if rt_rows is not None else None, "round_trip_rows": rt_rows,
@@ -231,7 +255,8 @@ def phase_build(a) -> int:
     import t8_skyrl as KS
 
     try:
-        tab = build(a.resume, a.grad, parse_states(a.states), a.out, SS.real_export, KS.BLOCKS, a.rule_eps, plan_dir=a.plan, rt_group=a.rt_group)
+        tab = build(a.resume, a.grad, parse_states(a.states), a.out, SS.real_export, KS.BLOCKS, a.rule_eps, plan_dir=a.plan, rt_group=a.rt_group,
+                    import_fn=real_import, keep_masters=a.keep_masters)
     except (ValueError, OSError, KeyError) as e:
         print(f"REFUSED: {type(e).__name__}: {e}", flush=True)
         return SS.EXIT_INPUT
@@ -282,6 +307,7 @@ def main():
     ap.add_argument("--states", default="", help="build: <name>=<set>+<set>,... in the order they will be read")
     ap.add_argument("--rule-eps", type=float, default=1e-6, help="build: rule E's eps")
     ap.add_argument("--out", default="", help="build: the directory for rules.json and adapters/")
+    ap.add_argument("--keep-masters", action="store_true", help="build: also write every state's masters as masters/<name>.pt")
     ap.add_argument("--build", default="", help="states: the build directory (rules.json, adapters/)")
     ap.add_argument("--plan", default="")
     ap.add_argument("--rt-group", type=int, default=0)
