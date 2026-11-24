@@ -79,8 +79,9 @@ def rule_delta(rule: str, grads: list, coef: float, d_adam: list, size: float = 
 
 
 def add_delta(base: list, delta: list) -> list:
-    """fp32(float64(base) + delta), one rounding."""
-    return [(b.double() + d).float() for b, d in zip(base, delta)]
+    """fp32(float64(base) + delta), one rounding; an element whose delta is exactly zero keeps the base's bits (a start adapter may hold
+    negative zeros, and -0.0 + 0.0 would turn them into +0.0: the same value, another file)."""
+    return [torch.where(d == 0, b, (b.double() + d).float()) for b, d in zip(base, delta)]
 
 
 def table_row(name: str, delta: list, d_adam: list, nm: list, blocks: dict) -> dict:
@@ -108,8 +109,10 @@ def per_tensor_norms(delta: list, nm: list) -> dict:
 
 def load_first_update(ckpt_dir: str, grad_path: str, sha256, state_sha):
     """A checkpoint of the FIRST update from the zero adapter, with its gradient file. -> dict with theta0, theta1, d_adam, grads, coef, moments,
-    names, meta. theta0 is the checkpoint's masters with every B set to zero (at the first update from B = 0 no A moves); its hash must be the
-    checkpoint's theta0 hash, the gradient's hash the one grad.json records, and the moments the first Adam step's of that gradient."""
+    names, meta. theta0 is rebuilt from the checkpoint: every A as it is (at the first update from B = 0 no A has a gradient: checked on the
+    optimizer's first moment, which must be exactly zero for every A), every B zero, an unmoved B element copied with its bits (the start
+    adapter's zeros may be negative zeros, so theta0 cannot be checked by its hash; its VALUES are exact). The optimizer state must be the
+    first step's, the gradient's hash the one grad.json records, and the first moment (1 - beta1) x the clipped gradient."""
     meta = json.load(open(os.path.join(ckpt_dir, "meta.json")))
     for name in ("masters.pt", "optimizer.npz"):
         if sha256(os.path.join(ckpt_dir, name)) != meta["sha256"][name]:
@@ -118,9 +121,7 @@ def load_first_update(ckpt_dir: str, grad_path: str, sha256, state_sha):
     nm = list(saved)
     theta1 = [saved[n].float() for n in nm]
     is_b = [n.split(".", 1)[1].endswith("B") or n.split(".", 1)[1] in ("B13", "B2") for n in nm]
-    theta0 = [torch.zeros_like(t) if b else t.clone() for t, b in zip(theta1, is_b)]
-    if state_sha(theta0, nm) != meta.get("theta0_sha256"):
-        raise ValueError("this is not a checkpoint of the first update from the zero adapter (theta0 cannot be rebuilt from it)")
+    theta0 = [torch.where(t == 0, t, torch.zeros_like(t)) if b else t.clone() for t, b in zip(theta1, is_b)]
     gj = json.load(open(os.path.splitext(grad_path)[0] + ".json"))
     if sha256(grad_path) != gj["sha256"] or int(gj["update"]) != int(meta["update"]):
         raise ValueError("the gradient file is not the one its record names, or it is another update's")
@@ -135,6 +136,8 @@ def load_first_update(ckpt_dir: str, grad_path: str, sha256, state_sha):
         steps = {float(z[f"{i}.step"][0]) for i in range(len(nm))}
     if steps != {1.0}:
         raise ValueError(f"the optimizer state is not the first step's (steps {sorted(steps)})")
+    if any(bool(mi.ne(0).any()) for mi, b in zip(m, is_b) if not b):
+        raise ValueError("an A tensor has a gradient in this checkpoint: it is not the first update from the zero adapter")
     betas = tuple(float(b) for b in meta["optimizer"]["betas"])
     worst = 0.0                                               # the moments must be this gradient's: m = (1 - beta1) coef g
     for g, mi in zip(grads, m):

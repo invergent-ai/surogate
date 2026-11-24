@@ -648,6 +648,8 @@ def main():
     dPc = RU.rule_delta("P", gr, 0.25, dA)                    # the clip coefficient changes nothing in P and T
     assert all(float((a - b).abs().max()) <= 1e-15 for a, b in zip(dPc, dP))
     assert RU.parse_state("P:8") == ("P", 8.0, None) and RU.parse_state("E") == ("E", 1.0, 1e-6) and RU.parse_state("E:8:1e-5") == ("E", 8.0, 1e-5)
+    nz = RU.add_delta([torch.tensor([-0.0, -0.0, 1.0])], [torch.tensor([0.0, 2.0, 0.0], dtype=torch.float64)])[0]
+    assert nz.numpy().tobytes() == np.array([-0.0, 2.0, 1.0], dtype=np.float32).tobytes(), "an unmoved negative zero lost its sign bit"
     for bad_spec in ("Q", "P:0", "P:1:1e-6", "E:1:0"):
         try:
             RU.parse_state(bad_spec)
