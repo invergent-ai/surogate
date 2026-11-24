@@ -592,6 +592,41 @@ def main():
     assert RD.probe(FakeEngines(), ["e0", "e1"], panels, {"X": ads["X"], "Y": ads["X"]}, os.path.join(tmp, "probe")) == RD.EXIT_ROUNDTRIP   # empty comparison
     print("(7) zero-seed rows: gradient bitwise with and without their backward; counted; in the sketch records; an update that moves nothing is a gate: PASS")
     print("(8) the recipe is pinned: required backward options, the plan's lr / clip / head, the score adapters' signature; the adapter-swap probe: PASS")
+
+    # (9) a session that ends after update 1 of the two-update plan, and the session that resumes it
+    one = P.FakeTrainer(cfg_for(tmp), 2)                      # the reference: old log-probs of ALL rows, then the first mini-batch only
+    one_rows = load(plan_dir).rows
+    for r, x in zip(one_rows, one.logprobs(one_rows)):
+        r.notes["old_lp"] = x
+    o1 = one.compute([one_rows[i] for i in plan.updates[0]], 0, StepConfig(max_policy_lag=None), seeds="ppo", minibatch_index=0)
+    n1 = one.apply(o1, MI.LR)
+    rc9, run9, tr9, s9, _ = session(tmp, "only_update_1", plan_dir, ["GO"], panels=panels, transfer=transfer_dir, last_update=1)
+    assert rc9 == 0 and all(torch.equal(a, b) for a, b in zip(tr9.opt.masters, one.opt.masters)) and same_state(opt_state(tr9), opt_state(one)), s9.sess["exit"]
+    assert json.load(open(os.path.join(run9, "TRAINER_DONE.json")))["last_update"] == 1 and os.listdir(os.path.join(run9, "updates")) == ["1"]
+    assert SS.phase_finish(SimpleNamespace(plan=plan_dir, run_dir=run9, transfer="")) == 0 and json.load(open(os.path.join(run9, "STEP_DONE")))["updates"] == [1]
+    gsaved = torch.load(os.path.join(run9, "updates", "1", "grad.pt"), weights_only=True)
+    gj = json.load(open(os.path.join(run9, "updates", "1", "grad.json")))
+    assert list(gsaved) == nm and all(gsaved[k].numpy().tobytes() == g.numpy().tobytes() for k, g in zip(nm, o1.grads)), "grad.pt is not the update's gradient"
+    assert gj["norm_before_clip"] == n1 and gj["clip_coefficient"] == min(1.0, 1.0 / (n1 + 1e-6)) and gj["sha256"] == MI.sha256(os.path.join(run9, "updates", "1", "grad.pt"))
+    z9 = np.load(os.path.join(run9, "updates", "1", "ckpt", "optimizer.npz"))     # the first Adam step's state gives the clipped gradient back
+    for i, k in enumerate(nm):
+        want = (gsaved[k] * gj["clip_coefficient"] if gj["clip_coefficient"] < 1.0 else gsaved[k]) * 0.1
+        assert np.allclose(z9[f"{i}.exp_avg"], want.numpy(), rtol=1e-5, atol=0.0), k
+    rc9b, run9b, tr9b, s9b, _ = session(tmp, "then_update_2", plan_dir, ["GO", "GO"], panels=panels,
+                                        resume=os.path.join(run9, "updates", "1", "ckpt"), old_lp=os.path.join(run9, "old_lp.npz"))
+    m9 = json.load(open(os.path.join(run9b, "updates", "2", "ckpt", "meta.json")))
+    assert rc9b == 0 and m9["masters_sha256"] == m2["masters_sha256"] and m9["sha256"] == m2["sha256"] and m9["adapter_sha256"] == m2["adapter_sha256"]
+    g2a, g2b = (torch.load(os.path.join(r_, "updates", "2", "grad.pt"), weights_only=True) for r_ in (run, run9b))
+    assert all(g2a[k].numpy().tobytes() == g2b[k].numpy().tobytes() for k in nm), "update 2's gradient differs after the resume"
+    g2j = json.load(open(os.path.join(run, "updates", "2", "grad.json")))
+    assert g2j["clip_coefficient"] < 1.0 and g2j["norm_before_clip"] == res[1][1], g2j      # the fake's second gradient is above the clip
+    for bad_last in (0 + 3, 9):
+        rcx, _, _, sx, _ = session(tmp, f"refuse_last_{bad_last}", plan_dir, [], last_update=bad_last)
+        assert rcx == SS.EXIT_INPUT, sx.sess["exit"]
+    rcx, _, _, sx, _ = session(tmp, "refuse_last_before_resume", plan_dir, [], resume=os.path.join(run9, "updates", "1", "ckpt"),
+                               old_lp=os.path.join(run9, "old_lp.npz"), last_update=1)
+    assert rcx == SS.EXIT_INPUT, sx.sess["exit"]
+    print("(9) a session that ends after update 1 == the first mini-batch; its gradient file and optimizer state; the resumed update 2 == the uninterrupted run, bitwise: PASS")
     print("T8 STEP SESSION CPU TEST: PASS")
     return 0
 

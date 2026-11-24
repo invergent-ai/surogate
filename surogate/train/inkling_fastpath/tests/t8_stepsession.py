@@ -10,7 +10,8 @@ Inputs (read-only): a plan directory in the micro-step driver's form (t8_micro.l
   "first_update_number": n                                             optional, default 1: the number of the plan's first update in the run;
   "start_version": s and a per-row vector "version" in rows.npz         optional; a row of another version than s is REFUSED (no lagged path).
 Per update <n> the session writes under <run>/updates/<n>/:
-  step.json, first_order.json, sketches/, ckpt/ (masters.pt, optimizer.npz, meta.json), adapters.json (v, R, R2), roundtrip/trainer_<name>.npz,
+  step.json, first_order.json, grad.pt + grad.json (the update's gradient before the clip), sketches/, ckpt/ (masters.pt, optimizer.npz,
+  meta.json), adapters.json (v, R, R2), roundtrip/trainer_<name>.npz,
   TRAINER_READY.json (the hand-over; written last, atomically).
 The read side adds roundtrip/result.json, reads_dmg/<panel>/{v,R,R2,base2}.npz and READS_DONE; the loop side adds VERDICT.json.
   v  = the accumulated adapter after update n;  R, R2 = theta0 + random_like(v - theta0), two seeds (per tensor the accumulated update's norm,
@@ -359,7 +360,7 @@ class Session:
         self.tr, self.plan, self.run, self.work, self.sid, self.export_fn, self.blocks = tr, plan, run_dir, work_dir, session_id, export_fn, blocks
         self.o = {"lr": MI.LR, "verdict_timeout_s": 1200.0, "reads_timeout_s": 2700.0, "poll_s": 2.0, "early_stop": True,
                   "backward_options": {}, "resume": "", "old_lp": "", "plan_dir": "", "cards": [], "close_fn": None, "abort_fn": None,
-                  "zero_check_fn": None, "require_backward": None, "pattern_visits": 48, "head": None}
+                  "zero_check_fn": None, "require_backward": None, "pattern_visits": 48, "head": None, "last_update": None}
         unknown = set(opts) - set(self.o)
         if unknown:
             raise ValueError(f"unknown options {sorted(unknown)}")
@@ -445,6 +446,11 @@ class Session:
         elif self.o["zero_check_fn"]:
             self.sess["zero_adapter"] = self.o["zero_check_fn"](min(rows, key=lambda r: r.T))
         self.zero_start = resumed is None
+        plan_last = plan.number(len(plan.updates) - 1)
+        self.last = plan_last if self.o["last_update"] is None else int(self.o["last_update"])
+        if not plan.number(self.j0) <= self.last <= plan_last:
+            raise PlanError(f"--last-update {self.last}: this session can apply updates {plan.number(self.j0)}..{plan_last}")
+        self.sess["last_update"] = self.last
         # the old log-probs of ALL the step's rows at the step's start weights (as ppo_batch), and the replay gate on every row before any gradient
         op = os.path.join(self.run, "old_lp.npz")
         if old_file:
@@ -539,6 +545,20 @@ class Session:
         first_ever = self.cur is None
         step["grad_norm"] = tr.apply(out, self.o["lr"])
         self.cur = masters_list(tr)
+        # the update's summed gradient as the optimizer received it BEFORE the global clip, with the clip's coefficient (the kit's rule:
+        # min(1, max_grad_norm / (norm + 1e-6))): later rule tests build from these exact bits
+        mg = float(tr.opt.max_grad_norm)
+        step["clip_coefficient"] = min(1.0, mg / (step["grad_norm"] + 1e-6)) if mg else 1.0
+        gp = os.path.join(ud, "grad.pt")
+        torch.save({x: g.detach() for x, g in zip(self.nm, out.grads)}, gp + ".tmp")
+        os.replace(gp + ".tmp", gp)
+        step["grad_sha256"] = MI.sha256(gp)
+        write_json(os.path.join(ud, "grad.json"),
+                   {"update": n, "N": N, "sha256": step["grad_sha256"], "norm_before_clip": step["grad_norm"], "max_grad_norm": mg,
+                    "clip_coefficient": step["clip_coefficient"], "lr": self.o["lr"],
+                    "what": "grad.pt: per tensor the sum over the update's rows of the PPO loss's gradient (descent sense, token mean over N), fp32, "
+                            "before the global clip; the optimizer was given grad x clip_coefficient",
+                    "backward_options": self.o["backward_options"]})
         delta = [c - p for c, p in zip(self.cur, prev)]
         fo = MI.first_order(out.grads, N, delta, self.keys, self.blocks)
         a_keys = [i for i, x in enumerate(self.nm) if x.split(".", 1)[1].endswith("A") or x.split(".", 1)[1] in ("A13", "A2")]
@@ -752,8 +772,8 @@ class Session:
         self.close_trainer()                                  # the cards are free while the last reads and their verdict are awaited
         if self.pending is not None:
             self.await_verdict(self.pending, time.time(), last=True)
-        last = self.plan.number(len(self.plan.updates) - 1)
-        self.sess["exit"] = {"code": EXIT_OK, "reason": "every update applied and judged GO"}
+        last = self.last
+        self.sess["exit"] = {"code": EXIT_OK, "reason": f"every update up to {last} applied and judged GO"}
         self.sess["min_mem_available_gb"] = min([self.mem.take()] + [u.get("min_mem_available_gb", 1e9) for u in self.sess["updates"].values()])
         write_json(os.path.join(self.run, "TRAINER_DONE.json"), {"session_id": self.sid, "last_update": last, "time": time.time()})
         self.phase("trainer done")
@@ -779,7 +799,7 @@ class Session:
         """The whole session. The trainer is closed (or its workers ended) on every way out."""
         try:
             self.begin()
-            for j in range(self.j0, len(self.plan.updates)):
+            for j in range(self.j0, self.last - self.plan.first + 1):   # a session may end before the plan's last update (--last-update)
                 self.update(j)
             self.finish()
             return EXIT_OK
@@ -892,7 +912,8 @@ def phase_trainer(a) -> int:
     s = Session(tr, plan, a.run_dir, a.work, sid, export, KS.BLOCKS, lr=a.lr, verdict_timeout_s=a.verdict_timeout_min * 60.0,
                 reads_timeout_s=a.reads_timeout_min * 60.0, early_stop=not a.no_early_stop, backward_options=MI.backward_options(a),
                 resume=a.resume, old_lp=a.old_lp, plan_dir=a.plan, cards=list(cards), close_fn=tr.close, abort_fn=abort, zero_check_fn=zero_check,
-                require_backward=required, pattern_visits=int(tr.cfg.visits), head=str(tr.cfg.head))
+                require_backward=required, pattern_visits=int(tr.cfg.visits), head=str(tr.cfg.head),
+                last_update=a.last_update if a.last_update > 0 else None)
     install_signals(s)
     rc = s.run_all()
     signal.alarm(0)
@@ -1009,6 +1030,8 @@ def main():
     ap.add_argument("--transfer", default="", help="finish: the transfer plan directory, when its reads are part of the step")
     ap.add_argument("--require-backward", default="", help="trainer: the backward options this launch must run with, as p,g,b (compared "
                     "with --pattern-grad-from / --gate-grad-from / --bank-grad-from; a mismatch is refused)")
+    ap.add_argument("--last-update", type=int, default=0, help="trainer: end the session after this update (its number in the run); the plan's "
+                    "later updates are left for a session that resumes from its checkpoint. 0 = the plan's last")
     ap.add_argument("--no-early-stop", action="store_true", help="do not interrupt a running gradient when the previous update is stopped")
     ap.add_argument("--deadline-min", type=float, default=0.0)
     ap.add_argument("--outcomes", default="", help="stub_judge: comma list, one per update: GO, STOP, INCONCLUSIVE, NONE, BADHASH")
