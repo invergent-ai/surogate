@@ -83,13 +83,14 @@ def fake_export(n_layers):
 
 
 class FakeEngines:
-    """The serving engines of the test: one fake model per URL, one adapter slot. An adapter's work values are bf16(master), as the trainer's.
-    leak: after an unload the NEXT loaded adapter is served with the previous one's values (a state carried over).
-    flip: one log-prob of the named adapter changed by one ulp. die_at: raise in the n-th score call."""
+    """The serving engines of the test: one fake model per URL, one adapter slot. An adapter is loaded from its exported file (bf16 values,
+    what the trainer's work values are). leak: after an unload the NEXT loaded adapter is served with the previous one's values (a state
+    carried over). flip: one log-prob of the named adapter changed by one ulp; flip_second: the same, but only from the second time the
+    same row is asked under that adapter. die_at: raise in the n-th score call."""
 
-    def __init__(self, leak=False, flip=None, die_at=None):
+    def __init__(self, leak=False, flip=None, die_at=None, flip_second=None):
         self.models, self.slot, self.prev, self.lock = {}, {}, {}, threading.Lock()
-        self.leak, self.flip, self.die_at, self.calls = leak, flip, die_at, 0
+        self.leak, self.flip, self.die_at, self.calls, self.flip_second, self.seen = leak, flip, die_at, 0, flip_second, {}
         self.base = [p.detach().clone() for p in FakeInkling(seed=0, rank=4, alpha=8).parameters()]
 
     def _model(self, url):
@@ -99,8 +100,8 @@ class FakeEngines:
             return self.models[url]
 
     def load(self, url, name, path):
-        st = torch.load(os.path.join(path, "state.pt"), weights_only=True)
-        vals = [torch.from_numpy(AD.round_bf16(t.numpy()).reshape(tuple(t.shape))) for t in st]
+        layers, _ = AD.import_adapter(path, physical_layers=3)
+        vals = [torch.from_numpy(np.ascontiguousarray(d[k], dtype=np.float32)) for d in layers for k in KEYS]
         if self.leak and url in self.prev:
             vals = self.prev[url]
         self.slot[url] = (name, vals)
@@ -125,14 +126,21 @@ class FakeEngines:
         out[0] = 0.0
         if self.flip is not None and name is not None and name.endswith("_" + self.flip):
             out[-1] = np.nextafter(out[-1], np.float32(-np.inf))
+        if self.flip_second is not None and name is not None and name.endswith("_" + self.flip_second):
+            key = (url, name, np.asarray(ids).tobytes())
+            with self.lock:
+                again = key in self.seen
+                self.seen[key] = True
+            if again:
+                out[-1] = np.nextafter(out[-1], np.float32(-np.inf))
         return out
 
 
 class Parties:
     """The read side and the stub judge as threads beside a session that runs in the main thread."""
 
-    def __init__(self, run, plan_dir, panels, transfer, engines, outcomes, first=1, urls=("e0", "e1")):
-        self.run, self.th, self.reader_rc = run, [], None
+    def __init__(self, run, plan_dir, panels, transfer, engines, outcomes, first=1, urls=("e0", "e1"), judge_exit=False):
+        self.run, self.th, self.reader_rc, self.judge_exit = run, [], None, judge_exit
         os.makedirs(run, exist_ok=True)
         open(os.path.join(run, "session_id.txt"), "w").write("cpu-test-" + os.path.basename(run))
         self.reader = RD.Reader(engines, list(urls), run, plan_dir, panels, transfer, engine_sha="fake", poll_s=0.02)
@@ -148,6 +156,8 @@ class Parties:
 
     def _judge(self):
         SS.phase_stub_judge(SimpleNamespace(run_dir=self.run, outcomes=",".join(self.outcomes), first_update=self.first, deadline_min=2.0))
+        if self.judge_exit:                                   # as the launcher does when the judge's process has ended
+            open(os.path.join(self.run, "judge.exit"), "w").write("0")
 
     def __enter__(self):
         self.th = [threading.Thread(target=self._read, daemon=True), threading.Thread(target=self._judge, daemon=True)]
@@ -162,7 +172,7 @@ class Parties:
             t.join(60)
 
 
-def session(tmp, name, plan_dir, outcomes, tr=None, engines=None, first=1, transfer="", panels=None, workers=2, **opts):
+def session(tmp, name, plan_dir, outcomes, tr=None, engines=None, first=1, transfer="", panels=None, workers=2, judge_exit=False, **opts):
     """One whole session on the fake. -> (exit code, run dir, trainer, session, parties)."""
     run = os.path.join(tmp, name)
     plan = load(plan_dir)
@@ -172,7 +182,7 @@ def session(tmp, name, plan_dir, outcomes, tr=None, engines=None, first=1, trans
                    verdict_timeout_s=opts.pop("verdict_timeout_s", 30.0), reads_timeout_s=opts.pop("reads_timeout_s", 30.0), poll_s=0.02,
                    abort_fn=lambda: aborted.append(1), close_fn=lambda: None, **opts)
     SS.install_signals(s)
-    with Parties(run, plan_dir, panels or {}, transfer, engines or FakeEngines(), outcomes, first) as pt:
+    with Parties(run, plan_dir, panels or {}, transfer, engines or FakeEngines(), outcomes, first, judge_exit=judge_exit) as pt:
         rc = s.run_all()
     s.aborted = aborted
     return rc, run, tr, s, pt
@@ -218,6 +228,17 @@ def main():
             raise AssertionError(f"the plan loader accepted: {what}")
         except SS.PlanError:
             pass
+    d = write_step_plan(os.path.join(tmp, "bad_rows_json_sha"), rows, [[0, 1], [2, 3]])
+    man = json.load(open(os.path.join(d, "manifest.json")))
+    man["files"]["rows.json"] = MI.sha256(os.path.join(d, "rows.json"))
+    json.dump(man, open(os.path.join(d, "manifest.json"), "w"))
+    assert load(d).info["rows_json_sha256"] == man["files"]["rows.json"]
+    json.dump({"updates": [[0], [1, 2, 3]]}, open(os.path.join(d, "rows.json"), "w"))      # re-partitioned after the manifest was written
+    try:
+        load(d)
+        raise AssertionError("the plan loader accepted a rows.json that does not match its manifest")
+    except SS.PlanError:
+        pass
     d = write_step_plan(os.path.join(tmp, "ok_version"), rows, [[0, 1], [2, 3]], {"start_version": 2, "round_trip_group": [1, 3]},
                         lambda z: z.__setitem__("version", np.full(12, 2, dtype=np.int32)))
     assert load(d).start_version == 2 and load(d).rt_groups == [1, 3]
@@ -263,13 +284,20 @@ def main():
         want = {f"updates/{n}/reads_dmg/a/{x}.{e}" for x in ("v", "R", "R2", "base2") for e in ("npz", "json")}
         want |= {"base/reads_dmg/a/base.npz", "base/reads_dmg/a/base.json", f"updates/{n}/adapters.json", f"updates/{n}/roundtrip/result.json"}
         want |= {f"updates/{n}/roundtrip/{side}_{x}.npz" for side in ("trainer", "engine") for x in ("v", "R", "R2")}
+        want |= {f"updates/{n}/roundtrip/engine_{x}_last.npz" for x in ("v", "R", "R2")}
         want |= {f"updates/{n}/roundtrip/engine_base2.npz", "base/roundtrip/base_g0.npz", "base/roundtrip/base_g2.npz"}
         assert set(rd["files"]) == want, sorted(set(rd["files"]) ^ want)
         assert all(MI.sha256(os.path.join(run, k)) == h for k, h in rd["files"].items())
         assert rd["adapters"] == {k: ad[k]["sha256"] for k in ad}
         rr = json.load(open(os.path.join(ud, "roundtrip", "result.json")))
-        assert rr["result"] == "equal" and rr["checks"]["v_vs_base_positions_differing"] > 0
-        assert all(c["differ"] == 0 and c["loss_tokens"] > 0 for k, c in rr["checks"].items() if isinstance(c, dict))
+        assert rr["result"] == "equal" and rr["v_vs_base_positions_differing"] > 0 and rr["adapters"] == rd["adapters"]
+        assert set(rr["second_read"]) == {"v", "R", "R2"} and rr["base_second_read"]["differ"] == 0
+        assert all(c["differ"] == 0 and c["rows"] == 3 and c["loss_tokens"] == rr["checks"]["trainer_vs_engine_v"]["loss_tokens"] for c in rr["second_read"].values())
+        for x in ("v", "R", "R2"):                            # the last read under each adapter is a file of its own, byte-equal to the trainer's
+            a, b = np.load(os.path.join(ud, "roundtrip", f"trainer_{x}.npz")), np.load(os.path.join(ud, "roundtrip", f"engine_{x}_last.npz"))
+            assert sorted(a.files) == sorted(b.files) and all(a[k].tobytes() == b[k].tobytes() for k in a.files)
+        assert set(rr["checks"]) == {"trainer_vs_engine_v", "trainer_vs_engine_R", "trainer_vs_engine_R2", "engine_base_reread_vs_start_base"}
+        assert all(c["differ"] == 0 and c["loss_tokens"] > 0 and c["rows"] == 3 for c in rr["checks"].values())
         b0, b2 = np.load(os.path.join(run, "base", "reads_dmg", "a", "base.npz")), np.load(os.path.join(ud, "reads_dmg", "a", "base2.npz"))
         vz = np.load(os.path.join(ud, "reads_dmg", "a", "v.npz"))
         assert all(b0[k].tobytes() == b2[k].tobytes() for k in b0.files) and any(b0[k].tobytes() != vz[k].tobytes() for k in b0.files if k != "ids_crc32")
@@ -282,7 +310,7 @@ def main():
     rd2 = RD.Reader(FakeEngines(), ["e0", "e1", "e2"], run, plan_dir, {}, transfer_dir, engine_sha="fake")
     assert rd2.transfer_reads(2) == 0
     assert SS.phase_finish(SimpleNamespace(plan=plan_dir, run_dir=run, transfer=transfer_dir)) == 0 and os.path.exists(os.path.join(run, "STEP_DONE"))
-    assert SS.MI.sha256 and json.load(open(os.path.join(run, "STEP_DONE")))["updates"] == [1, 2]
+    assert json.load(open(os.path.join(run, "STEP_DONE")))["updates"] == [1, 2]
     print("(2) complete session == ppo_batch bitwise; controls, reads, READS_DONE, STEP_DONE: PASS")
 
     # (3A) resume inside the step
@@ -310,6 +338,16 @@ def main():
                      ("the last update's checkpoint", {"resume": ck2, "old_lp": os.path.join(run, "old_lp.npz")})):
         rcx, _, _, sx, _ = session(tmp, "refuse_" + what.replace(" ", "_").replace("'", ""), plan_dir, [], **kw)
         assert rcx == SS.EXIT_INPUT, (what, rcx, sx.sess["exit"])
+    rcx, _, _, sx, _ = session(tmp, "refuse_other_lr", plan_dir, [], resume=ck1, old_lp=os.path.join(run, "old_lp.npz"), lr=1e-5)
+    assert rcx == SS.EXIT_INPUT and "lr" in sx.sess["exit"]["reason"], sx.sess["exit"]
+    rcx, _, _, sx, _ = session(tmp, "refuse_other_backward", plan_dir, [], resume=ck1, old_lp=os.path.join(run, "old_lp.npz"),
+                               backward_options={"pattern_grad_from": 48})
+    assert rcx == SS.EXIT_INPUT, sx.sess["exit"]
+    repart = write_step_plan(os.path.join(tmp, "plan_repartitioned"), rows, [[0, 1, 2], [3]])
+    rcx, _, _, sx, _ = session(tmp, "refuse_repartitioned", repart, [], resume=ck1, old_lp=os.path.join(run, "old_lp.npz"))
+    assert rcx == SS.EXIT_INPUT and "another plan" in sx.sess["exit"]["reason"], sx.sess["exit"]
+    rcx, _, _, sx, _ = session(tmp, "refuse_no_meta", plan_dir, [], resume=os.path.join(tmp, "plan"), old_lp=os.path.join(run, "old_lp.npz"))
+    assert rcx == SS.EXIT_INPUT, sx.sess["exit"]
     import shutil
     bad_ck = os.path.join(tmp, "bad_ck")
     shutil.copytree(ck1, bad_ck)
@@ -364,12 +402,18 @@ def main():
         assert os.path.isdir(os.path.join(run4, "updates", "1", "ckpt")) and os.path.exists(os.path.join(run4, "updates", "1", "READS_DONE"))
         m1 = json.load(open(os.path.join(run4, "updates", "1", "ckpt", "meta.json")))
         assert m1["masters_sha256"] == json.load(open(os.path.join(ck1, "meta.json")))["masters_sha256"]
+        assert SS.state_sha(tr4.opt.masters, nm) == m1["masters_sha256"], "the masters moved after the stop"
     rc4, run4, tr4, s4, _ = session(tmp, "v2_STOP", plan_dir, ["GO", "STOP"], panels=panels)
     stp = json.load(open(os.path.join(run4, "STOPPED.json")))
     assert rc4 == 20 and stp["at_update"] == 2 and stp["v_2"] == "not kept" and stp["last_adapter_above_line"] == 1 and stp["resume_from"] == "updates/1/ckpt"
     rc4, run4, tr4, s4, _ = session(tmp, "v2_NONE", plan_dir, ["GO", "NONE"], panels=panels, verdict_timeout_s=12.0)
     stp = json.load(open(os.path.join(run4, "STOPPED.json")))
     assert rc4 == 20 and stp["at_update"] == 2 and stp["v_2"] == "not judged" and "READS_DONE" in stp["reason"]
+    t0 = time.time()                                          # a judge whose process has ended without a verdict: no waiting for the timeout
+    rc4, run4, tr4, s4, _ = session(tmp, "v1_judge_gone", plan_dir, ["NONE"], panels=panels, judge_exit=True, verdict_timeout_s=600.0)
+    stp = json.load(open(os.path.join(run4, "STOPPED.json")))
+    assert rc4 == 20 and stp["at_update"] == 1 and stp["v_1"] == "not judged" and "judge ended" in stp["reason"] and time.time() - t0 < 60, stp
+    assert not os.path.isdir(os.path.join(run4, "updates", "2", "ckpt"))
     # check_verdict on the complete run's files
     sid = "cpu-test-full"
     assert SS.check_verdict(run, 1, sid) == ("GO", None)
@@ -377,6 +421,7 @@ def main():
     vp = os.path.join(run, "updates", "1", "VERDICT.json")
     good = json.load(open(vp))
     for what, mut in (("another update", lambda v: v.__setitem__("update", 2)), ("another session", lambda v: v.__setitem__("session_id", "x")),
+                      ("update as a float", lambda v: v.__setitem__("update", 1.0)), ("update as true", lambda v: v.__setitem__("update", True)),
                       ("an outcome not in the list", lambda v: v.__setitem__("outcome", "PASS")),
                       ("a file not covered", lambda v: v["judged"].pop("updates/1/reads_dmg/a/R2.npz")),
                       ("base not covered", lambda v: v["judged"].pop("base/reads_dmg/a/base.npz"))):
@@ -394,7 +439,8 @@ def main():
     print("(4) verdicts: STOP, INCONCLUSIVE, timeout, wrong hash, and check_verdict's refusals: PASS")
 
     # (5) round trip and a dead read side
-    for what, eng, code in (("leak", FakeEngines(leak=True), 21), ("one value in R", FakeEngines(flip="R"), 21), ("one value in v", FakeEngines(flip="v"), 21)):
+    for what, eng, code in (("leak", FakeEngines(leak=True), 21), ("one value in R", FakeEngines(flip="R"), 21), ("one value in v", FakeEngines(flip="v"), 21),
+                            ("second read of R2", FakeEngines(flip_second="R2"), 21)):
         rc5, run5, tr5, s5, pt5 = session(tmp, "rt_" + what.replace(" ", "_"), plan_dir, ["GO", "GO"], engines=eng, panels=panels)
         rr = json.load(open(os.path.join(run5, "updates", "1", "roundtrip", "result.json")))
         assert rc5 == code and pt5.reader_rc == 21 and rr["result"] == "differ", (what, rc5, pt5.reader_rc)

@@ -6,11 +6,12 @@ serve (while the trainer runs), on the read engines:
           base/roundtrip/base_g<group>.npz (when the plan's rows were sampled by the base model, i.e. its first update is number 1, this read
           must equal the rows' recorded log-probs bitwise, else exit 21); then of the transfer plan -> base/transfer/base.npz.
   per update n, when updates/<n>/TRAINER_READY.json appears: on EVERY engine, in this order,
-      for X in v, R, R2:  load X; its share of the round-trip rows; its share of every panel; unload X
-      base again:         its share of the round-trip rows; its share of every panel (-> base2)
+      for X in v, R, R2:  load X; its share of the round-trip rows; its share of every panel; the round-trip rows AGAIN; unload X
+      base again:         its share of the round-trip rows; its share of every panel (-> base2); the round-trip rows again
     ROUND TRIP (bitwise, at every loss token of the round-trip rows): engine(X) == the trainer's log-probs at X for v, R and R2, and the base
-    re-read == the base read of the same rows at the start. The same rows are asked under v, then R, then R2, then no adapter, on the same
-    engine: a state that leaked from one adapter into the next request would show here. -> roundtrip/engine_<X>.npz, roundtrip/result.json ("result": "equal" |
+    re-read == the base read of the same rows at the start; BOTH reads of the rows under each adapter. The last requests under one adapter and
+    the first under the next are then the same prompts on the same engine: a state carried over from one adapter into the next request
+    (slot or prefix cache) would show here, whatever the panel reads in between did to the cache. -> roundtrip/engine_<X>.npz, roundtrip/result.json ("result": "equal" |
     "differ"). On "differ" nothing more is written for the update and the process ends with exit 21.
     Panels -> reads_dmg/<panel>/{v,R,R2,base2}.npz: lp_<row> float32 [T] = the value at the panel's mask, 0 elsewhere, + ids_crc32 [R] of the ids
     sent; <X>.json {"adapter_sha256", "head", "engine_sha", "source", "session_id", "panel_rows_sha256"}. A read that is not complete is not written.
@@ -297,7 +298,7 @@ class Reader:
         rt, base0 = self.rt_sets[g], self.rt_base[g]
         adapters = [(name, ads[name]["lora_name"], ads[name]["path"]) for name in NAMES] + [("base2", None, None)]
         t0 = time.time()
-        res = run_pass(self.c, self.urls, adapters, [rt] + list(self.panels.values()))
+        res = run_pass(self.c, self.urls, adapters, [rt] + list(self.panels.values()) + [rt.subset("rt2", rt.rows)])
         # the round trip
         rd = os.path.join(ud, "roundtrip")
         checks, differ_total = {}, 0
@@ -313,14 +314,22 @@ class Reader:
         checks["engine_base_reread_vs_start_base"] = {"rows": len(rt.rows), "loss_tokens": checks["trainer_vs_engine_v"]["loss_tokens"], "differ": d}
         differ_total += d
         save_npz(os.path.join(rd, "engine_base2.npz"), **{f"lp_{r}": res[("rt", "base2")][r] for r in rt.rows})
+        second = {}                                           # the rows' second read under each adapter (after the panels)
+        for name in NAMES + ("base2",):
+            ref = base0 if name == "base2" else np.load(os.path.join(rd, f"trainer_{name}.npz"))
+            d = sum(bits_differ(res[("rt2", name)][r], ref[r] if name == "base2" else ref[f"lp_{r}"], rt.mask(r)) for r in rt.rows)
+            second[name] = {"rows": len(rt.rows), "differ": d}
+            differ_total += d
         moved = sum(bits_differ(res[("rt", "v")][r], res[("rt", "base2")][r], rt.mask(r)) for r in rt.rows)
-        checks["v_vs_base_positions_differing"] = moved        # an adapter that changes nothing would make "equal" empty: reported
         per_engine = {str(e): rt.share(e, len(self.urls)) for e in range(len(self.urls))}
         result = "equal" if differ_total == 0 and checks["trainer_vs_engine_v"]["loss_tokens"] > 0 else "differ"
         write_json(os.path.join(rd, "result.json"), {"result": result, "update": n, "session_id": sid, "checks": checks,
-                                                    "round_trip_rows_per_engine": per_engine, "order": "v, R, R2, base re-read, on each engine",
+                                                    "v_vs_base_positions_differing": moved,   # reported: an adapter that moves nothing
+                                                    "second_read": second,
+                                                    "round_trip_rows_per_engine": per_engine,
+                                                    "order": "on each engine: v, R, R2, no adapter; under each: round-trip rows, panels, round-trip rows",
                                                     "adapters": {k: ads[k]["sha256"] for k in NAMES}})
-        log(f"update {n}: round trip {result}: {checks}")
+        log(f"update {n}: round trip {result}: {checks}; second read {second}; v differs from base at {moved} positions")
         if result != "equal":
             return EXIT_ROUNDTRIP
         for f in sorted(os.listdir(rd)):

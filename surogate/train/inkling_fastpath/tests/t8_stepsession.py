@@ -18,13 +18,16 @@ The read side adds roundtrip/result.json, reads_dmg/<panel>/{v,R,R2,base2}.npz a
 Handshake: before update n + 1 is APPLIED (its gradient is computed meanwhile) the session needs, for update n: the round trip "equal" and a
 VERDICT.json {"update": n, "session_id", "outcome": "GO", "judged": {path: sha256}} whose judged hashes equal the session's own hash of every
 file READS_DONE lists. STOP / INCONCLUSIVE: nothing is applied, v_n is labelled "not kept". Malformed verdict or timeout: nothing is applied,
-v_n is labelled "not judged". Either way STOPPED.json names last_adapter_above_line = n - 1 and the session ends (exit 20). After the last
-update the trainer is closed first, then its verdict awaited; TRAINER_DONE.json is written on GO.
+v_n is labelled "not judged". Either way STOPPED.json names last_adapter_above_line = n - 1 and the session ends (exit 20). A judge whose
+process has ended without a verdict for the waiting update (judge.exit, written by the launcher) counts as a timeout at once. A read side
+that fails before the first hand-over ends the session with the update in work labelled "not applied". After the last update the trainer
+is closed first, then its verdict awaited; TRAINER_DONE.json is written on GO.
 Resume (--resume <ckpt dir>): masters and optimizer state restored (hashes checked, theta0 and the re-exported adapter compared with the
 checkpoint's record). A checkpoint of update u continues (A) the same plan at update u + 1 (needs that session's old log-probs file) or (B) a
 plan whose first update is u + 1 (old log-probs recomputed at the restored weights). The restored state is exported, round-tripped and read
 again under the new session, and needs its own GO before the next apply.
-Exit codes: 0 complete; 20 stopped by a verdict or its timeout; 21 round trip not bitwise; 4 a trainer gate; 5 inputs; 6 the read side failed.
+Exit codes: 0 complete; 20 stopped by a verdict, its timeout or the judge's end; 21 round trip not bitwise; 4 a trainer gate; 5 inputs;
+6 the read side failed or its reads were not done in time.
 Phases: check (the plan), trainer (the session), finish (STEP_DONE), stub_judge (TEST ONLY: writes verdicts from a fixed list).
 """
 from __future__ import annotations
@@ -113,6 +116,13 @@ def load_step_plan(plan_dir: str, cap: int = MI.CAP) -> StepPlan:
         rows, info = MI.load_plan(plan_dir, cap=cap)
     except ValueError as e:
         raise PlanError(str(e)) from e
+    man = read_json(os.path.join(plan_dir, "manifest.json"))
+    listed = {os.path.basename(k): v for k, v in (man.get("files") or man).items() if isinstance(v, str) and len(v) == 64}
+    if "rows.npz" not in listed:
+        raise PlanError("the plan's manifest does not list rows.npz")
+    json_sha = MI.sha256(os.path.join(plan_dir, "rows.json"))
+    if "rows.json" in listed and listed["rows.json"] != json_sha:
+        raise PlanError("rows.json does not match its manifest sha256")
     meta = read_json(os.path.join(plan_dir, "rows.json"))
     if not isinstance(meta, dict) or not isinstance(meta.get("updates"), list) or not meta["updates"]:
         raise PlanError('rows.json has no "updates" list')
@@ -142,7 +152,7 @@ def load_step_plan(plan_dir: str, cap: int = MI.CAP) -> StepPlan:
         if v.shape != (len(rows),) or bool((v != sv).any()):
             raise PlanError(f'rows of another adapter version than start_version {sv}: the lagged-row path is not built; refused')
     info = dict(info, updates=[len(u) for u in updates], update_groups=[[int(g) for g in u] for u in ups], first_update_number=first,
-                start_version=sv, round_trip_group=[int(g) for g in rt],
+                start_version=sv, round_trip_group=[int(g) for g in rt], rows_json_sha256=json_sha,
                 update_loss_tokens=[int(sum(int(rows[i].loss_mask.sum()) for i in u)) for u in updates],
                 update_row_tokens=[int(sum(rows[i].T for i in u)) for u in updates])
     return StepPlan(rows, info, updates, [int(g) for g in rt], first, sv, seq)
@@ -175,7 +185,7 @@ def control_state(theta0: list, cur: list, nm: list, seed: int) -> list:
 def save_ckpt(tr, d: str, nm: list, meta: dict) -> dict:
     os.makedirs(d, exist_ok=True)
     mp, op = os.path.join(d, "masters.pt"), os.path.join(d, "optimizer.npz")
-    torch.save({n: m.detach().clone() for n, m in zip(nm, tr.opt.masters)}, mp + ".tmp")
+    torch.save({n: m.detach() for n, m in zip(nm, tr.opt.masters)}, mp + ".tmp")
     os.replace(mp + ".tmp", mp)
     arrs = tr.opt.state_arrays()
     with open(op + ".tmp", "wb") as f:
@@ -191,11 +201,16 @@ def save_ckpt(tr, d: str, nm: list, meta: dict) -> dict:
 
 def load_ckpt(tr, d: str, nm: list) -> dict:
     """Masters and optimizer state from a checkpoint directory, every recorded hash checked. -> its meta."""
-    meta = read_json(os.path.join(d, "meta.json"))
     mp, op = os.path.join(d, "masters.pt"), os.path.join(d, "optimizer.npz")
-    for name, path in (("masters.pt", mp), ("optimizer.npz", op)):
-        if MI.sha256(path) != meta["sha256"][name]:
-            raise PlanError(f"checkpoint {d}: {name} does not match the hash in meta.json")
+    try:
+        meta = read_json(os.path.join(d, "meta.json"))
+        for name, path in (("masters.pt", mp), ("optimizer.npz", op)):
+            if MI.sha256(path) != meta["sha256"][name]:
+                raise PlanError(f"checkpoint {d}: {name} does not match the hash in meta.json")
+        for k in ("update", "optimizer", "masters_sha256"):
+            meta[k]
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        raise PlanError(f"checkpoint {d}: not a complete checkpoint ({type(e).__name__}: {e})") from e
     saved = torch.load(mp, map_location="cpu", weights_only=True)
     if list(saved) != list(nm) or any(tuple(saved[n].shape) != tuple(m.shape) for n, m in zip(nm, tr.opt.masters)):
         raise PlanError(f"checkpoint {d}: tensor names or shapes differ from this trainer's")
@@ -230,9 +245,12 @@ def check_verdict(run_dir: str, n: int, session_id: str):
         return None, f"a verdict without a readable READS_DONE: {e}"
     if not isinstance(v, dict) or not isinstance(rd, dict):
         return None, "VERDICT.json or READS_DONE is not an object"
-    if rd.get("update") != n or rd.get("session_id") != session_id:
+    def is_n(x):
+        return isinstance(x, int) and not isinstance(x, bool) and x == n
+
+    if not is_n(rd.get("update")) or rd.get("session_id") != session_id:
         return None, "READS_DONE names another update or session"
-    if v.get("update") != n or v.get("session_id") != session_id:
+    if not is_n(v.get("update")) or v.get("session_id") != session_id:
         return None, f"the verdict names update {v.get('update')!r}, session {v.get('session_id')!r}"
     if v.get("outcome") not in OUTCOMES:
         return None, f"outcome {v.get('outcome')!r}"
@@ -240,6 +258,8 @@ def check_verdict(run_dir: str, n: int, session_id: str):
     if not isinstance(judged, dict) or not isinstance(files, dict) or not files:
         return None, "no judged hashes, or READS_DONE lists no file"
     for rel, h in sorted(files.items()):
+        if not isinstance(rel, str) or os.path.isabs(rel) or ".." in rel.replace("\\", "/").split("/"):
+            return None, f"{rel!r}: READS_DONE lists a path outside the results directory"
         p = os.path.join(run_dir, rel)
         if not os.path.isfile(p):
             return None, f"{rel}: listed in READS_DONE, not on disk"
@@ -375,6 +395,9 @@ class Session:
             meta = load_ckpt(tr, self.o["resume"], self.nm)
             if meta.get("theta0_sha256") != self.sess["theta0_sha256"]:
                 raise PlanError("the checkpoint's theta0 is not this trainer's start adapter")
+            if meta.get("lr") != self.o["lr"] or meta.get("backward_options") != self.o["backward_options"]:
+                raise PlanError(f"the checkpoint was written at lr {meta.get('lr')} with backward options {meta.get('backward_options')}; this "
+                                f"session runs lr {self.o['lr']} with {self.o['backward_options']}")
             u = int(meta["update"])
             if u == plan.first - 1:                           # (B) the next step's plan: old log-probs at the restored weights
                 self.j0 = 0
@@ -383,8 +406,9 @@ class Session:
                 old_file = self.o["old_lp"]
                 if not old_file:
                     raise PlanError("resuming inside a step needs --old-lp (the earlier session's old log-probs at the step's start weights)")
-                if meta.get("plan_rows_sha256") != plan.info["rows_sha256"] or MI.sha256(old_file) != meta.get("old_lp_sha256"):
-                    raise PlanError("the checkpoint was written for another plan or other old log-probs")
+                if meta.get("plan_rows_sha256") != plan.info["rows_sha256"] or meta.get("plan_json_sha256") != plan.info["rows_json_sha256"] \
+                        or not os.path.isfile(old_file) or MI.sha256(old_file) != meta.get("old_lp_sha256"):
+                    raise PlanError("the checkpoint was written for another plan (rows or updates) or other old log-probs")
             else:
                 raise PlanError(f"checkpoint of update {u}: this plan holds updates {plan.first}..{plan.first + len(plan.updates) - 1}")
             self.cur = masters_list(tr)
@@ -399,8 +423,11 @@ class Session:
         # the old log-probs of ALL the step's rows at the step's start weights (as ppo_batch), and the replay gate on every row before any gradient
         op = os.path.join(self.run, "old_lp.npz")
         if old_file:
-            with np.load(old_file, allow_pickle=False) as z:
-                olds = [np.asarray(z[f"old_{r.notes['plan_row']}"], dtype=np.float32) for r in rows]
+            try:
+                with np.load(old_file, allow_pickle=False) as z:
+                    olds = [np.asarray(z[f"old_{r.notes['plan_row']}"], dtype=np.float32) for r in rows]
+            except (OSError, ValueError, KeyError) as e:
+                raise PlanError(f"the old log-probs file does not hold this plan's rows ({type(e).__name__}: {e})") from e
             if os.path.abspath(old_file) != os.path.abspath(op):
                 shutil.copyfile(old_file, op)
         else:
@@ -446,7 +473,8 @@ class Session:
                 raise SessionStop(rs[0], n, rs[1], "not applied")
             self.phase(f"update {n}: gradient interrupted, update {self.pending} cannot get a GO")
             self.await_verdict(self.pending, time.time(), last=False)
-            raise SessionStop(EXIT_READS, self.pending, "the gradient was interrupted but the previous update shows no stop", "not judged")
+            # not expected: the watcher saw a stop that the check after it does not confirm. The trainer is gone: end here, nothing applied.
+            raise SessionStop(EXIT_READS, n, f"the gradient was interrupted although update {self.pending} has its GO", "not applied")
         wall = time.time() - t0
         m = out.metrics
         N = float(m["total_tokens"])
@@ -456,7 +484,8 @@ class Session:
                 "replay_skipped_rows": m["replay_skipped_rows"], "stale_checked_rows": m["stale_checked_rows"],
                 "ratio_max": m.get("ppo_ratio_max"), "clip_share": m.get("ppo_clip_ratio"), "policy_loss": m.get("policy_loss"),
                 "tok_per_s_per_card": m["tok_per_s_per_card"], "row_tokens": m["row_tokens"], "gradient_wall_s": wall,
-                "zero_seed_rows": m.get("zero_seed_rows"), "backward_options": self.o["backward_options"],
+                "zero_seed_rows": m.get("zero_seed_rows"), "oom_retries": int(sum(int(r.get("oom_retries") or 0) for r in out.rows)),
+                "backward_options": self.o["backward_options"],
                 "workers": [{k: x.get(k) for k in ("card", "VmHWM_gib", "card_peak_torch_gib")} for x in m.get("workers", [])],
                 "metrics": {k: v for k, v in m.items() if isinstance(v, (int, float))}}
         bad = []
@@ -474,7 +503,7 @@ class Session:
         if bad:
             write_json(os.path.join(ud, "step.json"), dict(step, gate_failures=bad))
             raise GateFailure(f"update {n}: " + "; ".join(bad))
-        step["attempts"] = self.take_sketches(n, sub, out)
+        step["attempts"], sketch_files = self.read_sketches(n, sub, out)
         if self.pending is not None:                          # nothing is applied before the previous update has its GO
             self.await_verdict(self.pending, time.time(), last=False)
         else:                                                 # nor when the read side has already failed (no later read could be judged)
@@ -485,6 +514,10 @@ class Session:
         first_ever = self.cur is None
         step["grad_norm"] = tr.apply(out, self.o["lr"])
         self.cur = masters_list(tr)
+        if sketch_files:                                      # the sketches of an update that was applied (an unapplied one leaves none)
+            os.makedirs(os.path.join(ud, "sketches"), exist_ok=True)
+            for f in sketch_files:
+                shutil.move(f, os.path.join(ud, "sketches", os.path.basename(f)))
         delta = [c - p for c, p in zip(self.cur, prev)]
         fo = MI.first_order(out.grads, N, delta, self.keys, self.blocks)
         a_keys = [i for i, x in enumerate(self.nm) if x.split(".", 1)[1].endswith("A") or x.split(".", 1)[1] in ("A13", "A2")]
@@ -507,20 +540,17 @@ class Session:
         self.post_state(n, j, step=step)
         self.pending = n
 
-    def take_sketches(self, n: int, sub: list, out) -> dict:
-        """The update's sketch files moved under updates/<n>/sketches, and per attempt what the signal read needs to know about them."""
-        sd = os.path.join(self.ud(n), "sketches")
+    def read_sketches(self, n: int, sub: list, out):
+        """Per attempt what the signal read needs to know about the update's sketches (the files stay where the workers wrote them until the
+        update is applied). -> (attempts, sketch files)."""
         files = list(out.metrics.get("sketch_files", []))
         got = {}
-        if files:
-            os.makedirs(sd, exist_ok=True)
         for f in files:
             d = torch.load(f, map_location="cpu", weights_only=False)
             g = got.setdefault(int(d["trial"]), {"rows": 0, "tensors": 0})
             g["rows"] += int(d["rows"])
             g["tensors"] += len(d["tensors"])
             del d
-            shutil.move(f, os.path.join(sd, os.path.basename(f)))
         att = {}
         for res in out.rows:
             r = sub[res["i"]]
@@ -542,14 +572,14 @@ class Session:
                 a["sketch"] = "absent: advantage 0"
             elif g["rows"] > 0 and g["tensors"] > 0:
                 a["sketch"] = "written"
-            elif a["clip_share"] == 1.0:
-                a["sketch"] = "absent: every loss token clipped"
+            elif a["backward_rows"] == 0:                     # every seed of every row exactly 0 (all tokens clipped): no backward ran
+                a["sketch"] = "absent: every seed 0"
             else:
                 a["sketch"] = "absent"
                 missing.append(t)
         if files and missing:                                 # only a session that asked for sketches gates on them
             raise GateFailure(f"update {n}: no sketch for attempts {sorted(missing)[:8]} with a non-zero advantage")
-        return {str(t): att[t] for t in sorted(att)}
+        return {str(t): att[t] for t in sorted(att)}, files
 
     # ------------------------------------------------------------------ after an apply (or a resume): checkpoint, adapters, round trip, hand-over
     def post_state(self, n: int, j: int, step: dict | None = None, want_sha: str | None = None) -> None:
@@ -576,7 +606,8 @@ class Session:
         if step is not None:
             save_ckpt(tr, os.path.join(ud, "ckpt"), self.nm,
                       {"update": n, "lr": self.o["lr"], "adapter_sha256": sha, "theta0_sha256": self.sess["theta0_sha256"],
-                       "plan_rows_sha256": plan.info["rows_sha256"], "old_lp_sha256": self.old_sha, "session_id": self.sid,
+                       "plan_rows_sha256": plan.info["rows_sha256"], "plan_json_sha256": plan.info["rows_json_sha256"],
+                       "old_lp_sha256": self.old_sha, "session_id": self.sid,
                        "first_update_number": plan.first, "backward_options": self.o["backward_options"]})
         lv = trainer_lp("v")                                  # the masters are v
         for name, seed in CONTROLS:
@@ -623,6 +654,9 @@ class Session:
                 return EXIT_ROUNDTRIP, f"round trip of update {n}: {r.get('result')!r}"
         if code is not None and not os.path.exists(os.path.join(ud, "READS_DONE")):
             return EXIT_READS, f"the read side ended (exit {code}) without the reads of update {n}"
+        jx = os.path.join(self.run, "judge.exit")             # written when the judge's process has ended: it writes no verdict after that
+        if os.path.exists(jx) and not os.path.exists(os.path.join(ud, "VERDICT.json")):
+            return EXIT_STOPPED, f"the judge ended (exit {open(jx).read().strip()}) without a verdict for update {n}"
         return None
 
     def bad_news(self, n):
@@ -645,9 +679,6 @@ class Session:
         reads_deadline = self.handoff.get(n, t_ready) + self.o["reads_timeout_s"]
         self.phase(f"update {n}: waiting for its verdict")
         while True:
-            rs = self.reader_state(n)
-            if rs:
-                raise SessionStop(rs[0], n, rs[1], "not judged")
             if os.path.exists(os.path.join(ud, "VERDICT.json")):
                 outcome, problem = check_verdict(self.run, n, self.sid)
                 if problem:
@@ -660,6 +691,9 @@ class Session:
                     self.phase(f"update {n}: GO")
                     return
                 raise SessionStop(EXIT_STOPPED, n, f"verdict {outcome}", "not kept", outcome)
+            rs = self.reader_state(n)
+            if rs:
+                raise SessionStop(rs[0], n, rs[1], "not judged")
             now = time.time()
             done = os.path.exists(os.path.join(ud, "READS_DONE"))
             if done and n not in self.reads_seen:
@@ -768,6 +802,9 @@ def phase_trainer(a) -> int:
     cards = tuple(int(x) for x in a.cards.split(","))
     sid_file = os.path.join(a.run_dir, "session_id.txt")
     sid = open(sid_file).read().strip() if os.path.exists(sid_file) else f"step-{time.strftime('%Y%m%dT%H%M%S')}-{os.getpid()}"
+    def _term(signum, frame):                                 # from here on a TERM ends this process through its exit handlers,
+        raise SystemExit(143)                                 # which end the spawned workers (they are daemon children)
+    signal.signal(signal.SIGTERM, _term)
     if a.deadline_min > 0:
         def _late(signum, frame):
             raise TimeoutError(f"the trainer phase passed its {a.deadline_min} min deadline")
@@ -793,6 +830,9 @@ def phase_trainer(a) -> int:
             p = getattr(h, "proc", None)
             if p is not None:
                 p.join(20)
+                if p.is_alive():
+                    p.kill()
+                    p.join(10)
         tr.handles = []
 
     def zero_check(row):
