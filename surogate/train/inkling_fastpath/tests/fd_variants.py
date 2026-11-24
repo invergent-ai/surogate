@@ -79,11 +79,27 @@ def run(C, tt, vals, head, round_on, kw):
     return out, time.time() - t0, len(seen)
 
 
+def gate_verdict(rep, var, labels=("12.B13", "3.B13", "21.B13")):
+    """PASS = every label's last reading (the repeat at twice the step when there was one) is readable and inside [0.7, 1.3]."""
+    out = {}
+    for lab in labels:
+        rs = [r for r in rep["follow"] if r["variant"] == var and r["what"] == lab]
+        if not rs:
+            out[lab] = "missing"
+        elif not rs[-1]["readable"]:
+            out[lab] = f"not readable ({rs[-1]['f']:.3f})"
+        else:
+            out[lab] = f"{'in band' if 0.7 <= rs[-1]['f'] <= 1.3 else 'outside'} ({rs[-1]['f']:.3f})"
+    return {"variant": var, "readings": out, "pass": all(v.startswith("in band") for v in out.values())}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--row", type=int, required=True)
     ap.add_argument("--variants", default="H30,QD,H36,Q,HD30")
     ap.add_argument("--no-cos", action="store_true", help="skip the chain-state backwards")
+    ap.add_argument("--gate", action="store_true", help="the trainer's finite-difference gate: verdict for the FIRST variant from the engine "
+                    "follow of one tensor inside the loop (12.B13), one before it (3.B13) and the control (21.B13); exit 3 on a fail")
     ap.add_argument("--plan", required=True)
     ap.add_argument("--bin", required=True)
     ap.add_argument("--artifact", required=True)
@@ -236,9 +252,14 @@ def main():
         C.rig.w.close()
         return 1
     rep["seconds"] = a.budget_s - left()
+    rc = 0
+    if a.gate:
+        rep["gate"] = gate_verdict(rep, order[0])
+        log(f"FINITE-DIFFERENCE GATE ({order[0]}): {'PASS' if rep['gate']['pass'] else 'FAIL'} {rep['gate']['readings']}")
+        rc = 0 if rep["gate"]["pass"] else 3
     save()
     C.rig.w.close()
-    return 0
+    return rc
 
 
 if __name__ == "__main__":

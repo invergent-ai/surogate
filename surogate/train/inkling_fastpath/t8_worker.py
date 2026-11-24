@@ -164,7 +164,9 @@ class T8Worker(WorkerCore):
         def run(on_grad, qb):
             TL.backward_row(self.eng, self.W, ctx["ids"], ctx["res"], self.lora, B.ALPHA / B.RANK, self.v_first, g, self.buffers, on_grad,
                             head_grad=head, q_block=qb, train_idx=self.train_idx, empty_host_each_visit=bool(self.cfg.empty_pinned_each_visit),
-                            attn_scale=(self.cfg.attn_alpha / self.cfg.attn_rank) if self.cfg.attn_rank else None)
+                            attn_scale=(self.cfg.attn_alpha / self.cfg.attn_rank) if self.cfg.attn_rank else None,
+                            pattern_grad_from=int(self.cfg.pattern_grad_from), gate_grad_from=int(self.cfg.gate_grad_from),
+                            bank_grad_from=int(self.cfg.bank_grad_from))
 
         visits = [self.eng.visits[v].layer for v in range(len(self.eng.visits))]
         pg, ps, retries, qb = accumulate_row(self, run, row.T, part, ctx["qb"], visits, torch.cuda.empty_cache)

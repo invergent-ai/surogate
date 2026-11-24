@@ -226,8 +226,15 @@ def trainer_cfg(a, cards, sketch_dir=""):
     kw = {}
     if sketch_dir:
         kw = {"sketch_visits": (3, 12, 36, 45), "sketch_expert_stride": 64, "sketch_dir": sketch_dir}
+    kw.update(backward_options(a))
     return TS.T8Config(bin_dir=a.bin, artifact=a.artifact, cards=cards, K=48, head="plain", attn_rank=64, attn_alpha=32.0,
                        train_keys=TS.param_keys(64), segment_keys=(), run_dir=a.run_dir, lean_host=bool(sketch_dir), max_row_tokens=CAP, **kw)
+
+
+def backward_options(a) -> dict:
+    """The constants of the backward this session runs with (T8Config; all 0 = the exact backward)."""
+    return {"pattern_grad_from": int(getattr(a, "pattern_grad_from", 0)), "gate_grad_from": int(getattr(a, "gate_grad_from", 0)),
+            "bank_grad_from": int(getattr(a, "bank_grad_from", 0))}
 
 
 def pick_pre_rows(rows: list, k: int = 3) -> list:
@@ -309,7 +316,7 @@ def phase_trainer(a):
     rows, info = load_plan(a.plan)
     cards = tuple(int(x) for x in a.cards.split(","))
     sk = os.path.join(a.run_dir, "sketches")
-    rep = {"plan": info, "cards": list(cards), "lr": LR, "time_start": time.time()}
+    rep = {"plan": info, "cards": list(cards), "lr": LR, "time_start": time.time(), "backward_options": backward_options(a)}
     if a.deadline_min > 0:                                    # the card-hour budget: the phase stops itself (workers closed in `finally`)
         import signal
 
@@ -536,6 +543,9 @@ def main():
     ap.add_argument("--engine-sha-file", default="")
     ap.add_argument("--deadline-min", type=float, default=0.0, help="trainer phase: stop (no outputs) after this many minutes")
     ap.add_argument("--out", default="")
+    ap.add_argument("--pattern-grad-from", type=int, default=0, help="visits below it hold their attention pattern constant in the backward")
+    ap.add_argument("--gate-grad-from", type=int, default=0, help="visits below it hold their router gate weights constant in the backward")
+    ap.add_argument("--bank-grad-from", type=int, default=0, help="looped visits below it hold their bank inputs constant in the backward")
     a = ap.parse_args()
     return {"check": phase_check, "pre": phase_pre, "pre_compare": phase_pre_compare, "trainer": phase_trainer, "compare": phase_compare}[a.phase](a)
 
