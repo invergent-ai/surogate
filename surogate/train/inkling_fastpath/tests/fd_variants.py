@@ -123,6 +123,7 @@ def trainer_path_check(C, var, G, keys):
 
     cfg, rig = C.rig.cfg, C.rig
     old_opts = {k: getattr(cfg, k) for k in ("pattern_grad_from", "gate_grad_from", "bank_grad_from")}
+    RA.ROUND["on"] = True          # the trainer's setting (this test's context switches it off for the chain; the direct gradient ran with it on)
     try:
         for k_, v_ in VARIANTS[var].items():
             setattr(cfg, k_, v_)
@@ -144,6 +145,7 @@ def trainer_path_check(C, var, G, keys):
                            "rel_diff": float(gt.double().norm())}
         return res
     finally:
+        RA.ROUND["on"] = False
         for k_, v_ in old_opts.items():
             setattr(cfg, k_, v_)
 
