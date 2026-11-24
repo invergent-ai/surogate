@@ -112,7 +112,7 @@ def concentration(go, out_host, lo):
 class Ctx:
     """The rig at the start point, the row, the engine's routing and x0."""
 
-    def __init__(self, a):
+    def __init__(self, a, keep_engine=False):
         RA.ROUND["on"] = False
         self.rig = TD.Rig(a)
         rig = self.rig
@@ -122,7 +122,9 @@ class Ctx:
         lp, ctx = rig.w._forward(self.row)
         self.ids, self.qb = ctx["ids"], ctx["qb"]
         self.routing = ctx["res"]["routing"].clone()
-        rig.w._release(ctx)
+        self.engine_res = ctx["res"] if keep_engine else None      # the engine's stored states (host views; valid until the next _forward)
+        if not keep_engine:
+            rig.w._release(ctx)
         del ctx, lp
         with torch.no_grad():
             self.x0 = F.forward(self.eng, self.ids, save=True, adapters_per_layer=rig.w._adapters())["x0"].float().clone()

@@ -188,9 +188,19 @@ def forward_keep(eng, ids: torch.Tensor, adapters_per_layer, buffers: RowBuffers
 
 def backward_row(eng, W, ids, vals: dict, lora_host: list, scale: float, v_first: int, g_lp: torch.Tensor, buffers: RowBuffers,
                  on_grad, head_grad=None, q_block: int | None = None, train_idx=(0, 1, 2, 3), attn_scale=None,
-                 empty_host_each_visit: bool = False, on_visit_grad=None) -> None:
+                 empty_host_each_visit: bool = False, on_visit_grad=None, bank_grad_from: int = 0, pattern_grad_from: int = 0,
+                 gate_grad_from: int = 0) -> None:
     """The reverse loop of ift_long.LongModel over visits >= v_first. g_lp [T - 1] = the seed on the per-target log-probs.
-    lora_host: per physical layer {A13, B13, A2, B2} (fp32 values on the host). on_grad(v, layer, key index, gradient on the card)."""
+    lora_host: per physical layer {A13, B13, A2, B2} (fp32 values on the host). on_grad(v, layer, key index, gradient on the card).
+    bank_grad_from: looped visits with an index below it treat their two bank inputs (the previous pass's outputs) as constants: no gradient
+    goes into the visits that produced them. 0 (default) = the full backward. With the index of the last pass's first visit, the gradient
+    crosses the bank once (last pass -> the pass before, whose own bank inputs are constants); with the number of visits it never does:
+    the visits of the earlier passes then receive no gradient and are skipped, and the layers before the loop get only the gradient of
+    the direct reads of their output by the last pass, the later visits and the final mix.
+    pattern_grad_from: visits with an index below it hold their attention pattern constant in the backward (no gradient through the softmax
+    scores into q, k and the relative bias; the value path keeps its gradient). 0 (default) = the exact backward; the number of visits =
+    every visit; in between = the later visits keep the pattern's gradient.
+    gate_grad_from: the same switch for the router's gate weights of the visit's experts (constants of the backward below it)."""
     dev = g_lp.device
     T = ids.numel()
     visits = eng.visits
@@ -251,13 +261,16 @@ def backward_row(eng, W, ids, vals: dict, lora_host: list, scale: float, v_first
                 keys = [k for k in lo if k != "scale"]          # the layer's key order: the 4 expert keys, then the attention keys (S3)
                 lt = [lo[k].to(dev) for k in keys]
                 n = len(vi.stack)
-                sinks = [sink_for(p, v - 1) for p in ps]
+                cut_bank = vi.looped and v < bank_grad_from      # ps = stack..., partial, bank0, bank1
+                sinks = [None if (cut_bank and i > n) else sink_for(p, v - 1) for i, p in enumerate(ps)]
                 with torch.enable_grad(), torch.device(dev):
                     ins = [torch.zeros(1, dtype=F32, device=dev).expand(T, D) for _ in ps]
                     leaves = [t.detach().requires_grad_(j in train_idx) for j, t in enumerate(lt)]  # keys not trained: no vjp
                     want = [t for t in leaves if t.requires_grad]
                     lora = TV.lora_dict(keys, leaves, scale, attn_scale)
                     LG.SINK_DUMMIES.clear()
+                    LG.PATTERN_GRAD["on"] = v >= pattern_grad_from   # read by this visit's backward only; reset in the finally below
+                    B.GATE_GRAD["on"] = v >= gate_grad_from
                     out = TV.visit_torch_t8(W, vi, ins[:n], ins[n], (ins[n + 1], ins[n + 2]) if vi.looped else None,
                                               vals["routing"][v], lora, act_vals=[host_vals[p] for p in ps], act_sinks=sinks)
                     with B._tick("bwd.autograd"):
@@ -277,6 +290,8 @@ def backward_row(eng, W, ids, vals: dict, lora_host: list, scale: float, v_first
                     torch._C._host_emptyCache()
     finally:
         LG._q_block = saved_q_block
+        LG.PATTERN_GRAD["on"] = True
+        B.GATE_GRAD["on"] = True
         LG.SINK_DUMMIES.clear()
         # also on an out-of-memory error: every queued copy into a host accumulator lands before a retry can zero and reuse its slot
         torch.cuda.current_stream(dev).synchronize()

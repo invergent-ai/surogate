@@ -188,6 +188,11 @@ def bmm32(a, w, name, g0, g1):
     return _bmm_f32(a, w.dequant(name, g0, g1))
 
 
+# The gradient through the router's gate weights (the normalised sigmoids of the replayed experts) into the MLP input. True: the exact
+# backward. False: the gate weights are constants of the backward. backward_row sets it per visit (gate_grad_from); nothing else writes it.
+GATE_GRAD = {"on": True}
+
+
 def moe_vec(x, w, ids, lora=None):
     """rig.moe_vec with act_quant=False and routing=(ids, None): gammas from this recompute's router (gradient flows
     into x through them), W4A16 GEMMs (NVFP4 global applied to the fp32 output), LoRA from the fp32 masters
@@ -195,7 +200,8 @@ def moe_vec(x, w, ids, lora=None):
     x = x.float()
     t, h = x.shape
     ids = ids.long()
-    gam = RA.route_weights(RA._router_logits(x, w.gate_w), ids)
+    lg = RA._router_logits(x, w.gate_w)
+    gam = RA.route_weights(lg if GATE_GRAD["on"] else lg.detach(), ids)
     topk = ids.shape[1]
     nv = w.fmt == "nvfp4"
     flat = ids.reshape(-1)

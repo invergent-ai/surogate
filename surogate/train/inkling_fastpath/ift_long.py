@@ -204,9 +204,15 @@ def _rel_block(r_out, rel_proj, b0, b1):
     return RA.rb(torch.einsum("thj,jd->thd", r_out[b0:b1], rel_proj.float()))
 
 
+# The attention PATTERN's gradient (through the softmax scores into q, k and the relative bias r). True: the exact backward. False: the
+# pattern is a constant of the backward (d scores = 0); only the value path keeps its gradient (dv = p^T dout), dq = dk = dr = 0.
+# backward_row sets it per visit (pattern_grad_from); nothing else writes it.
+PATTERN_GRAD = {"on": True}
+
+
 class RelAttentionR(torch.autograd.Function):
     """B.RelAttention with rel = bf16(r_out . rel_proj) formed per query block (STE through the bf16 rounding):
-    gradients for q, k, v and r_out; rel_proj is frozen."""
+    gradients for q, k, v and r_out; rel_proj is frozen. With PATTERN_GRAD off: the value gradient only."""
 
     @staticmethod
     def forward(ctx, q, k, v, r_out, rel_proj, window, q_block=128):
@@ -269,6 +275,9 @@ class RelAttentionR(torch.autograd.Function):
             ob = out[b0:b1].reshape(nq, hk, g, dh).permute(1, 2, 0, 3)
             dlb = dlse[b0:b1].reshape(nq, hk, g).permute(1, 2, 0)[..., None]
             qq = q[b0:b1].reshape(nq, hk, g, dh).permute(1, 2, 0, 3)
+            if not PATTERN_GRAD["on"]:  # the pattern p is a constant: out = p . v / l carries gradient to v only
+                dv[k0:b1] += torch.einsum("hgbk,hgbd->hkd", p, do).permute(1, 0, 2)
+                continue
             if ATTN_TC:
                 # the same four contractions as below, [Hk, G x nq, .] bmms on bf16 tensor cores (fp32 accumulate):
                 # K, V, q hold exact bf16 values; fp32 factors (do, ds, p) are split hi + lo
