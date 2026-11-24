@@ -41,7 +41,7 @@ SEEDS = {"R": MI.R_SEED, "R2": MI.R_SEED_B}
 
 
 def parse_states(spec: str) -> list:
-    """"A8=t0x+census+own+transfer,RA8=t0x+census,..." -> [{"name", "kind", "rule", "size", "draw", "sets"}], in the given order."""
+    """"A8=p1+p2+own,RA8=p1+p2,..." -> [{"name", "kind", "rule", "size", "draw", "sets"}], in the given order."""
     out, seen = [], set()
     for item in [x for x in spec.split(",") if x]:
         name, _, sets = item.partition("=")
@@ -69,7 +69,7 @@ def state_masters(st: dict, fu: dict, eps: float) -> tuple:
 
 
 def round_trip_rows_of(plan_dir: str, rt_group: int) -> list:
-    """The session's round-trip rows, from the plan's row lengths alone: the two longest and the four shortest rows of the group."""
+    """The session's round-trip rows, from the plan's row lengths alone: the two longest and the six shortest rows of the group."""
     with np.load(os.path.join(plan_dir, "rows.npz"), allow_pickle=False) as z:
         T, g = np.array(z["T"]), np.array(z["group_idx"])
     grp = {int(n): int(T[n]) for n in range(len(T)) if int(g[n]) == int(rt_group)}
@@ -86,37 +86,53 @@ def build(ckpt_dir: str, grad_path: str, states: list, out_dir: str, export_fn, 
     nm, meta = fu["names"], fu["meta"]
     gj = json.load(open(os.path.splitext(grad_path)[0] + ".json"))
     N = float(gj["N"])
-    G = [-g.double() for g in fu["grads"]]                    # the gradient of sum A sum_t log pi over N (ascent sense), before the clip
-    dA = [d.double() for d in fu["d_adam"]]
+    dA = fu["d_adam"]
+    na = RU._norm(dA)
     score = [i for i, n in enumerate(nm) if n.split(".", 1)[1] in ("qA", "qB", "kA", "kB", "rA", "rB")]
+    # the score adapters stay untouched only under the pattern-constant backward (every visit): the check is made only then
+    pc = int((meta.get("backward_options") or {}).get("pattern_grad_from", 0)) >= 48
     os.makedirs(os.path.join(out_dir, "adapters"), exist_ok=True)
-    rows, checks = [], {"overall_norm_vs_adam_step": {}, "per_tensor_norm_vs_adam_step": {}, "score_adapters_untouched": {}, "A_is_theta0_plus_size_x_step": {}}
+    rows, checks = [], {"overall_norm_vs_adam_step": {}, "per_tensor_norm_vs_adam_step": {}, "score_adapters_untouched": {}, "A_is_theta0_plus_size_x_step": {},
+                        "control_per_tensor_norm_vs_its_state": {}, "control_zero_where_its_state_is_zero": {}}
+    rule_norms = {}
     for st in states:
         masters, d = state_masters(st, fu, eps)
         row = RU.table_row(st["name"], d, fu["d_adam"], nm, blocks)
         row.update(name=st["name"], kind=st["kind"], rule=st["rule"], size=st["size"], eps=eps if st["rule"] == "E" else None, sets=st["sets"],
                    of=None if st["kind"] == "rule" else f"{st['rule']}{st['size']:g}", seed=SEEDS.get(st["draw"]),
                    per_tensor_l2=RU.per_tensor_norms(d, nm), masters_sha256=SS.state_sha(masters, nm))
-        fo = N * sum(float((g * x).sum()) for g, x in zip(G, d))
+        fo = -N * sum(float((g.double() * x).sum()) for g, x in zip(fu["grads"], d))     # N x <-grad, d>, the gradient before the clip
         row["first_order"] = {"at_size": fo, "size_1": fo / st["size"], "N": N, "what": "N x <-grad, d>"}
         sha = export_fn(masters, os.path.join(out_dir, "adapters", st["name"]), f"rule-test-{st['name']}")
         row["adapter_sha256"] = sha[0] if isinstance(sha, tuple) else sha
-        checks["score_adapters_untouched"][st["name"]] = all(torch.equal(masters[i], fu["theta0"][i]) for i in score)
-        s, na = st["size"], RU._norm(dA)
+        if pc:
+            checks["score_adapters_untouched"][st["name"]] = all(torch.equal(masters[i], fu["theta0"][i]) for i in score)
+        s = st["size"]
+        if st["kind"] == "control":                           # against the rule state it mirrors, built here once more if it is not in the list
+            key = (st["rule"], s)
+            if key not in rule_norms:
+                rule_norms[key] = RU.per_tensor_norms(RU.rule_delta(st["rule"], fu["grads"], fu["coef"], dA, s, eps if st["rule"] == "E" else None,
+                                                                    fu["moments"]), nm)
+            want = rule_norms[key]
+            checks["control_per_tensor_norm_vs_its_state"][st["name"]] = max(
+                (abs(row["per_tensor_l2"][k] - want[k]) / want[k] for k in nm if want[k] > 0), default=0.0)
+            checks["control_zero_where_its_state_is_zero"][st["name"]] = all(row["per_tensor_l2"][k] == 0.0 for k in nm if want[k] == 0.0)
         if st["kind"] == "rule":
+            rule_norms[(st["rule"], s)] = row["per_tensor_l2"]
             if st["rule"] in ("P", "E", "A"):
                 checks["overall_norm_vs_adam_step"][st["name"]] = abs(row["l2"] / s - na) / na if na > 0 else 0.0
             if st["rule"] in ("T", "A"):
                 checks["per_tensor_norm_vs_adam_step"][st["name"]] = max(
-                    (abs(float(x.norm()) / s - float(a.norm())) / float(a.norm()) for x, a in zip(d, dA) if float(a.norm()) > 0), default=0.0)
+                    (abs(float(x.norm()) / s - float(a.double().norm())) / float(a.double().norm()) for x, a in zip(d, dA) if float(a.double().norm()) > 0),
+                    default=0.0)
             if st["rule"] == "A":
-                want = RU.add_delta(fu["theta0"], [a * s for a in dA])
+                want = RU.add_delta(fu["theta0"], [a.double() * s for a in dA])
                 checks["A_is_theta0_plus_size_x_step"][st["name"]] = all(torch.equal(m, w) for m, w in zip(masters, want))
         rows.append(row)
         log(f"{st['name']}: l2 {row['l2']:.6e}, cos with the optimizer's step {row['cos_with_adam_step']:+.4f}, non-zero {row['nonzero_entries']}, "
             f"first order {fo:+.4f}, adapter {row['adapter_sha256'][:16]}")
         del masters, d
-    a1 = RU.add_delta(fu["theta0"], dA)                       # A at size 1 must be the checkpoint itself, to the bit and to the file
+    a1 = RU.add_delta(fu["theta0"], [a.double() for a in dA])   # A at size 1 must be the checkpoint itself, to the bit and to the file
     sha1 = export_fn(a1, os.path.join(out_dir, "adapters", "_A1_check"), f"step-session-u{int(meta['update'])}-v")
     sha1 = sha1[0] if isinstance(sha1, tuple) else sha1
     checks["A_at_size_1"] = {"masters_equal_checkpoint": SS.state_sha(a1, nm) == meta["masters_sha256"],
@@ -124,15 +140,20 @@ def build(ckpt_dir: str, grad_path: str, states: list, out_dir: str, export_fn, 
                              "adapter_equal_checkpoint": sha1 == meta.get("adapter_sha256")}
     ok = (all(v <= 1e-6 for v in checks["overall_norm_vs_adam_step"].values()) and all(v <= 1e-6 for v in checks["per_tensor_norm_vs_adam_step"].values())
           and all(checks["score_adapters_untouched"].values()) and all(checks["A_is_theta0_plus_size_x_step"].values())
+          and all(v <= 1e-3 for v in checks["control_per_tensor_norm_vs_its_state"].values())      # a control is rounded once to fp32 around theta0
+          and all(checks["control_zero_where_its_state_is_zero"].values())
           and checks["A_at_size_1"]["masters_equal_checkpoint"] and checks["A_at_size_1"]["adapter_equal_checkpoint"])
     tab = {"checkpoint": {"update": meta["update"], "masters_sha256": meta["masters_sha256"], "adapter_sha256": meta.get("adapter_sha256"),
                           "session_id": meta.get("session_id")},
            "grad_sha256": fu["grad_sha256"], "N": N, "clip_coefficient": fu["coef"], "lr": meta.get("lr"), "rule_E_eps": eps,
-           "moment_check_worst_rel": fu["moment_check_worst_rel"], "adam_step_l2": RU._norm(dA), "grad_l2": RU._norm(fu["grads"]),
+           "moment_check_worst_rel": fu["moment_check_worst_rel"], "adam_step_l2": na, "grad_l2": RU._norm(fu["grads"]),
+           "score_adapters_checked": pc,
+           "controls_note": "every R control is the SAME fixed-seed direction per tensor (drawn from the tensor's name), rescaled to its state's "
+                            "per-tensor norms; only R2 is a second draw; a control is zero where a whole tensor of its state is zero",
            "control_seeds": SEEDS, "round_trip_group": int(rt_group) if rt_rows is not None else None, "round_trip_rows": rt_rows,
            "states": rows, "checks": checks, "checks_pass": bool(ok)}
     SS.write_json(os.path.join(out_dir, "rules.json"), tab)
-    log(f"rules.json: {len(rows)} states; checks {'PASS' if ok else 'FAIL'}: {json.dumps({k: v for k, v in checks.items() if k != 'score_adapters_untouched'}, default=float)[:600]}")
+    log(f"rules.json: {len(rows)} states; checks {'PASS' if ok else 'FAIL'}: {json.dumps({k: v for k, v in checks.items() if k != 'score_adapters_untouched'}, default=float)[:900]}")
     return tab
 
 
@@ -187,6 +208,14 @@ def run_states(tr, plan, fu: dict, tab: dict, run_dir: str, adapters_dir: str, r
     return 0
 
 
+def check_build(tab: dict, fu: dict) -> None:
+    """rules.json must have passed its checks and be built from THIS checkpoint and gradient file."""
+    if not tab.get("checks_pass"):
+        raise SS.PlanError("rules.json's checks did not pass")
+    if fu["grad_sha256"] != tab.get("grad_sha256") or fu["meta"]["masters_sha256"] != (tab.get("checkpoint") or {}).get("masters_sha256"):
+        raise SS.PlanError("rules.json was built from another checkpoint or gradient")
+
+
 def phase_build(a) -> int:
     import t8_skyrl as KS
 
@@ -207,11 +236,8 @@ def phase_states(a) -> int:
     try:
         plan = SS.load_step_plan(a.plan)
         tab = SS.read_json(os.path.join(a.build, "rules.json"))
-        if not tab.get("checks_pass"):
-            raise SS.PlanError("rules.json's checks did not pass")
         fu = RU.load_first_update(a.resume, a.grad, MI.sha256, SS.state_sha)
-        if fu["grad_sha256"] != tab["grad_sha256"] or fu["meta"]["masters_sha256"] != tab["checkpoint"]["masters_sha256"]:
-            raise SS.PlanError("rules.json was built from another checkpoint or gradient")
+        check_build(tab, fu)
     except (ValueError, OSError, KeyError) as e:
         print(f"REFUSED: {type(e).__name__}: {e}", flush=True)
         return SS.EXIT_INPUT
@@ -227,6 +253,8 @@ def phase_states(a) -> int:
         rc, why = SS.EXIT_INPUT, str(e)
     except SS.SessionStop as e:
         rc, why = e.code, e.reason
+    except Exception as e:                                    # a trainer gate, a worker failure: the read side must see an end, not wait
+        rc, why = (SS.EXIT_GATE if type(e).__name__ == "T8GateError" else 1), f"{type(e).__name__}: {e}"[:500]
     finally:
         tr.close()
     SS.write_json(os.path.join(a.run_dir, "trainer_end.json"), {"exit": rc, "reason": why, "time": time.time()})

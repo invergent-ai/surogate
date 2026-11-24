@@ -30,7 +30,10 @@ again under the new session, and needs its own GO before the next apply.
 Exit codes: 0 complete; 20 stopped by a verdict, its timeout or the judge's end; 21 round trip not bitwise; 4 a trainer gate; 5 inputs;
 6 the read side failed or its reads were not done in time.
 Phases: check (the plan), trainer (the session), finish (STEP_DONE), stub_judge (TEST ONLY: writes verdicts from a fixed list),
-export_masters (a checkpoint's masters as an adapter directory, for probes).
+export_masters (a checkpoint's masters as an adapter directory, for probes), rule_table and rebuild_ckpt (card-free, t8_rules: the update
+rules' deltas from a first update's checkpoint and gradient; that checkpoint rebuilt under a rule).
+Update rule (--rule, t8_rules): A = the optimizer's own step (the default); P, T, E replace it after the optimizer has stepped. A resume from a
+checkpoint written or rebuilt under another rule must state --rule.
 """
 from __future__ import annotations
 
@@ -198,7 +201,7 @@ def score_adapters_delta(nm: list, cur: list, theta0: list) -> float:
 
 def hist_quantiles(counts, qs=(0.5, 0.9, 0.99, 0.999)) -> dict:
     """Upper bounds of the quantiles of |log ratio| from a histogram over the step code's bin edges (a quantile lies inside the bin whose upper
-    edge is given; the last bin is open: its bound is reported as the last finite edge with "+")."""
+    edge is given; the last bin is open: its bound is reported as ">" + the last finite edge). A non-finite |log ratio| is in no bin."""
     import t8_step as TS
 
     c = np.asarray(counts, dtype=np.int64)
@@ -380,14 +383,18 @@ class Session:
         self.o = {"lr": MI.LR, "verdict_timeout_s": 1200.0, "reads_timeout_s": 2700.0, "poll_s": 2.0, "early_stop": True,
                   "backward_options": {}, "resume": "", "old_lp": "", "plan_dir": "", "cards": [], "close_fn": None, "abort_fn": None,
                   "zero_check_fn": None, "require_backward": None, "pattern_visits": 48, "head": None, "last_update": None,
-                  "rule": "A", "rule_size": 1.0, "rule_eps": None}
+                  "rule": None, "rule_size": 1.0, "rule_eps": None}
         unknown = set(opts) - set(self.o)
         if unknown:
             raise ValueError(f"unknown options {sorted(unknown)}")
         self.o.update(opts)
-        if self.o["rule"] not in RU.RULES or not float(self.o["rule_size"]) > 0 or (self.o["rule"] == "E" and not self.o["rule_eps"]):
-            raise ValueError(f"update rule {self.o['rule']!r}, size {self.o['rule_size']!r}, eps {self.o['rule_eps']!r}")
-        self.rule = {"rule": self.o["rule"], "size": float(self.o["rule_size"]), "eps": self.o["rule_eps"] if self.o["rule"] == "E" else None}
+        # the update rule; None = not stated: the optimizer's own step, EXCEPT on a resume from a checkpoint written or rebuilt under
+        # another rule, which then must state the rule of the updates to come (begin refuses otherwise)
+        self.rule_given = self.o["rule"] is not None
+        rule = self.o["rule"] or "A"
+        if rule not in RU.RULES or not float(self.o["rule_size"]) > 0 or (rule == "E" and not self.o["rule_eps"]):
+            raise ValueError(f"update rule {rule!r}, size {self.o['rule_size']!r}, eps {self.o['rule_eps']!r}")
+        self.rule = {"rule": rule, "size": float(self.o["rule_size"]), "eps": self.o["rule_eps"] if rule == "E" else None}
         self.version = plan.start_version if version is None else version
         self.keys = tuple(tr.shapes[0])
         self.nm = MI.names(len(tr.shapes), self.keys)
@@ -448,6 +455,10 @@ class Session:
             if meta.get("lr") != self.o["lr"] or meta.get("backward_options") != self.o["backward_options"]:
                 raise PlanError(f"the checkpoint was written at lr {meta.get('lr')} with backward options {meta.get('backward_options')}; this "
                                 f"session runs lr {self.o['lr']} with {self.o['backward_options']}")
+            src_rule = meta.get("update_rule") or {"rule": "A", "size": 1.0}
+            if (src_rule.get("rule") != "A" or float(src_rule.get("size", 1.0)) != 1.0 or "rebuilt" in meta) and not self.rule_given:
+                raise PlanError(f"the checkpoint was written under update rule {src_rule}"
+                                + (" and rebuilt" if "rebuilt" in meta else "") + ": this session must state its own rule (--rule)")
             u = int(meta["update"])
             if u == plan.first - 1:                           # (B) the next step's plan: old log-probs at the restored weights
                 self.j0 = 0
@@ -464,7 +475,8 @@ class Session:
             self.cur = masters_list(tr)
             resumed = {"update": u, "meta": meta, "dir": self.o["resume"]}
             self.sess["resumed_from"] = {"dir": self.o["resume"], "update": u, "session_id": meta.get("session_id"),
-                                         "kind": "same plan" if old_file else "next plan"}
+                                         "kind": "same plan" if old_file else "next plan", "update_rule": src_rule,
+                                         "rebuilt": (meta.get("rebuilt") or {}).get("state"), "masters_sha256": meta.get("masters_sha256")}
         elif plan.first != 1:
             raise PlanError(f"a plan whose first update is number {plan.first} needs --resume with the checkpoint of update {plan.first - 1}")
         elif self.o["zero_check_fn"]:
@@ -589,9 +601,10 @@ class Session:
                            [torch.from_numpy(np.array(arr[f"{i}.exp_avg_sq"])) for i in range(len(self.nm))],
                            float(arr["0.step"][0]), tuple(float(b) for b in grp["betas"]))
             d_rule = RU.rule_delta(self.rule["rule"], out.grads, step["clip_coefficient"], d_adam, self.rule["size"], self.rule["eps"], moments)
+            del moments
             step["update_rule_table"] = RU.table_row(f"{self.rule['rule']}:{self.rule['size']:g}", d_rule, d_adam, self.nm, self.blocks)
             put_masters(tr, RU.add_delta(prev, d_rule))
-            del d_adam, d_rule, moments
+            del d_adam, d_rule
         self.cur = masters_list(tr)
         gp = os.path.join(ud, "grad.pt")
         torch.save({x: g.detach() for x, g in zip(self.nm, out.grads)}, gp + ".tmp")
@@ -1070,6 +1083,14 @@ def rebuild_checkpoint(ckpt_dir: str, grad_path: str, spec: str, out_dir: str, e
     new = RU.add_delta(fu["theta0"], d)
     nm, meta = fu["names"], dict(fu["meta"])
     os.makedirs(out_dir, exist_ok=False)
+    # this exporter must reproduce the checkpoint's own adapter file from its masters: else the resumed session, which exports the rebuilt
+    # masters the same way, would only find the mismatch after its trainer is up
+    n0 = int(meta["update"])
+    sha0 = export_fn(fu["theta1"], os.path.join(out_dir, "adapter_of_source"), f"step-session-u{n0}-v")
+    sha0 = sha0[0] if isinstance(sha0, tuple) else sha0
+    if meta.get("adapter_sha256") is not None and sha0 != meta["adapter_sha256"]:
+        raise ValueError(f"this exporter gives {sha0[:16]} for the source checkpoint's masters; the checkpoint recorded {meta['adapter_sha256'][:16]}")
+    shutil.rmtree(os.path.join(out_dir, "adapter_of_source"), ignore_errors=True)
     mp, op = os.path.join(out_dir, "masters.pt"), os.path.join(out_dir, "optimizer.npz")
     torch.save(dict(zip(nm, new)), mp)
     shutil.copyfile(os.path.join(ckpt_dir, "optimizer.npz"), op)
@@ -1135,7 +1156,8 @@ def phase_stub_judge(a) -> int:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--phase", required=True, choices=("check", "trainer", "finish", "stub_judge", "export_masters", "rule_table", "rebuild_ckpt"))
-    ap.add_argument("--rule", default="A", choices=RU.RULES, help="trainer: the update rule (t8_rules); A = the optimizer's own step")
+    ap.add_argument("--rule", default=None, choices=RU.RULES, help="trainer: the update rule (t8_rules); A = the optimizer's own step (the "
+                    "default, except on a resume from a checkpoint of another rule or a rebuilt one, which must state it)")
     ap.add_argument("--rule-size", type=float, default=1.0, help="trainer: the rule's delta multiplied by this")
     ap.add_argument("--rule-eps", type=float, default=1e-6, help="trainer: rule E's eps")
     ap.add_argument("--grad", default="", help="rule_table / rebuild_ckpt: the first update's grad.pt (its grad.json beside it)")

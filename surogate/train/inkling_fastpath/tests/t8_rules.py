@@ -50,32 +50,31 @@ def adam_direction(m: list, v: list, step: float, betas=(0.9, 0.999), eps: float
 
 def rule_delta(rule: str, grads: list, coef: float, d_adam: list, size: float = 1.0, eps: float | None = None, moments=None) -> list:
     """The rule's delta (float64 tensors, one per master). grads: the update's gradient before the clip; coef: the clip coefficient;
-    d_adam: the optimizer's own step (masters after - before); moments = (m, v, step, betas) for rule E."""
+    d_adam: the optimizer's own step (masters after - before); moments = (m, v, step, betas) for rule E.
+    One tensor at a time: beside the result only one tensor's float64 copies exist at any moment (the full set is several GB)."""
     if rule not in RULES:
         raise ValueError(f"rule {rule!r}")
-    dA = [d.double() for d in d_adam]
+    s = float(size)
     if rule == "A":
-        out = dA
-    elif rule == "P":
-        g = [x.double() * coef for x in grads]
-        ng = _norm(g)
-        k = _norm(dA) / ng if ng > 0 else 0.0
-        out = [-k * x for x in g]
-    elif rule == "T":
+        return [d.double() * s for d in d_adam]
+    if rule == "T":
         out = []
-        for x, d in zip(grads, dA):
+        for x, d in zip(grads, d_adam):
             gx = x.double() * coef
             ng = float(gx.norm())
-            out.append(-gx * (float(d.norm()) / ng) if ng > 0 else torch.zeros_like(gx))
-    else:
-        if moments is None or eps is None:
-            raise ValueError("rule E needs the optimizer's moments and an eps")
-        m, v, step, betas = moments
-        u = adam_direction(m, v, step, betas, eps)
-        nu = _norm(u)
-        k = _norm(dA) / nu if nu > 0 else 0.0
-        out = [-k * x for x in u]
-    return [x * float(size) for x in out] if size != 1.0 else out
+            out.append(gx.mul_(-s * float(d.double().norm()) / ng) if ng > 0 else gx.zero_())
+        return out
+    na = _norm(d_adam)                                        # the size both P and E are matched to
+    if rule == "P":
+        ng = float(np.sqrt(sum(float((x.double() * coef).pow(2).sum()) for x in grads)))
+        k = na / ng if ng > 0 else 0.0
+        return [(x.double() * coef).mul_(-k * s) for x in grads]
+    if moments is None or eps is None:
+        raise ValueError("rule E needs the optimizer's moments and an eps")
+    m, v, step, betas = moments
+    nu = float(np.sqrt(sum(float(adam_direction([mi], [vi], step, betas, eps)[0].pow(2).sum()) for mi, vi in zip(m, v))))
+    k = na / nu if nu > 0 else 0.0
+    return [adam_direction([mi], [vi], step, betas, eps)[0].mul_(-k * s) for mi, vi in zip(m, v)]
 
 
 def add_delta(base: list, delta: list) -> list:
@@ -87,9 +86,8 @@ def add_delta(base: list, delta: list) -> list:
 def table_row(name: str, delta: list, d_adam: list, nm: list, blocks: dict) -> dict:
     """What a reader needs to check a rule before any card is used: the delta's L2 norm overall, per layer block and kind (attention / experts),
     the number of non-zero entries, and its cosine with the optimizer's step."""
-    dA = [d.double() for d in d_adam]
-    dot = sum(float((x * y).sum()) for x, y in zip(delta, dA))
-    nd, na = _norm(delta), _norm(dA)
+    dot = sum(float((x * y.double()).sum()) for x, y in zip(delta, d_adam))
+    nd, na = _norm(delta), _norm(d_adam)
     by = {}
     for x, n in zip(delta, nm):
         L, key = n.split(".", 1)
@@ -117,6 +115,11 @@ def load_first_update(ckpt_dir: str, grad_path: str, sha256, state_sha):
     for name in ("masters.pt", "optimizer.npz"):
         if sha256(os.path.join(ckpt_dir, name)) != meta["sha256"][name]:
             raise ValueError(f"{ckpt_dir}: {name} does not match the hash in meta.json")
+    # the masters must be the optimizer's OWN first step: a checkpoint written or rebuilt under another rule, or with weight decay, would
+    # pass every check below and give a "step" that is not the optimizer's
+    ur = meta.get("update_rule") or {"rule": "A", "size": 1.0}    # absent: written before rules existed = the optimizer's step
+    if ur.get("rule") != "A" or float(ur.get("size", 1.0)) != 1.0 or "rebuilt" in meta or float(meta["optimizer"]["weight_decay"]) != 0.0:
+        raise ValueError("not a checkpoint of the optimizer's own first step (another update rule, a rebuilt checkpoint, or weight decay)")
     saved = torch.load(os.path.join(ckpt_dir, "masters.pt"), map_location="cpu", weights_only=True)
     nm = list(saved)
     theta1 = [saved[n].float() for n in nm]

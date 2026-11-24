@@ -12,7 +12,7 @@ per state, in rules.json's order, when states/<name>/TRAINER_READY.json appears,
 end:    without an adapter again: the round-trip rows and every set named for the re-read -> base/<set>/base2.npz; every re-read must
         equal the first read bitwise (base/reread.json; exit 21 if not). RULES_DONE lists every file of the run with its sha256.
 The row-to-engine split of a set is the same for every read of it. The round-trip rows are a fixed choice from one plan group: its two longest
-and its four shortest rows (pick_round_trip_rows).
+and its six shortest rows (pick_round_trip_rows).
 """
 from __future__ import annotations
 
@@ -30,9 +30,10 @@ import t8_stepsession_reads as RD  # noqa: E402
 
 
 def pick_round_trip_rows(T: dict) -> list:
-    """From {plan row: length} of one group: the two longest and the four shortest rows (all of them if the group has six or fewer)."""
+    """From {plan row: length} of one group: the two longest and the six shortest rows (all of them if the group has eight or fewer).
+    Eight rows: every read engine of an eight-card session (seven engines) must hold at least one."""
     by = sorted(T, key=lambda n: (T[n], n))
-    return sorted(by) if len(by) <= 6 else sorted(by[:4] + by[-2:])
+    return sorted(by) if len(by) <= 8 else sorted(by[:6] + by[-2:])
 
 
 class StateReader(RD.Reader):
@@ -181,6 +182,16 @@ class StateReader(RD.Reader):
         return 0
 
 
+def check_sets(rules: dict, rd: "StateReader") -> None:
+    """Every set a state names must be one the read side holds, every set it holds must be named by a state, and the round-trip rows must be
+    rules.json's: a mismatch found at the last state would cost the whole run."""
+    need = {s for r in rules["states"] for s in r["sets"]}
+    if need != set(rd.sets):
+        raise ValueError(f"rules.json names the sets {sorted(need)}; the read side was given {sorted(rd.sets)}")
+    if rules.get("round_trip_rows") is not None and (sorted(rules["round_trip_rows"]) != rd.rt.rows or rules.get("round_trip_group") != rd.rt_group):
+        raise ValueError("rules.json names other round-trip rows than this plan and group give")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--urls", required=True)
@@ -198,8 +209,10 @@ def main():
     try:
         names = [r["name"] for r in json.load(open(a.rules))["states"]]
         eng = open(a.engine_sha_file).read().strip() if a.engine_sha_file else ""
+        rules = json.load(open(a.rules))
         rd = StateReader(RD.HttpClient(a.model), [u for u in a.urls.split(",") if u], a.run_dir, a.plan, dict(x.split("=", 1) for x in a.set),
                          [g for g in a.own_groups.split(",") if g], a.rt_group, a.reread.split(","), eng)
+        check_sets(rules, rd)                                 # before a single token is read
         rc = rd.serve_states(names)
     except (ValueError, KeyError, OSError) as e:
         RD.log(f"READ SIDE: inputs: {type(e).__name__}: {e}")

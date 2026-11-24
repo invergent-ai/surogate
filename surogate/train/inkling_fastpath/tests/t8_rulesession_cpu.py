@@ -64,10 +64,10 @@ def run_session(tmp, name, plan_dir, build_dir, ck, grad, panel_dir, engines):
 def main():
     tmp = tempfile.mkdtemp(dir=os.environ.get("TMPDIR"))
     # (1)
-    st = RS.parse_states("A8=t0x+census+own,R2A8=t0x,RP8=t0x,E12=t0x")
+    st = RS.parse_states("A8=p1+p2+own,R2A8=p1,RP8=p1,E12=p1")
     assert [(s["name"], s["kind"], s["rule"], s["size"], s["draw"]) for s in st] == [("A8", "rule", "A", 8.0, None), ("R2A8", "control", "A", 8.0, "R2"),
                                                                                      ("RP8", "control", "P", 8.0, "R"), ("E12", "rule", "E", 12.0, None)]
-    assert st[0]["sets"] == ["t0x", "census", "own"]
+    assert st[0]["sets"] == ["p1", "p2", "own"]
     for bad in ("X8=a", "A8", "A8=a,A8=b", "RR8=a", ""):
         try:
             RS.parse_states(bad)
@@ -75,7 +75,8 @@ def main():
         except ValueError:
             pass
     T = {n: 100 + 7 * n for n in range(10)}
-    assert RR.pick_round_trip_rows(T) == [0, 1, 2, 3, 8, 9] and RR.pick_round_trip_rows({3: 5, 4: 9}) == [3, 4]
+    assert RR.pick_round_trip_rows(T) == [0, 1, 2, 3, 4, 5, 8, 9] and RR.pick_round_trip_rows({3: 5, 4: 9}) == [3, 4]
+    assert RR.pick_round_trip_rows({n: 50 - n for n in range(12)}) == [0, 1, 6, 7, 8, 9, 10, 11]
     print("(1) state list and round-trip row choice: PASS")
 
     # a first update on the fake, through the step session itself
@@ -99,6 +100,7 @@ def main():
     assert all(abs(by[k]["l2"] - s * na) <= 1e-6 * s * na for k, s in (("A8", 8), ("P8", 8), ("E8", 8), ("A4", 4), ("P12", 12))) and abs(by["A8"]["cos_with_adam_step"] - 1) <= 1e-9
     assert 0 < by["P8"]["cos_with_adam_step"] < 1 and abs(by["P12"]["first_order"]["at_size"] - 12 * by["P12"]["first_order"]["size_1"]) <= 1e-9 * abs(by["P12"]["first_order"]["at_size"])
     assert abs(by["P8"]["first_order"]["size_1"] - by["P12"]["first_order"]["size_1"]) <= 1e-9 * abs(by["P8"]["first_order"]["size_1"]) and by["P8"]["first_order"]["at_size"] > 0
+    assert set(tab["checks"]["control_per_tensor_norm_vs_its_state"]) == {"RA8", "R2A8", "RP8"} and all(tab["checks"]["control_zero_where_its_state_is_zero"].values())
     for ctl, of in (("RA8", "A8"), ("R2A8", "A8"), ("RP8", "P8")):
         assert by[ctl]["kind"] == "control" and by[ctl]["of"] == of and abs(by[ctl]["cos_with_adam_step"]) < 0.5
         for k in nm:                                          # the rule state's per-tensor norms (to fp32 rounding), zero where it is zero
@@ -149,8 +151,28 @@ def main():
     assert os.path.exists(os.path.join(run4, "states", "A8", "READS_DONE")) and not os.path.exists(os.path.join(run4, "states", "P8", "READS_DONE"))
     assert json.load(open(os.path.join(run4, "states", "P8", "roundtrip", "result.json")))["result"] == "differ" and not os.path.exists(os.path.join(run4, "RULES_DONE"))
     fu2 = RU.load_first_update(ck, grad, MI.sha256, SS.state_sha)
-    bad_tab = dict(tab, grad_sha256="0" * 64)
-    assert fu2["grad_sha256"] != bad_tab["grad_sha256"]
+    RS.check_build(tab, fu2)
+    for what, bad_tab in (("another gradient", dict(tab, grad_sha256="0" * 64)), ("failed checks", dict(tab, checks_pass=False)),
+                          ("another checkpoint", dict(tab, checkpoint=dict(tab["checkpoint"], masters_sha256="0" * 64)))):
+        try:
+            RS.check_build(bad_tab, fu2)
+            raise AssertionError(f"a rules.json with {what} was accepted")
+        except SS.PlanError:
+            pass
+    rd_ok = RR.StateReader(C.FakeEngines(), ["e0", "e1"], os.path.join(tmp, "rules"), plan_dir, {"a": panel_dir}, [0, 1], 0, ["a"], engine_sha="fake")
+    RR.check_sets(tab, rd_ok)
+    for what, kw in (("a set the states do not name", {"sets": {"a": panel_dir, "b": panel_dir}, "own": [0, 1]}), ("no own set", {"sets": {"a": panel_dir}, "own": []})):
+        rd_bad = RR.StateReader(C.FakeEngines(), ["e0", "e1"], os.path.join(tmp, "rules"), plan_dir, kw["sets"], kw["own"], 0, ["a"], engine_sha="fake")
+        try:
+            RR.check_sets(tab, rd_bad)
+            raise AssertionError(what)
+        except ValueError:
+            pass
+    try:                                                      # more engines than round-trip rows: refused when the read side is built
+        RR.StateReader(C.FakeEngines(), [f"e{i}" for i in range(4)], os.path.join(tmp, "rules"), plan_dir, {"a": panel_dir}, [0, 1], 0, ["a"], engine_sha="fake")
+        raise AssertionError("four engines for three round-trip rows were accepted")
+    except ValueError:
+        pass
     tr = P.FakeTrainer(C.cfg_for(tmp), 1)
     t2 = dict(tab, states=[dict(tab["states"][0], masters_sha256="0" * 64)])
     os.makedirs(os.path.join(tmp, "rules_badsha"))
@@ -159,7 +181,8 @@ def main():
         raise AssertionError("a state whose rebuilt masters do not match rules.json was handed over")
     except SS.GateFailure:
         pass
-    print("(4) a leaked state stops the read side (exit 21, nothing listed for it); a state that does not match rules.json is not handed over: PASS")
+    print("(4) a leaked state stops the read side (exit 21, nothing listed for it); a state that does not match rules.json is not handed over; "
+          "rules.json from another gradient or checkpoint, set names that do not match, too few round-trip rows are refused: PASS")
     print("T8 RULE SESSION CPU TEST: PASS")
     return 0
 

@@ -702,10 +702,29 @@ def main():
     hand1 = by_hand("P", None, updates_=(0,))
     assert mP_["masters_sha256"] == SS.state_sha(hand1.opt.masters, nm) != m9_["masters_sha256"], "the rebuilt masters are not theta0 + P(g1)"
     handP = by_hand("P", None)
+    rcx, _, _, sx, _ = session(tmp, "refuse_rebuilt_without_rule", plan_dir, [], resume=os.path.join(tmp, "rebuilt_P"), old_lp=os.path.join(run9, "old_lp.npz"))
+    assert rcx == SS.EXIT_INPUT and "--rule" in sx.sess["exit"]["reason"], sx.sess["exit"]      # a rebuilt checkpoint needs the rule stated
     rcq, runq, trq, sq, _ = session(tmp, "resume_rebuilt_P", plan_dir, ["GO", "GO"], panels=panels, rule="P",
                                     resume=os.path.join(tmp, "rebuilt_P"), old_lp=os.path.join(run9, "old_lp.npz"))
     assert rcq == 0 and all(torch.equal(a, b) for a, b in zip(trq.opt.masters, handP.opt.masters)) and same_state(opt_state(trq), opt_state(handP)), sq.sess["exit"]
     assert json.load(open(os.path.join(runq, "updates", "1", "adapters.json")))["v"]["sha256"] == mP_["adapter_sha256"]
+    assert sq.sess["resumed_from"]["rebuilt"] == "P:1" and sq.sess["resumed_from"]["update_rule"]["rule"] == "P" and sq.sess["update_rule"]["rule"] == "P"
+    ck_p1 = os.path.join(tmp, "rule_P", "updates", "1", "ckpt")      # a checkpoint WRITTEN under P: not the optimizer's own step
+    for what, args_ in (("a checkpoint written under P", (ck_p1, os.path.join(tmp, "rule_P", "updates", "1", "grad.pt"))),
+                        ("a rebuilt checkpoint", (os.path.join(tmp, "rebuilt_P"), g9))):
+        try:
+            RU.load_first_update(*args_, MI.sha256, SS.state_sha)
+            raise AssertionError(f"load_first_update accepted {what}")
+        except ValueError as e:
+            assert "own first step" in str(e), (what, str(e))
+    rcx, _, _, sx, _ = session(tmp, "refuse_ruleP_ckpt_without_rule", plan_dir, [], resume=ck_p1, old_lp=os.path.join(tmp, "rule_P", "old_lp.npz"))
+    assert rcx == SS.EXIT_INPUT, sx.sess["exit"]
+    bad_exp = lambda st, dst, tag: "0" * 64                    # noqa: E731  an exporter that does not reproduce the source's adapter file
+    try:
+        SS.rebuild_checkpoint(ck9, g9, "P:1", os.path.join(tmp, "rebuilt_bad_exporter"), bad_exp, BLOCKS)
+        raise AssertionError("rebuild accepted an exporter that does not reproduce the checkpoint's adapter")
+    except ValueError:
+        pass
     tab = SS.rule_table(ck9, g9, ["A:1", "P:1", "T:1", "E:1:1e-6", "P:8"], BLOCKS, os.path.join(tmp, "rule_table.json"))
     rows_t = {r_["state"]: r_ for r_ in tab["states"]}
     assert abs(rows_t["A:1"]["cos_with_adam_step"] - 1.0) <= 1e-12 and abs(rows_t["P:8"]["l2"] - 8 * rows_t["P:1"]["l2"]) <= 1e-9 * rows_t["P:8"]["l2"]
