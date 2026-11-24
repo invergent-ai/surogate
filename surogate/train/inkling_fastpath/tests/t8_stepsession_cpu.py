@@ -557,7 +557,41 @@ def main():
     zplan = write_step_plan(os.path.join(tmp, "plan_zero_update"), z0, [[0], [1, 2, 3]])
     rc7, run7, _, s7, _ = session(tmp, "zero_update", zplan, ["GO", "GO"], panels=panels)
     assert rc7 == SS.EXIT_GATE and "exactly zero" in s7.sess["exit"]["reason"], s7.sess["exit"]
+    # (8) the recipe is pinned: required backward options, the plan's settings, and the pattern-constant backward's signature
+    rc8, _, _, s8, _ = session(tmp, "pin_backward", plan_dir, [], backward_options={"pattern_grad_from": 0, "gate_grad_from": 0, "bank_grad_from": 0},
+                               require_backward={"pattern_grad_from": 48, "gate_grad_from": 48, "bank_grad_from": 0})
+    assert rc8 == SS.EXIT_INPUT and "required" in s8.sess["exit"]["reason"], s8.sess["exit"]
+    for what, st in (("lr", {"lr": 1e-5, "clip": 1.0}), ("clip", {"lr": MI.LR, "clip": 0.5}), ("head", {"head": "centred"})):
+        d8 = write_step_plan(os.path.join(tmp, "plan_settings_" + what), rows, [[0, 1], [2, 3]], {"settings": st})
+        rc8, _, _, s8, _ = session(tmp, "pin_" + what, d8, [], head="plain")
+        assert rc8 == SS.EXIT_INPUT and what in s8.sess["exit"]["reason"], (what, s8.sess["exit"])
+    d8 = write_step_plan(os.path.join(tmp, "plan_settings_ok"), rows, [[0, 1], [2, 3]], {"settings": {"lr": MI.LR, "clip": 1.0, "head": "plain", "row_cap": 58010}})
+    bo = {"pattern_grad_from": 48, "gate_grad_from": 48, "bank_grad_from": 0}
+    rc8, run8, _, s8, _ = session(tmp, "pin_ok", d8, ["GO", "GO"], panels=panels, head="plain", backward_options=bo, require_backward=dict(bo), pattern_visits=48)
+    assert rc8 == 0 and s8.sess["recipe"]["plan_settings"] == {"lr": MI.LR, "clip": 1.0, "head": "plain"}, s8.sess["exit"]
+    assert json.load(open(os.path.join(run8, "updates", "2", "step.json")))["score_adapters_delta_max_abs"] == 0.0   # the fake has no such adapter
+    nm8 = ["0.qA", "0.qB", "0.vB", "1.kB", "1.rA", "1.B13"]
+    t8 = [torch.ones(3) for _ in nm8]
+    moved = [t.clone() for t in t8]
+    moved[2] += 1.0
+    moved[5] += 1.0
+    assert SS.score_adapters_delta(nm8, moved, t8) == 0.0     # v and the experts may move
+    for i in (0, 1, 3, 4):
+        m_ = [t.clone() for t in moved]
+        m_[i][1] += 1e-7
+        assert SS.score_adapters_delta(nm8, m_, t8) > 0.0, nm8[i]
+    try:
+        load(write_step_plan(os.path.join(tmp, "bad_rt_other_update"), rows, [[0, 1], [2, 3]], {"round_trip_group": [2, 0]}))
+        raise AssertionError("a round-trip group of another update was accepted")
+    except SS.PlanError:
+        pass
+    ads = {"X": os.path.join(run, "work", "adapters", "u1_v"), "Y": os.path.join(run, "work", "adapters", "u2_v")}
+    os.makedirs(os.path.join(tmp, "probe"), exist_ok=True)
+    assert RD.probe(FakeEngines(), ["e0", "e1"], panels, ads, os.path.join(tmp, "probe")) == 0
+    assert RD.probe(FakeEngines(leak=True), ["e0", "e1"], panels, ads, os.path.join(tmp, "probe")) == RD.EXIT_ROUNDTRIP   # Y served with X's state
+    assert RD.probe(FakeEngines(), ["e0", "e1"], panels, {"X": ads["X"], "Y": ads["X"]}, os.path.join(tmp, "probe")) == RD.EXIT_ROUNDTRIP   # empty comparison
     print("(7) zero-seed rows: gradient bitwise with and without their backward; counted; in the sketch records; an update that moves nothing is a gate: PASS")
+    print("(8) the recipe is pinned: required backward options, the plan's lr / clip / head, the score adapters' signature; the adapter-swap probe: PASS")
     print("T8 STEP SESSION CPU TEST: PASS")
     return 0
 

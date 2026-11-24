@@ -28,7 +28,8 @@ plan whose first update is u + 1 (old log-probs recomputed at the restored weigh
 again under the new session, and needs its own GO before the next apply.
 Exit codes: 0 complete; 20 stopped by a verdict, its timeout or the judge's end; 21 round trip not bitwise; 4 a trainer gate; 5 inputs;
 6 the read side failed or its reads were not done in time.
-Phases: check (the plan), trainer (the session), finish (STEP_DONE), stub_judge (TEST ONLY: writes verdicts from a fixed list).
+Phases: check (the plan), trainer (the session), finish (STEP_DONE), stub_judge (TEST ONLY: writes verdicts from a fixed list),
+export_masters (a checkpoint's masters as an adapter directory, for probes).
 """
 from __future__ import annotations
 
@@ -140,8 +141,9 @@ def load_step_plan(plan_dir: str, cap: int = MI.CAP) -> StepPlan:
     rt = meta.get("round_trip_group")
     if rt is None:
         rt = [int(u[0]) for u in ups]
-    if not isinstance(rt, list) or len(rt) != len(ups) or any(int(g) not in seq for g in rt):
-        raise PlanError('"round_trip_group": one group id of the plan per update')
+    if not isinstance(rt, list) or len(rt) != len(ups) or any(int(g) not in [int(x) for x in u] for g, u in zip(rt, ups)):
+        raise PlanError('"round_trip_group": one group id per update, a group of that update')
+    settings = meta.get("settings") if isinstance(meta.get("settings"), dict) else {}
     first = int(meta.get("first_update_number", 1))
     if first < 1:
         raise PlanError('"first_update_number" must be >= 1')
@@ -153,6 +155,7 @@ def load_step_plan(plan_dir: str, cap: int = MI.CAP) -> StepPlan:
             raise PlanError(f'rows of another adapter version than start_version {sv}: the lagged-row path is not built; refused')
     info = dict(info, updates=[len(u) for u in updates], update_groups=[[int(g) for g in u] for u in ups], first_update_number=first,
                 start_version=sv, round_trip_group=[int(g) for g in rt], rows_json_sha256=json_sha,
+                settings={k: settings.get(k) for k in ("lr", "clip", "head") if k in settings},
                 update_loss_tokens=[int(sum(int(rows[i].loss_mask.sum()) for i in u)) for u in updates],
                 update_row_tokens=[int(sum(rows[i].T for i in u)) for u in updates])
     return StepPlan(rows, info, updates, [int(g) for g in rt], first, sv, seq)
@@ -180,6 +183,15 @@ def control_state(theta0: list, cur: list, nm: list, seed: int) -> list:
         r = MI.random_like([c - t0], [n], 1.0, seed)[0]
         out.append((t0.double() + r).float())
     return out
+
+
+def score_adapters_delta(nm: list, cur: list, theta0: list) -> float:
+    """max |cur - theta0| over the attention adapters that act only through the scores (keys qA, qB, kA, kB, rA, rB); 0.0 if there are none."""
+    worst = 0.0
+    for n, c, t0 in zip(nm, cur, theta0):
+        if n.split(".", 1)[1] in ("qA", "qB", "kA", "kB", "rA", "rB"):
+            worst = max(worst, float((c - t0).abs().max()))
+    return worst
 
 
 def save_ckpt(tr, d: str, nm: list, meta: dict) -> dict:
@@ -295,6 +307,8 @@ class Watch:
             if bad and self.s.armed:
                 signal.pthread_kill(main, signal.SIGUSR1)
                 return
+            if bad is None and self.n is not None and os.path.exists(os.path.join(self.s.ud(self.n), "VERDICT.json")):
+                return                                        # a well-formed GO is there: the wait after the gradient checks it once more
 
     def __exit__(self, *a):
         self.s.armed = False
@@ -345,7 +359,7 @@ class Session:
         self.tr, self.plan, self.run, self.work, self.sid, self.export_fn, self.blocks = tr, plan, run_dir, work_dir, session_id, export_fn, blocks
         self.o = {"lr": MI.LR, "verdict_timeout_s": 1200.0, "reads_timeout_s": 2700.0, "poll_s": 2.0, "early_stop": True,
                   "backward_options": {}, "resume": "", "old_lp": "", "plan_dir": "", "cards": [], "close_fn": None, "abort_fn": None,
-                  "zero_check_fn": None}
+                  "zero_check_fn": None, "require_backward": None, "pattern_visits": 48, "head": None}
         unknown = set(opts) - set(self.o)
         if unknown:
             raise ValueError(f"unknown options {sorted(unknown)}")
@@ -385,6 +399,17 @@ class Session:
     # ------------------------------------------------------------------ start
     def begin(self) -> None:
         tr, plan, rows = self.tr, self.plan, self.plan.rows
+        # the recipe is pinned before anything runs: the backward's options against the value the launch requires, lr / clip / head against
+        # the plan's settings (a mistyped or empty option string would otherwise train another estimator without a word)
+        req, bo = self.o["require_backward"], self.o["backward_options"]
+        if req is not None and {k: int(bo.get(k, 0)) for k in req} != {k: int(v) for k, v in req.items()}:
+            raise PlanError(f"backward options {bo} are not the required {req}")
+        st = plan.info.get("settings") or {}
+        have = {"lr": self.o["lr"], "clip": float(tr.opt.max_grad_norm), "head": self.o["head"]}
+        for k, v in st.items():
+            if have[k] is not None and v is not None and have[k] != v:
+                raise PlanError(f"the plan's settings say {k} = {v!r}; this session runs {k} = {have[k]!r}")
+        self.sess["recipe"] = {"required_backward": req, "plan_settings": st, "session": have}
         self.theta0 = masters_list(tr)                        # a new trainer holds the run's start adapter (a fixed function of its seed)
         self.sess["theta0_sha256"] = state_sha(self.theta0, self.nm)
         b_names = [i for i, n in enumerate(self.nm) if n.split(".", 1)[1].endswith("B") or n.split(".", 1)[1] in ("B13", "B2")]
@@ -528,6 +553,14 @@ class Session:
         if first_ever and self.zero_start and step["A_delta_max_abs"] != 0.0:
             write_json(os.path.join(ud, "step.json"), dict(step, gate_failures=["A moved at the first update from B = 0"]))
             raise GateFailure(f"update {n}: A moved by {step['A_delta_max_abs']} at the first update from B = 0")
+        # the pattern-constant backward's signature: when EVERY visit holds its attention pattern constant, the adapters that act only through
+        # the scores (q, k and the relative bias r) get exactly zero gradient, so they stay at the run's start values, bit for bit
+        if int(self.o["backward_options"].get("pattern_grad_from", 0)) >= int(self.o["pattern_visits"]):
+            step["score_adapters_delta_max_abs"] = score_adapters_delta(self.nm, self.cur, self.theta0)
+            if step["score_adapters_delta_max_abs"] != 0.0:
+                write_json(os.path.join(ud, "step.json"), dict(step, gate_failures=["a q / k / r attention adapter moved under the pattern-constant backward"]))
+                raise GateFailure(f"update {n}: a q / k / r attention adapter moved by {step['score_adapters_delta_max_abs']} "
+                                  "although every visit holds its attention pattern constant")
         step["min_mem_available_gb"] = self.mem.take()
         self.sess["updates"][str(n)] = {k: step[k] for k in ("N", "rows", "policy_loss", "clip_share", "ratio_max", "grad_norm", "gradient_wall_s",
                                                               "tok_per_s_per_card", "min_mem_available_gb")}
@@ -808,6 +841,15 @@ def phase_trainer(a) -> int:
         print(f"PLAN REFUSED: {e}", flush=True)
         return EXIT_INPUT
     cards = tuple(int(x) for x in a.cards.split(","))
+    try:                                                      # the backward options the launch REQUIRES, stated a second time on purpose
+        p_, g_, b_ = (int(x) for x in a.require_backward.split(","))
+    except ValueError:
+        print("--require-backward <pattern_grad_from>,<gate_grad_from>,<bank_grad_from> is needed (e.g. 48,48,0; 0,0,0 = the exact backward)", flush=True)
+        return EXIT_INPUT
+    required = {"pattern_grad_from": p_, "gate_grad_from": g_, "bank_grad_from": b_}
+    if MI.backward_options(a) != required:
+        print(f"backward options {MI.backward_options(a)} are not the required {required}: refused before the trainer is built", flush=True)
+        return EXIT_INPUT
     sid_file = os.path.join(a.run_dir, "session_id.txt")
     sid = open(sid_file).read().strip() if os.path.exists(sid_file) else f"step-{time.strftime('%Y%m%dT%H%M%S')}-{os.getpid()}"
     def _term(signum, frame):                                 # from here on a TERM ends this process through its exit handlers,
@@ -849,7 +891,8 @@ def phase_trainer(a) -> int:
 
     s = Session(tr, plan, a.run_dir, a.work, sid, export, KS.BLOCKS, lr=a.lr, verdict_timeout_s=a.verdict_timeout_min * 60.0,
                 reads_timeout_s=a.reads_timeout_min * 60.0, early_stop=not a.no_early_stop, backward_options=MI.backward_options(a),
-                resume=a.resume, old_lp=a.old_lp, plan_dir=a.plan, cards=list(cards), close_fn=tr.close, abort_fn=abort, zero_check_fn=zero_check)
+                resume=a.resume, old_lp=a.old_lp, plan_dir=a.plan, cards=list(cards), close_fn=tr.close, abort_fn=abort, zero_check_fn=zero_check,
+                require_backward=required, pattern_visits=int(tr.cfg.visits), head=str(tr.cfg.head))
     install_signals(s)
     rc = s.run_all()
     signal.alarm(0)
@@ -888,6 +931,33 @@ def phase_finish(a) -> int:
     return 0
 
 
+def phase_export_masters(a) -> int:
+    """A checkpoint's masters.pt written as an adapter directory <work>/adapters/<tag>, on the CPU (no trainer, no card): for probes that need
+    adapter files outside a session. --scale-b f multiplies every B tensor by f (a second, different adapter from the same file)."""
+    import t8_adapter as TA
+    import t8_step as TS
+
+    saved = torch.load(a.masters, map_location="cpu", weights_only=True)
+    keys = TS.param_keys(64)
+    n_layers = 1 + max(int(n.split(".", 1)[0]) for n in saved)
+    if sorted(saved) != sorted(MI.names(n_layers, keys)):
+        print("the file does not hold the full adapter's tensors (experts + attention rank 64)", flush=True)
+        return EXIT_INPUT
+    layers = []
+    for L in range(n_layers):
+        d = {}
+        for k in keys:
+            t = saved[f"{L}.{k}"].float()
+            if a.scale_b != 1.0 and (k.endswith("B") or k in ("B13", "B2")):
+                t = t * float(a.scale_b)
+            d[k] = t.numpy()
+        layers.append(d)
+    dst = os.path.join(a.work, "adapters", a.tag)
+    sha = TA.export_combined(layers, dst, 64, 32.0, int(saved["0.A13"].shape[1]), "BF16", metadata={"step": f"probe-{a.tag}"})
+    print(f"exported {a.tag} (B x {a.scale_b}) -> {dst}: {sha}", flush=True)
+    return 0
+
+
 def phase_stub_judge(a) -> int:
     """TEST ONLY (smokes and CPU tests): stands where the loop side's judge runs. For each update in order it waits for READS_DONE and writes
     VERDICT.json with the next outcome of --outcomes; "NONE" writes nothing (the session's timeout), "BADHASH" a GO with one wrong hash."""
@@ -921,7 +991,10 @@ def phase_stub_judge(a) -> int:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--phase", required=True, choices=("check", "trainer", "finish", "stub_judge"))
+    ap.add_argument("--phase", required=True, choices=("check", "trainer", "finish", "stub_judge", "export_masters"))
+    ap.add_argument("--masters", default="", help="export_masters: a checkpoint's masters.pt")
+    ap.add_argument("--tag", default="X", help="export_masters: the adapter directory's name")
+    ap.add_argument("--scale-b", type=float, default=1.0, help="export_masters: every B tensor multiplied by this")
     ap.add_argument("--plan", default="")
     ap.add_argument("--bin", default="")
     ap.add_argument("--artifact", default="")
@@ -934,6 +1007,8 @@ def main():
     ap.add_argument("--resume", default="", help="a checkpoint directory (updates/<n>/ckpt of an earlier session)")
     ap.add_argument("--old-lp", default="", help="resume inside a step: that session's old_lp.npz")
     ap.add_argument("--transfer", default="", help="finish: the transfer plan directory, when its reads are part of the step")
+    ap.add_argument("--require-backward", default="", help="trainer: the backward options this launch must run with, as p,g,b (compared "
+                    "with --pattern-grad-from / --gate-grad-from / --bank-grad-from; a mismatch is refused)")
     ap.add_argument("--no-early-stop", action="store_true", help="do not interrupt a running gradient when the previous update is stopped")
     ap.add_argument("--deadline-min", type=float, default=0.0)
     ap.add_argument("--outcomes", default="", help="stub_judge: comma list, one per update: GO, STOP, INCONCLUSIVE, NONE, BADHASH")
@@ -944,7 +1019,8 @@ def main():
     a = ap.parse_args()
     if a.bank_grad_from:
         ap.error("--bank-grad-from cannot run in this session: its trainer runs with lean_host (the sketches)")
-    return {"check": phase_check, "trainer": phase_trainer, "finish": phase_finish, "stub_judge": phase_stub_judge}[a.phase](a)
+    return {"check": phase_check, "trainer": phase_trainer, "finish": phase_finish, "stub_judge": phase_stub_judge,
+            "export_masters": phase_export_masters}[a.phase](a)
 
 
 if __name__ == "__main__":

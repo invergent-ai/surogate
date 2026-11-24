@@ -110,17 +110,19 @@ class RowSet:
         if any(n not in self.T for n in self.rows):
             raise ValueError(f"{tag}: rows {self.rows} are not all in the file")
 
-    def subset(self, tag: str, only) -> "RowSet":
+    def subset(self, tag: str, only, reverse: bool = False) -> "RowSet":
         s = RowSet.__new__(RowSet)
         s.__dict__.update(self.__dict__)
-        s.tag, s.rows = tag, sorted(int(n) for n in only)
+        s.tag, s.rows, s.reverse = tag, sorted(int(n) for n in only), reverse
         if any(n not in self.T for n in s.rows):
             raise ValueError(f"{tag}: rows {s.rows} are not all in the file")
         return s
 
     def share(self, e: int, engines: int) -> list:
-        """Engine e's rows: longest first to the engine with the fewest tokens (t8_micro_reads.split), on this set's rows only."""
-        return MR.split({n: self.T[n] for n in self.rows}, engines)[e]
+        """Engine e's rows: longest first to the engine with the fewest tokens (t8_micro_reads.split), on this set's rows only.
+        A reversed set gives the same rows in the opposite order (shortest first)."""
+        mine = MR.split({n: self.T[n] for n in self.rows}, engines)[e]
+        return mine[::-1] if getattr(self, "reverse", False) else mine
 
     def ids(self, n):
         return self.z[f"ids_{n}"]
@@ -301,7 +303,9 @@ class Reader:
         rt, base0 = self.rt_sets[g], self.rt_base[g]
         adapters = [(name, ads[name]["lora_name"], ads[name]["path"]) for name in NAMES] + [("base2", None, None)]
         t0 = time.time()
-        res = run_pass(self.c, self.urls, adapters, [rt] + list(self.panels.values()) + [rt.subset("rt2", rt.rows)])
+        # the last read runs the engine's round-trip rows in the opposite order: the last request under one adapter and the first under
+        # the next are then the SAME row (the engine's longest)
+        res = run_pass(self.c, self.urls, adapters, [rt] + list(self.panels.values()) + [rt.subset("rt2", rt.rows, reverse=True)])
         # the round trip
         rd = os.path.join(ud, "roundtrip")
         checks, differ_total = {}, 0
@@ -388,9 +392,55 @@ class Reader:
         return 0
 
 
+def probe(client, urls, panels: dict, adapters: dict, run_dir: str) -> int:
+    """Adapter-swap probe on panel rows. Engine 0: load X; read each panel's shortest and longest row; unload X; load Y (the swap a session
+    makes); read the longest and the shortest row, twice. Engine 1, which never saw X: load Y; read the same rows. PASS line (exit 0): every
+    read under Y on engine 0, at EVERY position of the row, equals engine 1's bit for bit, and X differs from Y somewhere on every row (else
+    the comparison would be empty). Exit 21 otherwise. -> <run dir>/probe.json"""
+    if len(urls) != 2 or set(adapters) != {"X", "Y"}:
+        raise ValueError("the probe takes two engines and the adapters X and Y")
+    e0, e1 = urls
+    rows = []
+    for name, d in panels.items():
+        rs = RowSet(name, d)
+        by = sorted(rs.rows, key=lambda n: (rs.T[n], n))
+        rows += [(name, by[0], rs), (name, by[-1], rs)]
+
+    def read(url, lora):
+        return {(nm, n): np.asarray(client.score(url, lora, rs.ids(n)), dtype=np.float32) for nm, n, rs in order}
+
+    order = rows                                              # shortest, longest per panel
+    client.load(e0, "probe_X", adapters["X"])
+    x0 = read(e0, "probe_X")
+    client.unload(e0, "probe_X")
+    client.load(e0, "probe_Y", adapters["Y"])
+    order = rows[::-1]                                        # the row asked last under X is asked first under Y
+    y0a = read(e0, "probe_Y")
+    y0b = read(e0, "probe_Y")
+    client.unload(e0, "probe_Y")
+    client.load(e1, "probe_Y", adapters["Y"])                 # the fresh engine
+    y1 = read(e1, "probe_Y")
+    client.unload(e1, "probe_Y")
+    rep, ok = {"rows": [], "engines": urls}, True
+    for nm, n, rs in rows:
+        k = (nm, n)
+        bits = lambda a, b: int((a.view(np.int32) != b.view(np.int32)).sum())  # noqa: E731
+        r = {"panel": nm, "row": int(n), "T": rs.T[n], "swapped_first_vs_fresh": bits(y0a[k], y1[k]), "swapped_second_vs_fresh": bits(y0b[k], y1[k]),
+             "X_vs_Y_positions_differing": bits(x0[k], y1[k])}
+        ok = ok and r["swapped_first_vs_fresh"] == 0 and r["swapped_second_vs_fresh"] == 0 and r["X_vs_Y_positions_differing"] > 0
+        rep["rows"].append(r)
+        log(f"probe {nm} row {n} (T {rs.T[n]}): after the swap vs a fresh engine: {r['swapped_first_vs_fresh']} / {r['swapped_second_vs_fresh']} "
+            f"positions differ; X vs Y: {r['X_vs_Y_positions_differing']}")
+    rep["result"] = "equal" if ok else "differ"
+    write_json(os.path.join(run_dir, "probe.json"), rep)
+    log(f"ADAPTER-SWAP PROBE: {'PASS' if ok else 'FAIL'}")
+    return 0 if ok else EXIT_ROUNDTRIP
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--phase", required=True, choices=("serve", "transfer"))
+    ap.add_argument("--phase", required=True, choices=("serve", "transfer", "probe"))
+    ap.add_argument("--probe-adapters", default="", help="probe: X=<adapter dir>,Y=<adapter dir>")
     ap.add_argument("--urls", required=True, help="comma list of engine URLs")
     ap.add_argument("--model", default="inkling")
     ap.add_argument("--plan", required=True)
@@ -400,6 +450,13 @@ def main():
     ap.add_argument("--engine-sha-file", default="")
     ap.add_argument("--update", type=int, default=0, help="transfer: the update whose adapters are read")
     a = ap.parse_args()
+    if a.phase == "probe":
+        try:
+            return probe(HttpClient(a.model), [u for u in a.urls.split(",") if u], dict(x.split("=", 1) for x in a.panel),
+                         dict(x.split("=", 1) for x in a.probe_adapters.split(",")), a.run_dir)
+        except Exception as e:
+            log(f"PROBE FAILED TO RUN: {type(e).__name__}: {e}")
+            return EXIT_READS
     try:
         panels = dict(x.split("=", 1) for x in a.panel)
         eng = open(a.engine_sha_file).read().strip() if a.engine_sha_file else ""
