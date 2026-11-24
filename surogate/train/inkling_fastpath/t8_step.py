@@ -95,6 +95,12 @@ class T8Config:
     sketch_dir: str = ""
     empty_pinned_each_visit: bool = False  # S4 (b): torch's pinned pool emptied after every visit. G17 (g17-2): (a) + (b) together saved 1.1 GiB host
                                     # per worker at 57k but cost 15 % tok/s (171 -> 146); off by default
+    # Constants of the backward (t8_lean.backward_row; 0 = the exact backward). A visit with an index below the value holds that path constant:
+    # pattern_grad_from: its attention pattern (no gradient through the softmax scores into q, k and the relative bias; the value path stays);
+    # gate_grad_from: the router's gate weights of its experts; bank_grad_from: a looped visit's two bank inputs (the previous pass's outputs).
+    pattern_grad_from: int = 0
+    gate_grad_from: int = 0
+    bank_grad_from: int = 0
 
 
 def validate_config(cfg: T8Config) -> None:
@@ -111,6 +117,14 @@ def validate_config(cfg: T8Config) -> None:
         raise ValueError("sketch_visits name attention keys: attn_rank must be > 0")
     if any(not 0 <= int(v) < int(cfg.visits) for v in cfg.sketch_visits):
         raise ValueError(f"sketch_visits {cfg.sketch_visits}")
+    for name in ("pattern_grad_from", "gate_grad_from", "bank_grad_from"):
+        v = getattr(cfg, name)
+        if not isinstance(v, int) or isinstance(v, bool) or not 0 <= v <= int(cfg.visits):
+            raise ValueError(f"{name} {v!r}: a visit index 0..{cfg.visits}")
+    if cfg.gate_grad_from and STACKS[cfg.stack].get("IFT_MOE_GM", "1") != "0":
+        raise ValueError("gate_grad_from needs the plain expert backward (a stack with IFT_MOE_GM=0)")
+    if cfg.bank_grad_from and cfg.lean_host:
+        raise ValueError("bank_grad_from skips visits of the looped layers: lean_host adds a layer's sum at its last visit and would not fire")
     if cfg.lean_host and cfg.split_final:
         raise ValueError("lean_host adds straight into the step's sum: with split_final the two parts would be added in another order")
     if cfg.attn_rank and not set(cfg.train_keys) & set(ATTN_KEYS):
