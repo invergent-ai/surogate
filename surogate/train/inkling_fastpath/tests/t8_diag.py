@@ -316,13 +316,15 @@ def phase_fd(a):
 def phase_inject(a):
     """diag-2: per-visit Jacobian check with the rounding OFF in both the backward and the chained forward (the smooth function; routing frozen at
     theta0's). g_out(v) = the backward's d S / d (output of visit v); the chain's S with that output perturbed by +- eps u; follow
-    f(v) = [S(+) - S(-)] / (2 eps <g_out(v), u>). A correct backward gives f(v) = 1 at every v; the first v (going back from 47) where f leaves
-    [0.9, 1.1] locates the fault between that visit and the next one checked. If f(v) stays in [0.9, 1.1] at every injected visit, the fault is in
-    the vjp onto the LoRA tensors, not in the chain through the residual stream.
-    Part 1 first (written before any data): central differences of the smooth chain along the smooth gradient G_C for 12.B13 and 3.B13 at x1, x1/4,
-    x1/16 of diag-1's e. Follow staying near diag-1's (0.26 / 0.07) = the gradient is wrong for the chain; follow rising above 0.7 at the small
-    steps = the gradient is right and the micro-step's step size is outside the linear range. The chain freezes the expert SET only (the gate
-    weights are recomputed from the stepped state, as the backward differentiates them) and applies a looped layer's tensor at all its visits."""
+    f(v) = [S(+) - S(-)] / (2 eps <g_out(v), u>), eps = 0.5 / <g_out(v), u> (a predicted change of 0.5 nats). A correct backward gives f(v) in
+    [0.9, 1.1] at every v; the first v (going back from 47; pairs across every pass boundary) where f leaves [0.9, 1.1] locates the fault between
+    that visit and the previous one checked. If f(v) stays in [0.9, 1.1] at every injected visit, the fault is in the vjp onto the LoRA tensors,
+    not in the chain through the residual stream.
+    Order (written before any data): u = g_out/|g_out| at visits 47, 42, 41, 36, 30, 29, 24, 18, 17, 12, 6, 5, 3, 45; then u = sign(g_out)/sqrt(n)
+    at 47, 36, 24, 12, 3; last, central differences of the smooth chain along the smooth gradient G_C for 12.B13 (then 3.B13) at x1/4 and x1/16
+    of diag-1's e: follow near diag-1's (0.26 / 0.07) = the gradient is wrong for the chain; above 0.7 = the micro-step's size is outside the
+    linear range. The chain freezes the expert SET only (gate weights recomputed from the stepped state, as the backward differentiates them)
+    and applies a looped layer's tensor at all its visits. Every task's result is saved at once; a cut at the deadline costs only the tail."""
     deadline = time.time() + a.budget_s
     RA.ROUND["on"] = False
     rig = Rig(a)
@@ -331,25 +333,25 @@ def phase_inject(a):
     mask_t = torch.as_tensor(row.loss_mask.copy(), device=dev)
     lp, ctx = rig.w._forward(row)
     g = torch.as_tensor(row.loss_mask[1:].astype(np.float32), device=dev)
-    VIS = (47, 44, 36, 24, 12, 3)
-    norms, gouts = {}, {}
-    pgrad = {}                                                # the smooth gradient G_C of 12.B13 and 3.B13 (all visits summed)
+    G_ORDER = (47, 42, 41, 36, 30, 29, 24, 18, 17, 12, 6, 5, 3, 45)
+    S_ORDER = (47, 36, 24, 12, 3)
+    norms, gouts, pgrad = {}, {}, {}
+
+    def onv(v, g_out):
+        norms[v] = float(g_out.double().norm())
+        if v in G_ORDER:
+            gouts[v] = g_out.detach().float().cpu()            # on the host; one at a time back to the card
 
     def ong(v, layer, j, gj):
         if j == 1 and layer in (12, 3):
             c = gj.detach().float().cpu()
             pgrad[layer] = c if layer not in pgrad else pgrad[layer].add_(c)
 
-    def onv(v, g_out):
-        norms[v] = float(g_out.double().norm())
-        if v in VIS:
-            gouts[v] = g_out.detach().float().clone()
-
     t0 = time.time()
     TL.backward_row(rig.w.eng, rig.w.W, ctx["ids"], ctx["res"], rig.w.lora, B.ALPHA / B.RANK, rig.w.v_first, g, rig.w.buffers,
                     ong, q_block=ctx["qb"], train_idx=rig.w.train_idx, attn_scale=0.5, on_visit_grad=onv)
     rep = {"row": ROW, "round": False, "gout_norm_per_visit": {str(k): norms[k] for k in sorted(norms)}, "backward_s": time.time() - t0,
-           "inject": [], "dropped": []}
+           "inject": [], "small_steps": [], "dropped": []}
     routing0 = ctx["res"]["routing"].clone()
     ids = ctx["ids"]
     rig.w._release(ctx)
@@ -359,45 +361,42 @@ def phase_inject(a):
     rep["S0_smooth"] = S0
     log(f"backward {rep['backward_s']:.0f} s; |g_out| per visit {[round(norms[k], 3) for k in sorted(norms)]}")
     json.dump(rep, open(a.out, "w"), indent=1)
-    # part 1 (agent-RX's item 2): small central differences of the smooth chain along G_C for 12.B13 and 3.B13 (x1, x1/4, x1/16 of diag-1's e)
-    rep["small_steps"] = []
-    for L in (12, 3):
+
+    def inject(v, dname):
+        go = gouts[v].to(dev)
+        u = go / go.norm() if dname == "g" else torch.sign(go) / float(go.numel()) ** 0.5
+        ip = float((go.double() * u.double()).sum())
+        del go
+        eps = 0.5 / ip
+        sp = chain_S(rig, ids, x0, routing0, mask_t, inject=(v, eps * u))[0]
+        sm = chain_S(rig, ids, x0, routing0, mask_t, inject=(v, -eps * u))[0]
+        f = (sp - sm) / (2 * eps * ip)
+        rep["inject"].append({"visit": v, "dir": dname, "eps": eps, "ip": ip, "pred": eps * ip, "S+": sp, "S-": sm, "f": f,
+                              "curv": (sp + sm - 2 * S0) / 2})
+        log(f"visit {v} {dname}: f {f:.4f}, curvature {(sp + sm - 2 * S0) / 2:.4g}")
+
+    def small(L, mult):
         gC = pgrad[L].double()
-        n = gC.numel()
-        for mult in (1.0, 0.25, 0.0625):
-            if time.time() > deadline:
-                rep["dropped"].append([f"{L}.B13", "g", mult])
-                continue
-            step = (gC / gC.norm() * BASE_E * mult * n ** 0.5).float()
-            pred = float((gC * step.double()).sum())
-            rig.set_one(L, "B13", step)
-            sp = chain_S(rig, ids, x0, routing0, mask_t)[0]
-            rig.set_one(L, "B13", -step)
-            sm = chain_S(rig, ids, x0, routing0, mask_t)[0]
-            rig.set_one(L, "B13", None)
-            f = (sp - sm) / (2 * pred)
-            rep["small_steps"].append({"tensor": f"{L}.B13", "mult": mult, "pred": pred, "S+": sp, "S-": sm, "f_smooth": f})
-            log(f"smooth chain {L}.B13 along G_C x{mult:g}: pred {pred:.4g}, f {f:.4f}")
-            json.dump(rep, open(a.out, "w"), indent=1)
-    # part 2: injections into the residual stream
-    gen = torch.Generator(device=dev).manual_seed(7)
-    for v in VIS:
-        for dname, mult in (("g", 1.0), ("r", 1.0)):
-            if time.time() > deadline:
-                rep["dropped"].append([v, dname, mult])
-                continue
-            go = gouts[v]
-            u = go / go.norm() if dname == "g" else torch.randn(go.shape, generator=gen, device=dev)
-            u = u / u.norm()
-            ip = float((go.double() * u.double()).sum())
-            eps = mult * 0.5 / float(go.norm())               # "g": a predicted change of 0.5 nats x mult
-            sp = chain_S(rig, ids, x0, routing0, mask_t, inject=(v, eps * u))[0]
-            sm = chain_S(rig, ids, x0, routing0, mask_t, inject=(v, -eps * u))[0]
-            f = (sp - sm) / (2 * eps * ip) if ip else None
-            rep["inject"].append({"visit": v, "dir": dname, "mult": mult, "eps": eps, "pred": eps * ip, "S+": sp, "S-": sm, "f": f,
-                                  "curv": (sp + sm - 2 * S0) / 2})
-            log(f"visit {v} {dname} x{mult:g}: pred {eps * ip:.4g}, f {f}, curvature {(sp + sm - 2 * S0) / 2:.4g}")
-            json.dump(rep, open(a.out, "w"), indent=1)
+        step = (gC / gC.norm() * BASE_E * mult * gC.numel() ** 0.5).float()
+        pred = float((gC * step.double()).sum())
+        rig.set_one(L, "B13", step)
+        sp = chain_S(rig, ids, x0, routing0, mask_t)[0]
+        rig.set_one(L, "B13", -step)
+        sm = chain_S(rig, ids, x0, routing0, mask_t)[0]
+        rig.set_one(L, "B13", None)
+        f = (sp - sm) / (2 * pred)
+        rep["small_steps"].append({"tensor": f"{L}.B13", "mult": mult, "pred": pred, "S+": sp, "S-": sm, "f_smooth": f})
+        log(f"smooth chain {L}.B13 along G_C x{mult:g}: pred {pred:.4g}, f {f:.4f}")
+
+    tasks = [("inject", v, "g") for v in G_ORDER] + [("inject", v, "s") for v in S_ORDER] + \
+            [("small", 12, 0.25), ("small", 12, 0.0625), ("small", 3, 0.25), ("small", 3, 0.0625)]
+    for t in tasks:
+        if time.time() > deadline:
+            rep["dropped"].append(list(t))
+            continue
+        inject(t[1], t[2]) if t[0] == "inject" else small(t[1], t[2])
+        json.dump(rep, open(a.out, "w"), indent=1)
+    json.dump(rep, open(a.out, "w"), indent=1)
     rig.w.close()
     return 0
 
