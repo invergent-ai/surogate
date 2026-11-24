@@ -122,12 +122,12 @@ class Ctx:
         lp, ctx = rig.w._forward(self.row)
         self.ids, self.qb = ctx["ids"], ctx["qb"]
         self.routing = ctx["res"]["routing"].clone()
+        self.x0 = ctx["res"]["host"][-1].to(self.dev).float().clone()   # the normed embedding the engine stored (no second forward: at 57k
+        #                                                                  tokens a forward that keeps all 48 outputs does not fit beside it)
         self.engine_res = ctx["res"] if keep_engine else None      # the engine's stored states (host views; valid until the next _forward)
         if not keep_engine:
             rig.w._release(ctx)
         del ctx, lp
-        with torch.no_grad():
-            self.x0 = F.forward(self.eng, self.ids, save=True, adapters_per_layer=rig.w._adapters())["x0"].float().clone()
         self.eng._ws = None
         self.mask = torch.as_tensor(self.row.loss_mask.copy(), device=self.dev)
         self.scale, self.attn_scale = B.ALPHA / B.RANK, rig.cfg.attn_alpha / rig.cfg.attn_rank
