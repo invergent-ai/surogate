@@ -1,0 +1,607 @@
+"""Micro-step session: one real PPO mini-batch at the zero adapter, the update it makes, the adapters a follow read serves, and the gates that
+make the read's inputs trustworthy. Nothing is kept as a model; the step's result is measured, not used.
+PASS LINES, written before any run:
+  M1 zero adapter: the trainer at the start adapter Z (A = init, B = 0) == the base forward on every worker, bitwise (check_zero_adapter);
+     the engine's reads with Z loaded == its base reads, bitwise at every loss token of every row.
+  M2 replay: the trainer's old log-probs (start weights) == the rollout's recorded log-probs bitwise at every loss token of every row (the step's
+     replay gate; one mismatch stops the step), and == the engine's base reads bitwise at every loss token.
+  M3 ratio 1: the mini-batch's forward == the old log-probs bitwise on every row (stale gate on every row), ppo_ratio_max == 1.0, clip share 0.
+  M4 step: every gradient finite, no row refused, no gate of the step fails; N (the divisor) == the plan's loss tokens; the update of every
+     A tensor exactly 0 (B starts at 0, so A has no gradient at the first step; the follow read relies on it).
+  M5 round trip: the trainer's log-probs at U12, R12 and U4 == the engine's reads of the same adapters bitwise at every loss token of the
+     round-trip rows (the first group's rows; roundtrip/trainer_<X>.npz). 0 values differing; the scale each file declares is in adapters.json.
+  M6 files: gates.json, first_order.json, masters/theta0 + theta1, rows_used.npz, adapters.json and the round-1 reads (base, Z, U12, R12, U4) of
+     every row written; a sketch file for every attempt with a non-zero advantage (zero-advantage attempts counted). Round 2 (the block adapters)
+     runs if the card-hour cap leaves room, round 3 (block random controls) likewise; both reported, no line.
+  Pre-check (one card, before the session): G18a / G18b of t8_gate_s5 on three of the plan's rows (trainer Z == engine base, trainer with a
+     test adapter == engine with its exported file, bitwise at every position) and the replay of those rows (trainer Z == recorded, every loss token).
+Known and accepted limits (written before any run): the trainer round trip (M5) covers group 0's rows only (about 30 % of the loss tokens) and
+the adapters U12, R12 and U4; R12b and the block adapters are not round-tripped; the trainer's zero-adapter check uses one row per worker, the
+engine's Z against base covers every row.
+Phases: check (CPU: the plan file), pre (trainer half of the pre-check), pre_compare, trainer (the session's trainer half), compare (after reads).
+The update's adapters (theta0 = Z): U_k = theta0 + k d; R12 = theta0 + r, r a fixed-seed Gaussian scaled tensor by tensor to the norm of 12 d;
+U12_<block> / R12_<block> = the same restricted to one layer block (before 0-5, inside 6-17, after 18-23).
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import sys
+import time
+import zlib
+
+import numpy as np
+import torch
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))
+sys.path.insert(0, HERE)
+
+CAP = 58010
+LR = 2e-5
+R_SEED = 20261124                                            # the follow read's seed for R12's direction
+R_SEED_B = 20261125                                          # R12b: a second draw, same per-tensor norms
+ROUND1 = ("base", "U12", "R12", "U4", "Z")                    # Z last: Z == base then also shows nothing leaked through the cache or the slot
+ROUND2 = ("R12b", "U12_before", "U12_inside", "U12_after")
+RT_ADAPTERS = ("U12", "R12", "U4")
+ROUND3 = ("R12_before", "R12_inside", "R12_after")
+EXTRA = ("R4",)                                               # the damage read's control of U4: R12's draw at a third of its size (exported, not in a round)
+DAMAGE_READS = ("base", "U12", "R12", "U4", "R4", "R12b")     # read on every damage panel; all six or none (the damage judge refuses a missing one)
+
+
+def log(msg):
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 22), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+# ------------------------------------------------------------------------------------------------------------------------------- the plan
+def load_plan(plan_dir: str, cap: int = CAP):
+    """The planner's rows.npz as records.Row objects, every check of the agreed form; -> (rows, info)."""
+    from surogate.inkling_rl.records import Row
+
+    path = os.path.join(plan_dir, "rows.npz")
+    man = json.load(open(os.path.join(plan_dir, "manifest.json")))
+    want = {os.path.basename(k): v for k, v in (man.get("files") or man).items() if isinstance(v, str) and len(v) == 64}
+    if "rows.npz" in want and want["rows.npz"] != sha256(path):
+        raise ValueError("rows.npz does not match its manifest sha256")
+    z = np.load(path, allow_pickle=False)
+    R = sum(1 for k in z.files if k.startswith("ids_") and k[4:].isdigit())   # not ids_crc32
+    adv, trial, group, Tv, crc = (z[k] for k in ("advantage", "trial_idx", "group_idx", "T", "ids_crc32"))
+    if not all(len(x) == R for x in (adv, trial, group, Tv, crc)):
+        raise ValueError("per-row vectors and row count differ")
+    rows = []
+    for n in range(R):
+        ids = z[f"ids_{n}"].astype(np.int32)
+        mask = z[f"mask_{n}"].astype(bool)
+        lp = z[f"lp_{n}"].astype(np.float32)
+        if not (len(ids) == len(mask) == len(lp) == int(Tv[n])):
+            raise ValueError(f"row {n}: lengths differ")
+        if zlib.crc32(ids.astype("<i4").tobytes()) & 0xFFFFFFFF != int(crc[n]):
+            raise ValueError(f"row {n}: crc32 of ids differs")
+        if mask[0] or not mask.any() or len(ids) > cap:
+            raise ValueError(f"row {n}: mask[0] set, no loss token, or T {len(ids)} > {cap}")
+        if not np.isfinite(lp[mask]).all() or (lp[mask] > 0).any():
+            raise ValueError(f"row {n}: recorded log-probs not finite or > 0 at a loss token")
+        notes = {"weight": 1.0, "plan_row": n}
+        if f"fin_{n}" in z.files:
+            fin = z[f"fin_{n}"].astype(bool)
+            if (fin & ~mask).any():
+                raise ValueError(f"row {n}: final-reply tokens outside the loss mask")
+            notes["final_mask"] = fin
+        r = Row(ids=ids.astype(np.int64), loss_mask=mask, engine_lp=lp.astype(np.float64), advantage=float(adv[n]), versions=None,
+                teacher_lp=None, routed=None, notes=notes)
+        r.trial_idx, r.group_idx = int(trial[n]), int(group[n])
+        rows.append(r)
+    seen = []
+    for r in rows:                                            # each group's rows contiguous, and an attempt in one group
+        if not seen or seen[-1] != r.group_idx:
+            if r.group_idx in seen:
+                raise ValueError(f"group {r.group_idx} is not contiguous")
+            seen.append(r.group_idx)
+    tg = {}
+    for r in rows:
+        if tg.setdefault(r.trial_idx, (r.group_idx, r.advantage)) != (r.group_idx, r.advantage):
+            raise ValueError(f"attempt {r.trial_idx}: rows with different group or advantage")
+    info = {"rows": R, "row_tokens": int(sum(r.T for r in rows)), "loss_tokens": int(sum(int(r.loss_mask.sum()) for r in rows)),
+            "attempts": len(tg), "groups": len(seen), "zero_advantage_attempts": sum(1 for g, a in tg.values() if a == 0.0),
+            "longest": int(max(r.T for r in rows)), "rows_sha256": sha256(path)}
+    return rows, info
+
+
+# ------------------------------------------------------------------------------------------------------------------------------- the update
+def names(n_layers: int, keys: tuple) -> list:
+    return [f"{L}.{k}" for L in range(n_layers) for k in keys]
+
+
+def block_of(name: str, blocks: dict) -> str:
+    L = int(name.split(".", 1)[0])
+    return next(b for b, rng in blocks.items() if L in rng)
+
+
+def random_like(delta: list, nm: list, scale: float, seed: int = R_SEED) -> list:
+    """R's direction, reproducible from the tensor names alone: per tensor a Gaussian z from numpy default_rng([seed, crc32(name UTF-8)]) with
+    the tensor's shape, r = z / ||z|| x ||scale d|| (float64); r = 0 where d is exactly 0 (the follow read's random_like)."""
+    out = []
+    for d, n in zip(delta, nm):
+        dl = d.detach().double().numpy() * float(scale)
+        nrm = float(np.linalg.norm(dl))
+        if nrm == 0.0:
+            out.append(torch.zeros(d.shape, dtype=torch.float64))
+            continue
+        z = np.random.default_rng([int(seed), zlib.crc32(n.encode("utf-8")) & 0xFFFFFFFF]).standard_normal(dl.shape)
+        out.append(torch.from_numpy(z / np.linalg.norm(z) * nrm))
+    return out
+
+
+def states(theta0: list, delta: list, nm: list, blocks: dict, which: tuple) -> dict:
+    """The named parameter states (lists of fp32 tensors in the trainer's order)."""
+    out = {}
+    rnd = {}
+    for w in which:
+        base, _, blk = w.partition("_")
+        if base == "Z":
+            out[w] = [t.clone() for t in theta0]
+            continue
+        if base.startswith("U"):
+            k = float(base[1:])
+            step = [d * k for d in delta]
+        elif base.startswith("R"):
+            seed = R_SEED_B if base.endswith("b") else R_SEED
+            if base not in rnd:
+                rnd[base] = random_like(delta, nm, float(base[1:].rstrip("b")), seed)
+            out[w] = [(t0.double() + (s if not blk or block_of(n, blocks) == blk else torch.zeros_like(s))).float()
+                      for t0, s, n in zip(theta0, rnd[base], nm)]
+            continue
+        else:
+            raise ValueError(w)
+        out[w] = [t0 + (s if not blk or block_of(n, blocks) == blk else torch.zeros_like(s)) for t0, s, n in zip(theta0, step, nm)]
+    return out
+
+
+def first_order(grads: list, N: float, delta: list, keys: tuple, blocks: dict) -> dict:
+    """<G, d> per block and in all, G = -N x the first mini-batch's PPO gradient (ratio 1: the advantage-weighted gradient of sum A sum_t log pi),
+    and the same split into attention and expert tensors."""
+    import t8_skyrl as KS
+
+    G = [g.double() * (-float(N)) for g in grads]
+    res = {"by_block": KS.first_order_by_block(G, delta, keys, blocks)}
+    nk = len(keys)
+    for kind, pick in (("attention", lambda k: k not in ("A13", "B13", "A2", "B2")), ("experts", lambda k: k in ("A13", "B13", "A2", "B2"))):
+        res[kind] = float(sum(float((g * d.double()).sum()) for i, (g, d) in enumerate(zip(G, delta)) if pick(keys[i % nk])))
+    res["grad_norm_G"] = float(torch.sqrt(sum((g * g).sum() for g in G)))
+    res["delta_norm"] = float(torch.sqrt(sum((d.double() * d.double()).sum() for d in delta)))
+    return res
+
+
+def layers_of(flat_list: list, n_layers: int, keys: tuple) -> list:
+    nk = len(keys)
+    return [{k: flat_list[L * nk + j].detach().cpu().numpy() for j, k in enumerate(keys)} for L in range(n_layers)]
+
+
+# ------------------------------------------------------------------------------------------------------------------------------- reads
+def lp_at_mask(lp_full: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """[T] float32 with the values at the loss tokens and 0 elsewhere (lp_full: [T], position t = log p(ids[t] | ids[:t]))."""
+    out = np.zeros(len(mask), dtype=np.float32)
+    out[mask] = np.asarray(lp_full, dtype=np.float32)[mask]
+    return out
+
+
+def bits_equal(a: np.ndarray, b: np.ndarray, mask: np.ndarray):
+    """(equal, differ) at the mask's positions, float32 bit patterns."""
+    a32, b32 = np.asarray(a, dtype=np.float32)[mask], np.asarray(b, dtype=np.float32)[mask]
+    same = a32.view(np.int32) == b32.view(np.int32)
+    return int(same.sum()), int((~same).sum())
+
+
+def cmp_reads(x: dict, y: dict, masks: dict):
+    """x, y: {plan row: [T] float32}; compared on the rows both hold. -> (rows, equal, differ)."""
+    common = sorted(set(x) & set(y))
+    eq = ne = 0
+    for n in common:
+        e, d = bits_equal(x[n], y[n], masks[n])
+        eq, ne = eq + e, ne + d
+    return len(common), eq, ne
+
+
+def _text(path: str):
+    return open(path).read().strip() if os.path.exists(path) else None
+
+
+def load_reads(path: str) -> dict:
+    z = np.load(path)
+    return {int(k[3:]): z[k] for k in z.files if k.startswith("lp_")}
+
+
+# ------------------------------------------------------------------------------------------------------------------------------- phases
+def trainer_cfg(a, cards, sketch_dir=""):
+    import t8_step as TS
+
+    kw = {}
+    if sketch_dir:
+        kw = {"sketch_visits": (3, 12, 36, 45), "sketch_expert_stride": 64, "sketch_dir": sketch_dir}
+    kw.update(backward_options(a))
+    return TS.T8Config(bin_dir=a.bin, artifact=a.artifact, cards=cards, K=48, head="plain", attn_rank=64, attn_alpha=32.0,
+                       train_keys=TS.param_keys(64), segment_keys=(), run_dir=a.run_dir, lean_host=bool(sketch_dir), max_row_tokens=CAP, **kw)
+
+
+def backward_options(a) -> dict:
+    """The constants of the backward this session runs with (T8Config; all 0 = the exact backward)."""
+    return {"pattern_grad_from": int(getattr(a, "pattern_grad_from", 0)), "gate_grad_from": int(getattr(a, "gate_grad_from", 0)),
+            "bank_grad_from": int(getattr(a, "bank_grad_from", 0))}
+
+
+def pick_pre_rows(rows: list, k: int = 3) -> list:
+    return sorted(range(len(rows)), key=lambda i: (rows[i].T, i))[:k]
+
+
+def phase_pre(a):
+    import t8_step as TS
+
+    rows, info = load_plan(a.plan)
+    pick = pick_pre_rows(rows)
+    sub = [rows[i] for i in pick]
+    from surogate.inkling_rl.step import StepConfig
+
+    tr = TS.T8Trainer(trainer_cfg(a, (int(a.cards.split(",")[0]),), sketch_dir=os.path.join(a.run_dir, "sketches_pre")))
+    try:
+        lz = tr.logprobs(sub)
+        tr.check_zero_adapter([sub[0]])
+        for r, x in zip(sub, lz):                             # the session's step gates (replay, stale) on these rows, no apply
+            r.notes["old_lp"] = x
+        o = tr.compute(sub, 0, StepConfig(max_policy_lag=None), seeds="ppo", minibatch_index=0)
+        step_gates = {"replay_checked_rows": o.metrics["replay_checked_rows"], "stale_checked_rows": o.metrics["stale_checked_rows"],
+                      "ratio_max": o.metrics.get("ppo_ratio_max"), "finite": all(bool(torch.isfinite(g).all()) for g in o.grads)}
+        del o
+        M = tr.masters()
+        g = torch.Generator().manual_seed(21)
+        for d in M:
+            for key in d:
+                if key.endswith("B") or key in ("B13", "B2"):
+                    d[key] = torch.randn(d[key].shape, generator=g) * 0.02
+        tr.set_masters(M)
+        la = tr.logprobs(sub)
+        sha = tr.export_adapter(os.path.join(a.work, "adapters", "pretest"), "BF16", meta={"step": "t8-micro-pre"})
+    finally:
+        tr.close()
+    eq = ne = 0
+    for r, x in zip(sub, lz):
+        e, d = bits_equal(np.concatenate([[0.0], x]), r.engine_lp, r.loss_mask)
+        eq, ne = eq + e, ne + d
+    json.dump([{"ids": r.ids.tolist()} for r in sub], open(os.path.join(a.run_dir, "rows_ids.json"), "w"))
+    np.savez(os.path.join(a.run_dir, "trainer_zero.npz"), **{f"lp_{i}": x for i, x in enumerate(lz)})
+    np.savez(os.path.join(a.run_dir, "trainer_adapter.npz"), **{f"lp_{i}": x for i, x in enumerate(la)})
+    rep = {"plan": info, "pre_rows": pick, "pre_rows_T": [r.T for r in sub], "adapter_sha256": sha, "step_gates": step_gates,
+           "backward_options": backward_options(a),
+           "replay": {"equal": eq, "differ": ne, "pass": bool(ne == 0 and eq > 0 and step_gates["replay_checked_rows"] == len(sub)
+                                                             and step_gates["stale_checked_rows"] == len(sub) and step_gates["finite"])}}
+    import shutil
+
+    shutil.rmtree(os.path.join(a.run_dir, "sketches_pre"), ignore_errors=True)
+    json.dump(rep, open(a.out, "w"), indent=1)
+    log(f"pre trainer half: rows {rep['pre_rows_T']}, replay {rep['replay']}")
+    return 0 if rep["replay"]["pass"] else 4
+
+
+def phase_pre_compare(a):
+    import t8_gate_s5 as S5
+
+    rep = json.load(open(a.out))
+    d = a.run_dir
+    e0, n0 = S5.cmp(os.path.join(d, "trainer_zero.npz"), os.path.join(d, "engine_base.json"))
+    e1, n1 = S5.cmp(os.path.join(d, "trainer_adapter.npz"), os.path.join(d, "engine_adapter.json"))
+    za, zb = np.load(os.path.join(d, "trainer_zero.npz")), np.load(os.path.join(d, "trainer_adapter.npz"))
+    moved = int(sum(int((za[k] != zb[k]).sum()) for k in za.files))
+    rep["engine_cmdline"] = _text(os.path.join(d, "engine_flags.txt"))
+    rep["G18a"] = {"equal": e0, "differ": n0, "pass": bool(n0 == 0 and e0 > 0)}
+    rep["G18b"] = {"equal": e1, "differ": n1, "adapter_changed_positions": moved, "pass": bool(n1 == 0 and e1 > 0 and moved > 0)}
+    rep["pass"] = bool(rep["G18a"]["pass"] and rep["G18b"]["pass"] and rep["replay"]["pass"])
+    json.dump(rep, open(a.out, "w"), indent=1)
+    print(f"replay {rep['replay']}\nG18a {rep['G18a']}\nG18b {rep['G18b']}\nT8 MICRO PRE-CHECK: {'PASS' if rep['pass'] else 'FAIL'}", flush=True)
+    return 0 if rep["pass"] else 4
+
+
+def phase_trainer(a):
+    import t8_adapter as TA
+    import t8_gate8 as G8
+    import t8_skyrl as KS
+    import t8_step as TS
+    from surogate.inkling_rl.step import StepConfig
+
+    rows, info = load_plan(a.plan)
+    cards = tuple(int(x) for x in a.cards.split(","))
+    sk = os.path.join(a.run_dir, "sketches")
+    rep = {"plan": info, "cards": list(cards), "lr": LR, "time_start": time.time(), "backward_options": backward_options(a)}
+    if a.deadline_min > 0:                                    # the card-hour budget: the phase stops itself (workers closed in `finally`)
+        import signal
+
+        def _late(signum, frame):
+            raise TimeoutError(f"the trainer phase passed its {a.deadline_min} min deadline")
+        signal.signal(signal.SIGALRM, _late)
+        signal.alarm(int(a.deadline_min * 60))
+    tr = TS.T8Trainer(trainer_cfg(a, cards, sketch_dir=sk))
+    keys, n_layers = tr.keys, len(tr.shapes)
+    nm = names(n_layers, keys)
+    try:
+        with G8.MemWatch() as mw:
+            shortest = min(rows, key=lambda r: r.T)
+            zc = tr.check_zero_adapter([shortest])            # M1 (trainer half), every worker
+            theta0 = [m.detach().clone() for m in tr.opt.masters]
+            t0 = time.time()
+            res = TS.ppo_batch(tr, rows, 0, LR, 1, StepConfig(max_policy_lag=None))
+            rep["step_wall_s"] = time.time() - t0
+            out, gnorm = res[0]
+            theta1 = [m.detach().clone() for m in tr.opt.masters]
+            delta = [t1 - t0_ for t0_, t1 in zip(theta0, theta1)]
+            N = float(out.metrics["total_tokens"])
+            m = out.metrics
+            fo = first_order(out.grads, N, delta, keys, KS.BLOCKS)
+            rep["first_order"] = fo
+            rep["step"] = {"N": N, "rows_used": len(out.rows), "rows_refused": len(rows) - len(out.rows), "grad_norm": gnorm,
+                           "finite": all(bool(torch.isfinite(g).all()) for g in out.grads),
+                           "replay_checked_rows": m["replay_checked_rows"], "replay_skipped_rows": m["replay_skipped_rows"],
+                           "replay_checked_final_tokens": m.get("replay_checked_final_tokens"), "stale_checked_rows": m["stale_checked_rows"],
+                           "ratio_max": m.get("ppo_ratio_max"), "clip_ratio": m.get("ppo_clip_ratio"), "tok_per_s_per_card": m["tok_per_s_per_card"],
+                           "row_tokens": m["row_tokens"], "wall_s": m["wall_s"],
+                           "refused": {k: m.get(k) for k in ("refused_long_rows", "r3_refused_rows", "r3_lagged_uncovered_refused_rows")},
+                           "workers": [{"card": x["card"], "VmHWM_gib": x["VmHWM_gib"], "card_peak_torch_gib": x["card_peak_torch_gib"]}
+                                       for x in m["workers"]]}
+            rep["zero_adapter"] = {"rows_checked_per_worker": [1] * len(tr.handles), "checks": len(zc),
+                                   "all_bitwise": all(x.get("log_probs_equal") and x.get("routing_equal") for x in zc)}
+            rep["step"]["policy_loss"] = m.get("policy_loss")
+            rep["step"]["metrics"] = {k: v for k, v in m.items() if isinstance(v, (int, float))}
+            # the files of the follow read
+            fo_json = {**fo["by_block"], "N": N, "rows_used": len(out.rows), "rows_refused": len(rows) - len(out.rows), "k": 1,
+                       "G": "-N x grads of mini-batch 0", "d": "theta1 - theta0", "attention": fo["attention"], "experts": fo["experts"]}
+            fo_json["backward_options"] = backward_options(a)   # the gradient behind these predictions (all 0 = the exact backward)
+            json.dump(fo_json, open(os.path.join(a.run_dir, "first_order.json"), "w"), indent=1)
+            os.makedirs(os.path.join(a.run_dir, "masters"), exist_ok=True)
+            torch.save(dict(zip(nm, theta0)), os.path.join(a.run_dir, "masters", "theta0.pt"))
+            torch.save(dict(zip(nm, theta1)), os.path.join(a.run_dir, "masters", "theta1.pt"))
+            a_keys = [i for i, n in enumerate(nm) if n.split(".", 1)[1] in ("A13", "A2") or n.split(".", 1)[1].endswith("A")]
+            rep["A_delta_max_abs"] = max(float(delta[i].abs().max()) for i in a_keys)  # B0 = 0: A has no gradient, d_A == 0 exactly
+            pos, old = {}, {}
+            for r in rows:
+                n = r.notes["plan_row"]
+                p = np.nonzero(r.loss_mask)[0].astype(np.int32)
+                pos[f"pos_{n}"] = p
+                old[f"old_{n}"] = np.asarray(r.notes["old_lp"], dtype=np.float32)[p - 1]
+            np.savez(os.path.join(a.run_dir, "rows_used.npz"), **pos, **old, N=np.array([N]))
+            # M5, trainer half: log-probs at U12, R12 and U4 on the round-trip rows
+            rt = [r for r in rows if r.group_idx in sorted({x.group_idx for x in rows})[:a.rt_groups]]
+            os.makedirs(os.path.join(a.run_dir, "roundtrip"), exist_ok=True)   # a subset of rows: kept out of reads/ (reads/ holds every row)
+            for w in RT_ADAPTERS:
+                sw = states(theta0, delta, nm, KS.BLOCKS, (w,))[w]
+                tr.set_masters([{k: sw[L * len(keys) + j] for j, k in enumerate(keys)} for L in range(n_layers)])
+                del sw
+                lu = tr.logprobs(rt)
+                np.savez(os.path.join(a.run_dir, "roundtrip", f"trainer_{w}.npz"),
+                         **{f"lp_{r.notes['plan_row']}": lp_at_mask(np.concatenate([[0.0], x]), r.loss_mask) for r, x in zip(rt, lu)})
+            rep["round_trip_rows"] = [r.notes["plan_row"] for r in rt]
+            rank = tr.B.RANK
+            files = list(out.metrics.get("sketch_files", []))
+            tr.close()                                        # the workers' host memory is free before the exports
+            tr.opt = tr.work = tr.work_flat = tr.flats = tr.work_layers = None
+            del res, out, theta1
+            import gc
+
+            gc.collect()
+            # the adapters, one state at a time, exported from the parameter states directly (no worker state is involved)
+            rep["adapters"] = {}
+            for w in [x for x in ROUND1 + ROUND2 + ROUND3 + EXTRA if x != "base"]:
+                st = states(theta0, delta, nm, KS.BLOCKS, (w,))[w]
+                dst = os.path.join(a.work, "adapters", w)
+                sha = TA.export_combined(layers_of(st, n_layers, keys), dst, 64, 32.0, rank, "BF16", metadata={"step": f"t8-micro-{w}"})
+                del st
+                ac = json.load(open(os.path.join(dst, "adapter_config.json")))
+                ex = [int(v) for v in (ac.get("rank_pattern") or {}).values()]
+                rep["adapters"][w] = {"sha256": sha, "r": ac["r"], "lora_alpha": ac["lora_alpha"], "rank_pattern": ac.get("rank_pattern"),
+                                      "alpha_pattern": ac.get("alpha_pattern"), "scale_attention": float(ac["lora_alpha"]) / float(ac["r"]),
+                                      "scale_experts": [float(ac["lora_alpha"]) / e for e in ex]}
+            json.dump(rep["adapters"], open(os.path.join(a.run_dir, "adapters.json"), "w"), indent=1)
+        rep["min_mem_available_gb"] = mw.low
+        if a.deadline_min > 0:
+            import signal
+
+            signal.alarm(0)
+    finally:
+        tr.close()
+    sketched, zero_counted = set(), 0
+    for f in files:
+        d_ = torch.load(f, map_location="cpu", weights_only=False)
+        if d_["rows"] > 0 and d_["tensors"]:
+            sketched.add(d_["trial"])
+        zero_counted += d_["rows_skipped_zero_factor"]
+    want = {r.trial_idx for r in rows if r.advantage != 0.0}
+    rep["sketches"] = {"files": len(files), "sketched_attempts": sorted(sketched), "missing": sorted(want - sketched),
+                       "zero_advantage_rows_counted": zero_counted, "zero_advantage_rows": sum(1 for r in rows if r.advantage == 0.0),
+                       "bytes": sum(os.path.getsize(f) for f in files)}
+    s = rep["step"]
+    rep["M3"] = bool(s["stale_checked_rows"] == len(rows) and s["ratio_max"] == 1.0 and s["clip_ratio"] == 0.0)
+    rep["M4"] = bool(s["finite"] and s["rows_refused"] == 0 and s["replay_skipped_rows"] == 0 and s["N"] == info["loss_tokens"]
+                     and rep["A_delta_max_abs"] == 0.0)
+    rep["M2_trainer"] = bool(s["replay_checked_rows"] == len(rows))  # the step raises on any replay mismatch
+    rep["M6_trainer"] = bool(not rep["sketches"]["missing"] and zero_counted == rep["sketches"]["zero_advantage_rows"])
+    rep["host_peak_sum_gib"] = sum(x["VmHWM_gib"] for x in s["workers"])
+    json.dump(rep, open(a.out, "w"), indent=1, default=float)
+    ok = rep["M2_trainer"] and rep["M3"] and rep["M4"] and rep["M6_trainer"]
+    log(f"trainer half: N {s['N']:.0f}, first order {fo['by_block']}, M2t {rep['M2_trainer']} M3 {rep['M3']} M4 {rep['M4']} M6t {rep['M6_trainer']}")
+    return 0 if ok else 4
+
+
+def phase_compare(a):
+    rows, info = load_plan(a.plan)
+    masks = {r.notes["plan_row"]: r.loss_mask for r in rows}
+    rd = os.path.join(a.run_dir, "reads")
+    rep = json.load(open(a.out))
+    R = {}
+    fl = sorted(f for f in os.listdir(rd) if f.endswith(".npz"))
+    merged = {f[:-4] for f in fl if ".part" not in f}
+    for f in fl:                                              # <name>.npz, or (if absent) the engine parts <name>.part<k>.npz merged
+        name = f[:-4].split(".part")[0]
+        if ".part" not in f or name not in merged:
+            part = load_reads(os.path.join(rd, f))
+            if set(part) & set(R.get(name, {})):
+                raise ValueError(f"{f}: a row read twice")
+            R.setdefault(name, {}).update(part)
+    ad = json.load(open(os.path.join(a.run_dir, "adapters.json")))
+    eng = open(a.engine_sha_file).read().strip() if a.engine_sha_file else ""
+    sid = _text(os.path.join(a.run_dir, "session_id.txt"))
+    rep["session_id"] = sid
+    rep["engine_cmdline"] = _text(os.path.join(a.run_dir, "engine_flags.txt"))
+    rep["rounds"] = {}
+    rt_ = os.path.join(a.run_dir, "rounds.txt")
+    for line in (open(rt_) if os.path.exists(rt_) else []):
+        if line.strip():
+            k, v = line.split()
+            rep["rounds"][k] = v                              # ran / failed / skipped_for_budget
+    full_rows = set(masks)
+    rep["reads_incomplete"] = {}
+    for name, v in list(R.items()):                           # one file per adapter for the follow read, and its JSON: only when complete
+        if set(v) != full_rows:                               # a partial read stays as its parts (the follow read would refuse it)
+            rep["reads_incomplete"][name] = len(v)
+            del R[name]
+            continue
+        if not os.path.exists(os.path.join(rd, name + ".npz")):
+            np.savez(os.path.join(rd, name + ".npz"), **{f"lp_{n}": x for n, x in sorted(v.items())})
+        json.dump({"adapter_sha256": (ad.get(name) or {}).get("sha256"), "head": "plain", "engine_sha": eng, "source": "engine", "session_id": sid},
+                  open(os.path.join(rd, name + ".json"), "w"), indent=1)
+    for w in RT_ADAPTERS:
+        R[f"trainer_{w}"] = load_reads(os.path.join(a.run_dir, "roundtrip", f"trainer_{w}.npz"))
+    rep["reads"] = {k: len(v) for k, v in R.items()}
+    rep["plan_rows_sha256"] = info["rows_sha256"]
+    rep["engine_sha"] = eng
+    ro = os.path.join(a.run_dir, "reads_order.txt")
+    rep["reads_order"] = [x.strip() for x in open(ro) if x.strip()] if os.path.exists(ro) else None
+    u = np.load(os.path.join(a.run_dir, "rows_used.npz"))
+    old = {}
+    for r in rows:
+        n = r.notes["plan_row"]
+        x = np.zeros(r.T, dtype=np.float32)
+        x[u[f"pos_{n}"]] = u[f"old_{n}"]
+        old[n] = x
+    rec = {r.notes["plan_row"]: r.engine_lp.astype(np.float32) for r in rows}
+    full = len(rows)
+    out = {}
+    out["M1_engine_Z_vs_base"] = cmp_reads(R.get("Z", {}), R.get("base", {}), masks)   # a failed round leaves reads missing: counted, not a crash
+    out["M2_old_vs_recorded"] = cmp_reads(old, rec, masks)
+    out["M2_old_vs_engine_base"] = cmp_reads(old, R.get("base", {}), masks)
+    for w in RT_ADAPTERS:
+        out[f"M5_trainer_vs_engine_{w}"] = cmp_reads(R[f"trainer_{w}"], R.get(w, {}), masks)
+    rep["compare"] = {k: {"rows": v[0], "equal": v[1], "differ": v[2]} for k, v in out.items()}
+    rep["M1"] = bool(out["M1_engine_Z_vs_base"][2] == 0 and out["M1_engine_Z_vs_base"][0] == full and rep.get("zero_adapter", {}).get("all_bitwise"))
+    rep["M2"] = bool(rep.get("M2_trainer") and all(out[k][2] == 0 and out[k][0] == full for k in ("M2_old_vs_recorded", "M2_old_vs_engine_base")))
+    rep["M5"] = bool(all(out[f"M5_trainer_vs_engine_{w}"][2] == 0 and out[f"M5_trainer_vs_engine_{w}"][0] == len(rep["round_trip_rows"])
+                         for w in RT_ADAPTERS))
+    s_ = rep.get("step", {})
+    gates = {"replay": {"rows": full, "rows_checked": out["M2_old_vs_recorded"][0], "mismatch_tokens": out["M2_old_vs_recorded"][2],
+                        "tokens_compared": out["M2_old_vs_recorded"][1] + out["M2_old_vs_recorded"][2]},
+             "ratio_first_update": {"loss_tokens": int(s_.get("N", 0)),
+                                    # the stale gate compares the update's forward with the old log-probs bit for bit on every row and raises
+                                    # on one differing token: so all rows checked == every ratio exactly exp(0) = 1
+                                    "tokens_not_exactly_1": 0 if s_.get("stale_checked_rows") == full else None,
+                                    "stale_checked_rows": s_.get("stale_checked_rows"), "ratio_max": s_.get("ratio_max"), "clip_share": s_.get("clip_ratio")},
+             "zero_adapter": {"bitwise": bool(rep.get("zero_adapter", {}).get("all_bitwise") and rep["M1"]),
+                              "trainer_checks": rep.get("zero_adapter", {}).get("checks"), "engine_Z_vs_base": rep["compare"]["M1_engine_Z_vs_base"]},
+             "finite": s_.get("finite"), "rows_refused": s_.get("rows_refused"), "A_delta_max_abs": rep.get("A_delta_max_abs"),
+             "A_delta_exactly_zero": rep.get("A_delta_max_abs") == 0.0, "plan_rows_sha256": info["rows_sha256"], "engine_sha": eng,
+             "backward_options": rep.get("backward_options"), "source": "micro.json (measured values)"}
+    json.dump(gates, open(os.path.join(a.run_dir, "gates.json"), "w"), indent=1, default=float)
+    need = ("first_order.json", "gates.json", "masters/theta0.pt", "masters/theta1.pt", "rows_used.npz", "adapters.json")
+    rep["M6"] = bool(rep.get("M6_trainer") and all(os.path.exists(os.path.join(a.run_dir, f)) for f in need)
+                     and all(len(R.get(w, {})) == full for w in ROUND1))
+    rep["reads_complete"] = {w: len(R.get(w, {})) == full for w in ROUND1 + ROUND2 + ROUND3}
+    rep["pass"] = bool(rep["M1"] and rep["M2"] and rep.get("M3") and rep.get("M4") and rep["M5"] and rep["M6"])
+    json.dump(rep, open(a.out, "w"), indent=1, default=float)
+    for k, v in rep["compare"].items():
+        print(f"{k}: {v}")
+    print(f"M1 {rep['M1']} M2 {rep['M2']} M3 {rep.get('M3')} M4 {rep.get('M4')} M5 {rep['M5']} M6 {rep['M6']}")
+    print(f"T8 MICRO SESSION: {'PASS' if rep['pass'] else 'FAIL'}", flush=True)
+    return 0 if rep["pass"] else 4
+
+
+def phase_check(a):
+    rows, info = load_plan(a.plan)
+    print(json.dumps(info, indent=1))
+    return 0
+
+
+def phase_dmg_merge(a):
+    """The damage reads of one panel: the engine parts <X>.part<k>.npz of <run>/reads_dmg/<panel>/ merged into <X>.npz (lp_<n> float32 [T], the
+    value at the panel's mask and 0 elsewhere, + ids_crc32 uint32 [R] of the ids the reader sent) and <X>.json. A read that is not complete for every
+    panel row is NOT written. --plan = the panel directory, --panel = its name."""
+    man = json.load(open(os.path.join(a.plan, "manifest.json")))
+    want = {os.path.basename(k): v for k, v in (man.get("files") or man).items() if isinstance(v, str) and len(v) == 64}
+    rows_path = os.path.join(a.plan, "rows.npz")
+    rows_sha = sha256(rows_path)
+    if want.get("rows.npz") != rows_sha:
+        raise ValueError(f"panel {a.panel}: rows.npz does not match its manifest sha256")
+    z = np.load(rows_path, allow_pickle=False)
+    R = sum(1 for k in z.files if k.startswith("ids_") and k[4:].isdigit())
+    crc = np.array([zlib.crc32(z[f"ids_{n}"].astype("<i4").tobytes()) & 0xFFFFFFFF for n in range(R)], dtype=np.uint32)
+    if "ids_crc32" in z.files and not np.array_equal(crc, z["ids_crc32"].astype(np.uint32)):
+        raise ValueError(f"panel {a.panel}: crc32 of the ids differs from the panel's ids_crc32")
+    rd = os.path.join(a.run_dir, "reads_dmg", a.panel)
+    ad = json.load(open(os.path.join(a.run_dir, "adapters.json")))
+    eng = open(a.engine_sha_file).read().strip() if a.engine_sha_file else ""
+    sid = _text(os.path.join(a.run_dir, "session_id.txt"))
+    done, missing = [], []
+    for name in DAMAGE_READS:
+        got = {}
+        for f in sorted(os.listdir(rd)) if os.path.isdir(rd) else []:
+            if f.startswith(name + ".part") and f.endswith(".npz"):
+                part = load_reads(os.path.join(rd, f))
+                if set(part) & set(got):
+                    raise ValueError(f"{a.panel}/{f}: a row read twice")
+                got.update(part)
+        ok = set(got) == set(range(R)) and all(got[n].dtype == np.float32 and got[n].shape == (int(z["T"][n]),) and
+                                                bool(np.isfinite(got[n]).all()) and not bool(got[n][~z[f"mask_{n}"].astype(bool)].any())
+                                                for n in got)
+        if name != "base" and not (ad.get(name) or {}).get("sha256"):
+            ok = False
+        if not ok:
+            missing.append(name)
+            continue
+        np.savez(os.path.join(rd, name + ".npz"), ids_crc32=crc, **{f"lp_{n}": got[n] for n in range(R)})
+        json.dump({"adapter_sha256": None if name == "base" else ad[name]["sha256"], "head": "plain", "engine_sha": eng, "source": "engine",
+                   "session_id": sid, "panel_rows_sha256": rows_sha}, open(os.path.join(rd, name + ".json"), "w"), indent=1)
+        done.append(name)
+    log(f"damage reads of panel {a.panel}: written {done}; not complete (not written) {missing}")
+    return 0 if not missing else 4
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--phase", required=True, choices=("check", "pre", "pre_compare", "trainer", "compare", "dmg_merge"))
+    ap.add_argument("--panel", default="", help="dmg_merge: the panel's name (its reads are in <run-dir>/reads_dmg/<panel>/)")
+    ap.add_argument("--plan", default="")
+    ap.add_argument("--bin", default="")
+    ap.add_argument("--artifact", default="")
+    ap.add_argument("--cards", default="0")
+    ap.add_argument("--work", default="", help="the run's scratch directory (adapters; not copied back)")
+    ap.add_argument("--run-dir", default="")
+    ap.add_argument("--rt-groups", type=int, default=1, help="round trip on the rows of the first n groups")
+    ap.add_argument("--engine-sha-file", default="")
+    ap.add_argument("--deadline-min", type=float, default=0.0, help="trainer phase: stop (no outputs) after this many minutes")
+    ap.add_argument("--out", default="")
+    ap.add_argument("--pattern-grad-from", type=int, default=0, help="visits below it hold their attention pattern constant in the backward")
+    ap.add_argument("--gate-grad-from", type=int, default=0, help="visits below it hold their router gate weights constant in the backward")
+    ap.add_argument("--bank-grad-from", type=int, default=0, help="looped visits below it hold their bank inputs constant in the backward")
+    a = ap.parse_args()
+    if a.bank_grad_from:
+        ap.error("--bank-grad-from cannot run in this session: its trainer runs with lean_host (the sketches), which adds a looped layer's "
+                 "gradient at the layer's last visit, and a bank cut skips visits (t8_step.validate_config refuses the pair)")
+    return {"check": phase_check, "pre": phase_pre, "pre_compare": phase_pre_compare, "trainer": phase_trainer, "compare": phase_compare,
+            "dmg_merge": phase_dmg_merge}[a.phase](a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
