@@ -26,12 +26,12 @@ RULES = ("A", "P", "T", "E")
 EXPERT_KEYS = ("A13", "B13", "A2", "B2")
 
 
-def parse_state(spec: str):
-    """"P:8" -> ("P", 8.0, None); "E:1:1e-6" -> ("E", 1.0, 1e-6). The size defaults to 1, E's eps to 1e-6."""
+def parse_state(spec: str, need_size: bool = False):
+    """"P:8" -> ("P", 8.0, None); "E:1:1e-6" -> ("E", 1.0, 1e-6). The size defaults to 1 (need_size: it must be written), E's eps to 1e-6."""
     parts = spec.split(":")
     rule = parts[0]
-    if rule not in RULES or len(parts) > 3:
-        raise ValueError(f"rule state {spec!r}: <rule>[:<size>[:<eps>]] with rule one of {RULES}")
+    if rule not in RULES or len(parts) > 3 or (need_size and (len(parts) < 2 or not parts[1])):
+        raise ValueError(f"rule state {spec!r}: <rule>[:<size>[:<eps>]] with rule one of {RULES}" + (", the size written" if need_size else ""))
     size = float(parts[1]) if len(parts) > 1 and parts[1] else 1.0
     eps = float(parts[2]) if len(parts) > 2 else (1e-6 if rule == "E" else None)
     if not size > 0 or (rule == "E" and not eps > 0) or (rule != "E" and len(parts) > 2):

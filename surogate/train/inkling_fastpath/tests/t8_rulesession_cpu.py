@@ -20,6 +20,7 @@ import torch
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 sys.path.insert(0, HERE)
+from surogate.inkling_rl import adapter as AD  # noqa: E402
 import t8_micro as MI  # noqa: E402
 import t8_ppo_cpu as P  # noqa: E402
 import t8_rules as RU  # noqa: E402
@@ -29,6 +30,12 @@ import t8_stepsession as SS  # noqa: E402
 import t8_stepsession_cpu as C  # noqa: E402
 
 STATES = "A8=a+own,P8=a+own,T8=a,E8=a,RA8=a+own,R2A8=a,RP8=a,A4=a,P12=a"
+
+
+def fake_import(adapter_dir):
+    """The exported file's values in the fake trainer's parameter order (the kit's reader of its own adapter form)."""
+    layers, _ = AD.import_adapter(adapter_dir, physical_layers=3)
+    return [torch.from_numpy(np.ascontiguousarray(d[k], dtype=np.float32)) for d in layers for k in C.KEYS]
 
 
 def run_session(tmp, name, plan_dir, build_dir, ck, grad, panel_dir, engines):
@@ -50,10 +57,11 @@ def run_session(tmp, name, plan_dir, build_dir, ck, grad, panel_dir, engines):
     th = threading.Thread(target=read, daemon=True)
     th.start()
     tr = P.FakeTrainer(C.cfg_for(tmp), 1)
-    fu = RU.load_first_update(ck, grad, MI.sha256, SS.state_sha)
+    m_before = [m.detach().clone() for m in tr.opt.masters]
     try:
-        trc = RS.run_states(tr, C.load(plan_dir), fu, tab, run, os.path.join(build_dir, "adapters"), 0, "rules-cpu-" + name, float(tab["rule_E_eps"]),
+        trc = RS.run_states(tr, C.load(plan_dir), tab, run, os.path.join(build_dir, "adapters"), 0, "rules-cpu-" + name, fake_import,
                             log=lambda *_: None)
+        assert all(torch.equal(a, b) for a, b in zip(tr.opt.masters, m_before)), "the trainer's masters were not put back"
     except SS.SessionStop as e:
         trc = e.code
     SS.write_json(os.path.join(run, "trainer_end.json"), {"exit": trc})
@@ -150,15 +158,21 @@ def main():
     assert out.get("rc") == RR.RD.EXIT_ROUNDTRIP and trc in (0, SS.EXIT_ROUNDTRIP), (trc, out)
     assert os.path.exists(os.path.join(run4, "states", "A8", "READS_DONE")) and not os.path.exists(os.path.join(run4, "states", "P8", "READS_DONE"))
     assert json.load(open(os.path.join(run4, "states", "P8", "roundtrip", "result.json")))["result"] == "differ" and not os.path.exists(os.path.join(run4, "RULES_DONE"))
-    fu2 = RU.load_first_update(ck, grad, MI.sha256, SS.state_sha)
-    RS.check_build(tab, fu2)
+    ck_meta, g_json = json.load(open(os.path.join(ck, "meta.json"))), json.load(open(os.path.splitext(grad)[0] + ".json"))
+    RS.check_build(tab, ck_meta, g_json)
+    RS.check_build(tab, None, None)
     for what, bad_tab in (("another gradient", dict(tab, grad_sha256="0" * 64)), ("failed checks", dict(tab, checks_pass=False)),
                           ("another checkpoint", dict(tab, checkpoint=dict(tab["checkpoint"], masters_sha256="0" * 64)))):
         try:
-            RS.check_build(bad_tab, fu2)
+            RS.check_build(bad_tab, ck_meta, g_json)
             raise AssertionError(f"a rules.json with {what} was accepted")
         except SS.PlanError:
             pass
+    # the trainer side takes a state from its adapter FILE: the values it runs are the file's (bf16), whatever host built the masters
+    a8 = fake_import(os.path.join(bd, "adapters", "A8"))
+    fu2 = RU.load_first_update(ck, grad, MI.sha256, SS.state_sha)
+    want8 = RU.add_delta(fu2["theta0"], RU.rule_delta("A", fu2["grads"], fu2["coef"], fu2["d_adam"], 8.0))
+    assert all(torch.equal(x, torch.from_numpy(AD.round_bf16(w.numpy()).reshape(tuple(w.shape)))) for x, w in zip(a8, want8)), "the file is not bf16(masters)"
     rd_ok = RR.StateReader(C.FakeEngines(), ["e0", "e1"], os.path.join(tmp, "rules"), plan_dir, {"a": panel_dir}, [0, 1], 0, ["a"], engine_sha="fake")
     RR.check_sets(tab, rd_ok)
     for what, kw in (("a set the states do not name", {"sets": {"a": panel_dir, "b": panel_dir}, "own": [0, 1]}), ("no own set", {"sets": {"a": panel_dir}, "own": []})):
@@ -174,13 +188,18 @@ def main():
     except ValueError:
         pass
     tr = P.FakeTrainer(C.cfg_for(tmp), 1)
-    t2 = dict(tab, states=[dict(tab["states"][0], masters_sha256="0" * 64)])
+    t2 = dict(tab, states=[dict(tab["states"][0], adapter_sha256="0" * 64)])
     os.makedirs(os.path.join(tmp, "rules_badsha"))
     try:
-        RS.run_states(tr, plan, fu2, t2, os.path.join(tmp, "rules_badsha"), os.path.join(bd, "adapters"), 0, "x", 1e-6, log=lambda *_: None)
-        raise AssertionError("a state whose rebuilt masters do not match rules.json was handed over")
-    except SS.GateFailure:
+        RS.run_states(tr, plan, t2, os.path.join(tmp, "rules_badsha"), os.path.join(bd, "adapters"), 0, "x", fake_import, log=lambda *_: None)
+        raise AssertionError("a state whose adapter file is not rules.json's was handed over")
+    except SS.PlanError:
         pass
+    assert not os.path.exists(os.path.join(tmp, "rules_badsha", "states", "A8", "TRAINER_READY.json"))
+    rd_dl = RR.StateReader(C.FakeEngines(), ["e0", "e1"], os.path.join(tmp, "rules_deadline"), plan_dir, {"a": panel_dir}, [0, 1], 0, ["a"], engine_sha="fake")
+    os.makedirs(os.path.join(tmp, "rules_deadline"))
+    open(os.path.join(tmp, "rules_deadline", "session_id.txt"), "w").write("x")
+    assert rd_dl.serve_states(["A8"], deadline_s=1e-9) == RR.RD.EXIT_READS, "the reads' time limit did not stop the read side"
     print("(4) a leaked state stops the read side (exit 21, nothing listed for it); a state that does not match rules.json is not handed over; "
           "rules.json from another gradient or checkpoint, set names that do not match, too few round-trip rows are refused: PASS")
     print("T8 RULE SESSION CPU TEST: PASS")

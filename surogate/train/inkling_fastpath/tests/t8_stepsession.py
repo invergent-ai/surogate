@@ -455,10 +455,16 @@ class Session:
             if meta.get("lr") != self.o["lr"] or meta.get("backward_options") != self.o["backward_options"]:
                 raise PlanError(f"the checkpoint was written at lr {meta.get('lr')} with backward options {meta.get('backward_options')}; this "
                                 f"session runs lr {self.o['lr']} with {self.o['backward_options']}")
-            src_rule = meta.get("update_rule") or {"rule": "A", "size": 1.0}
+            src_rule = meta.get("update_rule") or {"rule": "A", "size": 1.0, "eps": None}
             if (src_rule.get("rule") != "A" or float(src_rule.get("size", 1.0)) != 1.0 or "rebuilt" in meta) and not self.rule_given:
                 raise PlanError(f"the checkpoint was written under update rule {src_rule}"
                                 + (" and rebuilt" if "rebuilt" in meta else "") + ": this session must state its own rule (--rule)")
+            # one rule per run of updates: the session's rule, size and eps must be the checkpoint's (a run that changes its rule between
+            # updates is another design and would need its own option)
+            mine = (self.rule["rule"], self.rule["size"], self.rule["eps"])
+            theirs = (src_rule.get("rule"), float(src_rule.get("size", 1.0)), src_rule.get("eps"))
+            if mine != theirs:
+                raise PlanError(f"the checkpoint's update rule is {theirs} (rule, size, eps); this session runs {mine}")
             u = int(meta["update"])
             if u == plan.first - 1:                           # (B) the next step's plan: old log-probs at the restored weights
                 self.j0 = 0
@@ -1077,7 +1083,7 @@ def rebuild_checkpoint(ckpt_dir: str, grad_path: str, spec: str, out_dir: str, e
     (its moments are the gradient's under every rule). The meta keeps every record a resume compares (theta0, plan, old log-probs, lr,
     backward options), with the new masters' and adapter's hashes and a "rebuilt" entry. -> the new meta."""
     fu = RU.load_first_update(ckpt_dir, grad_path, MI.sha256, state_sha)
-    rule, size, eps = RU.parse_state(spec)
+    rule, size, eps = RU.parse_state(spec, need_size=True)    # a rebuilt checkpoint states its size: no default
     d = RU.rule_delta(rule, fu["grads"], fu["coef"], fu["d_adam"], size, eps, fu["moments"])
     new = RU.add_delta(fu["theta0"], d)
     nm, meta = fu["names"], dict(fu["meta"])

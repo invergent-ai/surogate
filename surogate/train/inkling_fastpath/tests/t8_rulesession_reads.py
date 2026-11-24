@@ -155,11 +155,15 @@ class StateReader(RD.Reader):
         RD.log(f"state {name}: READS_DONE on {tr['sets']}, {len(files)} files, {time.time() - t0:.0f} s")
         return 0
 
-    def serve_states(self, names: list) -> int:
+    def serve_states(self, names: list, deadline_s: float = 0.0) -> int:
+        t_start = time.time()
         rc = self.base_pass("base", sorted(self.sets))
         if rc:
             return rc
         for name in names:
+            if deadline_s and time.time() - t_start > deadline_s:      # a read side that is this late is stopped before its next state
+                RD.log(f"the reads passed their limit of {deadline_s / 60:.0f} min before state {name}")
+                return RD.EXIT_READS
             ready = os.path.join(self.run, "states", name, "TRAINER_READY.json")
             while not os.path.exists(ready):
                 end = os.path.join(self.run, "trainer_end.json")
@@ -202,6 +206,7 @@ def main():
     ap.add_argument("--rt-group", type=int, default=0)
     ap.add_argument("--reread", default="", help="comma list of sets read again without an adapter at the end")
     ap.add_argument("--rules", required=True, help="rules.json (the states and their order)")
+    ap.add_argument("--deadline-min", type=float, default=0.0, help="no further state is started after this many minutes (0 = no limit)")
     ap.add_argument("--run-dir", required=True)
     ap.add_argument("--engine-sha-file", default="")
     a = ap.parse_args()
@@ -213,7 +218,7 @@ def main():
         rd = StateReader(RD.HttpClient(a.model), [u for u in a.urls.split(",") if u], a.run_dir, a.plan, dict(x.split("=", 1) for x in a.set),
                          [g for g in a.own_groups.split(",") if g], a.rt_group, a.reread.split(","), eng)
         check_sets(rules, rd)                                 # before a single token is read
-        rc = rd.serve_states(names)
+        rc = rd.serve_states(names, a.deadline_min * 60.0)
     except (ValueError, KeyError, OSError) as e:
         RD.log(f"READ SIDE: inputs: {type(e).__name__}: {e}")
         rc = RD.EXIT_INPUT

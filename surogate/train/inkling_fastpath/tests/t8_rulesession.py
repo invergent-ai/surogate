@@ -9,9 +9,11 @@ build (CPU, no card): from a first update's checkpoint and gradient file, every 
   cos_with_adam_step, first_order {at_size, size_1} = N x <-grad, d>, sets}; "round_trip_rows" (with a plan given); "checks": P and E have the optimizer step's overall norm
   and T its per-tensor norms (largest relative difference), the score adapters (q, k, r) are untouched in every state, A<s> is
   theta0 + s x (theta1 - theta0), A at size 1 is the checkpoint's masters and exports to the checkpoint's adapter hash.
-states (trainer side, one worker): the trainer's start adapter must equal the checkpoint's by value and replay the round-trip rows' records
-  bitwise; then per state, in the list's order: the masters rebuilt (their hash must be rules.json's), the shipped adapter's hash checked,
-  the trainer's log-probs of the round-trip rows -> states/<name>/roundtrip/trainer.npz, and the hand-over states/<name>/TRAINER_READY.json.
+states (trainer side, one worker): the trainer's start adapter must replay the round-trip rows' records bitwise; then per state, in the
+  list's order: the shipped adapter FILE is checked against rules.json's hash and its values are taken as the trainer's masters (the file
+  holds bf16 values, which are exactly the trainer's work values of that state: nothing is recomputed on the card host, so no
+  floating-point difference between the build host and the card host can enter), the trainer's log-probs of the round-trip rows ->
+  states/<name>/roundtrip/trainer.npz, and the hand-over states/<name>/TRAINER_READY.json.
 The read side (tests/t8_rulesession_reads.py) reads every state on the row sets its entry names. Exit codes as the step session's
 (0; 21 a round trip or a base re-read not bitwise; 4 a trainer gate; 5 inputs; 6 the read side failed).
 """
@@ -157,9 +159,9 @@ def build(ckpt_dir: str, grad_path: str, states: list, out_dir: str, export_fn, 
     return tab
 
 
-def run_states(tr, plan, fu: dict, tab: dict, run_dir: str, adapters_dir: str, rt_group: int, session_id: str, eps: float, log=MI.log) -> int:
-    """The trainer side of the card session (one worker): per state the trainer's log-probs of the round-trip rows and the hand-over."""
-    nm = fu["names"]
+def run_states(tr, plan, tab: dict, run_dir: str, adapters_dir: str, rt_group: int, session_id: str, import_fn, log=MI.log) -> int:
+    """The trainer side of the card session (one worker): per state the trainer's log-probs of the round-trip rows and the hand-over.
+    import_fn(adapter dir) -> the adapter file's values as a list of fp32 tensors in the trainer's parameter order."""
     os.makedirs(os.path.join(run_dir, "states"), exist_ok=True)
     grp = [r for r in plan.rows if r.group_idx == rt_group]
     pick = set(pick_round_trip_rows({int(r.notes["plan_row"]): r.T for r in grp}))
@@ -167,25 +169,22 @@ def run_states(tr, plan, fu: dict, tab: dict, run_dir: str, adapters_dir: str, r
     if tab.get("round_trip_rows") is not None and (sorted(pick) != sorted(tab["round_trip_rows"]) or tab.get("round_trip_group") != rt_group):
         raise SS.PlanError("rules.json names other round-trip rows than this plan and group give")
     start = [m.detach().clone() for m in tr.opt.masters]
-    if not all(torch.equal(a, b) for a, b in zip(start, fu["theta0"])):      # by value: the zeros' sign bits are the trainer's own
-        raise SS.GateFailure("the trainer's start adapter is not the checkpoint's theta0")
-    lz = tr.logprobs(rt)
+    lz = tr.logprobs(rt)                                      # the start adapter (B = 0) is the base model: it must replay the records
     differ = sum(MI.bits_equal(np.concatenate([[0.0], x]), r.engine_lp, r.loss_mask)[1] for r, x in zip(rt, lz))
     SS.write_json(os.path.join(run_dir, "trainer_start.json"), {"session_id": session_id, "round_trip_group": rt_group,
                                                                 "round_trip_rows": sorted(pick), "replay_differ": differ,
                                                                 "loss_tokens": int(sum(int(r.loss_mask.sum()) for r in rt))})
     if differ:
         raise SS.GateFailure(f"REPLAY GATE: {differ} loss tokens of the round-trip rows differ from the records at the start adapter")
-    by = {s["name"]: s for s in parse_states(",".join(f"{r['name']}={'+'.join(r['sets'])}" for r in tab["states"]))}
     for row in tab["states"]:
         name, t0 = row["name"], time.time()
-        masters, _ = state_masters(by[name], fu, eps)
-        if SS.state_sha(masters, nm) != row["masters_sha256"]:
-            raise SS.GateFailure(f"state {name}: the masters rebuilt here do not hash to rules.json's")
         ad = os.path.join(adapters_dir, name)
         if MI.sha256(os.path.join(ad, "adapter_model.safetensors")) != row["adapter_sha256"]:
             raise SS.PlanError(f"state {name}: the shipped adapter is not the file rules.json names")
-        SS.put_masters(tr, masters)
+        masters = import_fn(ad)
+        if len(masters) != len(start) or any(tuple(a.shape) != tuple(b.shape) for a, b in zip(masters, start)):
+            raise SS.PlanError(f"state {name}: the adapter file's tensors are not this trainer's")
+        SS.put_masters(tr, masters)                           # bf16 values: the workers' values are these, bit for bit
         del masters
         lu = tr.logprobs(rt)
         sd = os.path.join(run_dir, "states", name, "roundtrip")
@@ -208,12 +207,24 @@ def run_states(tr, plan, fu: dict, tab: dict, run_dir: str, adapters_dir: str, r
     return 0
 
 
-def check_build(tab: dict, fu: dict) -> None:
-    """rules.json must have passed its checks and be built from THIS checkpoint and gradient file."""
+def check_build(tab: dict, ckpt_meta: dict | None, grad_json: dict | None) -> None:
+    """rules.json must have passed its checks and, when the checkpoint's meta.json and the gradient's grad.json are given, be built from them."""
     if not tab.get("checks_pass"):
         raise SS.PlanError("rules.json's checks did not pass")
-    if fu["grad_sha256"] != tab.get("grad_sha256") or fu["meta"]["masters_sha256"] != (tab.get("checkpoint") or {}).get("masters_sha256"):
-        raise SS.PlanError("rules.json was built from another checkpoint or gradient")
+    if grad_json is not None and grad_json.get("sha256") != tab.get("grad_sha256"):
+        raise SS.PlanError("rules.json was built from another gradient")
+    if ckpt_meta is not None and ckpt_meta.get("masters_sha256") != (tab.get("checkpoint") or {}).get("masters_sha256"):
+        raise SS.PlanError("rules.json was built from another checkpoint")
+
+
+def real_import(adapter_dir: str) -> list:
+    """The full adapter file's values (experts + attention) as fp32 tensors in the trainer's parameter order."""
+    import t8_adapter as TA
+    import t8_step as TS
+
+    layers, cfg = TA.import_combined(adapter_dir)
+    keys = TS.param_keys(int(cfg["r"]))
+    return [torch.from_numpy(np.ascontiguousarray(d[k], dtype=np.float32)) for d in layers for k in keys]
 
 
 def phase_build(a) -> int:
@@ -236,8 +247,7 @@ def phase_states(a) -> int:
     try:
         plan = SS.load_step_plan(a.plan)
         tab = SS.read_json(os.path.join(a.build, "rules.json"))
-        fu = RU.load_first_update(a.resume, a.grad, MI.sha256, SS.state_sha)
-        check_build(tab, fu)
+        check_build(tab, SS.read_json(a.ckpt_meta) if a.ckpt_meta else None, SS.read_json(a.grad_json) if a.grad_json else None)
     except (ValueError, OSError, KeyError) as e:
         print(f"REFUSED: {type(e).__name__}: {e}", flush=True)
         return SS.EXIT_INPUT
@@ -246,7 +256,7 @@ def phase_states(a) -> int:
     tr = TS.T8Trainer(MI.trainer_cfg(a, (card,)))
     rc, why = 1, ""
     try:
-        rc = run_states(tr, plan, fu, tab, a.run_dir, os.path.join(a.build, "adapters"), a.rt_group, sid, float(tab["rule_E_eps"]))
+        rc = run_states(tr, plan, tab, a.run_dir, os.path.join(a.build, "adapters"), a.rt_group, sid, real_import)
     except SS.GateFailure as e:
         rc, why = SS.EXIT_GATE, str(e)
     except SS.PlanError as e:
@@ -265,8 +275,10 @@ def phase_states(a) -> int:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--phase", required=True, choices=("build", "states"))
-    ap.add_argument("--resume", required=True, help="the first update's checkpoint directory")
-    ap.add_argument("--grad", required=True, help="its grad.pt (grad.json beside it)")
+    ap.add_argument("--resume", default="", help="build: the first update's checkpoint directory")
+    ap.add_argument("--grad", default="", help="build: its grad.pt (grad.json beside it)")
+    ap.add_argument("--ckpt-meta", default="", help="states: the checkpoint's meta.json (rules.json must be built from it)")
+    ap.add_argument("--grad-json", default="", help="states: the gradient's grad.json (rules.json must be built from it)")
     ap.add_argument("--states", default="", help="build: <name>=<set>+<set>,... in the order they will be read")
     ap.add_argument("--rule-eps", type=float, default=1e-6, help="build: rule E's eps")
     ap.add_argument("--out", default="", help="build: the directory for rules.json and adapters/")

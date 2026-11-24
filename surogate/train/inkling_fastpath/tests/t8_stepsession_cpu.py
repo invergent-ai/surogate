@@ -656,6 +656,11 @@ def main():
     dPc = RU.rule_delta("P", gr, 0.25, dA)                    # the clip coefficient changes nothing in P and T
     assert all(float((a - b).abs().max()) <= 1e-15 for a, b in zip(dPc, dP))
     assert RU.parse_state("P:8") == ("P", 8.0, None) and RU.parse_state("E") == ("E", 1.0, 1e-6) and RU.parse_state("E:8:1e-5") == ("E", 8.0, 1e-5)
+    try:
+        RU.parse_state("P", need_size=True)
+        raise AssertionError("a rebuild state without its size was accepted")
+    except ValueError:
+        pass
     nz = RU.add_delta([torch.tensor([-0.0, -0.0, 1.0])], [torch.tensor([0.0, 2.0, 0.0], dtype=torch.float64)])[0]
     assert nz.numpy().tobytes() == np.array([-0.0, 2.0, 1.0], dtype=np.float32).tobytes(), "an unmoved negative zero lost its sign bit"
     for bad_spec in ("Q", "P:0", "P:1:1e-6", "E:1:0"):
@@ -726,6 +731,12 @@ def main():
     handP = by_hand("P", None)
     rcx, _, _, sx, _ = session(tmp, "refuse_rebuilt_without_rule", plan_dir, [], resume=os.path.join(tmp, "rebuilt_P"), old_lp=os.path.join(run9, "old_lp.npz"))
     assert rcx == SS.EXIT_INPUT and "--rule" in sx.sess["exit"]["reason"], sx.sess["exit"]      # a rebuilt checkpoint needs the rule stated
+    for what, kw in (("another rule", {"rule": "T"}), ("another size", {"rule": "P", "rule_size": 2.0})):      # ... and it must be the checkpoint's
+        rcx, _, _, sx, _ = session(tmp, "refuse_rebuilt_" + what.replace(" ", "_"), plan_dir, [], resume=os.path.join(tmp, "rebuilt_P"),
+                                   old_lp=os.path.join(run9, "old_lp.npz"), **kw)
+        assert rcx == SS.EXIT_INPUT and "update rule" in sx.sess["exit"]["reason"], (what, sx.sess["exit"])
+    rcx, _, _, sx, _ = session(tmp, "refuse_plain_ckpt_under_P", plan_dir, [], resume=ck9, old_lp=os.path.join(run9, "old_lp.npz"), rule="P")
+    assert rcx == SS.EXIT_INPUT and "update rule" in sx.sess["exit"]["reason"], sx.sess["exit"]      # a checkpoint of the optimizer's step: rule A only
     rcq, runq, trq, sq, _ = session(tmp, "resume_rebuilt_P", plan_dir, ["GO", "GO"], panels=panels, rule="P",
                                     resume=os.path.join(tmp, "rebuilt_P"), old_lp=os.path.join(run9, "old_lp.npz"))
     assert rcq == 0 and all(torch.equal(a, b) for a, b in zip(trq.opt.masters, handP.opt.masters)) and same_state(opt_state(trq), opt_state(handP)), sq.sess["exit"]
