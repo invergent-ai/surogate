@@ -192,6 +192,18 @@ void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const 
     }
 }
 
+void speculative_truncate_at_phase_switch_launch(const Tensor& drafts, Tensor& current_extents,
+                                                 const SamplingConfig* configs, cudaStream_t stream) {
+    constexpr int kBlock = 32;
+    const int k          = drafts.ne[0];
+    const int batch      = drafts.ne[1];
+    speculative_truncate_at_phase_switch_kernel<<<static_cast<unsigned int>(div_up(batch, kBlock)), kBlock, 0,
+                                                  stream>>>(
+        static_cast<const std::int32_t*>(drafts.data), static_cast<std::int32_t*>(current_extents.data), configs,
+        k, batch);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void speculative_select_accepted_hidden_launch(const Tensor& hidden, const Tensor& selectors,
                                                Tensor& out, cudaStream_t stream) {
     constexpr int kBlock = 256;

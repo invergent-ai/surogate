@@ -89,6 +89,7 @@ std::string usage_text(const char* argv0) {
            "[--spec-max-lanes N|all] [--spec-adaptive]\n"
            "       [--lm-head-draft|--full-head-draft]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
+           "       [--reply-temperature F] [--reply-top-p F] [--reply-top-k N] [--reply-min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking] [--prefill-warmup]\n"
@@ -261,6 +262,18 @@ Options parse_options(int argc, char** argv) {
             options.sampling.top_k = static_cast<std::int32_t>(top_k);
         } else if (arg == "--min-p") {
             options.sampling.min_p = parse_float(value(arg), "min-p", 0.0F, 1.0F);
+        } else if (arg == "--reply-temperature") {
+            options.sampling.reply_temperature = parse_float(value(arg), "reply-temperature", 0.0F, 2.0F);
+        } else if (arg == "--reply-top-p") {
+            options.sampling.reply_top_p = parse_float(value(arg), "reply-top-p", 0.0F, 1.0F);
+        } else if (arg == "--reply-top-k") {
+            const std::uint32_t top_k = parse_u32(value(arg), "reply-top-k", true);
+            if (top_k > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
+                throw std::invalid_argument("--reply-top-k exceeds INT32_MAX");
+            }
+            options.sampling.reply_top_k = static_cast<std::int32_t>(top_k);
+        } else if (arg == "--reply-min-p") {
+            options.sampling.reply_min_p = parse_float(value(arg), "reply-min-p", 0.0F, 1.0F);
         } else if (arg == "--presence-penalty") {
             options.sampling.presence_penalty =
                 parse_float(value(arg), "presence-penalty", -2.0F, 2.0F);

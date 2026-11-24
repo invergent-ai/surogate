@@ -36,6 +36,12 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
     }
     if (execution.stage.last >= 0 && execution.stage.last < execution.model.geometry.layers) { return; }
     if (execution.constraints) { execution.constraints->enqueue(frame.drafts, execution.device.stream); }
+    // Reply-phase sampler: a row still in its thought accepts no draft at or after a drafted reasoning close
+    // (SamplingConfig::phase_switch_armed); rows without the option are untouched.
+    if (frame.ids.ne[0] > 1) {
+        ops::speculative_truncate_at_phase_switch(frame.drafts, frame.current_extents, frame.sampling,
+                                                  execution.device.stream);
+    }
     ops::sampling_update_greedy_targets(frame.target_logits, frame.target_tokens,
                                        execution.model.geometry.token_domain, frame.sampling,
                                        execution.device.stream);

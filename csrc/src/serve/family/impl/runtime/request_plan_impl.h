@@ -133,6 +133,14 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     base->summary.transient_bytes        = 0;
     base->sampling                       = translate_sampling(options.sampling);
     base->sampling.top_logprobs = options.top_logprobs;
+    if (options.sampling.reply && options.reply_switch_token >= 0) {
+        if (options.reply_switch_token >= cfg.token_domain) {
+            throw std::invalid_argument("reply-phase switch token is outside the token domain");
+        }
+        base->reply.armed        = true;
+        base->reply.switch_token = options.reply_switch_token;
+        base->reply.values       = *options.sampling.reply;
+    }
     base->logit_bias                     = options.sampling.logit_bias;
     base->constraint                     = options.constraint;
     if (options.next_token_candidates.size() > 256 ||
@@ -267,9 +275,14 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
         // install_sampling's switch and the split routes' (the coupled verify is a split route)
         static const bool coupled = runtime::kv_dspark_verify_coupled(std::getenv("SUROGATE_SPEC_COUPLED"),
                                                                       std::getenv("SUROGATE_SPEC_EXACT_SPLIT"));
+        // A reply-phase request is recomputed exactly only when both of its phases are.
+        const bool reply_exact = !base->reply.armed ||
+            runtime::kv_dspark_row_recomputes_exactly(base->reply.values.temperature, base->reply.values.top_k,
+                                                      base->reply.values.top_p, base->reply.values.min_p, coupled);
         return truncated_on_demand ||
-               runtime::kv_dspark_row_recomputes_exactly(base->sampling.temperature, base->sampling.top_k,
-                                                         base->sampling.top_p, base->sampling.min_p, coupled);
+               (reply_exact &&
+                runtime::kv_dspark_row_recomputes_exactly(base->sampling.temperature, base->sampling.top_k,
+                                                          base->sampling.top_p, base->sampling.min_p, coupled));
     }();
     base->summary.on_demand_kv = kv_on_demand_ && !base->target_only && !gpu_prefix_readout &&
                                  options.prompt_logprobs < 0 &&
@@ -460,6 +473,7 @@ RequestPlan ProgramImplCore::plan_request_for_sequence(std::uint32_t lane,
     plan->lora_slot                   = base.lora_slot;
     plan->min_tokens                  = base.min_tokens;
     plan->stop_barrier_count          = base.stop_barrier_count;
+    plan->reply                       = base.reply;
     plan->page_hashes                 = base.page_hashes;
 
     // Even a target-only readout may contain images. Plan its transient memory and

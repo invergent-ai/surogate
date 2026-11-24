@@ -37,6 +37,9 @@ struct SamplingConfig {
     float repetition_penalty   = 1.0f;
     unsigned long long seed    = 0;
     std::int32_t token_bitmask_stride = 0; // words between speculative verification-column masks
+    /// Reply-phase sampler (runtime/contract/reply_phase.h), read only where phase_switch_armed != 0: the
+    /// model's reasoning close token. Sits in what was padding, so the layout is unchanged.
+    std::int32_t phase_switch_token = -1;
     const std::int32_t* token_bitmask = nullptr; // optional allowed-token bitmap [ceil(token_domain/32)]
     const float* logit_bias = nullptr; // optional device F32 [token_domain], added before temperature
     std::int32_t* token_counts = nullptr; // device [token_domain] i32, or null
@@ -64,10 +67,19 @@ struct SamplingConfig {
     /// position and kSamplePurposeDecode) and accepts a draft iff it equals that token -- the committed tokens are
     /// those of MTP-off decoding with the same seed. Zero: the one-hot rejection rule. Ignored outside verification.
     std::int32_t speculative_coupled        = 0;
+    /// Nonzero while a request with a reply-phase sampler is still in its thought: a speculative verify accepts no
+    /// draft at or after the row's first draft equal to phase_switch_token (speculative_truncate_at_phase_switch), so
+    /// every token a round commits is drawn with this config and the tokens after the close are drawn in the next
+    /// round, with the answer's values. Zero (every other request): nothing changes. Sits in the tail padding.
+    std::int32_t phase_switch_armed         = 0;
 };
 // A public header, copied to the device every round and sized into the persistent layout (24 -> 26 words per lane at
 // M10): a change of this size is deliberate and needs every separately built consumer rebuilt (review R5 minor 5).
 static_assert(sizeof(SamplingConfig) == 104, "SamplingConfig layout changed");
+// The reply-phase fields took two padding words; every other field keeps its offset.
+static_assert(offsetof(SamplingConfig, phase_switch_token) == 44 && offsetof(SamplingConfig, token_bitmask) == 48 &&
+                  offsetof(SamplingConfig, phase_switch_armed) == 100,
+              "SamplingConfig reply-phase fields must stay in the former padding");
 
 /// The (position, purpose) a row's draw is keyed by; see SamplingConfig::continue_decode_key.
 struct SampleKey {

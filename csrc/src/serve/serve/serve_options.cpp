@@ -240,7 +240,10 @@ std::string serve_usage_text(const char* argv0) {
            "[--thinking-loop-guard] [--thinking-answer-reserve N] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy] [--decision-temperature T] "
-           "[--decision-attempts N]\n"
+           "[--decision-attempts N] [--reply-temperature F] [--reply-top-p F] [--reply-top-k N] [--reply-min-p F]\n"
+           "       --reply-temperature/--reply-top-p/--reply-top-k/--reply-min-p: defaults for the request fields\n"
+           "         reply_temperature/... (reply-phase sampler): the answer after the model's thought closes is drawn\n"
+           "         with them, the thought with the ordinary values. Not given (and not in the request): off.\n"
            "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
            "       --default-max-tokens N: without a max_tokens a request gets N, capped to the rest of the context;\n"
            "         not given, it gets the rest of the context (vLLM with no generation-config max_new_tokens).\n"
@@ -880,6 +883,18 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--min-p") {
             options.sampling_overrides.min_p =
                 parse_float_in(require_value("--min-p"), "min-p", 0.0f, 1.0f);
+        } else if (arg == "--reply-temperature") {
+            options.sampling_overrides.reply_temperature =
+                parse_float_in(require_value("--reply-temperature"), "reply-temperature", 0.0f, 2.0f);
+        } else if (arg == "--reply-top-p") {
+            options.sampling_overrides.reply_top_p =
+                parse_float_in(require_value("--reply-top-p"), "reply-top-p", 0.0f, 1.0f);
+        } else if (arg == "--reply-top-k") {
+            options.sampling_overrides.reply_top_k =
+                parse_nonnegative_int(require_value("--reply-top-k"), "reply-top-k");
+        } else if (arg == "--reply-min-p") {
+            options.sampling_overrides.reply_min_p =
+                parse_float_in(require_value("--reply-min-p"), "reply-min-p", 0.0f, 1.0f);
         } else if (arg == "--presence-penalty") {
             options.sampling_overrides.presence_penalty = parse_float_in(
                 require_value("--presence-penalty"), "presence-penalty", -2.0f, 2.0f);

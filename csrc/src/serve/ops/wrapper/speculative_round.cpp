@@ -157,6 +157,22 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
         licensed_counts, accepted, token_domain, configs, scratch, stream, k, split_routes);
 }
 
+void speculative_truncate_at_phase_switch(const Tensor& drafts, Tensor& current_extents,
+                                          const SamplingConfig* configs, cudaStream_t stream) {
+    constexpr const char* op = "speculative_truncate_at_phase_switch";
+    const std::int32_t k     = drafts.ne[0];
+    const std::int32_t batch = drafts.ne[1];
+    if (k < 1 || batch < 1) {
+        throw std::invalid_argument("speculative_truncate_at_phase_switch: K and B must be positive");
+    }
+    require_matrix(drafts, DType::I32, k, batch, op, "drafts");
+    require_vector(current_extents, DType::I32, batch, op, "current_extents");
+    if (configs == nullptr) {
+        throw std::invalid_argument("speculative_truncate_at_phase_switch: configs must be non-null");
+    }
+    detail::speculative_truncate_at_phase_switch_launch(drafts, current_extents, configs, stream);
+}
+
 void speculative_select_accepted_hidden(const Tensor& hidden, const Tensor& selectors, Tensor& out,
                                         cudaStream_t stream) {
     constexpr const char* op = "speculative_select_accepted_hidden";

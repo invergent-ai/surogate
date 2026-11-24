@@ -104,6 +104,29 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
                                       bool no_drafts = false, bool split_routes = false);
 
 /**
+ * Op: speculative_truncate_at_phase_switch
+ *
+ * Math / indexing:
+ *   For each row b with configs[b].phase_switch_armed != 0, let i be the smallest index in [0, min(K, Pcur[b])) with
+ *   drafts[i,b] == configs[b].phase_switch_token; when one exists, Pcur[b] = i. Every other row is unchanged.
+ *
+ * Purpose:
+ *   The reply-phase sampler (runtime/contract/reply_phase.h). A row still in its thought must not accept a draft
+ *   after the model's reasoning close token: the tokens after the close belong to the answer and are drawn with other
+ *   values. Cutting the available drafts before the first drafted close leaves every verified column a thought
+ *   column, drawn with the row's config; the close itself, when the target draws it, is the round's correction or
+ *   bonus token, and the next round is staged with the answer's values. Speculative decoding accepts any draft count
+ *   (the adaptive window changes it every round), so the committed tokens keep their exact distribution; a coupled
+ *   row (SamplingConfig::speculative_coupled) commits exactly the tokens of MTP-off decoding, as before.
+ *
+ * Logical shapes:
+ *   drafts is contiguous I32 [K,B] with K>=1, current_extents contiguous I32 [B] (updated in place before the verify's
+ *   accept; nothing after the accept reads it), configs a device-resident SamplingConfig[B]. No workspace.
+ */
+void speculative_truncate_at_phase_switch(const Tensor& drafts, Tensor& current_extents,
+                                          const SamplingConfig* configs, cudaStream_t stream);
+
+/**
  * Op: speculative_select_accepted_hidden
  *
  * Math / indexing:

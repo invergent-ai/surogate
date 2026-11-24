@@ -95,6 +95,55 @@ int prepare_verify_case(int k) {
     return failures;
 }
 
+// Reply-phase sampler: a row still in its thought (phase_switch_armed) keeps only the drafts before its first drafted
+// close token; an unarmed row, a row whose close lies past its extent, and a row with no close keep their extents.
+int truncate_at_phase_switch_case() {
+    constexpr int k        = 7;
+    constexpr int kClose   = 200002;
+    // row: armed?, extent, index of the close among the drafts (-1: none), expected extent
+    struct Row { int armed; int extent; int close_at; int expected; };
+    const std::vector<Row> rows = {
+        {1, 7, 3, 3},  // close mid-block: drafts 0..2 stay
+        {1, 7, 0, 0},  // close is the first draft: no draft stays
+        {1, 7, 6, 6},  // close is the last draft
+        {1, 2, 4, 2},  // close past the extent: unchanged
+        {1, 5, -1, 5}, // no close: unchanged
+        {0, 7, 3, 7},  // not armed (option off / already answering): unchanged
+        {1, 0, 0, 0},  // nothing proposed
+        {1, 7, 2, 2},  // two closes: the first one counts (second at 5)
+    };
+    const int batch = static_cast<int>(rows.size());
+    std::vector<std::int32_t> drafts(static_cast<std::size_t>(k * batch));
+    std::vector<std::int32_t> extents(rows.size());
+    std::vector<ops::SamplingConfig> configs(rows.size());
+    for (int b = 0; b < batch; ++b) {
+        for (int i = 0; i < k; ++i) drafts[static_cast<std::size_t>(b * k + i)] = 1000 + 13 * b + i;
+        if (rows[b].close_at >= 0) drafts[static_cast<std::size_t>(b * k + rows[b].close_at)] = kClose;
+        if (b == batch - 1) drafts[static_cast<std::size_t>(b * k + 5)] = kClose;
+        extents[static_cast<std::size_t>(b)] = rows[b].extent;
+        configs[static_cast<std::size_t>(b)].temperature        = 1.0F;
+        configs[static_cast<std::size_t>(b)].phase_switch_token = kClose;
+        configs[static_cast<std::size_t>(b)].phase_switch_armed = rows[b].armed;
+    }
+    // An unarmed row with a default config: the token field is -1 and never read.
+    configs[5] = ops::SamplingConfig{};
+    DeviceBuffer d_drafts  = to_device(drafts);
+    DeviceBuffer d_extents = to_device(extents);
+    DeviceBuffer d_configs = to_device(configs);
+    Tensor draft_tensor(d_drafts.p, DType::I32, {k, batch});
+    Tensor extent_tensor(d_extents.p, DType::I32, {batch});
+    ops::speculative_truncate_at_phase_switch(draft_tensor, extent_tensor,
+                                              static_cast<const ops::SamplingConfig*>(d_configs.p), nullptr);
+    cuda_synchronize();
+    std::vector<std::int32_t> expected;
+    for (const Row& row : rows) expected.push_back(row.expected);
+    int failures = verify_exact("truncate at phase switch extents", from_device<std::int32_t>(d_extents, rows.size()),
+                                expected);
+    failures += verify_exact("truncate at phase switch drafts unchanged",
+                             from_device<std::int32_t>(d_drafts, drafts.size()), drafts);
+    return failures;
+}
+
 struct AcceptExpected {
     std::vector<std::int32_t> sampled;
     std::int32_t num_sampled;
@@ -550,6 +599,7 @@ int main() {
         ++failures;
     } catch (const std::invalid_argument&) {}
     for (const int k : {1, 5, 15}) failures += prepare_verify_case(k);
+    failures += truncate_at_phase_switch_case();
     failures += greedy_accept_case(0, 0);
     for (const int domain : {257, 32769}) {
         for (const int top_k : {1, 64, 0}) {

@@ -44,6 +44,13 @@ sinfer::SamplingOverrides resolve_sampling_overrides(const SamplingParams& reque
         sampling.top_k = *request.top_k < 0 ? 0 : static_cast<std::int32_t>(*request.top_k);
     }
     if (request.min_p) { sampling.min_p = static_cast<float>(*request.min_p); }
+    // Reply-phase sampler: a request's reply_* field replaces the server's --reply-* default of the same field.
+    if (request.reply_temperature) { sampling.reply_temperature = static_cast<float>(*request.reply_temperature); }
+    if (request.reply_top_p) { sampling.reply_top_p = static_cast<float>(*request.reply_top_p); }
+    if (request.reply_top_k) {
+        sampling.reply_top_k = *request.reply_top_k < 0 ? 0 : static_cast<std::int32_t>(*request.reply_top_k);
+    }
+    if (request.reply_min_p) { sampling.reply_min_p = static_cast<float>(*request.reply_min_p); }
     if (request.repetition_penalty) {
         sampling.repetition_penalty = static_cast<float>(*request.repetition_penalty);
     }
@@ -90,6 +97,21 @@ sinfer::SamplingOverrides resolve_sampling_overrides(const SamplingParams& reque
     if (sampling.min_p && (*sampling.min_p < 0.0F || *sampling.min_p > 1.0F)) {
         invalid_sampling("min_p must be in [0,1]", "min_p");
     }
+    if (!finite(sampling.reply_temperature) || !finite(sampling.reply_top_p) || !finite(sampling.reply_min_p)) {
+        invalid_sampling("reply sampling parameters must be finite", "sampling");
+    }
+    if (sampling.reply_temperature && (*sampling.reply_temperature < 0.0F || *sampling.reply_temperature > 2.0F)) {
+        invalid_sampling("reply_temperature must be in [0,2]", "reply_temperature");
+    }
+    if (sampling.reply_top_p && (*sampling.reply_top_p < 0.0F || *sampling.reply_top_p > 1.0F)) {
+        invalid_sampling("reply_top_p must be in [0,1]", "reply_top_p");
+    }
+    if (request.reply_top_k && *request.reply_top_k < -1) {
+        invalid_sampling("reply_top_k must be -1 (no limit) or nonnegative", "reply_top_k");
+    }
+    if (sampling.reply_min_p && (*sampling.reply_min_p < 0.0F || *sampling.reply_min_p > 1.0F)) {
+        invalid_sampling("reply_min_p must be in [0,1]", "reply_min_p");
+    }
     if (sampling.presence_penalty &&
         (*sampling.presence_penalty < -2.0F || *sampling.presence_penalty > 2.0F)) {
         invalid_sampling("presence_penalty must be in [-2,2]", "presence_penalty");
@@ -98,7 +120,10 @@ sinfer::SamplingOverrides resolve_sampling_overrides(const SamplingParams& reque
         (*sampling.frequency_penalty < -2.0F || *sampling.frequency_penalty > 2.0F)) {
         invalid_sampling("frequency_penalty must be in [-2,2]", "frequency_penalty");
     }
-    if (server.greedy) { sampling.temperature = 0.0F; }
+    if (server.greedy) {
+        sampling.temperature = 0.0F;
+        if (sampling.has_reply()) { sampling.reply_temperature = 0.0F; }
+    }
     return sampling;
 }
 

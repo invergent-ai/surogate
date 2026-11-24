@@ -1660,6 +1660,7 @@ PreparedPrompt PreparedPrompt::with_continuation(std::span<const TokenId> genera
 PreparedPrompt PreparedPrompt::with_answer_continuation(std::span<const TokenId> tokens) const {
     PreparedPrompt out              = with_continuation(tokens);
     out.data_->starts_in_reasoning = false;
+    out.data_->answer_continuation = true;
     return out;
 }
 PreparedPrompt& PreparedPrompt::operator=(PreparedPrompt&&) noexcept = default;
@@ -2141,6 +2142,16 @@ std::shared_ptr<const CompiledTokenConstraint> Frontend::compile_json_constraint
     if (!close) { return nullptr; }
     std::lock_guard lock(impl_->constraint_mutex);
     return impl_->json_constraint_compiler().compile_after(schema, static_cast<TokenId>(*close));
+}
+
+std::pair<bool, std::optional<TokenId>> Frontend::reply_phase_switch(bool starts_in_reasoning) const {
+    if (!impl_) { throw std::logic_error("frontend is moved from"); }
+    const fi::ReasoningSyntax& reasoning = impl_->reasoning;
+    const bool may_think = starts_in_reasoning || reasoning.model_opens;
+    if (!may_think || reasoning.muse_glimmer || reasoning.close.empty()) { return {may_think, std::nullopt}; }
+    const std::optional<int> close = impl_->tokenizer->token_id(reasoning.close);
+    if (!close) { return {may_think, std::nullopt}; }
+    return {may_think, static_cast<TokenId>(*close)};
 }
 
 std::shared_ptr<const CompiledTokenConstraint> Frontend::compile_tool_constraint(const std::string& tag) const {

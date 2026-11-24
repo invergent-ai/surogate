@@ -142,7 +142,7 @@ Json event_base(const std::string& server_instance_id, std::uint64_t timestamp, 
 }
 
 Json sampler_json(const sinfer::ResolvedSamplingParameters& sampling) {
-    return Json{{"temperature", sampling.temperature},
+    Json result{{"temperature", sampling.temperature},
                 {"top_p", sampling.top_p},
                 {"top_k", sampling.top_k},
                 {"min_p", sampling.min_p},
@@ -150,6 +150,14 @@ Json sampler_json(const sinfer::ResolvedSamplingParameters& sampling) {
                 {"frequency_penalty", sampling.frequency_penalty},
                 {"repetition_penalty", sampling.repetition_penalty},
                 {"seed", sampling.seed}};
+    // Reply-phase sampler (the answer's values after the thought): present only when the request has it.
+    if (sampling.reply) {
+        result["reply"] = Json{{"temperature", sampling.reply->temperature},
+                               {"top_p", sampling.reply->top_p},
+                               {"top_k", sampling.reply->top_k},
+                               {"min_p", sampling.reply->min_p}};
+    }
+    return result;
 }
 
 Json preset_json(const sinfer::SamplingPreset& preset) {
@@ -179,6 +187,11 @@ Json overrides_json(const sinfer::SamplingOverrides& overrides) {
     if (overrides.frequency_penalty) { result["frequency_penalty"] = *overrides.frequency_penalty; }
     if (overrides.repetition_penalty) { result["repetition_penalty"] = *overrides.repetition_penalty; }
     if (overrides.seed) { result["seed"] = *overrides.seed; }
+    // Reply-phase sampler: present only when set, so records without it are unchanged.
+    if (overrides.reply_temperature) { result["reply_temperature"] = *overrides.reply_temperature; }
+    if (overrides.reply_top_k) { result["reply_top_k"] = *overrides.reply_top_k; }
+    if (overrides.reply_top_p) { result["reply_top_p"] = *overrides.reply_top_p; }
+    if (overrides.reply_min_p) { result["reply_min_p"] = *overrides.reply_min_p; }
     return result;
 }
 

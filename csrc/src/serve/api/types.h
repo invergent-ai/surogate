@@ -395,6 +395,28 @@ struct SamplingOverrides {
     std::optional<float> frequency_penalty;
     std::optional<std::uint64_t> seed;
     std::unordered_map<TokenId, float> logit_bias;
+    /// Reply-phase sampler (off unless one of these is set): the tokens a request generates after
+    /// its thought has closed -- the answer -- are drawn with these values instead of the four
+    /// above; the thought itself is drawn exactly as without them (same values, same random
+    /// stream). A reply field left unset takes the request's own resolved value of that field.
+    /// A request whose output does not open with a thought (the prompt opens none and the model
+    /// does not open one itself) draws every token with them.
+    std::optional<float> reply_temperature;
+    std::optional<std::int32_t> reply_top_k;
+    std::optional<float> reply_top_p;
+    std::optional<float> reply_min_p;
+
+    [[nodiscard]] bool has_reply() const noexcept {
+        return reply_temperature || reply_top_k || reply_top_p || reply_min_p;
+    }
+};
+
+/// The answer-phase values of SamplingOverrides::reply_*, resolved (SamplingOverrides).
+struct ReplySamplingParameters {
+    float temperature  = 0.0F;
+    std::int32_t top_k = 0;
+    float top_p        = 1.0F;
+    float min_p        = 0.0F;
 };
 
 // Complete parameters after Engine resolution. Target runtimes consume only this type.
@@ -409,6 +431,8 @@ struct ResolvedSamplingParameters {
     float repetition_penalty = 1.0F;
     std::uint64_t seed      = 0;
     std::unordered_map<TokenId, float> logit_bias;
+    /// The reply-phase values (SamplingOverrides::reply_*), or none: every token drawn with the above.
+    std::optional<ReplySamplingParameters> reply;
 };
 
 enum class OutputChannel : std::uint8_t {

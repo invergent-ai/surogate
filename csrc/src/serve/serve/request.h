@@ -170,6 +170,12 @@ struct SamplingParams {
     std::optional<double> frequency_penalty;
     std::optional<std::uint64_t> seed;
     std::unordered_map<int, double> logit_bias;
+    /// Reply-phase sampler (sinfer::SamplingOverrides::reply_*): the answer -- every token after the model's
+    /// thought closes -- is drawn with these; the thought keeps the fields above. Unset: off (or --reply-* defaults).
+    std::optional<double> reply_temperature;
+    std::optional<double> reply_top_p;
+    std::optional<int> reply_top_k;
+    std::optional<double> reply_min_p;
     int n = 1;
 };
 

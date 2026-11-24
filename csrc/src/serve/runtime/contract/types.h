@@ -55,6 +55,10 @@ struct ResolvedExecutionOptions {
     std::uint32_t min_tokens         = 0;
     std::array<TokenId, 4> stop_barrier{};
     std::uint32_t stop_barrier_count = 0;
+    /// Reply-phase sampler (sampling.reply): the model's reasoning close token, after which the reply values apply.
+    /// -1 with sampling.reply set never happens: Engine::submit folds the reply values into `sampling` for a request
+    /// whose output opens with no thought.
+    TokenId reply_switch_token = -1;
     /// Set by the executor when it re-admits a request it preempted (--kv-admission ondemand):
     /// the prompt then ends with the tokens this request already generated.
     std::shared_ptr<const KvResumeState> resume;

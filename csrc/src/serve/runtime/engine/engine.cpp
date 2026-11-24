@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -534,6 +535,36 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
     std::visit([&](const auto& target) {
         target->loaded->frontend.validate_sampling_tokens(resolved_options.execution.sampling);
     }, impl_->active);
+    // Reply-phase sampler (SamplingOverrides::reply_*). An output that may open with a thought keeps the request's own
+    // values until the model's close token and takes the reply values after it (the runtime switches, reply_phase.h);
+    // an output that opens with none -- the prompt opened no thought and the model does not open one itself, or the
+    // prompt is the answer after a closed thought -- is answer from its first token and is drawn with the reply
+    // values throughout. A model that may think but has no single close token cannot tell its answer apart: its
+    // requests are drawn with their own values (the reply values are not used).
+    if (ResolvedSamplingParameters& sampling = resolved_options.execution.sampling; sampling.reply) {
+        const auto& view = family::PreparedPromptAccess::view(prompt.impl_->value);
+        const auto [may_think, close] = std::visit([&](const auto& target) {
+            return target->loaded->frontend.reply_phase_switch(view.starts_in_reasoning);
+        }, impl_->active);
+        if (may_think && !view.answer_continuation) {
+            if (close) {
+                resolved_options.execution.reply_switch_token = *close;
+            } else {
+                static std::once_flag warned;
+                std::call_once(warned, [] {
+                    std::fprintf(stderr, "reply-phase sampler: this model has no single reasoning close token; "
+                                         "reply_* values are not used\n");
+                });
+                sampling.reply.reset();
+            }
+        } else {
+            sampling.temperature = sampling.reply->temperature;
+            sampling.top_k       = sampling.reply->top_k;
+            sampling.top_p       = sampling.reply->top_p;
+            sampling.min_p       = sampling.reply->min_p;
+            sampling.reply.reset();
+        }
+    }
     if (!json_schema.empty()) {
         std::visit([&](const auto& target) {
             const auto& frontend = target->loaded->frontend;

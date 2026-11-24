@@ -36,6 +36,24 @@ __global__ void speculative_prepare_verify_inputs_kernel(const std::int32_t* anc
     }
 }
 
+// speculative_truncate_at_phase_switch: one thread per row.
+__global__ void speculative_truncate_at_phase_switch_kernel(const std::int32_t* drafts,
+                                                            std::int32_t* current_extents,
+                                                            const SamplingConfig* configs, int k,
+                                                            int batch) {
+    const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (row >= batch) { return; }
+    const SamplingConfig& cfg = configs[row];
+    if (cfg.phase_switch_armed == 0) { return; }
+    const int extent = min(k, max(0, current_extents[row]));
+    for (int i = 0; i < extent; ++i) {
+        if (drafts[row * k + i] == cfg.phase_switch_token) {
+            current_extents[row] = i;
+            return;
+        }
+    }
+}
+
 template <typename T>
 __device__ inline T* speculative_workspace_offset(T* ptr, std::size_t byte_offset) {
     return ptr == nullptr

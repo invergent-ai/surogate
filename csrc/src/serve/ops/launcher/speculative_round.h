@@ -29,6 +29,9 @@ void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const 
                                              cudaStream_t stream, std::int32_t draft_count,
                                              bool split_routes = false);
 
+void speculative_truncate_at_phase_switch_launch(const Tensor& drafts, Tensor& current_extents,
+                                                 const SamplingConfig* configs, cudaStream_t stream);
+
 void speculative_select_accepted_hidden_launch(const Tensor& hidden, const Tensor& selectors,
                                                Tensor& out, cudaStream_t stream);
 

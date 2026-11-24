@@ -100,6 +100,26 @@ ResolvedSamplingParameters resolve_sampling(const ModelSamplingDefaults& default
         }
     }
     validate(resolved);
+    if (overrides.has_reply()) {
+        // Each reply field the request left unset is the request's own value of it: a request that
+        // names only reply_temperature keeps its top_k / top_p / min_p in the answer.
+        const ReplySamplingParameters reply{
+            .temperature = overrides.reply_temperature.value_or(resolved.temperature),
+            .top_k       = overrides.reply_top_k.value_or(resolved.top_k),
+            .top_p       = overrides.reply_top_p.value_or(resolved.top_p),
+            .min_p       = overrides.reply_min_p.value_or(resolved.min_p),
+        };
+        if (!std::isfinite(reply.temperature) || !std::isfinite(reply.top_p) || !std::isfinite(reply.min_p)) {
+            throw std::invalid_argument("reply sampling parameters must be finite");
+        }
+        if (reply.temperature < 0.0F || reply.temperature > 2.0F) {
+            throw std::invalid_argument("reply_temperature must be in [0,2]");
+        }
+        if (reply.top_k < 0) { throw std::invalid_argument("reply_top_k must be nonnegative"); }
+        if (reply.top_p < 0.0F || reply.top_p > 1.0F) { throw std::invalid_argument("reply_top_p must be in [0,1]"); }
+        if (reply.min_p < 0.0F || reply.min_p > 1.0F) { throw std::invalid_argument("reply_min_p must be in [0,1]"); }
+        resolved.reply = reply;
+    }
     return resolved;
 }
 
