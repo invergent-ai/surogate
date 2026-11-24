@@ -12,6 +12,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 
 namespace sinfer::ops {
 
@@ -36,25 +37,35 @@ __global__ void speculative_prepare_verify_inputs_kernel(const std::int32_t* anc
                                                          std::int32_t* current_extents,
                                                          std::int32_t* verify_ids,
                                                          std::int32_t* positions, std::int32_t k,
-                                                         const SamplingConfig* configs) {
+                                                         const SamplingConfig* configs, int trace) {
+    // One block per row (the launcher's grid is (1, B)): the write-back below follows every thread's read.
     const int row = static_cast<int>(blockIdx.y);
     const int T   = k + 1;
     int extent    = current_extents[row];
     extent        = extent < 0 ? 0 : (extent > k ? k : extent);
+    // Reply-phase cut: the accept reads the cut extent, but the verify keeps the round's shape -- its positions run
+    // sequentially over the uncut extent, as the host staged the valid columns and RoPE positions -- and only the ids
+    // past the cut are the anchor (a token sequence like any other, at its own positions and cache rows). So the
+    // forward of every column up to the cut is exactly the option-off forward, and no cache row is written twice.
+    int cut = extent;
     if (configs != nullptr && configs[row].phase_switch_armed != 0) {
-        // The cut extent is what the round's accept reads; the columns past it verify the anchor, as for any
-        // shorter extent. Only reply-phase rows are written, and the cut is idempotent, so blocks of one row agree.
-        const int cut = speculative_phase_cut(drafts + row * k, extent, configs, row);
-        if (cut != extent) {
-            if (blockIdx.x == 0 && threadIdx.x == 0) { current_extents[row] = cut; }
-            extent = cut;
+        cut = speculative_phase_cut(drafts + row * k, extent, configs, row);
+    }
+    if (cut != extent) {
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            current_extents[row] = cut;
+            // SUROGATE_SERVE_TRACE_REPLY_PHASE: which drafts the cut removed (a debugging aid; off by default).
+            if (trace != 0) {
+                printf("reply-phase cut: row %d armed %d extent %d -> %d\n", row, configs[row].phase_switch_armed,
+                       extent, cut);
+            }
         }
     }
-    for (int j = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x; j < T;
-         j += blockDim.x * gridDim.x) {
+    for (int j = static_cast<int>(threadIdx.x); j < T; j += blockDim.x) {
         const int off = row * T + j;
         verify_ids[off] =
-            j == 0 ? anchors[row] : (j <= extent ? drafts[row * k + j - 1] : anchors[row]);
+            j == 0 ? anchors[row] : (j <= cut ? drafts[row * k + j - 1] : anchors[row]);
         if (positions != nullptr) {
             positions[off] = base_positions[row] + (j <= extent ? j : extent);
         }

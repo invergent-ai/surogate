@@ -40,7 +40,10 @@ namespace sinfer::ops {
  * configs[b].phase_switch_armed != 0 first has its extent cut -- armed 1 (in its thought): to the index of its first
  * draft equal to configs[b].phase_switch_token (the model's reasoning close), when one lies within it; armed 2 (its
  * output has not yet shown whether it thinks): to 0 -- and the cut extent is written back to current_extents[b], which
- * the round's accept then reads. Every token such a round commits is drawn with the row's config: the close (or the
+ * the round's accept then reads. The verify keeps the uncut shape: positions[j,b] = base_positions[b] + min(j,Pcur[b])
+ * with the UNCUT extent (as the host stages valid columns and RoPE positions), and verify_ids past the cut are
+ * anchors[b], so no cache row is written twice and every column up to the cut is the option-off forward. Every token
+ * such a round commits is drawn with the row's config: the close (or the
  * marker that decides) can only be the round's correction / bonus token, and the next round is staged with the
  * answer's values (runtime/contract/reply_phase.h). Any draft count is valid speculative decoding, and coupled rows
  * (SamplingConfig::speculative_coupled) still commit MTP-off decoding's tokens. Rows with armed 0 are unchanged; the

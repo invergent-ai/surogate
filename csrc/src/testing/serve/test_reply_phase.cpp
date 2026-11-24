@@ -201,7 +201,7 @@ int main() {
     sinfer::ReplyPhaseVocabulary inkling{.model_opens = true, .close = kClose, .open = kOpen, .headers = {kHeader, -1}};
     sinfer::ReplyPhaseVocabulary plain{}; // no reasoning tokens at all
     sinfer::ReplyPhaseVocabulary channel{.model_opens = true}; // reasoning as a message channel: no close token
-    const auto plan = sinfer::runtime::plan_reply_phase;
+    const auto plan = [](const auto&... a) { return sinfer::runtime::plan_reply_phase(a...); };
     failures += check(plan(qwen, true, true, false) == Plan::ArmThinking, "a chat prompt that opens a thought was not armed");
     failures += check(plan(qwen, false, true, false) == Plan::Fold, "a chat prompt without a thought was not folded");
     // Review item 1: token-id and /v1/completions prompts are never folded for a model whose prompts open thoughts.
@@ -217,14 +217,22 @@ int main() {
                       "a model without reasoning tokens was not folded");
     failures += check(plan(plain, true, true, false) == Plan::Ignore && plan(channel, false, true, false) == Plan::Ignore,
                       "a thought without a single close token was not left alone");
+    // Review 2, low item: a raw prompt whose last reasoning marker is a close, on a prompt-opens model, is folded.
+    failures += check(plan(qwen, false, false, false, true) == Plan::Fold,
+                      "a raw prompt after a closed thought (prompt-opens model) was not folded");
+    failures += check(plan(inkling, false, false, false, true) == Plan::ArmOpening,
+                      "an Inkling raw prompt after a closed thought was not armed opening");
     // The raw prompt's tail: inside a thought iff its last opening marker follows its last close.
     using Span = std::span<const sinfer::TokenId>;
     const std::vector<sinfer::TokenId> open_tail = {1, kOpen, 2, kClose, 3, kHeader, kOpen, 9, 9};
     const std::vector<sinfer::TokenId> closed_tail = {1, kOpen, 2, kClose, 3, kHeader};
     failures += check(sinfer::runtime::prompt_tail_in_thought(Span(open_tail), inkling) &&
                           !sinfer::runtime::prompt_tail_in_thought(Span(closed_tail), inkling) &&
-                          !sinfer::runtime::prompt_tail_in_thought(Span(open_tail), plain),
-                      "prompt_tail_in_thought misread a prompt's tail");
+                          !sinfer::runtime::prompt_tail_in_thought(Span(open_tail), plain) &&
+                          sinfer::runtime::prompt_tail(Span(closed_tail), inkling) == sinfer::runtime::PromptTail::AfterClose &&
+                          sinfer::runtime::prompt_tail(Span(std::vector<sinfer::TokenId>{1, 2}), inkling) ==
+                              sinfer::runtime::PromptTail::Unknown,
+                      "prompt_tail misread a prompt's tail");
 
     if (failures == 0) { std::cout << "reply_phase: ok\n"; }
     return failures == 0 ? 0 : 1;

@@ -152,13 +152,23 @@ int phase_cut_case() {
         cuda_synchronize();
         std::vector<std::int32_t> want_extents, want_ids, want_positions;
         for (int b = 0; b < batch; ++b) {
+            // The accept's extent is cut; the verify's shape is not: ids up to the cut are the drafts, the anchor
+            // after it, and positions run sequentially over the UNCUT extent (the host stages valid columns
+            // extent + 1 and RoPE frontier + min(j, extent) from it), so no two valid columns share a cache row.
             const int e = with_configs ? rows[b].expected : rows[b].extent;
+            const int uncut = rows[b].extent;
             want_extents.push_back(e);
-            const auto oracle = verify_inputs_oracle(
-                anchors[b], std::vector<std::int32_t>(drafts.begin() + b * k, drafts.begin() + b * k + e), bases[b]);
             for (int j = 0; j <= k; ++j) {
-                want_ids.push_back(j <= e ? oracle.verify_ids[j] : anchors[b]);
-                want_positions.push_back(bases[b] + (j <= e ? j : e));
+                want_ids.push_back(j == 0 ? anchors[b] : (j <= e ? drafts[static_cast<std::size_t>(b * k + j - 1)] : anchors[b]));
+                want_positions.push_back(bases[b] + (j <= uncut ? j : uncut));
+            }
+            // The MTP verify contract over the valid columns [0, uncut]: positions strictly sequential.
+            for (int j = 1; j <= uncut; ++j) {
+                if (want_positions[want_positions.size() - static_cast<std::size_t>(k + 1) + static_cast<std::size_t>(j)] !=
+                    bases[b] + j) {
+                    std::cerr << "phase cut oracle: valid columns are not sequential\n";
+                    ++failures;
+                }
             }
         }
         const std::string label = with_configs ? "phase cut" : "phase cut, null configs";

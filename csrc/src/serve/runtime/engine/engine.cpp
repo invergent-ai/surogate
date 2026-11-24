@@ -563,11 +563,12 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
         const ReplyPhaseVocabulary vocabulary = std::visit([&](const auto& target) {
             return target->loaded->frontend.reply_phase_vocabulary();
         }, impl_->active);
-        const bool starts_in_thought = view.starts_in_reasoning ||
-            (!view.uses_chat_template && runtime::prompt_tail_in_thought(view.token_ids, vocabulary));
+        const runtime::PromptTail tail = view.uses_chat_template ? runtime::PromptTail::Unknown
+                                                                  : runtime::prompt_tail(view.token_ids, vocabulary);
+        const bool starts_in_thought = view.starts_in_reasoning || tail == runtime::PromptTail::InThought;
         const bool answer_from_first_token = view.answer_continuation || resolved_options.output.structured;
         switch (runtime::plan_reply_phase(vocabulary, starts_in_thought, view.uses_chat_template,
-                                          answer_from_first_token)) {
+                                          answer_from_first_token, tail == runtime::PromptTail::AfterClose)) {
         case runtime::ReplyPhasePlan::Fold:
             sampling.temperature = sampling.reply->temperature;
             sampling.top_k       = sampling.reply->top_k;
@@ -590,8 +591,9 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
         case runtime::ReplyPhasePlan::Ignore: {
             static std::once_flag warned;
             std::call_once(warned, [] {
-                std::fprintf(stderr, "reply-phase sampler: this model has no single reasoning close token; "
-                                     "reply_* values are not used\n");
+                std::fprintf(stderr, "reply-phase sampler: this model's thought has no single close token, or it "
+                                     "opens its thought itself without a single opening token; reply_* values are "
+                                     "not used\n");
             });
             sampling.reply.reset();
             break;

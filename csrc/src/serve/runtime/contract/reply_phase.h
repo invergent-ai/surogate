@@ -31,10 +31,16 @@ enum class ReplyPhasePlan : std::uint8_t {
 /// armed, never folded, so a thought a raw prompt opened is never drawn with the reply values).
 /// `answer_from_first_token`: the prompt is the answer after a closed thought (the thinking guard's continuation), or
 /// the output is structured from its first token (a JSON schema without json_after_reasoning).
+/// `raw_tail_closed`: a raw prompt whose last reasoning marker is a close (prompt_tail): a model whose prompts open
+/// its thoughts cannot think after it, so its output is answer (folded).
 [[nodiscard]] constexpr ReplyPhasePlan plan_reply_phase(const ReplyPhaseVocabulary& vocabulary,
                                                         bool starts_in_reasoning, bool chat_rendered,
-                                                        bool answer_from_first_token) noexcept {
+                                                        bool answer_from_first_token,
+                                                        bool raw_tail_closed = false) noexcept {
     if (answer_from_first_token) { return ReplyPhasePlan::Fold; }
+    if (!starts_in_reasoning && !chat_rendered && !vocabulary.model_opens && raw_tail_closed) {
+        return ReplyPhasePlan::Fold;
+    }
     if (starts_in_reasoning || (!chat_rendered && !vocabulary.model_opens)) {
         // A thought is open (or may be: a raw prompt of a model whose prompts open it).
         if (vocabulary.close) { return ReplyPhasePlan::ArmThinking; }
@@ -46,16 +52,24 @@ enum class ReplyPhasePlan : std::uint8_t {
     return ReplyPhasePlan::Fold;
 }
 
-/// Whether a prompt the model's chat path did not render (token ids, /v1/completions) ends inside a thought: its last
-/// opening marker comes after its last close token. Only answerable for a model with a single opening token.
+/// Where a prompt the model's chat path did not render (token ids, /v1/completions) leaves the reasoning: the last of
+/// its opening markers and close tokens. Unknown without both single tokens, or when the prompt holds neither.
+enum class PromptTail : std::uint8_t { Unknown, InThought, AfterClose };
+
+[[nodiscard]] inline PromptTail prompt_tail(std::span<const TokenId> prompt,
+                                            const ReplyPhaseVocabulary& vocabulary) noexcept {
+    if (!vocabulary.open || !vocabulary.close) { return PromptTail::Unknown; }
+    for (std::size_t i = prompt.size(); i-- > 0;) {
+        if (prompt[i] == *vocabulary.close) { return PromptTail::AfterClose; }
+        if (prompt[i] == *vocabulary.open) { return PromptTail::InThought; }
+    }
+    return PromptTail::Unknown;
+}
+
+/// prompt_tail(...) == InThought.
 [[nodiscard]] inline bool prompt_tail_in_thought(std::span<const TokenId> prompt,
                                                  const ReplyPhaseVocabulary& vocabulary) noexcept {
-    if (!vocabulary.open || !vocabulary.close) { return false; }
-    for (std::size_t i = prompt.size(); i-- > 0;) {
-        if (prompt[i] == *vocabulary.close) { return false; }
-        if (prompt[i] == *vocabulary.open) { return true; }
-    }
-    return false;
+    return prompt_tail(prompt, vocabulary) == PromptTail::InThought;
 }
 
 /// The reply-phase sampler of one request (SamplingOverrides::reply_*): its thought is drawn with the request's own

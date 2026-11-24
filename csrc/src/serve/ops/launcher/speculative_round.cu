@@ -15,6 +15,17 @@
 
 namespace sinfer::ops::detail {
 
+namespace {
+// SUROGATE_SERVE_TRACE_REPLY_PHASE=1: the verify-input kernel prints each reply-phase draft cut (read once).
+int reply_phase_trace() {
+    static const int on = [] {
+        const char* raw = std::getenv("SUROGATE_SERVE_TRACE_REPLY_PHASE");
+        return raw != nullptr && raw[0] != '\0' && raw[0] != '0' ? 1 : 0;
+    }();
+    return on;
+}
+} // namespace
+
 void speculative_prepare_verify_inputs_launch(const Tensor& anchors, const Tensor& drafts,
                                               const Tensor& base_positions,
                                               const Tensor& current_extents, Tensor& verify_ids,
@@ -23,14 +34,15 @@ void speculative_prepare_verify_inputs_launch(const Tensor& anchors, const Tenso
     constexpr int kBlock = 32;
     const int k          = drafts.ne[0];
     const int batch      = drafts.ne[1];
-    const dim3 grid(static_cast<unsigned int>(div_up(k + 1, kBlock)),
-                    static_cast<unsigned int>(batch));
+    // One block per row: the reply-phase cut writes the row's extent back after every thread has read it.
+    const dim3 grid(1U, static_cast<unsigned int>(batch));
     speculative_prepare_verify_inputs_kernel<<<grid, kBlock, 0, stream>>>(
         static_cast<const std::int32_t*>(anchors.data),
         static_cast<const std::int32_t*>(drafts.data),
         static_cast<const std::int32_t*>(base_positions.data),
         static_cast<std::int32_t*>(current_extents.data),
-        static_cast<std::int32_t*>(verify_ids.data), static_cast<std::int32_t*>(positions.data), k, configs);
+        static_cast<std::int32_t*>(verify_ids.data), static_cast<std::int32_t*>(positions.data), k, configs,
+        reply_phase_trace());
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -40,13 +52,13 @@ void speculative_prepare_verify_ids_launch(const Tensor& anchors, const Tensor& 
     constexpr int kBlock = 32;
     const int k          = drafts.ne[0];
     const int batch      = drafts.ne[1];
-    const dim3 grid(static_cast<unsigned int>(div_up(k + 1, kBlock)),
-                    static_cast<unsigned int>(batch));
+    // One block per row: the reply-phase cut writes the row's extent back after every thread has read it.
+    const dim3 grid(1U, static_cast<unsigned int>(batch));
     speculative_prepare_verify_inputs_kernel<<<grid, kBlock, 0, stream>>>(
         static_cast<const std::int32_t*>(anchors.data),
         static_cast<const std::int32_t*>(drafts.data), nullptr,
         static_cast<std::int32_t*>(current_extents.data),
-        static_cast<std::int32_t*>(verify_ids.data), nullptr, k, configs);
+        static_cast<std::int32_t*>(verify_ids.data), nullptr, k, configs, reply_phase_trace());
     CUDA_CHECK(cudaGetLastError());
 }
 
