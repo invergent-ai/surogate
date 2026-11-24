@@ -275,8 +275,12 @@ class RelAttentionR(torch.autograd.Function):
             ob = out[b0:b1].reshape(nq, hk, g, dh).permute(1, 2, 0, 3)
             dlb = dlse[b0:b1].reshape(nq, hk, g).permute(1, 2, 0)[..., None]
             qq = q[b0:b1].reshape(nq, hk, g, dh).permute(1, 2, 0, 3)
-            if not PATTERN_GRAD["on"]:  # the pattern p is a constant: out = p . v / l carries gradient to v only
-                dv[k0:b1] += torch.einsum("hgbk,hgbd->hkd", p, do).permute(1, 0, 2)
+            if not PATTERN_GRAD["on"]:  # the (normalised) pattern p is a constant: out = p . v carries gradient to v only
+                if ATTN_TC:                # the exact branch's own dv contraction, so dv is the same number in both modes
+                    dvb = _bmm_ss(p.reshape(hk, g * nq, -1).transpose(1, 2), do.reshape(hk, g * nq, dh))
+                else:
+                    dvb = torch.einsum("hgbk,hgbd->hkd", p, do)
+                dv[k0:b1] += dvb.permute(1, 0, 2)
                 continue
             if ATTN_TC:
                 # the same four contractions as below, [Hk, G x nq, .] bmms on bf16 tensor cores (fp32 accumulate):

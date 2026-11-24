@@ -195,7 +195,7 @@ GATE_GRAD = {"on": True}
 
 def moe_vec(x, w, ids, lora=None):
     """rig.moe_vec with act_quant=False and routing=(ids, None): gammas from this recompute's router (gradient flows
-    into x through them), W4A16 GEMMs (NVFP4 global applied to the fp32 output), LoRA from the fp32 masters
+    into x through them unless GATE_GRAD is off), W4A16 GEMMs (NVFP4 global applied to the fp32 output), LoRA from the fp32 masters
     ({"A13" [E,r,H], "B13" [E,2I,r], "A2" [E,r,I], "B2" [E,H,r], "scale"}), one bf16 rounding per GEMM output."""
     x = x.float()
     t, h = x.shape

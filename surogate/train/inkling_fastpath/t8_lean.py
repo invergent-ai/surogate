@@ -200,7 +200,10 @@ def backward_row(eng, W, ids, vals: dict, lora_host: list, scale: float, v_first
     pattern_grad_from: visits with an index below it hold their attention pattern constant in the backward (no gradient through the softmax
     scores into q, k and the relative bias; the value path keeps its gradient). 0 (default) = the exact backward; the number of visits =
     every visit; in between = the later visits keep the pattern's gradient.
-    gate_grad_from: the same switch for the router's gate weights of the visit's experts (constants of the backward below it)."""
+    gate_grad_from: the same switch for the router's gate weights of the visit's experts (constants of the backward below it). It acts in
+    ift_backward.moe_vec only: the grouped expert backward (IFT_MOE_GM=1) does not read it, so that stack is refused."""
+    if gate_grad_from and LG.MOE_GM:
+        raise ValueError("gate_grad_from needs the plain expert backward (IFT_MOE_GM=0)")
     dev = g_lp.device
     T = ids.numel()
     visits = eng.visits

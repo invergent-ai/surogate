@@ -18,8 +18,13 @@ Measured per row and variant:
           f = [S(theta0 + step) - S(theta0 - step)] / (<G, step+> - <G, step->), the step sized for a predicted change p,
           for B13 of layers 12, 3, 9, 15, 21 one tensor at a time, then for "vo" = vB and oB of layers 3, 9, 12, 15 moved together, and
           for the hybrids "qkr" = qB, kB, rB of layers 9, 12, 15 moved together (the adapters only the kept visits train).
-  scatter the engine's S under four steps predicted at 0.01 nats (rms of S - S0): what any step, however small, moves S by.
-  p       = max(4 nats, 6 x scatter); recorded with S0.
+  scatter the engine's S under six steps predicted at 0.01 nats: the mean of S - S0 (a shift every step causes: the row's tokens were
+          sampled from the start policy, so any change of the function lowers their summed log-probability; a central difference cancels
+          it) and its standard deviation about that mean = the scatter.
+  p       = max(4 nats, 6 x scatter); recorded with S0. (Until snapshot 2d95074a the scatter was the rms about zero, which counts the
+          shift as noise and made p several times larger on rows with thousands of loss tokens: AMENDED AFTER the first data of row 72.)
+  repeat  a gating reading in [0.5, 0.7) or (1.3, 1.5] is read once more at twice the step; only a second reading outside [0.7, 1.3]
+          counts as outside (agent-RX's rule, accepted before any data was read).
 LINES, written before any data (2026-11-24; the coordinator's): a variant MEETS THE LINES on a row when, for the experts' tensor of every
 layer read before the loop (3) and in it (9, 12, 15), cos >= 0.9 and the engine follow is in [0.7, 1.3]. The control (21.B13, after the
 loop) must be followed or the row is not read. A reading whose predicted change is below 4 x scatter is not readable and counts for
@@ -117,7 +122,7 @@ def main():
         log(f"row {a.row} T {C.T} loss tokens {rep['loss_tokens']}: S0 engine {e0:.4f} (repeat {e0b:.4f}), engine forward {tfwd:.1f} s")
         save()
 
-        def follow(var, label, parts, pp):
+        def follow(var, label, parts, pp, rep_of=None):
             """parts: [(tensor, gradient)] moved together along the variant's gradient, predicted change pp."""
             parts = [(nm, G) for nm, G in parts if G is not None and float(G.double().norm()) > 0.0]
             if not parts:
@@ -140,10 +145,13 @@ def main():
                  "f": (S[1.0] - S[-1.0]) / (pred[1.0] - pred[-1.0]), "f_plus": (S[1.0] - e0) / pred[1.0], "f_minus": (S[-1.0] - e0) / pred[-1.0],
                  "even": (S[1.0] + S[-1.0] - 2 * e0) / 2, "norm": n2 ** 0.5, "readable": abs(pred[1.0]) >= 4 * rep["scatter"]}
             r["real_change_per_unit_step"] = r["f"] * r["norm"]
+            r["repeat_of_p"] = rep_of
             rep["follow"].append(r)
             log(f"follow {var} {label} p {pp:.2f}: f {r['f']:.3f} (+ {r['f_plus']:.3f}, - {r['f_minus']:.3f}), |G| {r['norm']:.3f}, "
-                f"f x |G| {r['real_change_per_unit_step']:.3f}, readable {r['readable']}")
+                f"f x |G| {r['real_change_per_unit_step']:.3f}, readable {r['readable']}" + (" (repeat at twice the step)" if rep_of else ""))
             save()
+            if rep_of is None and r["readable"] and (0.5 <= r["f"] < 0.7 or 1.3 < r["f"] <= 1.5):
+                follow(var, label, parts, 2 * pp, rep_of=pp)
 
         def cos_for(var):
             if a.no_cos or var in rep["cos"]:
@@ -193,15 +201,18 @@ def main():
             save()
             if "scatter" not in rep:
                 devs = []
-                for nm in ("3.B13", "12.B13"):
+                for nm in ("3.B13", "12.B13", "9.B13"):
                     for sg in (1.0, -1.0):
                         C.set_step(nm, G[nm], C.unit_step(G[nm], sg * 0.01))
                         devs.append(C.engine_S(vw) - e0)
                     C.set_step(nm, None, None)
+                mean = sum(devs) / len(devs)
                 rep["tiny_step_devs"] = devs
-                rep["scatter"] = (sum(d * d for d in devs) / len(devs)) ** 0.5
+                rep["tiny_step_shift"] = mean
+                rep["scatter_rms_about_zero"] = (sum(d * d for d in devs) / len(devs)) ** 0.5
+                rep["scatter"] = (sum((d - mean) ** 2 for d in devs) / (len(devs) - 1)) ** 0.5
                 rep["p"] = max(4.0, 6.0 * rep["scatter"])
-                log(f"tiny-step deviations {[round(d, 3) for d in devs]}; scatter {rep['scatter']:.3f}; p {rep['p']:.2f}")
+                log(f"tiny-step deviations {[round(d, 3) for d in devs]}; shift {mean:.3f}; scatter (sd) {rep['scatter']:.3f}; p {rep['p']:.2f}")
                 save()
             p = rep["p"]
             for L in (12, 3, 9, 15, 21):
