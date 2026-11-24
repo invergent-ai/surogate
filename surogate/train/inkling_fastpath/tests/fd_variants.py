@@ -8,8 +8,8 @@ point, with the production settings on the engine's stored states:
   Q     pattern_grad_from = 48: every visit holds its pattern constant.
   QD    Q, and the router's gate weights are constants of the backward at every visit (gate_grad_from = 48).
   HD30  H30, and the gate weights are constants at visits 0-29.
-  H42 / HD42 / HD36  the same forms with the cut at visit 42 (only the visits after the loop keep the exact backward) or 36. Added
-        2026-11-24 05:5x after row 72's cos for H30 (0.64 at layer 3), before any data of theirs; same lines.
+  H42 / HD42 / HD36  the same forms with the cut at visit 42 (only the visits after the loop keep the exact backward) or 36. Added after
+        the first data of H30, before any data of theirs; same lines.
   full  the exact backward (reference).
 Measured per row and variant:
   cos     between the variant's gradient on the engine's stored states (rounding straight-through, production head) and on the fp32
@@ -23,14 +23,13 @@ Measured per row and variant:
   scatter the engine's S under six steps predicted at 0.01 nats: the mean of S - S0 (a shift every step causes: the row's tokens were
           sampled from the start policy, so any change of the function lowers their summed log-probability; a central difference cancels
           it) and its standard deviation about that mean = the scatter.
-  p       = max(4 nats, 6 x scatter); recorded with S0. (Until snapshot 2d95074a the scatter was the rms about zero, which counts the
-          shift as noise and made p several times larger on rows with thousands of loss tokens: AMENDED AFTER the first data of row 72.)
-          AMENDED AGAIN AFTER DATA (row 127: 97 loss tokens, S0 near 0, the 4-nat floor asked the row to rise above S = 0: + side 0.02,
-          - side 4.7): p is capped at 0.4 |S0|; a row where 6 x scatter exceeds that cap cannot be read (p_valid False), and a reading
-          predicted above 0.81 |S0| (the repeat at twice the cap) is not readable.
+  p       = min(max(4 nats, 6 x scatter), 0.4 |S0|); recorded with S0. S <= 0, so a step predicted near |S0| cannot be followed upward: a row
+          where 6 x scatter exceeds the cap cannot be read (p_valid False), and a reading predicted above 0.81 |S0| is not readable.
+          (The first version took the scatter as an rms about zero, which counts the shift as noise, and had no cap; both were changed
+          after the first data and are recorded as such with the results.)
   repeat  a gating reading in [0.5, 0.7) or (1.3, 1.5] is read once more at twice the step; only a second reading outside [0.7, 1.3]
-          counts as outside (agent-RX's rule, accepted before any data was read).
-LINES, written before any data (2026-11-24; the coordinator's): a variant MEETS THE LINES on a row when, for the experts' tensor of every
+          counts as outside (set before any data was read).
+LINES, written before any data (2026-11-24): a variant MEETS THE LINES on a row when, for the experts' tensor of every
 layer read before the loop (3) and in it (9, 12, 15), cos >= 0.9 and the engine follow is in [0.7, 1.3]. The control (21.B13, after the
 loop) must be followed or the row is not read. A reading whose predicted change is below 4 x scatter is not readable and counts for
 nothing. "vo" and "qkr" are reported with the same band and do not enter the rule. Selection (fixed before data): the hybrid if it meets

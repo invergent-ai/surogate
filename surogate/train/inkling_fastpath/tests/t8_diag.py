@@ -1,5 +1,5 @@
 """Diagnostic of the micro-step's follow failure on ONE real plan row (one card, in-process worker; nothing trained, nothing kept as a model).
-PASS LINES, written before any data (2026-11-24, with the coordinator's additions):
+PASS LINES, written before any data (2026-11-24):
   Row: plan row 3 (11,031 tokens, 176 loss tokens). S = sum over the loss tokens of log pi. Start point theta0 = the micro-step's (A = the
   trainer's init, B = 0). Six tensors: qB and B13 of physical layer 3 (before the loop), 12 (looped, 3 passes summed), 21 (after, the control).
   G_X = -N x the PPO gradient at advantage 1 (= grad S), the micro-step's path; variants: A production; B chunk 512 + halved query block;
@@ -14,8 +14,8 @@ PASS LINES, written before any data (2026-11-24, with the coordinator's addition
       consecutive rungs differ by > 20 %) at every rung for that tensor.
   T-b "accumulation noise": |G_A - G_B| >= |G_A| (1 - f) for a layer-12 / layer-3 tensor.  "deterministic, from stored values / STE":
       cos(G_A, G_B) >= 0.999 and G_C's free follow >= 2x G_A's.  "deterministic, elsewhere": A, B, C agree and f stays low.
-  Erasure (coordinator): free f rises by >= 3x between the smallest and the largest stable rung AND smooth f in [0.7, 1.3].
-  Routing (coordinator): frozen f in [0.7, 1.3] while free f < 0.3 at every rung.
+  Erasure: free f rises by >= 3x between the smallest and the largest stable rung AND smooth f in [0.7, 1.3].
+  Routing: frozen f in [0.7, 1.3] while free f < 0.3 at every rung.
 Phases: grad (one variant per process: env T8D_VARIANT = A | B | C | D) and fd (one process, a deadline; tasks in priority order, results written
 after every task, so a stop at the deadline keeps what was measured)."""
 from __future__ import annotations
@@ -413,7 +413,7 @@ def phase_local(a):
     it names the operation path; all inside means the fault is in how the per-visit gradients are accumulated across visits (then the chain under
     plain autograd against backward_row is the next check). The gating vjp runs as backward_row runs it: inside LG._gemm_mode() and with
     LG._q_block fixed to the row's query block.
-    Added (agent-RX, before any data): (b) the same vjp on the plain path (no gemm mode, default query block): cos < 0.999 or norm ratio outside
+    Added before any data: (b) the same vjp on the plain path (no gemm mode, default query block): cos < 0.999 or norm ratio outside
     [0.99, 1.01] at any slot / tensor = the fast path differs. (c) the gating vjp at the ENGINE's saved values (backward_row's own act_vals),
     same cotangent, against the vjp at the chain's values: cos and norm ratio per slot, recorded with no line. Also per visit: RMS of each
     input slot's value and of the output."""
@@ -788,7 +788,7 @@ def variant_patches(name: str) -> list:
 
 
 def phase_sum(a):
-    """diag-5 (agent-RX's design; lines written before any data). Plan row 3, routing frozen at theta0's, theta0.
+    """diag-5 (lines written before any data). Plan row 3, routing frozen at theta0's, theta0.
     A THE SUMMING, no finite differences: on the first --prefix tokens (512; 2,048 ran out of card memory next to the engine) of row 3 (S = sum of log pi over every position; rounding ON, so every
       stored state is a bf16 value and TokenChunked's bf16 storage is exact in both), the frozen chain under plain autograd (real tensors,
       act_vals None, dS/d(output of visit v) by retain_grad, the six tensors as leaves) against backward_row fed exactly the chain's states
@@ -801,7 +801,7 @@ def phase_sum(a):
       LINE: cos > 0.8 at layers 12 and 3 = a candidate; otherwise discarded without finite differences. For candidates: follow in the ENGINE
       along the variant's gradient taken on the engine's states: 12.B13 and 3.B13 at x4 (x16 where the x4 prediction is under 3 nats),
       21.B13 at x1. LINE: [0.7, 1.3] at layers 12 and 3 = a usable gradient exists; < 0.5 = it does not.
-    B first (agent-RX, before data): TRUNCATION K = 18 / 24 / 30 (backward_row with v_first 30 / 24 / 18), on the engine's and the chain's
+    B first (set before data): TRUNCATION K = 18 / 24 / 30 (backward_row with v_first 30 / 24 / 18), on the engine's and the chain's
       states: cos and norm ratio for 12.B13, 12.qB, 21.B13 and per visit; the norm of 12.B13; always the engine follow of 12.B13 along the
       variant's gradient on the engine's states (x4, x16 where the x4 prediction is under 3 nats). LINE: engine follow of 12.B13 in
       [0.7, 1.3] = a backward truncated at that depth gives a gradient the engine follows at a looped layer; < 0.5 = it does not. 21.B13 at
