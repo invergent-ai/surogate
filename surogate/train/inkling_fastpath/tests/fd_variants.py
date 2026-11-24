@@ -48,6 +48,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 import fd_scan as FS  # noqa: E402
+import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
 TD = FS.TD
@@ -63,8 +64,9 @@ VARIANTS = {"H30": {"pattern_grad_from": 30}, "H36": {"pattern_grad_from": 36}, 
             "full": {}, "cut0": {"bank_grad_from": N_V}}
 
 
-def run(C, tt, vals, head, round_on, kw):
-    """{tensor: gradient on the host (summed over the layer's visits)}, seconds, number of visits that received a gradient."""
+def run(C, tt, vals, head, round_on, kw, seed_scale=None):
+    """{tensor: gradient on the host (summed over the layer's visits)}, seconds, number of visits that received a gradient.
+    seed_scale: the seed on every loss token's log-prob (default 1; the trainer's PPO seed at advantage 1 is -1 / N)."""
     out, seen = {}, []
 
     def ong(v, layer, j, gj):
@@ -77,7 +79,8 @@ def run(C, tt, vals, head, round_on, kw):
     torch.cuda.synchronize()
     t0 = time.time()
     try:
-        TL.backward_row(C.eng, C.W, C.ids, vals, C.rig.w.lora, C.scale, C.rig.w.v_first, C.mask[1:].float(), C.rig.w.buffers, ong,
+        g_seed = C.mask[1:].float() if seed_scale is None else C.mask[1:].float() * torch.tensor(seed_scale, dtype=torch.float32, device=C.dev)
+        TL.backward_row(C.eng, C.W, C.ids, vals, C.rig.w.lora, C.scale, C.rig.w.v_first, g_seed, C.rig.w.buffers, ong,
                         head_grad=head, q_block=C.qb, train_idx=C.rig.w.train_idx, attn_scale=C.attn_scale,
                         on_visit_grad=lambda v, go: seen.append(v), **kw)
     finally:
@@ -135,6 +138,20 @@ def trainer_path_check(C, var, G, keys):
         N = float(out.metrics["total_tokens"])
         nk = len(keys)
         res = {}
+        if C.seed_check is not None:
+            # the direct call with the trainer's own seed (-1 / N on every loss token) against the step's raw gradient: the backward of the
+            # experts' GEMMs rounds its cotangent to bf16, so the gradient is linear in the seed only up to that rounding; with the SAME
+            # seed the two paths should agree to fp32 accumulation, far below the 1e-3 seen with seeds 1 and -1 / N
+            tt_ = {(int(nm.split(".")[0]), keys.index(nm.split(".")[1])): nm for nm in G}
+            Gd, _, _ = run(C, tt_, C.engine_res, None, True, VARIANTS[var], seed_scale=float(np.float32(-1.0 / N)))
+            RA.ROUND["on"] = True
+            for nm in sorted(G):
+                L, k = nm.split(".")
+                raw = out.grads[int(L) * nk + keys.index(k)].detach().float().cpu()
+                d = Gd.get(nm)
+                C.seed_check[nm] = {"bitwise_equal": bool(d is not None and torch.equal(raw, d)),
+                                    "rel_diff": None if d is None or float(raw.double().norm()) == 0 else float((raw.double() - d.double()).norm() / raw.double().norm()),
+                                    "both_zero": bool(d is not None and float(raw.double().norm()) == 0 and float(d.double().norm()) == 0)}
         for nm in sorted(G):
             L, k = nm.split(".")
             gt = (-N * out.grads[int(L) * nk + keys.index(k)].double()).float().cpu()
@@ -155,6 +172,7 @@ def main():
     ap.add_argument("--row", type=int, required=True)
     ap.add_argument("--variants", default="H30,QD,H36,Q,HD30")
     ap.add_argument("--no-cos", action="store_true", help="skip the chain-state backwards")
+    ap.add_argument("--seed-check", action="store_true", help="with --gate: also the direct call with the trainer's own seed, against the step's raw gradient")
     ap.add_argument("--gate", action="store_true", help="the trainer's finite-difference gate: verdict for the FIRST variant from the engine "
                     "follow of one tensor inside the loop (12.B13), one before it (3.B13) and the control (21.B13); exit 3 on a fail")
     ap.add_argument("--plan", required=True)
@@ -319,8 +337,14 @@ def main():
     rc = 0
     if a.gate:
         if order[0] in GE and left() > 60:
+            C.seed_check = {} if a.seed_check else None
             try:
                 rep["trainer_path_vs_direct"] = trainer_path_check(C, order[0], GE[order[0]], keys)
+                if C.seed_check is not None:
+                    rep["trainer_path_vs_direct_same_seed"] = C.seed_check
+                    rd = [x["rel_diff"] for x in C.seed_check.values() if x["rel_diff"] is not None]
+                    log(f"same seed: bitwise equal on {sum(x['bitwise_equal'] for x in C.seed_check.values())} of {len(C.seed_check)} tensors; "
+                        f"largest relative difference {max(rd) if rd else 0.0:.3g}")
                 log("trainer path vs direct: " + " ".join(f"{nm} {x['cos']:.7f}/{x['norm_ratio']:.5f}" for nm, x in rep["trainer_path_vs_direct"].items()
                                                          if nm.endswith("B13") or nm.endswith("vB")))
             except Exception:
