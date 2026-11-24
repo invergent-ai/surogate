@@ -452,7 +452,9 @@ def main():
     assert not os.path.exists(os.path.join(run6, "updates", "2", "step.json")), "the interrupted gradient left a step record"
     assert json.load(open(os.path.join(run6, "STOPPED.json")))["v_1"] == "not kept" and not os.path.isdir(os.path.join(run6, "updates", "2", "ckpt"))
     rc6, run6, tr6, s6, _ = session(tmp, "no_early", plan_dir, ["STOP"], tr=SlowTrainer(cfg_for(tmp), 2), panels=panels, early_stop=False)
-    assert rc6 == 20 and not any("gradient interrupted" in p["what"] for p in s6.sess["phases"]) and os.path.exists(os.path.join(run6, "updates", "2", "step.json"))
+    ph = {p["what"]: p["t"] for p in s6.sess["phases"]}
+    assert rc6 == 20 and not any("gradient interrupted" in w for w in ph), (rc6, list(ph))
+    assert ph["update 1: waiting for its verdict"] - ph["update 2: gradient"] >= 5.0, "with the early stop off the gradient must run to its end"
     assert not os.path.isdir(os.path.join(run6, "updates", "2", "ckpt"))
     print(f"(6) a STOP during the next gradient interrupts it ({el:.1f} s into a 12 s gradient): PASS")
 

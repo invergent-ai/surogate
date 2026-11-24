@@ -392,13 +392,18 @@ def main():
         log(f"READ SIDE REFUSED: {e}")
         return EXIT_INPUT
     try:
-        return rd.serve() if a.phase == "serve" else rd.transfer_reads(a.update)
+        rc = rd.serve() if a.phase == "serve" else rd.transfer_reads(a.update)
     except ValueError as e:
         log(f"READ SIDE: inputs: {e}")
-        return EXIT_INPUT
+        rc = EXIT_INPUT
     except Exception as e:
         log(f"READ SIDE FAILED: {type(e).__name__}: {e}")
-        return EXIT_READS
+        rc = EXIT_READS
+    if a.phase == "serve":                                    # the trainer side looks at this file
+        with open(os.path.join(a.run_dir, "reader.exit.tmp"), "w") as f:
+            f.write(str(rc))
+        os.replace(os.path.join(a.run_dir, "reader.exit.tmp"), os.path.join(a.run_dir, "reader.exit"))
+    return rc
 
 
 if __name__ == "__main__":
