@@ -47,6 +47,8 @@ ROUND1 = ("base", "U12", "R12", "U4", "Z")                    # Z last: Z == bas
 ROUND2 = ("R12b", "U12_before", "U12_inside", "U12_after")
 RT_ADAPTERS = ("U12", "R12", "U4")
 ROUND3 = ("R12_before", "R12_inside", "R12_after")
+EXTRA = ("R4",)                                               # the damage read's control of U4: R12's draw at a third of its size (exported, not in a round)
+DAMAGE_READS = ("base", "U12", "R12", "U4", "R4", "R12b")     # read on every damage panel; all six or none (the damage judge refuses a missing one)
 
 
 def log(msg):
@@ -392,7 +394,7 @@ def phase_trainer(a):
             gc.collect()
             # the adapters, one state at a time, exported from the parameter states directly (no worker state is involved)
             rep["adapters"] = {}
-            for w in [x for x in ROUND1 + ROUND2 + ROUND3 if x != "base"]:
+            for w in [x for x in ROUND1 + ROUND2 + ROUND3 + EXTRA if x != "base"]:
                 st = states(theta0, delta, nm, KS.BLOCKS, (w,))[w]
                 dst = os.path.join(a.work, "adapters", w)
                 sha = TA.export_combined(layers_of(st, n_layers, keys), dst, 64, 32.0, rank, "BF16", metadata={"step": f"t8-micro-{w}"})
@@ -530,9 +532,54 @@ def phase_check(a):
     return 0
 
 
+def phase_dmg_merge(a):
+    """The damage reads of one panel: the engine parts <X>.part<k>.npz of <run>/reads_dmg/<panel>/ merged into <X>.npz (lp_<n> float32 [T], the
+    value at the panel's mask and 0 elsewhere, + ids_crc32 uint32 [R] of the ids the reader sent) and <X>.json. A read that is not complete for every
+    panel row is NOT written. --plan = the panel directory, --panel = its name."""
+    man = json.load(open(os.path.join(a.plan, "manifest.json")))
+    want = {os.path.basename(k): v for k, v in (man.get("files") or man).items() if isinstance(v, str) and len(v) == 64}
+    rows_path = os.path.join(a.plan, "rows.npz")
+    rows_sha = sha256(rows_path)
+    if want.get("rows.npz") != rows_sha:
+        raise ValueError(f"panel {a.panel}: rows.npz does not match its manifest sha256")
+    z = np.load(rows_path, allow_pickle=False)
+    R = sum(1 for k in z.files if k.startswith("ids_") and k[4:].isdigit())
+    crc = np.array([zlib.crc32(z[f"ids_{n}"].astype("<i4").tobytes()) & 0xFFFFFFFF for n in range(R)], dtype=np.uint32)
+    if "ids_crc32" in z.files and not np.array_equal(crc, z["ids_crc32"].astype(np.uint32)):
+        raise ValueError(f"panel {a.panel}: crc32 of the ids differs from the panel's ids_crc32")
+    rd = os.path.join(a.run_dir, "reads_dmg", a.panel)
+    ad = json.load(open(os.path.join(a.run_dir, "adapters.json")))
+    eng = open(a.engine_sha_file).read().strip() if a.engine_sha_file else ""
+    sid = _text(os.path.join(a.run_dir, "session_id.txt"))
+    done, missing = [], []
+    for name in DAMAGE_READS:
+        got = {}
+        for f in sorted(os.listdir(rd)) if os.path.isdir(rd) else []:
+            if f.startswith(name + ".part") and f.endswith(".npz"):
+                part = load_reads(os.path.join(rd, f))
+                if set(part) & set(got):
+                    raise ValueError(f"{a.panel}/{f}: a row read twice")
+                got.update(part)
+        ok = set(got) == set(range(R)) and all(got[n].dtype == np.float32 and got[n].shape == (int(z["T"][n]),) and
+                                                bool(np.isfinite(got[n]).all()) and not bool(got[n][~z[f"mask_{n}"].astype(bool)].any())
+                                                for n in got)
+        if name != "base" and not (ad.get(name) or {}).get("sha256"):
+            ok = False
+        if not ok:
+            missing.append(name)
+            continue
+        np.savez(os.path.join(rd, name + ".npz"), ids_crc32=crc, **{f"lp_{n}": got[n] for n in range(R)})
+        json.dump({"adapter_sha256": None if name == "base" else ad[name]["sha256"], "head": "plain", "engine_sha": eng, "source": "engine",
+                   "session_id": sid, "panel_rows_sha256": rows_sha}, open(os.path.join(rd, name + ".json"), "w"), indent=1)
+        done.append(name)
+    log(f"damage reads of panel {a.panel}: written {done}; not complete (not written) {missing}")
+    return 0 if not missing else 4
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--phase", required=True, choices=("check", "pre", "pre_compare", "trainer", "compare"))
+    ap.add_argument("--phase", required=True, choices=("check", "pre", "pre_compare", "trainer", "compare", "dmg_merge"))
+    ap.add_argument("--panel", default="", help="dmg_merge: the panel's name (its reads are in <run-dir>/reads_dmg/<panel>/)")
     ap.add_argument("--plan", default="")
     ap.add_argument("--bin", default="")
     ap.add_argument("--artifact", default="")
@@ -547,7 +594,8 @@ def main():
     ap.add_argument("--gate-grad-from", type=int, default=0, help="visits below it hold their router gate weights constant in the backward")
     ap.add_argument("--bank-grad-from", type=int, default=0, help="looped visits below it hold their bank inputs constant in the backward")
     a = ap.parse_args()
-    return {"check": phase_check, "pre": phase_pre, "pre_compare": phase_pre_compare, "trainer": phase_trainer, "compare": phase_compare}[a.phase](a)
+    return {"check": phase_check, "pre": phase_pre, "pre_compare": phase_pre_compare, "trainer": phase_trainer, "compare": phase_compare,
+            "dmg_merge": phase_dmg_merge}[a.phase](a)
 
 
 if __name__ == "__main__":
