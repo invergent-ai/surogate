@@ -74,7 +74,8 @@ std::size_t speculative_accept_greedy_drafts_workspace_capacity_bytes(std::int32
 
 void speculative_prepare_verify_inputs(const Tensor& anchors, const Tensor& drafts,
                                        const Tensor& base_positions, const Tensor& current_extents,
-                                       Tensor& verify_ids, Tensor& positions, cudaStream_t stream) {
+                                       Tensor& verify_ids, Tensor& positions, cudaStream_t stream,
+                                       const SamplingConfig* configs) {
     constexpr const char* op = "speculative_prepare_verify_inputs";
     const std::int32_t k     = drafts.ne[0];
     const std::int32_t batch = drafts.ne[1];
@@ -89,12 +90,12 @@ void speculative_prepare_verify_inputs(const Tensor& anchors, const Tensor& draf
     require_matrix(verify_ids, DType::I32, k + 1, batch, op, "verify_ids");
     require_matrix(positions, DType::I32, k + 1, batch, op, "positions");
     detail::speculative_prepare_verify_inputs_launch(
-        anchors, drafts, base_positions, current_extents, verify_ids, positions, stream);
+        anchors, drafts, base_positions, current_extents, verify_ids, positions, stream, configs);
 }
 
 void speculative_prepare_verify_ids(const Tensor& anchors, const Tensor& drafts,
                                     const Tensor& current_extents, Tensor& verify_ids,
-                                    cudaStream_t stream) {
+                                    cudaStream_t stream, const SamplingConfig* configs) {
     constexpr const char* op = "speculative_prepare_verify_ids";
     const std::int32_t k     = drafts.ne[0];
     const std::int32_t batch = drafts.ne[1];
@@ -106,7 +107,7 @@ void speculative_prepare_verify_ids(const Tensor& anchors, const Tensor& drafts,
     require_vector(current_extents, DType::I32, batch, op, "current_extents");
     require_matrix(verify_ids, DType::I32, k + 1, batch, op, "verify_ids");
     detail::speculative_prepare_verify_ids_launch(anchors, drafts, current_extents, verify_ids,
-                                                  stream);
+                                                  stream, configs);
 }
 
 void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor& logits,
@@ -155,22 +156,6 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
     detail::speculative_accept_greedy_drafts_launch(
         target_tokens, logits, drafts, current_extents, lengths, anchors, licensed_tokens,
         licensed_counts, accepted, token_domain, configs, scratch, stream, k, split_routes);
-}
-
-void speculative_truncate_at_phase_switch(const Tensor& drafts, Tensor& current_extents,
-                                          const SamplingConfig* configs, cudaStream_t stream) {
-    constexpr const char* op = "speculative_truncate_at_phase_switch";
-    const std::int32_t k     = drafts.ne[0];
-    const std::int32_t batch = drafts.ne[1];
-    if (k < 1 || batch < 1) {
-        throw std::invalid_argument("speculative_truncate_at_phase_switch: K and B must be positive");
-    }
-    require_matrix(drafts, DType::I32, k, batch, op, "drafts");
-    require_vector(current_extents, DType::I32, batch, op, "current_extents");
-    if (configs == nullptr) {
-        throw std::invalid_argument("speculative_truncate_at_phase_switch: configs must be non-null");
-    }
-    detail::speculative_truncate_at_phase_switch_launch(drafts, current_extents, configs, stream);
 }
 
 void speculative_select_accepted_hidden(const Tensor& hidden, const Tensor& selectors, Tensor& out,

@@ -938,7 +938,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
     // resumed after a KV preemption whose generated tokens already hold the close answers with the reply values from
     // its prefill's own draw on.
     request.reply = request_plan.reply;
-    if (request.reply.armed) {
+    if (request.reply.pending()) {
         request.reply.frontier = prompt.token_ids.size() - std::min<std::size_t>(request.resumed_tokens,
                                                                                  prompt.token_ids.size());
         (void)request.reply.advance(prompt.token_ids);
@@ -2973,8 +2973,9 @@ ops::SamplingConfig ProgramImplCore::staged_sampling(RequestControl& request,
             return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
         }();
         if (trace) {
-            // The close is the last token of its round when the verify cut the drafts after it (or none followed).
-            std::fprintf(stderr, "reply-phase: lane=%u close at generated token %zu, ledger %zu, round ended at the close: %s\n",
+            // The switch token (the close, or a first content marker) is the last of its round when the verify cut the
+            // drafts after it.
+            std::fprintf(stderr, "reply-phase: lane=%u answer starts after generated token %zu, ledger %zu, round ended there: %s\n",
                          sequence.lane, request.reply.frontier - 1 - request.prompt_tokens, sequence.ledger.size(),
                          request.reply.frontier == sequence.ledger.size() ? "yes" : "no");
         }
@@ -3592,11 +3593,12 @@ ProgramImplCore::launch_ordinary_round(std::span<const std::uint32_t> lanes,
         for (const auto lane : lanes) {
             burst = std::min(burst, dspark_barrier_draws_if<Variant>(requests[lane], sequences[lane]));
         }
-        // A chained burst stages each row's config once; a reply-phase row still in its thought takes one round at a
-        // time, so the round after its close token is staged with the reply values.
+        // A chained burst stages each row's config once, so a reply-phase row before its answer takes one round at a
+        // time and the round after its switch is staged with the reply values. BATCH-WIDE, like a constrained row:
+        // while any such row is in this ordinary round, the whole batch runs unchained (speculative rounds -- MTP,
+        // DFlash -- do not chain and are not affected).
         if (burst == 0 || pipeline_stage() || std::any_of(lanes.begin(), lanes.end(), [&](auto lane) {
-                return requests[lane].constraint != nullptr ||
-                       (requests[lane].reply.armed && !requests[lane].reply.replying);
+                return requests[lane].constraint != nullptr || requests[lane].reply.pending();
             })) { burst = 1; }
 
         DecodeGraphExecutable* executable = nullptr;

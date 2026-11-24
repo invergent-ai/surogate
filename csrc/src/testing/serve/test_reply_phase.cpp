@@ -9,6 +9,7 @@
 
 #include <cstring>
 #include <iostream>
+#include <span>
 #include <stdexcept>
 #include <vector>
 
@@ -123,9 +124,10 @@ int main() {
     failures += check(std::memcmp(&own, &unchanged, sizeof(own)) == 0,
                       "a request without reply values got a different config");
     sinfer::runtime::ReplyPhase phase;
-    phase.armed        = true;
-    phase.switch_token = kClose;
-    phase.values       = {.temperature = 0.7F, .top_k = 50, .top_p = 0.9F, .min_p = 0.01F};
+    phase.armed  = true;
+    phase.state  = sinfer::runtime::ReplyPhase::State::Thinking;
+    phase.close  = kClose;
+    phase.values = {.temperature = 0.7F, .top_k = 50, .top_p = 0.9F, .min_p = 0.01F};
     // Prompt of 4 tokens that itself contains the close token (a past turn): not counted.
     std::vector<sinfer::TokenId> ledger = {1, kClose, 2, 3};
     phase.frontier = ledger.size();
@@ -135,11 +137,11 @@ int main() {
                           thought.phase_switch_token == kClose,
                       "the thought's config is not the request's own with the draft cut armed");
     for (const sinfer::TokenId token : {10, 11, 12}) ledger.push_back(token);
-    failures += check(!phase.advance(ledger) && !phase.replying, "thought tokens switched the phase");
+    failures += check(!phase.advance(ledger) && !phase.replying(), "thought tokens switched the phase");
     // A round that commits the close as its last token: the next round answers.
     ledger.push_back(13);
     ledger.push_back(kClose);
-    failures += check(phase.advance(ledger) && phase.replying, "the close token did not switch the phase");
+    failures += check(phase.advance(ledger) && phase.replying(), "the close token did not switch the phase");
     auto answer = phase.apply(own);
     failures += check(answer.temperature == 0.7F && answer.top_k == 50 && answer.top_p == 0.9F &&
                           answer.min_p == 0.01F && answer.phase_switch_armed == 0,
@@ -153,16 +155,76 @@ int main() {
     failures += check(same_except_phase_fields(answer_rest, own),
                       "the answer's config changed more than temperature / top_k / top_p / min_p");
     ledger.push_back(kClose);
-    failures += check(!phase.advance(ledger) && phase.replying, "a later close token changed the phase again");
+    failures += check(!phase.advance(ledger) && phase.replying(), "a later close token changed the phase again");
 
     // A request resumed after a KV preemption: its generated tokens are the end of its prefill's prompt; a close among
     // them answers from the prefill's own draw on (start_prefill_lane walks from the end of its own prompt).
-    sinfer::runtime::ReplyPhase resumed;
-    resumed.armed        = true;
-    resumed.switch_token = kClose;
+    sinfer::runtime::ReplyPhase resumed = phase;
+    resumed.state = sinfer::runtime::ReplyPhase::State::Thinking;
     const std::vector<sinfer::TokenId> prefill = {1, 2, 3, 20, kClose, 21};
     resumed.frontier = prefill.size() - 3; // own prompt: 3 tokens; 3 generated before the preemption
-    failures += check(resumed.advance(prefill) && resumed.replying, "a resumed request lost its answer phase");
+    failures += check(resumed.advance(prefill) && resumed.replying(), "a resumed request lost its answer phase");
+
+    // Opening (a model that opens its thought itself; Inkling-2's shape): header, then a content marker decides.
+    constexpr sinfer::TokenId kHeader = 200001, kOpen = 200008, kText = 200004, kToolJson = 200049;
+    const auto opening = [&] {
+        sinfer::runtime::ReplyPhase p = phase;
+        p.state      = sinfer::runtime::ReplyPhase::State::Opening;
+        p.open       = kOpen;
+        p.headers    = {kHeader, -1};
+        p.frontier   = 0;
+        return p;
+    };
+    auto op = opening();
+    const auto opening_config = op.apply(own);
+    failures += check(same_except_phase_fields(opening_config, own) && opening_config.phase_switch_armed == 2,
+                      "an opening row is not the request's own config with every draft cut");
+    std::vector<sinfer::TokenId> out = {kHeader};
+    failures += check(!op.advance(out) && op.pending(), "the header token ended the opening");
+    out.push_back(kOpen);
+    failures += check(!op.advance(out) && op.state == sinfer::runtime::ReplyPhase::State::Thinking,
+                      "<|content_thinking|> did not start the thought");
+    for (const sinfer::TokenId token : {5, 6, kHeader, kText}) out.push_back(token); // a thought may mention anything
+    failures += check(!op.advance(out) && !op.replying(), "tokens inside the thought ended it");
+    out.push_back(kClose);
+    failures += check(op.advance(out) && op.replying(), "the thought's close did not start the answer");
+    for (const sinfer::TokenId first : {kText, kToolJson, sinfer::TokenId{42}}) {
+        auto direct = opening();
+        const std::vector<sinfer::TokenId> no_thought = {kHeader, first, 7, 8};
+        failures += check(direct.advance(no_thought) && direct.replying() && direct.frontier == 2,
+                          "an output that opens with an answer block did not answer right after its marker");
+    }
+
+    // The serving decision (Engine::submit): fold, arm, or ignore.
+    using Plan = sinfer::runtime::ReplyPhasePlan;
+    sinfer::ReplyPhaseVocabulary qwen{.model_opens = false, .close = 151668, .open = 151667};
+    sinfer::ReplyPhaseVocabulary inkling{.model_opens = true, .close = kClose, .open = kOpen, .headers = {kHeader, -1}};
+    sinfer::ReplyPhaseVocabulary plain{}; // no reasoning tokens at all
+    sinfer::ReplyPhaseVocabulary channel{.model_opens = true}; // reasoning as a message channel: no close token
+    const auto plan = sinfer::runtime::plan_reply_phase;
+    failures += check(plan(qwen, true, true, false) == Plan::ArmThinking, "a chat prompt that opens a thought was not armed");
+    failures += check(plan(qwen, false, true, false) == Plan::Fold, "a chat prompt without a thought was not folded");
+    // Review item 1: token-id and /v1/completions prompts are never folded for a model whose prompts open thoughts.
+    failures += check(plan(qwen, false, false, false) == Plan::ArmThinking, "a raw prompt of a thinking model was folded");
+    // Review item 2: a JSON schema from the first token (structured output) is answer throughout.
+    failures += check(plan(qwen, true, true, true) == Plan::Fold, "structured output was not folded");
+    failures += check(plan(inkling, false, true, true) == Plan::Fold, "Inkling structured output was not folded");
+    failures += check(plan(inkling, false, true, false) == Plan::ArmOpening, "an Inkling chat prompt was not armed opening");
+    failures += check(plan(inkling, false, false, false) == Plan::ArmOpening, "an Inkling raw prompt was not armed");
+    failures += check(plan(inkling, true, false, false) == Plan::ArmThinking,
+                      "an Inkling raw prompt ending inside a thought was not armed thinking");
+    failures += check(plan(plain, false, false, false) == Plan::Fold && plan(plain, false, true, false) == Plan::Fold,
+                      "a model without reasoning tokens was not folded");
+    failures += check(plan(plain, true, true, false) == Plan::Ignore && plan(channel, false, true, false) == Plan::Ignore,
+                      "a thought without a single close token was not left alone");
+    // The raw prompt's tail: inside a thought iff its last opening marker follows its last close.
+    using Span = std::span<const sinfer::TokenId>;
+    const std::vector<sinfer::TokenId> open_tail = {1, kOpen, 2, kClose, 3, kHeader, kOpen, 9, 9};
+    const std::vector<sinfer::TokenId> closed_tail = {1, kOpen, 2, kClose, 3, kHeader};
+    failures += check(sinfer::runtime::prompt_tail_in_thought(Span(open_tail), inkling) &&
+                          !sinfer::runtime::prompt_tail_in_thought(Span(closed_tail), inkling) &&
+                          !sinfer::runtime::prompt_tail_in_thought(Span(open_tail), plain),
+                      "prompt_tail_in_thought misread a prompt's tail");
 
     if (failures == 0) { std::cout << "reply_phase: ok\n"; }
     return failures == 0 ? 0 : 1;

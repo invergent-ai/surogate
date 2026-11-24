@@ -133,13 +133,11 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     base->summary.transient_bytes        = 0;
     base->sampling                       = translate_sampling(options.sampling);
     base->sampling.top_logprobs = options.top_logprobs;
-    if (options.sampling.reply && options.reply_switch_token >= 0) {
-        if (options.reply_switch_token >= cfg.token_domain) {
-            throw std::invalid_argument("reply-phase switch token is outside the token domain");
+    if (options.reply_phase.armed) {
+        if (options.reply_phase.close < 0 || options.reply_phase.close >= cfg.token_domain) {
+            throw std::invalid_argument("reply-phase close token is outside the token domain");
         }
-        base->reply.armed        = true;
-        base->reply.switch_token = options.reply_switch_token;
-        base->reply.values       = *options.sampling.reply;
+        base->reply = options.reply_phase;
     }
     base->logit_bias                     = options.sampling.logit_bias;
     base->constraint                     = options.constraint;

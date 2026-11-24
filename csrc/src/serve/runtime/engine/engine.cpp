@@ -4,6 +4,7 @@
 #include "core/device.h"
 #include "core/device_footprint.h"
 #include "runtime/contract/sampling.h"
+#include "runtime/contract/reply_phase.h"
 #include "core/limits.h"
 #include "runtime/contract/types.h"
 #include "ops/linear/w8a8/w4fp4_plane.h"
@@ -535,36 +536,6 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
     std::visit([&](const auto& target) {
         target->loaded->frontend.validate_sampling_tokens(resolved_options.execution.sampling);
     }, impl_->active);
-    // Reply-phase sampler (SamplingOverrides::reply_*). An output that may open with a thought keeps the request's own
-    // values until the model's close token and takes the reply values after it (the runtime switches, reply_phase.h);
-    // an output that opens with none -- the prompt opened no thought and the model does not open one itself, or the
-    // prompt is the answer after a closed thought -- is answer from its first token and is drawn with the reply
-    // values throughout. A model that may think but has no single close token cannot tell its answer apart: its
-    // requests are drawn with their own values (the reply values are not used).
-    if (ResolvedSamplingParameters& sampling = resolved_options.execution.sampling; sampling.reply) {
-        const auto& view = family::PreparedPromptAccess::view(prompt.impl_->value);
-        const auto [may_think, close] = std::visit([&](const auto& target) {
-            return target->loaded->frontend.reply_phase_switch(view.starts_in_reasoning);
-        }, impl_->active);
-        if (may_think && !view.answer_continuation) {
-            if (close) {
-                resolved_options.execution.reply_switch_token = *close;
-            } else {
-                static std::once_flag warned;
-                std::call_once(warned, [] {
-                    std::fprintf(stderr, "reply-phase sampler: this model has no single reasoning close token; "
-                                         "reply_* values are not used\n");
-                });
-                sampling.reply.reset();
-            }
-        } else {
-            sampling.temperature = sampling.reply->temperature;
-            sampling.top_k       = sampling.reply->top_k;
-            sampling.top_p       = sampling.reply->top_p;
-            sampling.min_p       = sampling.reply->min_p;
-            sampling.reply.reset();
-        }
-    }
     if (!json_schema.empty()) {
         std::visit([&](const auto& target) {
             const auto& frontend = target->loaded->frontend;
@@ -582,6 +553,50 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
         resolved_options.execution.constraint = std::visit([&](const auto& target) {
             return target->loaded->frontend.compile_tool_constraint(tool_tag);
         }, impl_->active);
+    }
+    // Reply-phase sampler (SamplingOverrides::reply_*), after the constraints: runtime::plan_reply_phase decides. An
+    // output that is answer from its first token -- structured from it, or the answer after a closed thought -- is
+    // drawn with the reply values throughout; one that is or may be inside a thought keeps the request's own values
+    // until it ends (the runtime switches, reply_phase.h); a prompt the chat path did not render is never folded.
+    if (ResolvedSamplingParameters& sampling = resolved_options.execution.sampling; sampling.reply) {
+        const auto& view = family::PreparedPromptAccess::view(prompt.impl_->value);
+        const ReplyPhaseVocabulary vocabulary = std::visit([&](const auto& target) {
+            return target->loaded->frontend.reply_phase_vocabulary();
+        }, impl_->active);
+        const bool starts_in_thought = view.starts_in_reasoning ||
+            (!view.uses_chat_template && runtime::prompt_tail_in_thought(view.token_ids, vocabulary));
+        const bool answer_from_first_token = view.answer_continuation || resolved_options.output.structured;
+        switch (runtime::plan_reply_phase(vocabulary, starts_in_thought, view.uses_chat_template,
+                                          answer_from_first_token)) {
+        case runtime::ReplyPhasePlan::Fold:
+            sampling.temperature = sampling.reply->temperature;
+            sampling.top_k       = sampling.reply->top_k;
+            sampling.top_p       = sampling.reply->top_p;
+            sampling.min_p       = sampling.reply->min_p;
+            sampling.reply.reset();
+            break;
+        case runtime::ReplyPhasePlan::ArmThinking:
+        case runtime::ReplyPhasePlan::ArmOpening: {
+            auto& phase        = resolved_options.execution.reply_phase;
+            phase.armed        = true;
+            phase.state        = starts_in_thought || !vocabulary.model_opens ? runtime::ReplyPhase::State::Thinking
+                                                                              : runtime::ReplyPhase::State::Opening;
+            phase.close        = *vocabulary.close;
+            phase.open         = vocabulary.open.value_or(-1);
+            phase.headers      = vocabulary.headers;
+            phase.values       = *sampling.reply;
+            break;
+        }
+        case runtime::ReplyPhasePlan::Ignore: {
+            static std::once_flag warned;
+            std::call_once(warned, [] {
+                std::fprintf(stderr, "reply-phase sampler: this model has no single reasoning close token; "
+                                     "reply_* values are not used\n");
+            });
+            sampling.reply.reset();
+            break;
+        }
+        }
     }
     const ResolvedSamplingParameters resolved_sampling = resolved_options.execution.sampling;
 

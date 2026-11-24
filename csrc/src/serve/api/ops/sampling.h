@@ -67,10 +67,11 @@ struct SamplingConfig {
     /// position and kSamplePurposeDecode) and accepts a draft iff it equals that token -- the committed tokens are
     /// those of MTP-off decoding with the same seed. Zero: the one-hot rejection rule. Ignored outside verification.
     std::int32_t speculative_coupled        = 0;
-    /// Nonzero while a request with a reply-phase sampler is still in its thought: a speculative verify accepts no
-    /// draft at or after the row's first draft equal to phase_switch_token (speculative_truncate_at_phase_switch), so
-    /// every token a round commits is drawn with this config and the tokens after the close are drawn in the next
-    /// round, with the answer's values. Zero (every other request): nothing changes. Sits in the tail padding.
+    /// Reply-phase sampler, before the answer (runtime/contract/reply_phase.h): 1 while the request is in its thought
+    /// -- a speculative verify accepts no draft at or after the row's first draft equal to phase_switch_token; 2 while
+    /// its output has not yet shown whether it thinks -- no draft at all (speculative_prepare_verify_inputs). Every
+    /// token a round commits is then drawn with this config; the answer's draws come in later rounds, with the reply
+    /// values. Zero (every other request): nothing changes. Sits in the tail padding.
     std::int32_t phase_switch_armed         = 0;
 };
 // A public header, copied to the device every round and sized into the persistent layout (24 -> 26 words per lane at

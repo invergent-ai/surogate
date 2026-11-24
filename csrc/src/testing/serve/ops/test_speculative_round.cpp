@@ -95,12 +95,14 @@ int prepare_verify_case(int k) {
     return failures;
 }
 
-// Reply-phase sampler: a row still in its thought (phase_switch_armed) keeps only the drafts before its first drafted
-// close token; an unarmed row, a row whose close lies past its extent, and a row with no close keep their extents.
-int truncate_at_phase_switch_case() {
-    constexpr int k        = 7;
-    constexpr int kClose   = 200002;
-    // row: armed?, extent, index of the close among the drafts (-1: none), expected extent
+// Reply-phase sampler: speculative_prepare_verify_inputs with configs cuts a row in its thought (phase_switch_armed 1)
+// before its first drafted close token, and an opening row (armed 2) to no draft; the cut extent is written back, the
+// verify ids past it are the anchor; unarmed rows, a close past the extent and no close leave everything as without
+// configs. Null configs: the old op exactly.
+int phase_cut_case() {
+    constexpr int k      = 7;
+    constexpr int kClose = 200010;
+    // row: armed, extent, index of the close among the drafts (-1: none), expected extent
     struct Row { int armed; int extent; int close_at; int expected; };
     const std::vector<Row> rows = {
         {1, 7, 3, 3},  // close mid-block: drafts 0..2 stay
@@ -111,36 +113,63 @@ int truncate_at_phase_switch_case() {
         {0, 7, 3, 7},  // not armed (option off / already answering): unchanged
         {1, 0, 0, 0},  // nothing proposed
         {1, 7, 2, 2},  // two closes: the first one counts (second at 5)
+        {2, 7, -1, 0}, // opening: no draft
     };
     const int batch = static_cast<int>(rows.size());
-    std::vector<std::int32_t> drafts(static_cast<std::size_t>(k * batch));
-    std::vector<std::int32_t> extents(rows.size());
+    std::vector<std::int32_t> drafts(static_cast<std::size_t>(k * batch)), anchors, bases, extents;
     std::vector<ops::SamplingConfig> configs(rows.size());
     for (int b = 0; b < batch; ++b) {
         for (int i = 0; i < k; ++i) drafts[static_cast<std::size_t>(b * k + i)] = 1000 + 13 * b + i;
         if (rows[b].close_at >= 0) drafts[static_cast<std::size_t>(b * k + rows[b].close_at)] = kClose;
-        if (b == batch - 1) drafts[static_cast<std::size_t>(b * k + 5)] = kClose;
-        extents[static_cast<std::size_t>(b)] = rows[b].extent;
+        if (b == 7) drafts[static_cast<std::size_t>(b * k + 5)] = kClose;
+        anchors.push_back(500 + b);
+        bases.push_back(100 * b);
+        extents.push_back(rows[b].extent);
         configs[static_cast<std::size_t>(b)].temperature        = 1.0F;
         configs[static_cast<std::size_t>(b)].phase_switch_token = kClose;
         configs[static_cast<std::size_t>(b)].phase_switch_armed = rows[b].armed;
     }
-    // An unarmed row with a default config: the token field is -1 and never read.
-    configs[5] = ops::SamplingConfig{};
-    DeviceBuffer d_drafts  = to_device(drafts);
-    DeviceBuffer d_extents = to_device(extents);
-    DeviceBuffer d_configs = to_device(configs);
-    Tensor draft_tensor(d_drafts.p, DType::I32, {k, batch});
-    Tensor extent_tensor(d_extents.p, DType::I32, {batch});
-    ops::speculative_truncate_at_phase_switch(draft_tensor, extent_tensor,
-                                              static_cast<const ops::SamplingConfig*>(d_configs.p), nullptr);
-    cuda_synchronize();
-    std::vector<std::int32_t> expected;
-    for (const Row& row : rows) expected.push_back(row.expected);
-    int failures = verify_exact("truncate at phase switch extents", from_device<std::int32_t>(d_extents, rows.size()),
-                                expected);
-    failures += verify_exact("truncate at phase switch drafts unchanged",
-                             from_device<std::int32_t>(d_drafts, drafts.size()), drafts);
+    configs[5] = ops::SamplingConfig{}; // an unarmed default config: the token field is -1 and never read
+    int failures = 0;
+    for (const bool with_configs : {false, true}) {
+        DeviceBuffer d_drafts  = to_device(drafts);
+        DeviceBuffer d_anchors = to_device(anchors);
+        DeviceBuffer d_bases   = to_device(bases);
+        DeviceBuffer d_extents = to_device(extents);
+        DeviceBuffer d_configs = to_device(configs);
+        GuardedDeviceBuffer d_verify(static_cast<std::size_t>((k + 1) * batch) * sizeof(std::int32_t));
+        GuardedDeviceBuffer d_positions(static_cast<std::size_t>((k + 1) * batch) * sizeof(std::int32_t));
+        Tensor draft_tensor(d_drafts.p, DType::I32, {k, batch});
+        Tensor anchor_tensor(d_anchors.p, DType::I32, {batch});
+        Tensor base_tensor(d_bases.p, DType::I32, {batch});
+        Tensor extent_tensor(d_extents.p, DType::I32, {batch});
+        Tensor verify(d_verify.data(), DType::I32, {k + 1, batch});
+        Tensor positions(d_positions.data(), DType::I32, {k + 1, batch});
+        ops::speculative_prepare_verify_inputs(anchor_tensor, draft_tensor, base_tensor, extent_tensor, verify, positions,
+                                               nullptr,
+                                               with_configs ? static_cast<const ops::SamplingConfig*>(d_configs.p)
+                                                            : nullptr);
+        cuda_synchronize();
+        std::vector<std::int32_t> want_extents, want_ids, want_positions;
+        for (int b = 0; b < batch; ++b) {
+            const int e = with_configs ? rows[b].expected : rows[b].extent;
+            want_extents.push_back(e);
+            const auto oracle = verify_inputs_oracle(
+                anchors[b], std::vector<std::int32_t>(drafts.begin() + b * k, drafts.begin() + b * k + e), bases[b]);
+            for (int j = 0; j <= k; ++j) {
+                want_ids.push_back(j <= e ? oracle.verify_ids[j] : anchors[b]);
+                want_positions.push_back(bases[b] + (j <= e ? j : e));
+            }
+        }
+        const std::string label = with_configs ? "phase cut" : "phase cut, null configs";
+        failures += verify_exact((label + " extents").c_str(), from_device<std::int32_t>(d_extents, extents.size()),
+                                 want_extents);
+        failures += verify_exact((label + " verify ids").c_str(), read<std::int32_t>(d_verify, want_ids.size()), want_ids);
+        failures += verify_exact((label + " positions").c_str(), read<std::int32_t>(d_positions, want_positions.size()),
+                                 want_positions);
+        failures += verify_exact((label + " drafts unchanged").c_str(),
+                                 from_device<std::int32_t>(d_drafts, drafts.size()), drafts);
+    }
     return failures;
 }
 
@@ -599,7 +628,7 @@ int main() {
         ++failures;
     } catch (const std::invalid_argument&) {}
     for (const int k : {1, 5, 15}) failures += prepare_verify_case(k);
-    failures += truncate_at_phase_switch_case();
+    failures += phase_cut_case();
     failures += greedy_accept_case(0, 0);
     for (const int domain : {257, 32769}) {
         for (const int top_k : {1, 64, 0}) {

@@ -411,6 +411,19 @@ struct SamplingOverrides {
     }
 };
 
+/// What a model's vocabulary says about where its thought ends (Frontend::reply_phase_vocabulary).
+struct ReplyPhaseVocabulary {
+    /// The model writes its thought's opening marker itself (Inkling-2, Gemma 4), rather than the prompt opening it.
+    bool model_opens = false;
+    /// The single token that closes a thought (Inkling-2: <|end_message|>; Qwen: </think>), when there is one and the
+    /// reasoning is a span rather than a message channel.
+    std::optional<TokenId> close;
+    /// The single token that opens a thought the model writes itself (Inkling-2: <|content_thinking|>).
+    std::optional<TokenId> open;
+    /// Tokens an output may start with before it shows whether it thinks (Inkling-2: <|message_model|>).
+    std::array<TokenId, 2> headers{-1, -1};
+};
+
 /// The answer-phase values of SamplingOverrides::reply_*, resolved (SamplingOverrides).
 struct ReplySamplingParameters {
     float temperature  = 0.0F;

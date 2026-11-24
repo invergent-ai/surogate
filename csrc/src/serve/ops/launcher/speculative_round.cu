@@ -18,7 +18,8 @@ namespace sinfer::ops::detail {
 void speculative_prepare_verify_inputs_launch(const Tensor& anchors, const Tensor& drafts,
                                               const Tensor& base_positions,
                                               const Tensor& current_extents, Tensor& verify_ids,
-                                              Tensor& positions, cudaStream_t stream) {
+                                              Tensor& positions, cudaStream_t stream,
+                                              const SamplingConfig* configs) {
     constexpr int kBlock = 32;
     const int k          = drafts.ne[0];
     const int batch      = drafts.ne[1];
@@ -28,14 +29,14 @@ void speculative_prepare_verify_inputs_launch(const Tensor& anchors, const Tenso
         static_cast<const std::int32_t*>(anchors.data),
         static_cast<const std::int32_t*>(drafts.data),
         static_cast<const std::int32_t*>(base_positions.data),
-        static_cast<const std::int32_t*>(current_extents.data),
-        static_cast<std::int32_t*>(verify_ids.data), static_cast<std::int32_t*>(positions.data), k);
+        static_cast<std::int32_t*>(current_extents.data),
+        static_cast<std::int32_t*>(verify_ids.data), static_cast<std::int32_t*>(positions.data), k, configs);
     CUDA_CHECK(cudaGetLastError());
 }
 
 void speculative_prepare_verify_ids_launch(const Tensor& anchors, const Tensor& drafts,
                                            const Tensor& current_extents, Tensor& verify_ids,
-                                           cudaStream_t stream) {
+                                           cudaStream_t stream, const SamplingConfig* configs) {
     constexpr int kBlock = 32;
     const int k          = drafts.ne[0];
     const int batch      = drafts.ne[1];
@@ -44,8 +45,8 @@ void speculative_prepare_verify_ids_launch(const Tensor& anchors, const Tensor& 
     speculative_prepare_verify_inputs_kernel<<<grid, kBlock, 0, stream>>>(
         static_cast<const std::int32_t*>(anchors.data),
         static_cast<const std::int32_t*>(drafts.data), nullptr,
-        static_cast<const std::int32_t*>(current_extents.data),
-        static_cast<std::int32_t*>(verify_ids.data), nullptr, k);
+        static_cast<std::int32_t*>(current_extents.data),
+        static_cast<std::int32_t*>(verify_ids.data), nullptr, k, configs);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -190,18 +191,6 @@ void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const 
             target_tokens, logits, drafts, current_extents, lengths, anchors, licensed_tokens,
             licensed_counts, accepted, token_domain, configs, workspace, stream, draft_count, split_routes);
     }
-}
-
-void speculative_truncate_at_phase_switch_launch(const Tensor& drafts, Tensor& current_extents,
-                                                 const SamplingConfig* configs, cudaStream_t stream) {
-    constexpr int kBlock = 32;
-    const int k          = drafts.ne[0];
-    const int batch      = drafts.ne[1];
-    speculative_truncate_at_phase_switch_kernel<<<static_cast<unsigned int>(div_up(batch, kBlock)), kBlock, 0,
-                                                  stream>>>(
-        static_cast<const std::int32_t*>(drafts.data), static_cast<std::int32_t*>(current_extents.data), configs,
-        k, batch);
-    CUDA_CHECK(cudaGetLastError());
 }
 
 void speculative_select_accepted_hidden_launch(const Tensor& hidden, const Tensor& selectors,

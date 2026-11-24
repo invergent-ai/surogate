@@ -15,16 +15,41 @@
 
 namespace sinfer::ops {
 
+// Reply-phase sampler (SamplingConfig::phase_switch_armed): the drafts a row may verify. 1 (in its thought): those
+// before its first drafted close token (phase_switch_token); 2 (its output has not yet said whether it thinks): none.
+// 0 (every other row): all of them. Idempotent: the cut of a cut extent is itself.
+__device__ inline int speculative_phase_cut(const std::int32_t* row_drafts, int extent, const SamplingConfig* configs,
+                                            int row) {
+    if (configs == nullptr) { return extent; }
+    const SamplingConfig& cfg = configs[row];
+    if (cfg.phase_switch_armed == 0) { return extent; }
+    if (cfg.phase_switch_armed == 2) { return 0; }
+    for (int i = 0; i < extent; ++i) {
+        if (row_drafts[i] == cfg.phase_switch_token) { return i; }
+    }
+    return extent;
+}
+
 __global__ void speculative_prepare_verify_inputs_kernel(const std::int32_t* anchors,
                                                          const std::int32_t* drafts,
                                                          const std::int32_t* base_positions,
-                                                         const std::int32_t* current_extents,
+                                                         std::int32_t* current_extents,
                                                          std::int32_t* verify_ids,
-                                                         std::int32_t* positions, std::int32_t k) {
+                                                         std::int32_t* positions, std::int32_t k,
+                                                         const SamplingConfig* configs) {
     const int row = static_cast<int>(blockIdx.y);
     const int T   = k + 1;
     int extent    = current_extents[row];
     extent        = extent < 0 ? 0 : (extent > k ? k : extent);
+    if (configs != nullptr && configs[row].phase_switch_armed != 0) {
+        // The cut extent is what the round's accept reads; the columns past it verify the anchor, as for any
+        // shorter extent. Only reply-phase rows are written, and the cut is idempotent, so blocks of one row agree.
+        const int cut = speculative_phase_cut(drafts + row * k, extent, configs, row);
+        if (cut != extent) {
+            if (blockIdx.x == 0 && threadIdx.x == 0) { current_extents[row] = cut; }
+            extent = cut;
+        }
+    }
     for (int j = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x; j < T;
          j += blockDim.x * gridDim.x) {
         const int off = row * T + j;
@@ -32,24 +57,6 @@ __global__ void speculative_prepare_verify_inputs_kernel(const std::int32_t* anc
             j == 0 ? anchors[row] : (j <= extent ? drafts[row * k + j - 1] : anchors[row]);
         if (positions != nullptr) {
             positions[off] = base_positions[row] + (j <= extent ? j : extent);
-        }
-    }
-}
-
-// speculative_truncate_at_phase_switch: one thread per row.
-__global__ void speculative_truncate_at_phase_switch_kernel(const std::int32_t* drafts,
-                                                            std::int32_t* current_extents,
-                                                            const SamplingConfig* configs, int k,
-                                                            int batch) {
-    const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    if (row >= batch) { return; }
-    const SamplingConfig& cfg = configs[row];
-    if (cfg.phase_switch_armed == 0) { return; }
-    const int extent = min(k, max(0, current_extents[row]));
-    for (int i = 0; i < extent; ++i) {
-        if (drafts[row * k + i] == cfg.phase_switch_token) {
-            current_extents[row] = i;
-            return;
         }
     }
 }
