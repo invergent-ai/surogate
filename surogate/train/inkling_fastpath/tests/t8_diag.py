@@ -409,7 +409,12 @@ def phase_local(a):
     recomputed with visit_torch_t8 on real tensors with slot i at +- eps u: f_local = <c, o(+) - o(-)> / (2 eps |vjp_i|). Same for qB / B13.
     PASS LINE (written before any data): a correct visit gives f_local in [0.98, 1.02] for every slot and tensor. The first (visit, slot) outside
     it names the operation path; all inside means the fault is in how the per-visit gradients are accumulated across visits (then the chain under
-    plain autograd against backward_row is the next check)."""
+    plain autograd against backward_row is the next check). The gating vjp runs as backward_row runs it: inside LG._gemm_mode() and with
+    LG._q_block fixed to the row's query block.
+    Added (agent-RX, before any data): (b) the same vjp on the plain path (no gemm mode, default query block): cos < 0.999 or norm ratio outside
+    [0.99, 1.01] at any slot / tensor = the fast path differs. (c) the gating vjp at the ENGINE's saved values (backward_row's own act_vals),
+    same cotangent, against the vjp at the chain's values: cos and norm ratio per slot, recorded with no line. Also per visit: RMS of each
+    input slot's value and of the output."""
     deadline = time.time() + a.budget_s
     RA.ROUND["on"] = False
     rig = Rig(a)
@@ -426,7 +431,8 @@ def phase_local(a):
                     on_visit_grad=lambda v, go: gouts.__setitem__(v, go.detach().float().cpu()))
     routing0 = ctx["res"]["routing"].clone()
     ids = ctx["ids"]
-    rig.w._release(ctx)
+    host_vals = ctx["res"]["host"]                            # the engine's saved values backward_row uses: kept alive until the end
+    qb = ctx["qb"]
     with torch.no_grad():
         x0 = F.forward(eng, ids, save=True, adapters_per_layer=rig.w._adapters())["x0"].float()
     outs = []
@@ -448,25 +454,50 @@ def phase_local(a):
         n = len(vi.stack)
         c = gouts[v].to(dev)
         vals = [val(p) for p in ps]
-        sinks = [torch.zeros(T, B.D, dtype=torch.float32, device=dev) for _ in ps]
         lo = rig.w.lora[vi.layer]
         keys = [k for k in lo if k != "scale"]
         lt = [lo[k].to(dev) for k in keys]
-        with torch.enable_grad(), torch.device(dev):
-            ins = [torch.zeros(1, dtype=torch.float32, device=dev).expand(T, B.D) for _ in ps]
-            leaves = [t.detach().requires_grad_(k in ("qB", "B13")) for k, t in zip(keys, lt)]
-            want = [t for t in leaves if t.requires_grad]
-            lora = TV.lora_dict(keys, leaves, scale, attn_scale)
-            LG.SINK_DUMMIES.clear()
-            out = TV.visit_torch_t8(W, vi, ins[:n], ins[n], (ins[n + 1], ins[n + 2]) if vi.looped else None, routing0[v], lora,
-                                    act_vals=vals, act_sinks=sinks)
-            got = torch.autograd.grad(out, want + list(LG.SINK_DUMMIES), c, allow_unused=True)
-            LG.SINK_DUMMIES.clear()
-        pk = [k for k, t in zip(keys, leaves) if t.requires_grad]
-        pgr = {k: (x.detach() if x is not None else None) for k, x in zip(pk, got[:len(want)])}
-        del out, got, leaves, want, lora
-        if not vi.first:
-            LG.sink_add(sinks[n], c)                          # the MLP-output conv's residual, as backward_row
+
+        def vjp(act, fast):
+            """backward_row's per-visit vjp at the values `act` (device fp32 or the engine's host bf16): sinks per slot + qB / B13 grads."""
+            sinks = [torch.zeros(T, B.D, dtype=torch.float32, device=dev) for _ in ps]
+            saved_qb = LG._q_block
+            try:
+                if fast:
+                    LG._q_block = lambda T_, window, hq=24: qb
+                ctxm = LG._gemm_mode() if fast else __import__("contextlib").nullcontext()
+                with ctxm, torch.enable_grad(), torch.device(dev):
+                    ins = [torch.zeros(1, dtype=torch.float32, device=dev).expand(T, B.D) for _ in ps]
+                    leaves = [t.detach().requires_grad_(k in ("qB", "B13")) for k, t in zip(keys, lt)]
+                    want = [t for t in leaves if t.requires_grad]
+                    lora = TV.lora_dict(keys, leaves, scale, attn_scale)
+                    LG.SINK_DUMMIES.clear()
+                    out = TV.visit_torch_t8(W, vi, ins[:n], ins[n], (ins[n + 1], ins[n + 2]) if vi.looped else None, routing0[v], lora,
+                                            act_vals=act, act_sinks=sinks)
+                    got = torch.autograd.grad(out, want + list(LG.SINK_DUMMIES), c, allow_unused=True)
+                    LG.SINK_DUMMIES.clear()
+                pk = [k for k, t in zip(keys, leaves) if t.requires_grad]
+                pg = {k: (x.detach() if x is not None else None) for k, x in zip(pk, got[:len(want)])}
+            finally:
+                LG._q_block = saved_qb
+                LG.SINK_DUMMIES.clear()
+            if not vi.first:
+                LG.sink_add(sinks[n], c)                      # the MLP-output conv's residual, as backward_row
+            return sinks, pg
+
+        def cmp(xs, ys):
+            out_ = []
+            for x_, y_ in zip(xs, ys):
+                if x_ is None or y_ is None:
+                    out_.append(None)
+                    continue
+                x_, y_ = x_.double(), y_.double()
+                ny = float(y_.norm())
+                out_.append({"cos": float((x_ * y_).sum() / (x_.norm() * y_.norm()).clamp(min=1e-300)),
+                             "norm_ratio": float(x_.norm()) / ny if ny else None})
+            return out_
+
+        sinks, pgr = vjp(vals, True)                          # the gating vjp: backward_row's path (gemm mode, fixed query block)
         base_lora = TV.lora_dict(keys, lt, scale, attn_scale)
 
         def fwd(vs, lo_):
@@ -474,6 +505,23 @@ def phase_local(a):
                 return TV.visit_torch_t8(W, vi, vs[:n], vs[n], (vs[n + 1], vs[n + 2]) if vi.looped else None, routing0[v], lo_).float()
 
         res = {"visit": v, "layer": vi.layer, "pass": vi.pass_, "first": vi.first, "looped": vi.looped, "slots": [], "lora": {}}
+        res["rms_in"] = [float(x.double().pow(2).mean().sqrt()) for x in vals]
+        res["rms_out"] = float(outs[v].double().pow(2).mean().sqrt())
+        try:                                                  # (b) the plain path
+            sb, pb = vjp(vals, False)
+            res["b_plain_vs_fast"] = {"slots": cmp(sb, sinks), "lora": dict(zip(("qB", "B13"), cmp([pb.get("qB"), pb.get("B13")],
+                                                                                                   [pgr.get("qB"), pgr.get("B13")])))}
+            del sb, pb
+        except Exception as e:
+            res["b_plain_vs_fast"] = {"error": f"{type(e).__name__}: {e}"[:500]}
+        try:                                                  # (c) at the engine's saved values
+            sc, pc = vjp([host_vals[p] for p in ps], True)
+            res["c_engine_vs_chain"] = {"slots": cmp(sc, sinks), "lora": dict(zip(("qB", "B13"), cmp([pc.get("qB"), pc.get("B13")],
+                                                                                                    [pgr.get("qB"), pgr.get("B13")])))}
+            del sc, pc
+        except Exception as e:
+            res["c_engine_vs_chain"] = {"error": f"{type(e).__name__}: {e}"[:500]}
+        torch.cuda.empty_cache()
         names = [f"stack{j}" for j in range(n)] + ["partial"] + (["bank0", "bank1"] if vi.looped else [])
         for i, (nm, p) in enumerate(zip(names, ps)):
             nv = float(sinks[i].double().norm())
@@ -521,6 +569,7 @@ def phase_local(a):
             + "; " + ", ".join(f"{k} {x['f']:.4f}" for k, x in r["lora"].items() if x is not None)
             + (f"  OUTSIDE: {bad}" if bad else "") + f"  ({time.time() - t0:.1f} s)")
         json.dump(rep, open(a.out, "w"), indent=1)
+    rig.w._release(ctx)
     rig.w.close()
     return 0
 
