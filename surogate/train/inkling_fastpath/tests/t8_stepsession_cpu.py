@@ -39,6 +39,7 @@ from surogate.inkling_rl.step import StepConfig  # noqa: E402
 import t8_micro as MI  # noqa: E402
 import t8_micro_cpu as MC  # noqa: E402
 import t8_ppo_cpu as P  # noqa: E402
+import t8_rules as RU  # noqa: E402
 import t8_step as TS  # noqa: E402
 import t8_stepsession as SS  # noqa: E402
 import t8_stepsession_reads as RD  # noqa: E402
@@ -627,6 +628,86 @@ def main():
                                old_lp=os.path.join(run9, "old_lp.npz"), last_update=1)
     assert rcx == SS.EXIT_INPUT, sx.sess["exit"]
     print("(9) a session that ends after update 1 == the first mini-batch; its gradient file and optimizer state; the resumed update 2 == the uninterrupted run, bitwise: PASS")
+
+    # (10) update rules: the rule's arithmetic; a session under rule P; a checkpoint rebuilt under a rule and resumed
+    gq = torch.Generator().manual_seed(9)
+    gr = [torch.randn(5, 3, generator=gq) * 1e-3, torch.zeros(4), torch.randn(7, generator=gq) * 1e-6]
+    dA = [-2e-5 * x / (x.abs() + 1e-8) for x in gr]           # the first Adam step of such a gradient
+    mom = ([0.1 * x for x in gr], [0.001 * x * x for x in gr], 1.0, (0.9, 0.999))
+    nrm = lambda xs: float(np.sqrt(sum(float((x.double() ** 2).sum()) for x in xs)))  # noqa: E731
+    cosv = lambda a, b: sum(float((x.double() * y.double()).sum()) for x, y in zip(a, b)) / (nrm(a) * nrm(b))  # noqa: E731
+    dP, dT = RU.rule_delta("P", gr, 1.0, dA), RU.rule_delta("T", gr, 1.0, dA)
+    dE8, dE6 = RU.rule_delta("E", gr, 1.0, dA, eps=1e-8, moments=mom), RU.rule_delta("E", gr, 1.0, dA, eps=1e-6, moments=mom)
+    assert abs(nrm(dP) - nrm(dA)) <= 1e-12 * nrm(dA) and abs(cosv(dP, gr) + 1.0) <= 1e-12, "P is not -k g at the optimizer's norm"
+    assert all(abs(float(a.norm()) - float(b.double().norm())) <= 1e-12 * nrm(dA) for a, b in zip(dT, dA)), "T does not keep the per-tensor norms"
+    assert abs(cosv([dT[0]], [gr[0]]) + 1.0) <= 1e-12 and abs(cosv([dT[2]], [gr[2]]) + 1.0) <= 1e-12
+    assert abs(nrm(dE6) - nrm(dA)) <= 1e-12 * nrm(dA) and cosv(dE8, dA) > 1 - 1e-6 and cosv(dE6, dA) < cosv(dE8, dA)
+    assert all(not bool(d[1].any()) for d in (dP, dT, dE6)), "a tensor without gradient moved"
+    assert all(torch.equal(a, b.double()) for a, b in zip(RU.rule_delta("A", gr, 1.0, dA), dA))
+    assert all(torch.equal(a, 8.0 * b) for a, b in zip(RU.rule_delta("P", gr, 1.0, dA, size=8.0), dP))
+    dPc = RU.rule_delta("P", gr, 0.25, dA)                    # the clip coefficient changes nothing in P and T
+    assert all(float((a - b).abs().max()) <= 1e-15 for a, b in zip(dPc, dP))
+    assert RU.parse_state("P:8") == ("P", 8.0, None) and RU.parse_state("E") == ("E", 1.0, 1e-6) and RU.parse_state("E:8:1e-5") == ("E", 8.0, 1e-5)
+    for bad_spec in ("Q", "P:0", "P:1:1e-6", "E:1:0"):
+        try:
+            RU.parse_state(bad_spec)
+            raise AssertionError(bad_spec)
+        except ValueError:
+            pass
+
+    def by_hand(rule, eps=None, updates_=(0, 1)):             # the reference: the optimizer steps, then the masters are set to prev + rule
+        t = P.FakeTrainer(cfg_for(tmp), 2)
+        rr = load(plan_dir).rows
+        for r, x in zip(rr, t.logprobs(rr)):
+            r.notes["old_lp"] = x
+        for j in updates_:
+            prev = [m.detach().clone() for m in t.opt.masters]
+            o = t.compute([rr[i] for i in plan.updates[j]], 0, StepConfig(max_policy_lag=None), seeds="ppo", minibatch_index=j)
+            n_ = t.apply(o, MI.LR)
+            coef = min(1.0, 1.0 / (n_ + 1e-6))
+            d_ad = [m.detach() - p_ for m, p_ in zip(t.opt.masters, prev)]
+            arr = t.opt.state_arrays()
+            mo = ([torch.from_numpy(np.array(arr[f"{i}.exp_avg"])) for i in range(len(nm))],
+                  [torch.from_numpy(np.array(arr[f"{i}.exp_avg_sq"])) for i in range(len(nm))], float(arr["0.step"][0]), (0.9, 0.999))
+            SS.put_masters(t, RU.add_delta(prev, RU.rule_delta(rule, o.grads, coef, d_ad, 1.0, eps, mo)))
+        return t
+
+    for rule, eps in (("P", None), ("T", None), ("E", 1e-6)):
+        hand = by_hand(rule, eps)
+        rcr, runr, trr, sr, _ = session(tmp, "rule_" + rule, plan_dir, ["GO", "GO"], panels=panels, rule=rule, rule_eps=eps)
+        assert rcr == 0 and all(torch.equal(a, b) for a, b in zip(trr.opt.masters, hand.opt.masters)) and same_state(opt_state(trr), opt_state(hand)), (rule, sr.sess["exit"])
+        assert not all(torch.equal(a, b) for a, b in zip(trr.opt.masters, tr.opt.masters)), f"rule {rule} left the optimizer's own step"
+        st_r = json.load(open(os.path.join(runr, "updates", "2", "step.json")))
+        tab_r = st_r["update_rule_table"]
+        assert st_r["update_rule"]["rule"] == rule and abs(tab_r["l2"] - tab_r["l2_adam_step"]) <= 1e-9 * tab_r["l2"] and 0.0 < tab_r["cos_with_adam_step"] < 1.0, tab_r
+        assert json.load(open(os.path.join(runr, "updates", "2", "ckpt", "meta.json")))["update_rule"]["rule"] == rule
+    # the first update's checkpoint rebuilt under a rule, card-free, and resumed
+    ck9, g9 = os.path.join(run9, "updates", "1", "ckpt"), os.path.join(run9, "updates", "1", "grad.pt")
+    exp = lambda st, dst, tag: fake_export(3)(st, dst, tag)[0]  # noqa: E731
+    mA_ = SS.rebuild_checkpoint(ck9, g9, "A:1", os.path.join(tmp, "rebuilt_A"), exp, BLOCKS)
+    m9_ = json.load(open(os.path.join(ck9, "meta.json")))
+    assert mA_["masters_sha256"] == m9_["masters_sha256"] and mA_["adapter_sha256"] == m9_["adapter_sha256"], "rebuilding under A is not the checkpoint itself"
+    assert mA_["sha256"]["optimizer.npz"] == m9_["sha256"]["optimizer.npz"] and abs(mA_["rebuilt"]["table"]["cos_with_adam_step"] - 1.0) <= 1e-12
+    mP_ = SS.rebuild_checkpoint(ck9, g9, "P:1", os.path.join(tmp, "rebuilt_P"), exp, BLOCKS)
+    hand1 = by_hand("P", None, updates_=(0,))
+    assert mP_["masters_sha256"] == SS.state_sha(hand1.opt.masters, nm) != m9_["masters_sha256"], "the rebuilt masters are not theta0 + P(g1)"
+    handP = by_hand("P", None)
+    rcq, runq, trq, sq, _ = session(tmp, "resume_rebuilt_P", plan_dir, ["GO", "GO"], panels=panels, rule="P",
+                                    resume=os.path.join(tmp, "rebuilt_P"), old_lp=os.path.join(run9, "old_lp.npz"))
+    assert rcq == 0 and all(torch.equal(a, b) for a, b in zip(trq.opt.masters, handP.opt.masters)) and same_state(opt_state(trq), opt_state(handP)), sq.sess["exit"]
+    assert json.load(open(os.path.join(runq, "updates", "1", "adapters.json")))["v"]["sha256"] == mP_["adapter_sha256"]
+    tab = SS.rule_table(ck9, g9, ["A:1", "P:1", "T:1", "E:1:1e-6", "P:8"], BLOCKS, os.path.join(tmp, "rule_table.json"))
+    rows_t = {r_["state"]: r_ for r_ in tab["states"]}
+    assert abs(rows_t["A:1"]["cos_with_adam_step"] - 1.0) <= 1e-12 and abs(rows_t["P:8"]["l2"] - 8 * rows_t["P:1"]["l2"]) <= 1e-9 * rows_t["P:8"]["l2"]
+    assert all(abs(rows_t[k]["l2"] - rows_t["A:1"]["l2"]) <= 1e-9 * rows_t["A:1"]["l2"] for k in ("P:1", "T:1", "E:1:1e-6")) and set(rows_t["T:1"]["per_tensor_l2"]) == set(nm)
+    for what, args_ in (("update 2's checkpoint", (ck2, g9)), ("another update's gradient", (ck9, os.path.join(run, "updates", "2", "grad.pt")))):
+        try:
+            SS.rebuild_checkpoint(*args_, "P:1", os.path.join(tmp, "rebuilt_bad_" + what[:6]), exp, BLOCKS)
+            raise AssertionError(f"rebuild accepted {what}")
+        except ValueError:
+            pass
+    print("(10) update rules P, T, E: arithmetic; a session under each == the optimizer's step replaced by hand, bitwise; a checkpoint rebuilt under "
+          "a rule (A gives the checkpoint itself) and resumed: PASS")
     print("T8 STEP SESSION CPU TEST: PASS")
     return 0
 

@@ -51,6 +51,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 import t8_micro as MI  # noqa: E402
+import t8_rules as RU  # noqa: E402
 
 EXIT_OK, EXIT_GATE, EXIT_INPUT, EXIT_READS, EXIT_STOPPED, EXIT_ROUNDTRIP = 0, 4, 5, 6, 20, 21
 CONTROLS = (("R", MI.R_SEED), ("R2", MI.R_SEED_B))            # the control's name and the seed of its draw
@@ -360,11 +361,15 @@ class Session:
         self.tr, self.plan, self.run, self.work, self.sid, self.export_fn, self.blocks = tr, plan, run_dir, work_dir, session_id, export_fn, blocks
         self.o = {"lr": MI.LR, "verdict_timeout_s": 1200.0, "reads_timeout_s": 2700.0, "poll_s": 2.0, "early_stop": True,
                   "backward_options": {}, "resume": "", "old_lp": "", "plan_dir": "", "cards": [], "close_fn": None, "abort_fn": None,
-                  "zero_check_fn": None, "require_backward": None, "pattern_visits": 48, "head": None, "last_update": None}
+                  "zero_check_fn": None, "require_backward": None, "pattern_visits": 48, "head": None, "last_update": None,
+                  "rule": "A", "rule_size": 1.0, "rule_eps": None}
         unknown = set(opts) - set(self.o)
         if unknown:
             raise ValueError(f"unknown options {sorted(unknown)}")
         self.o.update(opts)
+        if self.o["rule"] not in RU.RULES or not float(self.o["rule_size"]) > 0 or (self.o["rule"] == "E" and not self.o["rule_eps"]):
+            raise ValueError(f"update rule {self.o['rule']!r}, size {self.o['rule_size']!r}, eps {self.o['rule_eps']!r}")
+        self.rule = {"rule": self.o["rule"], "size": float(self.o["rule_size"]), "eps": self.o["rule_eps"] if self.o["rule"] == "E" else None}
         self.version = plan.start_version if version is None else version
         self.keys = tuple(tr.shapes[0])
         self.nm = MI.names(len(tr.shapes), self.keys)
@@ -373,6 +378,7 @@ class Session:
         self.mem = MemLow()
         self.sess = {"session_id": session_id, "time_start": time.time(), "plan": plan.info, "lr": self.o["lr"],
                      "backward_options": self.o["backward_options"], "cards": list(self.o["cards"]), "control_seeds": dict(CONTROLS),
+                     "update_rule": self.rule,
                      "verdict_timeout_s": self.o["verdict_timeout_s"], "reads_timeout_s": self.o["reads_timeout_s"], "updates": {},
                      "phases": [], "exit": None}
         os.makedirs(os.path.join(run_dir, "updates"), exist_ok=True)
@@ -543,12 +549,25 @@ class Session:
                 raise SessionStop(rs[0], n, rs[1], "not applied")
         prev = self.cur if self.cur is not None else self.theta0
         first_ever = self.cur is None
-        step["grad_norm"] = tr.apply(out, self.o["lr"])
-        self.cur = masters_list(tr)
+        step["grad_norm"] = tr.apply(out, self.o["lr"])       # the optimizer's own step (its moments advance whatever the rule is)
         # the update's summed gradient as the optimizer received it BEFORE the global clip, with the clip's coefficient (the kit's rule:
         # min(1, max_grad_norm / (norm + 1e-6))): later rule tests build from these exact bits
         mg = float(tr.opt.max_grad_norm)
         step["clip_coefficient"] = min(1.0, mg / (step["grad_norm"] + 1e-6)) if mg else 1.0
+        step["update_rule"] = self.rule
+        if self.rule["rule"] != "A" or self.rule["size"] != 1.0:   # another rule: the optimizer's step replaced by the rule's (t8_rules)
+            d_adam = [m.detach() - p_ for m, p_ in zip(tr.opt.masters, prev)]
+            moments = None
+            if self.rule["rule"] == "E":
+                arr, grp = tr.opt.state_arrays(), tr.opt.opt.param_groups[0]
+                moments = ([torch.from_numpy(np.array(arr[f"{i}.exp_avg"])) for i in range(len(self.nm))],
+                           [torch.from_numpy(np.array(arr[f"{i}.exp_avg_sq"])) for i in range(len(self.nm))],
+                           float(arr["0.step"][0]), tuple(float(b) for b in grp["betas"]))
+            d_rule = RU.rule_delta(self.rule["rule"], out.grads, step["clip_coefficient"], d_adam, self.rule["size"], self.rule["eps"], moments)
+            step["update_rule_table"] = RU.table_row(f"{self.rule['rule']}:{self.rule['size']:g}", d_rule, d_adam, self.nm, self.blocks)
+            put_masters(tr, RU.add_delta(prev, d_rule))
+            del d_adam, d_rule, moments
+        self.cur = masters_list(tr)
         gp = os.path.join(ud, "grad.pt")
         torch.save({x: g.detach() for x, g in zip(self.nm, out.grads)}, gp + ".tmp")
         os.replace(gp + ".tmp", gp)
@@ -664,7 +683,7 @@ class Session:
                       {"update": n, "lr": self.o["lr"], "adapter_sha256": sha, "theta0_sha256": self.sess["theta0_sha256"],
                        "plan_rows_sha256": plan.info["rows_sha256"], "plan_json_sha256": plan.info["rows_json_sha256"],
                        "old_lp_sha256": self.old_sha, "session_id": self.sid,
-                       "first_update_number": plan.first, "backward_options": self.o["backward_options"]})
+                       "first_update_number": plan.first, "backward_options": self.o["backward_options"], "update_rule": self.rule})
         lv = trainer_lp("v")                                  # the masters are v
         for name, seed in CONTROLS:
             st = control_state(self.theta0, self.cur, self.nm, seed)
@@ -913,7 +932,8 @@ def phase_trainer(a) -> int:
                 reads_timeout_s=a.reads_timeout_min * 60.0, early_stop=not a.no_early_stop, backward_options=MI.backward_options(a),
                 resume=a.resume, old_lp=a.old_lp, plan_dir=a.plan, cards=list(cards), close_fn=tr.close, abort_fn=abort, zero_check_fn=zero_check,
                 require_backward=required, pattern_visits=int(tr.cfg.visits), head=str(tr.cfg.head),
-                last_update=a.last_update if a.last_update > 0 else None)
+                last_update=a.last_update if a.last_update > 0 else None, rule=a.rule, rule_size=a.rule_size,
+                rule_eps=a.rule_eps if a.rule == "E" else None)
     install_signals(s)
     rc = s.run_all()
     signal.alarm(0)
@@ -979,6 +999,77 @@ def phase_export_masters(a) -> int:
     return 0
 
 
+def real_export(state, dst: str, tag: str) -> str:
+    """The full adapter (experts + attention rank 64) of a list of masters in the trainer's order, written on the CPU. -> sha256."""
+    import t8_adapter as TA
+    import t8_step as TS
+
+    keys = TS.param_keys(64)
+    n_layers = len(state) // len(keys)
+    return TA.export_combined(MI.layers_of(state, n_layers, keys), dst, 64, 32.0, int(state[0].shape[1]), "BF16", metadata={"step": tag})
+
+
+def rule_table(ckpt_dir: str, grad_path: str, states: list, blocks: dict, out_path: str = "") -> dict:
+    """Card-free: for each rule state "<rule>[:<size>[:<eps>]]" the delta's norms, non-zero entries and cosine with the optimizer's step, from
+    a first update's checkpoint and gradient file. Nothing is written but the table."""
+    fu = RU.load_first_update(ckpt_dir, grad_path, MI.sha256, state_sha)
+    rows = []
+    for spec in states:
+        rule, size, eps = RU.parse_state(spec)
+        d = RU.rule_delta(rule, fu["grads"], fu["coef"], fu["d_adam"], size, eps, fu["moments"])
+        row = RU.table_row(spec, d, fu["d_adam"], fu["names"], blocks)
+        row["per_tensor_l2"] = RU.per_tensor_norms(d, fu["names"])
+        rows.append(row)
+        MI.log(f"{spec}: l2 {row['l2']:.6e} (optimizer's step {row['l2_adam_step']:.6e}), cos with it {row['cos_with_adam_step']:.4f}, "
+               f"non-zero {row['nonzero_entries']} of {row['entries']}, by block {json.dumps(row['l2_by_block'])}")
+    tab = {"checkpoint": {"update": fu["meta"]["update"], "masters_sha256": fu["meta"]["masters_sha256"]}, "grad_sha256": fu["grad_sha256"],
+           "clip_coefficient": fu["coef"], "moment_check_worst_rel": fu["moment_check_worst_rel"], "states": rows}
+    if out_path:
+        write_json(out_path, tab)
+    return tab
+
+
+def rebuild_checkpoint(ckpt_dir: str, grad_path: str, spec: str, out_dir: str, export_fn, blocks: dict) -> dict:
+    """A first update's checkpoint with its masters replaced by theta0 + the rule's delta (t8_rules). The optimizer state is copied unchanged
+    (its moments are the gradient's under every rule). The meta keeps every record a resume compares (theta0, plan, old log-probs, lr,
+    backward options), with the new masters' and adapter's hashes and a "rebuilt" entry. -> the new meta."""
+    fu = RU.load_first_update(ckpt_dir, grad_path, MI.sha256, state_sha)
+    rule, size, eps = RU.parse_state(spec)
+    d = RU.rule_delta(rule, fu["grads"], fu["coef"], fu["d_adam"], size, eps, fu["moments"])
+    new = RU.add_delta(fu["theta0"], d)
+    nm, meta = fu["names"], dict(fu["meta"])
+    os.makedirs(out_dir, exist_ok=False)
+    mp, op = os.path.join(out_dir, "masters.pt"), os.path.join(out_dir, "optimizer.npz")
+    torch.save(dict(zip(nm, new)), mp)
+    shutil.copyfile(os.path.join(ckpt_dir, "optimizer.npz"), op)
+    n = int(meta["update"])
+    sha = export_fn(new, os.path.join(out_dir, "adapter"), f"step-session-u{n}-v")
+    sha = sha[0] if isinstance(sha, tuple) else sha
+    row = RU.table_row(spec, d, fu["d_adam"], nm, blocks)
+    meta.update(sha256={"masters.pt": MI.sha256(mp), "optimizer.npz": MI.sha256(op)}, masters_sha256=state_sha(new, nm), adapter_sha256=sha,
+                update_rule={"rule": rule, "size": size, "eps": eps},
+                rebuilt={"from_masters_sha256": fu["meta"]["masters_sha256"], "from_adapter_sha256": fu["meta"].get("adapter_sha256"),
+                         "grad_sha256": fu["grad_sha256"], "state": spec, "table": row})
+    write_json(os.path.join(out_dir, "meta.json"), meta)
+    return meta
+
+
+def phase_rules(a) -> int:
+    """rule_table (--states, --out) or rebuild_ckpt (--rule-state, --out): from --resume <first update's checkpoint> and --grad <its grad.pt>."""
+    import t8_skyrl as KS
+
+    try:
+        if a.phase == "rule_table":
+            rule_table(a.resume, a.grad, [x for x in a.states.split(",") if x], KS.BLOCKS, a.out)
+        else:
+            meta = rebuild_checkpoint(a.resume, a.grad, a.rule_state, a.out, real_export, KS.BLOCKS)
+            print(json.dumps({k: meta[k] for k in ("update", "masters_sha256", "adapter_sha256", "update_rule")}, indent=1), flush=True)
+    except (ValueError, OSError, KeyError) as e:
+        print(f"REFUSED: {type(e).__name__}: {e}", flush=True)
+        return EXIT_INPUT
+    return 0
+
+
 def phase_stub_judge(a) -> int:
     """TEST ONLY (smokes and CPU tests): stands where the loop side's judge runs. For each update in order it waits for READS_DONE and writes
     VERDICT.json with the next outcome of --outcomes; "NONE" writes nothing (the session's timeout), "BADHASH" a GO with one wrong hash."""
@@ -1012,7 +1103,14 @@ def phase_stub_judge(a) -> int:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--phase", required=True, choices=("check", "trainer", "finish", "stub_judge", "export_masters"))
+    ap.add_argument("--phase", required=True, choices=("check", "trainer", "finish", "stub_judge", "export_masters", "rule_table", "rebuild_ckpt"))
+    ap.add_argument("--rule", default="A", choices=RU.RULES, help="trainer: the update rule (t8_rules); A = the optimizer's own step")
+    ap.add_argument("--rule-size", type=float, default=1.0, help="trainer: the rule's delta multiplied by this")
+    ap.add_argument("--rule-eps", type=float, default=1e-6, help="trainer: rule E's eps")
+    ap.add_argument("--grad", default="", help="rule_table / rebuild_ckpt: the first update's grad.pt (its grad.json beside it)")
+    ap.add_argument("--states", default="", help="rule_table: comma list of <rule>[:<size>[:<eps>]]")
+    ap.add_argument("--rule-state", default="", help="rebuild_ckpt: <rule>[:<size>[:<eps>]]")
+    ap.add_argument("--out", default="", help="rule_table: the table's JSON; rebuild_ckpt: the new checkpoint directory")
     ap.add_argument("--masters", default="", help="export_masters: a checkpoint's masters.pt")
     ap.add_argument("--tag", default="X", help="export_masters: the adapter directory's name")
     ap.add_argument("--scale-b", type=float, default=1.0, help="export_masters: every B tensor multiplied by this")
@@ -1043,7 +1141,7 @@ def main():
     if a.bank_grad_from:
         ap.error("--bank-grad-from cannot run in this session: its trainer runs with lean_host (the sketches)")
     return {"check": phase_check, "trainer": phase_trainer, "finish": phase_finish, "stub_judge": phase_stub_judge,
-            "export_masters": phase_export_masters}[a.phase](a)
+            "export_masters": phase_export_masters, "rule_table": phase_rules, "rebuild_ckpt": phase_rules}[a.phase](a)
 
 
 if __name__ == "__main__":
