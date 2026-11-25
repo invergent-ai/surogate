@@ -143,7 +143,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     model.queries = &queries;
     if (loopcd_settings().enabled) {
         loopcd_scratch       = DeviceBuffer(loopcd_head_scratch_bytes());
-        model.loopcd_scratch = static_cast<float*>(loopcd_scratch.data());
+        model.loopcd_scratch = static_cast<float*>(loopcd_scratch.p);
     }
     if (weights.has_draft) {
         // DSpark: the fold and the drafter's derived weights; the runtime's DFlash guards need a payload.
