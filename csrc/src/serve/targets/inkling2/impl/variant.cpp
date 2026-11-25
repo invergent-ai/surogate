@@ -123,7 +123,7 @@ void Variant::lm_head(const ModelView& model, const Tensor& hidden, Tensor& logi
     if (logits.dtype != DType::FP32 || logits.ne[0] != C::output_rows ||
         (hidden.ne[0] != C::hidden && hidden.ne[0] != 2 * C::hidden) ||
         logits.ne[1] * logits.ne[2] != hidden.ne[1] * hidden.ne[2]) {
-        throw std::logic_error("inkling2: the LM head writes FP32 [201024, T] logits from a [2304, T] hidden");
+        throw std::logic_error("inkling2: the LM head writes FP32 [201024, T] logits from a [2304, T] (or LoopCD [4608, T]) hidden");
     }
     const std::int32_t tokens = hidden.ne[1] * hidden.ne[2];
     if (hidden.ne[0] == 2 * C::hidden) {

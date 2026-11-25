@@ -100,7 +100,7 @@ public:
     load::InklingWeights weights;
     DerivedQueries queries;
     DSparkDerived dspark; ///< the drafter's load-time derivations (DSpark); empty without `--speculative dflash`
-    DeviceBuffer loopcd_scratch; ///< FP32 [201024, 2 x 32] for the LoopCD head (loopcd.h); empty with LoopCD off
+    DeviceBuffer loopcd_scratch; ///< FP32 [201024, 2 x 64] for the LoopCD head (loopcd.h); empty with LoopCD off
     InklingModel model;
     RuntimeModelView runtime;
 };

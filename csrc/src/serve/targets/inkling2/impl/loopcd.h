@@ -51,7 +51,7 @@ inline constexpr int kLoopcdHiddenSlot = 5;   ///< where finish() finds the refe
 
 /// Head tokens per pass of the LoopCD head (each token = 2 columns) and its FP32 scratch (one per loaded model: the
 /// head runs on the card's one compute stream). 64 = the widest decode / verify round of 8 lanes x (7 drafts + 1) in one
-/// pass of the head weights (103 MB); wider rounds (prefill tails of many segments) take more passes.
+/// pass of the head weights (scratch 201024 x 128 x 4 B = 103 MB); wider rounds (prefill tails of many segments) take more passes.
 inline constexpr int kLoopcdHeadTokens = 64;
 [[nodiscard]] constexpr std::size_t loopcd_head_scratch_bytes() {
     return static_cast<std::size_t>(TextConfig::output_rows) * 2 * kLoopcdHeadTokens * sizeof(float);
