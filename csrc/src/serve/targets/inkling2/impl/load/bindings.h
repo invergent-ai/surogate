@@ -18,6 +18,7 @@
 #include "core/tensor.h"
 
 #include <api/family/frontend_resources.h>
+#include "family/impl/load/gemma_vision.h"
 
 #include <array>
 #include <cstdint>
@@ -154,6 +155,8 @@ struct DraftPlan {
 
 struct BindOptions {
     AttentionChoice attention;
+    /// Place the vision tower (`vision/*`, --vision) on the device; otherwise its objects, if any, are validated only.
+    bool vision = false;
     /// Bind the DSpark drafter to the device (MTP on); otherwise its objects are validated only.
     bool draft = false;
     /// The drafter's dense linears (q k v o k_ctx v_ctx gate up down) in a mapped host bank instead of the device: the
@@ -187,6 +190,8 @@ struct BindingPlan {
     std::vector<LayerPlan> layers;
     bool has_draft = false;
     DraftPlan draft;
+    /// The vision tower, when the artifact carries one (geometry empty otherwise).
+    family::GemmaVisionPlan vision;
 };
 
 /// Binds every object of an Inkling-2 artifact (and fails on any it does not know): after it, `binder.finish()`

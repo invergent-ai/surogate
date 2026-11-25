@@ -1,6 +1,7 @@
 #include "family/vision_tower.h"
 #include "family/gemma_vision.h"
 #include "family/muse_vision.h"
+#include "family/inkling_vision.h"
 #include "family/vision_fp8.h"
 
 #include "core/layout.h"
@@ -195,7 +196,7 @@ VisionContext::VisionContext(DeviceContext& ctx, const VisionWeights& vision,
                              Probe probe)
     : weights_(&vision), ctx_(ctx), probe_(std::move(probe)) {
     cfg_               = bound_vision_geometry(tower, text);
-    if (cfg_.gemma_version || cfg_.muse_glimmer) { return; }
+    if (cfg_.gemma_version || cfg_.muse_glimmer || cfg_.inkling) { return; }
     patch_embed_       = &vision.common.patch_embedding;
     patch_embed_bias_  = &vision.common.patch_embedding_bias;
     position_embed_    = &vision.common.position_embedding;
@@ -260,6 +261,7 @@ const VisionFp8Block* VisionContext::fp8_block(std::size_t layer, std::int32_t p
 std::size_t VisionContext::workspace_bytes(const VisionGeometry& geometry,
                                            const VisionItemControl& item) {
     if (geometry.muse_glimmer) { return muse_vision_workspace_bytes(geometry,item.merged_count); }
+    if (geometry.inkling) { return inkling_vision_workspace_bytes(geometry, item.merged_count); }
     if (geometry.gemma_version) { return gemma_vision_workspace_bytes(geometry,item.merged_count); }
     return build_workspace_layout(geometry, item.patch_count, item.merged_count,
                                   static_cast<std::size_t>(item.segment_count))
@@ -283,7 +285,9 @@ std::size_t VisionContext::encoding_transient_bytes(const VisionGeometry& geomet
                                                     std::size_t merged_tokens,
                                                     std::size_t text_residual_bytes) {
     const auto output = output_transient_bytes(geometry, merged_tokens);
-    const auto patches = checked_mul(merged_tokens, geometry.merge_unit(), "encoding patches");
+    // Inkling-2's tower carries one CLS row beside the patches.
+    const auto patches = checked_mul(merged_tokens, geometry.merge_unit(), "encoding patches") +
+                         (geometry.inkling ? 1U : 0U);
     // Once the tower finishes, the same storage holds the text block's residual.
     const auto residual = std::max(text_residual_bytes,
         checked_mul(checked_mul(patches, geometry.hidden, "encoding residual"),
@@ -301,6 +305,7 @@ std::size_t VisionContext::workspace_capacity_bytes(const VisionGeometry& geomet
         throw std::invalid_argument("Vision workspace capacity bounds must be positive");
     }
     if (geometry.muse_glimmer) { return muse_vision_workspace_bytes(geometry, std::min(max_merged_tokens, static_cast<std::uint32_t>(geometry.max_image_tokens))); }
+    if (geometry.inkling) { return inkling_vision_workspace_bytes(geometry, std::min(max_merged_tokens, static_cast<std::uint32_t>(geometry.max_image_tokens))); }
     if (geometry.gemma_version) { return gemma_vision_workspace_bytes(geometry, std::min(max_merged_tokens, static_cast<std::uint32_t>(geometry.max_image_tokens))); }
     const std::uint32_t segments = std::min(max_merged_tokens, max_segments);
     return build_workspace_layout(geometry,
@@ -335,12 +340,15 @@ bool VisionContext::encode_step(const VisionItemView& item, Tensor& output,
     }
     if (state.phase == VisionEncodeState::Phase::Complete) { return true; }
     if (state.residual.data && (state.residual.dtype != DType::BF16 ||
-        state.residual.ne[0] != g.hidden || state.residual.ne[1] != static_cast<int>(patches64) ||
+        state.residual.ne[0] != g.hidden || state.residual.ne[1] != static_cast<int>(patches64) + (g.inkling ? 1 : 0) ||
         state.residual.ne[2] != 1 || state.residual.ne[3] != 1 || !state.residual.is_contiguous())) {
         throw std::invalid_argument("Vision encoding residual has an invalid shape");
     }
     if (g.muse_glimmer) {
         return encode_muse_vision_step(g, *weights_, item, output, workspace, ctx_.stream, probe_, state);
+    }
+    if (g.inkling) {
+        return encode_inkling_vision_step(g, *weights_, item, output, workspace, ctx_.stream, probe_, state);
     }
     if (g.gemma_version) {
         return encode_gemma_vision_step(g, *weights_, item, output, workspace, ctx_.stream, probe_, state);

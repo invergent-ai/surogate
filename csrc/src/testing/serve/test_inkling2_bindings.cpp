@@ -91,20 +91,33 @@ bool small_global(const std::string& name) {
 
 void test_one_card_and_two_stages(const Reader& reader, const load::ArtifactConfig& c) {
     // 1 card, oracle attention, drafter on: every tensor except the FP8 variants, as before the split.
+    // An artifact with the vision tower is planned with --vision: the tower is placed too.
+    const bool vision = !reader.vision_geometry().empty();
     load::BindOptions one;
-    one.draft = true;
+    one.draft  = true;
+    one.vision = vision;
     const Placed card = place(reader, one);
-    std::uint64_t expected = 0;
+    std::uint64_t expected = 0, vision_bytes = 0;
     std::size_t tensors    = 0;
     for (const auto& object : reader.objects()) {
         const auto* t = std::get_if<TensorDescriptor>(&object);
         if (t == nullptr || t->name.find("/attn/fp8-") != std::string::npos) { continue; }
         require(card.device.count(t->name) == 1, "1-card plan places " + t->name);
         expected += t->bytes;
+        if (starts(t->name, "vision/")) { vision_bytes += t->bytes; }
         ++tensors;
     }
     require(card.device.size() == tensors && card.bytes == expected, "1-card plan = every non-FP8 tensor");
-    require(card.bytes == 19525154400ULL, "1-card device bytes unchanged by the split (19,525,154,400)");
+    require(card.bytes - vision_bytes == 19525154400ULL, "1-card text device bytes unchanged by the split (19,525,154,400)");
+    if (vision) {
+        // Without --vision the tower is validated only.
+        load::BindOptions text_only = one;
+        text_only.vision            = false;
+        const Placed text = place(reader, text_only);
+        require(text.bytes == card.bytes - vision_bytes, "text-only plan leaves the tower off the device");
+        for (const std::string& name : text.device) { require(!starts(name, "vision/"), "text-only plan places " + name); }
+        std::cout << "vision tower: " << vision_bytes << " device bytes with --vision, none without\n";
+    }
 
     // 2 stages, cut at visit 30 (Package::pipeline_stage_bounds): stage s keeps the layers its visits use.
     const std::int32_t cut = 30;
@@ -116,6 +129,7 @@ void test_one_card_and_two_stages(const Reader& reader, const load::ArtifactConf
     for (int s = 0; s < 2; ++s) {
         load::BindOptions o;
         o.draft             = s == 1;
+        o.vision            = vision;
         const auto keep     = resident[s];
         o.layer_placement   = [keep](std::int32_t layer) {
             return keep.count(layer) ? TensorPlacement::Device : TensorPlacement::ValidateOnly;
@@ -134,7 +148,7 @@ void test_one_card_and_two_stages(const Reader& reader, const load::ArtifactConf
         if (layer >= 0) {
             want0 = resident[0].count(layer) == 1;
             want1 = resident[1].count(layer) == 1;
-        } else if (name == "text/embedding" || name == "text/embedding_norm") {
+        } else if (name == "text/embedding" || name == "text/embedding_norm" || starts(name, "vision/")) {
             want0 = true;
         } else if (name == "text/output_head" || name == "text/final_norm" || starts(name, "mtp/")) {
             want1 = true;

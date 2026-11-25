@@ -156,6 +156,7 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
         if (last < detail::TextConfig::layers) { bind.draft_placement = artifact::TensorPlacement::ValidateOnly; }
     }
     bind.attention = attention_choice();
+    bind.vision    = options.enable_vision;
     if (bind.attention.fp8 != (weights_profile == WeightsProfile::Fp8Attention)) {
         throw std::logic_error("inkling2: the weights profile and the attention choice disagree");
     }
@@ -180,10 +181,11 @@ SINFER_TARGET_CONSTRUCT_LOADED_MODEL();
 Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineOptions& options) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
     bind_lora(model.impl_->data, options);
-    // The generic tokenizer frontend: token-id prompts and plain text until the native Inkling renderer is wired.
+    // The frontend renders Inkling prompts natively (inkling_render.h) and, with --vision, preprocesses their images
+    // as vLLM's Inkling2ImageProcessor does (inkling_vision.h).
     return family::make_frontend(model.impl_->data.frontend,
                                  family::FrontendOptions{
-                                     .vision_enabled           = false,
+                                     .vision_enabled           = model.impl_->data.runtime.features.vision,
                                      .max_context              = options.max_context,
                                      .media_cache_bytes        = options.media_cache_bytes,
                                      .media_live_bytes         = options.media_live_bytes,

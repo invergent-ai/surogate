@@ -286,6 +286,8 @@ BindingPlan bind_artifact(artifact::Binder& binder, const BindOptions& options) 
               .small_globals = options.small_globals_placement.value_or(gp),
     };
     const TensorPlacement ep = g.placement.embedding, hp = g.placement.head, sp = g.placement.small_globals;
+    // The tower feeds the embedding: it lives on the stage that embeds.
+    family::bind_inkling_vision(binder, out.vision, D, options.vision, ep);
     g.embedding       = b.linear("text/embedding", c.vocab_padded, D, ep, NumericFormat::BF16);
     g.embedding_norm  = b.tensor("text/embedding_norm", NumericFormat::BF16, {u64(D)}, ep);
     g.final_norm      = b.tensor("text/final_norm", NumericFormat::BF16, {u64(D)}, hp);

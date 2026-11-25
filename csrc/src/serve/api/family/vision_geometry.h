@@ -13,6 +13,9 @@ namespace sinfer::family {
 /// Tower dimensions and execution settings resolved from the checkpoint.
 struct VisionGeometry {
     std::int32_t muse_glimmer = 0;
+    /// Inkling-2's PE-style tower: a CLS token per image, LayerScale residuals, interleaved 2D RoPE and a 2 x 2
+    /// merge projector without bias or norm (family/inkling_vision.cpp).
+    std::int32_t inkling = 0;
     std::int32_t gemma_version = 0;
     std::int32_t gemma_pad_token = 0;
     std::int32_t encoder_free = 0;
@@ -58,7 +61,7 @@ struct VisionGeometry {
         VisionGeometry g;
         g.override_from(values);
 #define SINFER_GEOMETRY_INT(name) \
-        if (std::string_view(#name) != "muse_glimmer" && std::string_view(#name) != "gemma_pad_token" && std::string_view(#name) != "gemma_version" && std::string_view(#name) != "encoder_free" && \
+        if (std::string_view(#name) != "muse_glimmer" && std::string_view(#name) != "inkling" && std::string_view(#name) != "gemma_pad_token" && std::string_view(#name) != "gemma_version" && std::string_view(#name) != "encoder_free" && \
             std::string_view(#name) != "clipped_linears" && std::string_view(#name) != "standardize" && \
             std::string_view(#name) != "attention_mode" && std::string_view(#name) != "max_image_tokens" && \
             !(g.encoder_free && std::string_view(#name) == "layers") && \
@@ -76,6 +79,11 @@ struct VisionGeometry {
             g.encoder_free || g.deepstack_layers || g.merge != 2 || g.projector_hidden <= 0 ||
             g.max_image_tokens <= 0 || g.rotary_dim != g.head_dim())) {
             throw std::invalid_argument("invalid Muse-Glimmer vision geometry");
+        }
+        if (g.inkling && (g.inkling != 1 || g.muse_glimmer || g.gemma_version || g.siglip2 || g.encoder_free ||
+            g.deepstack_layers || g.attention_mode || g.merge != 2 || g.projector_hidden <= 0 ||
+            g.max_image_tokens <= 0 || g.rotary_dim != g.head_dim())) {
+            throw std::invalid_argument("invalid Inkling-2 vision geometry");
         }
         if ((g.gemma_version != 0 && g.gemma_version != 3 && g.gemma_version != 4) ||
             g.encoder_free > 1 || g.clipped_linears > 1 || g.standardize > 1 || g.attention_mode > 2 ||
