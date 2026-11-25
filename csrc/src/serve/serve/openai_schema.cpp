@@ -610,6 +610,10 @@ void parse_sampling(const OJson& body, GenerationRequest& out) {
     s.presence_penalty  = get_number(body, "presence_penalty");
     s.frequency_penalty = get_number(body, "frequency_penalty");
     s.seed              = get_u64(body, "seed");
+    s.reply_temperature = get_number(body, "reply_temperature");
+    s.reply_top_p       = get_number(body, "reply_top_p");
+    s.reply_top_k       = get_int(body, "reply_top_k");
+    s.reply_min_p       = get_number(body, "reply_min_p");
     if (body.contains("logit_bias") && !body.at("logit_bias").is_null()) {
         const OJson& bias = body.at("logit_bias");
         if (!bias.is_object()) { bad_request("logit_bias must be an object", "logit_bias"); }

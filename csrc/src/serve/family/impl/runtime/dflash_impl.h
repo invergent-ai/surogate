@@ -545,7 +545,8 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                                          cudaMemcpyDeviceToDevice, stream));
         } else {
             propose_batch_impl<Variant>(state, frame, batch_size, k, envelopes);
-            ops::speculative_prepare_verify_ids(anchors, drafts, extents, verify_ids, stream);
+            // frame.sampling: the reply-phase draft cut (speculative_prepare_verify_ids).
+            ops::speculative_prepare_verify_ids(anchors, drafts, extents, verify_ids, stream, frame.sampling);
         }
 
         TextContext card(state.execution.device, state.execution.model, state.execution.work, {},
@@ -679,7 +680,9 @@ void dflash_pipeline_propose(DFlashBatchContext& state, std::int32_t batch_size,
                                      {0, static_cast<std::uint32_t>(frame.append_positions.ne[0])});
         if (k == 0) { return; } // nothing proposed: every stage verifies the anchor at its frontier
         propose_batch_impl<Variant>(state, frame, batch_size, k, envelopes);
-        ops::speculative_prepare_verify_ids(anchors, drafts, extents, verify_ids, stream);
+        // The exported verify ids carry the reply-phase draft cut to the verifying stage: past the cut it verifies
+        // the anchor, so a drafted close never reaches its accept as a draft.
+        ops::speculative_prepare_verify_ids(anchors, drafts, extents, verify_ids, stream, frame.sampling);
         const auto count = static_cast<std::size_t>(width) * static_cast<std::size_t>(batch_size);
         auto* out        = static_cast<std::int32_t*>(draft_export);
         CUDA_CHECK(cudaMemcpyAsync(out, verify_ids.data, count * sizeof(std::int32_t), cudaMemcpyDeviceToHost, stream));

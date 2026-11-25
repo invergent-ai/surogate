@@ -569,6 +569,10 @@ void reject_unknown_top_level(const RJson& body) {
         "prompt_cache_options",
         "prompt_cache_retention",
         "reasoning",
+        "reply_min_p",
+        "reply_temperature",
+        "reply_top_k",
+        "reply_top_p",
         "safety_identifier",
         "service_tier",
         "store",
@@ -730,6 +734,12 @@ ResponsesRequest parse_request_impl(const RJson& body, const RequestLimits& limi
         if (*top_p < 0.0 || *top_p > 1.0) { bad_request("top_p must be in [0,1]", "top_p"); }
         out.generation.sampling.top_p = *top_p;
     }
+    // Reply-phase sampler (the same fields as Chat Completions; translate.cpp validates them against the server's
+    // --reply-* defaults as well).
+    out.generation.sampling.reply_temperature = optional_number(body, "reply_temperature");
+    out.generation.sampling.reply_top_p       = optional_number(body, "reply_top_p");
+    out.generation.sampling.reply_top_k       = optional_int(body, "reply_top_k");
+    out.generation.sampling.reply_min_p       = optional_number(body, "reply_min_p");
 
     if (const std::optional<int> max_output = optional_int(body, "max_output_tokens")) {
         if (*max_output < 16) {

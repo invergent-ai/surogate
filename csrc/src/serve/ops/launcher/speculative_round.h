@@ -10,10 +10,11 @@ namespace sinfer::ops::detail {
 void speculative_prepare_verify_inputs_launch(const Tensor& anchors, const Tensor& drafts,
                                               const Tensor& base_positions,
                                               const Tensor& current_extents, Tensor& verify_ids,
-                                              Tensor& positions, cudaStream_t stream);
+                                              Tensor& positions, cudaStream_t stream,
+                                              const SamplingConfig* configs);
 void speculative_prepare_verify_ids_launch(const Tensor& anchors, const Tensor& drafts,
                                            const Tensor& current_extents, Tensor& verify_ids,
-                                           cudaStream_t stream);
+                                           cudaStream_t stream, const SamplingConfig* configs);
 
 /// Untruncated stochastic rows of a verify round: the split route (speculative_exact_*_kernel, true, the default) or
 /// the one-CTA wide kernel. Same draws (the normalizer's double sum in another order). Read once from

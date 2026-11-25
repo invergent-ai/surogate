@@ -366,6 +366,16 @@ sinfer_add_test(sinfer_cuda_visibility_test
 sinfer_add_test(sinfer_sampling_defaults_test
   SOURCES test_sampling_defaults.cpp
   LIBRARIES sinfer_engine sinfer_serve)
+sinfer_add_test(sinfer_reply_phase_test
+  SOURCES test_reply_phase.cpp
+  LIBRARIES sinfer_engine sinfer_serve)
+# The reply-phase vocabulary on Inkling-2's own tokenizer files. CPU; skips (77) without INKLING_MODEL_DIR.
+sinfer_add_test(sinfer_reply_phase_inkling_test
+  SOURCES inkling/test_reply_phase_inkling.cpp
+  LIBRARIES sinfer_serve sinfer_engine sinfer_core)
+target_include_directories(sinfer_reply_phase_inkling_test PRIVATE
+  ${SERVE_ROOT}/family/export
+  ${SERVE_ROOT}/family/impl)
 sinfer_add_test(sinfer_kv_cache_test
   SOURCES test_kv_cache.cpp
   LIBRARIES sinfer_core)

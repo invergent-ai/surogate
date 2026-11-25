@@ -205,6 +205,10 @@ public:
         const std::string& schema) const;
     [[nodiscard]] std::shared_ptr<const CompiledTokenConstraint> compile_tool_constraint(
         const std::string& structural_tag) const;
+    /// Reply-phase sampler (SamplingOverrides::reply_*): where this model's thought opens and closes -- the close is
+    /// the token the thinking guard and compile_json_constraint_after_reasoning use. No close for a model without a
+    /// single close token, or whose reasoning is a message channel.
+    [[nodiscard]] ReplyPhaseVocabulary reply_phase_vocabulary() const;
     /// Encode a continuation fragment without adding BOS or interpreting special tokens.
     [[nodiscard]] std::vector<TokenId> encode_fragment(std::string_view text) const;
     [[nodiscard]] std::vector<std::string> token_texts(std::span<const TokenId> ids) const;

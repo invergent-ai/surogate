@@ -103,6 +103,9 @@ struct PreparedPromptData {
     std::vector<VisionItem> vision_items;
     PromptIdentity identity;
     bool starts_in_reasoning = false;
+    /// The prompt ends with a thought already closed (PreparedPrompt::with_answer_continuation): everything the model
+    /// writes after it is answer (the reply-phase sampler draws all of it with the reply values).
+    bool answer_continuation = false;
     bool uses_chat_template = false;
     /// Code points of the text tokenized into token_ids (PromptSummary::prompt_characters).
     std::uint64_t prompt_characters = 0;

@@ -135,7 +135,7 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
 
         ops::speculative_prepare_verify_inputs(anchors, current_drafts, frontiers, current_extents,
                                                verify_ids, target_positions,
-                                               state.execution.device.stream);
+                                               state.execution.device.stream, frame.sampling);
         Tensor adapter_columns = ops::speculative_lora_columns(frame.lora_slots, frame.lora_columns,
             verify_ids.ne[0], batch_size, state.execution.device.stream);
         if (!card.stage_finishes()) {

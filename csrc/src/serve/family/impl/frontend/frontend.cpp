@@ -1660,6 +1660,7 @@ PreparedPrompt PreparedPrompt::with_continuation(std::span<const TokenId> genera
 PreparedPrompt PreparedPrompt::with_answer_continuation(std::span<const TokenId> tokens) const {
     PreparedPrompt out              = with_continuation(tokens);
     out.data_->starts_in_reasoning = false;
+    out.data_->answer_continuation = true;
     return out;
 }
 PreparedPrompt& PreparedPrompt::operator=(PreparedPrompt&&) noexcept = default;
@@ -2141,6 +2142,26 @@ std::shared_ptr<const CompiledTokenConstraint> Frontend::compile_json_constraint
     if (!close) { return nullptr; }
     std::lock_guard lock(impl_->constraint_mutex);
     return impl_->json_constraint_compiler().compile_after(schema, static_cast<TokenId>(*close));
+}
+
+ReplyPhaseVocabulary Frontend::reply_phase_vocabulary() const {
+    if (!impl_) { throw std::logic_error("frontend is moved from"); }
+    const fi::ReasoningSyntax& reasoning = impl_->reasoning;
+    ReplyPhaseVocabulary out;
+    out.model_opens = reasoning.model_opens;
+    if (reasoning.muse_glimmer) { return out; } // a message channel: no single close token
+    const auto single = [&](const std::string& spelling) -> std::optional<TokenId> {
+        if (spelling.empty()) { return std::nullopt; }
+        const std::optional<int> id = impl_->tokenizer->token_id(spelling);
+        return id ? std::optional<TokenId>(static_cast<TokenId>(*id)) : std::nullopt;
+    };
+    out.close = single(reasoning.close);
+    out.open  = single(reasoning.open);
+    // Inkling-2 starts every model block with <|message_model|>; the content marker after it says what the block is.
+    if (impl_->inkling) {
+        if (const auto header = single("<|message_model|>")) { out.headers[0] = *header; }
+    }
+    return out;
 }
 
 std::shared_ptr<const CompiledTokenConstraint> Frontend::compile_tool_constraint(const std::string& tag) const {

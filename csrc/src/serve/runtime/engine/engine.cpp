@@ -4,6 +4,7 @@
 #include "core/device.h"
 #include "core/device_footprint.h"
 #include "runtime/contract/sampling.h"
+#include "runtime/contract/reply_phase.h"
 #include "core/limits.h"
 #include "runtime/contract/types.h"
 #include "ops/linear/w8a8/w4fp4_plane.h"
@@ -20,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -551,6 +553,52 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
         resolved_options.execution.constraint = std::visit([&](const auto& target) {
             return target->loaded->frontend.compile_tool_constraint(tool_tag);
         }, impl_->active);
+    }
+    // Reply-phase sampler (SamplingOverrides::reply_*), after the constraints: runtime::plan_reply_phase decides. An
+    // output that is answer from its first token -- structured from it, or the answer after a closed thought -- is
+    // drawn with the reply values throughout; one that is or may be inside a thought keeps the request's own values
+    // until it ends (the runtime switches, reply_phase.h); a prompt the chat path did not render is never folded.
+    if (ResolvedSamplingParameters& sampling = resolved_options.execution.sampling; sampling.reply) {
+        const auto& view = family::PreparedPromptAccess::view(prompt.impl_->value);
+        const ReplyPhaseVocabulary vocabulary = std::visit([&](const auto& target) {
+            return target->loaded->frontend.reply_phase_vocabulary();
+        }, impl_->active);
+        const runtime::PromptTail tail = view.uses_chat_template ? runtime::PromptTail::Unknown
+                                                                  : runtime::prompt_tail(view.token_ids, vocabulary);
+        const bool starts_in_thought = view.starts_in_reasoning || tail == runtime::PromptTail::InThought;
+        const bool answer_from_first_token = view.answer_continuation || resolved_options.output.structured;
+        switch (runtime::plan_reply_phase(vocabulary, starts_in_thought, view.uses_chat_template,
+                                          answer_from_first_token, tail == runtime::PromptTail::AfterClose)) {
+        case runtime::ReplyPhasePlan::Fold:
+            sampling.temperature = sampling.reply->temperature;
+            sampling.top_k       = sampling.reply->top_k;
+            sampling.top_p       = sampling.reply->top_p;
+            sampling.min_p       = sampling.reply->min_p;
+            sampling.reply.reset();
+            break;
+        case runtime::ReplyPhasePlan::ArmThinking:
+        case runtime::ReplyPhasePlan::ArmOpening: {
+            auto& phase        = resolved_options.execution.reply_phase;
+            phase.armed        = true;
+            phase.state        = starts_in_thought || !vocabulary.model_opens ? runtime::ReplyPhase::State::Thinking
+                                                                              : runtime::ReplyPhase::State::Opening;
+            phase.close        = *vocabulary.close;
+            phase.open         = vocabulary.open.value_or(-1);
+            phase.headers      = vocabulary.headers;
+            phase.values       = *sampling.reply;
+            break;
+        }
+        case runtime::ReplyPhasePlan::Ignore: {
+            static std::once_flag warned;
+            std::call_once(warned, [] {
+                std::fprintf(stderr, "reply-phase sampler: this model's thought has no single close token, or it "
+                                     "opens its thought itself without a single opening token; reply_* values are "
+                                     "not used\n");
+            });
+            sampling.reply.reset();
+            break;
+        }
+        }
     }
     const ResolvedSamplingParameters resolved_sampling = resolved_options.execution.sampling;
 

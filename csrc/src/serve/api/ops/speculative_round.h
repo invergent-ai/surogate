@@ -34,14 +34,28 @@ namespace sinfer::ops {
  *
  * Effects:
  *   Writes every physical output element, including safe invalid-tail values. Inputs remain
- *   unchanged.
+ *   unchanged, except as below.
+ *
+ * Reply-phase sampler (configs non-null, a device SamplingConfig[B]; null: as before): a row with
+ * configs[b].phase_switch_armed != 0 first has its extent cut -- armed 1 (in its thought): to the index of its first
+ * draft equal to configs[b].phase_switch_token (the model's reasoning close), when one lies within it; armed 2 (its
+ * output has not yet shown whether it thinks): to 0 -- and the cut extent is written back to current_extents[b], which
+ * the round's accept then reads. The verify keeps the uncut shape: positions[j,b] = base_positions[b] + min(j,Pcur[b])
+ * with the UNCUT extent (as the host stages valid columns and RoPE positions), and verify_ids past the cut are
+ * anchors[b], so no cache row is written twice and every column up to the cut is the option-off forward. Every token
+ * such a round commits is drawn with the row's config: the close (or the
+ * marker that decides) can only be the round's correction / bonus token, and the next round is staged with the
+ * answer's values (runtime/contract/reply_phase.h). Any draft count is valid speculative decoding, and coupled rows
+ * (SamplingConfig::speculative_coupled) still commit MTP-off decoding's tokens. Rows with armed 0 are unchanged; the
+ * cut adds no launch.
  *
  * Workspace:
  *   None.
  */
 void speculative_prepare_verify_inputs(const Tensor& anchors, const Tensor& drafts,
                                        const Tensor& base_positions, const Tensor& current_extents,
-                                       Tensor& verify_ids, Tensor& positions, cudaStream_t stream);
+                                       Tensor& verify_ids, Tensor& positions, cudaStream_t stream,
+                                       const SamplingConfig* configs = nullptr);
 
 /**
  * Prepare only the target verification ids when the caller already owns the matching position
@@ -50,7 +64,7 @@ void speculative_prepare_verify_inputs(const Tensor& anchors, const Tensor& draf
  */
 void speculative_prepare_verify_ids(const Tensor& anchors, const Tensor& drafts,
                                     const Tensor& current_extents, Tensor& verify_ids,
-                                    cudaStream_t stream);
+                                    cudaStream_t stream, const SamplingConfig* configs = nullptr);
 
 /**
  * Op: speculative_accept_greedy_drafts

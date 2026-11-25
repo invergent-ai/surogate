@@ -95,6 +95,94 @@ int prepare_verify_case(int k) {
     return failures;
 }
 
+// Reply-phase sampler: speculative_prepare_verify_inputs with configs cuts a row in its thought (phase_switch_armed 1)
+// before its first drafted close token, and an opening row (armed 2) to no draft; the cut extent is written back, the
+// verify ids past it are the anchor; unarmed rows, a close past the extent and no close leave everything as without
+// configs. Null configs: the old op exactly.
+int phase_cut_case() {
+    constexpr int k      = 7;
+    constexpr int kClose = 200010;
+    // row: armed, extent, index of the close among the drafts (-1: none), expected extent
+    struct Row { int armed; int extent; int close_at; int expected; };
+    const std::vector<Row> rows = {
+        {1, 7, 3, 3},  // close mid-block: drafts 0..2 stay
+        {1, 7, 0, 0},  // close is the first draft: no draft stays
+        {1, 7, 6, 6},  // close is the last draft
+        {1, 2, 4, 2},  // close past the extent: unchanged
+        {1, 5, -1, 5}, // no close: unchanged
+        {0, 7, 3, 7},  // not armed (option off / already answering): unchanged
+        {1, 0, 0, 0},  // nothing proposed
+        {1, 7, 2, 2},  // two closes: the first one counts (second at 5)
+        {2, 7, -1, 0}, // opening: no draft
+    };
+    const int batch = static_cast<int>(rows.size());
+    std::vector<std::int32_t> drafts(static_cast<std::size_t>(k * batch)), anchors, bases, extents;
+    std::vector<ops::SamplingConfig> configs(rows.size());
+    for (int b = 0; b < batch; ++b) {
+        for (int i = 0; i < k; ++i) drafts[static_cast<std::size_t>(b * k + i)] = 1000 + 13 * b + i;
+        if (rows[b].close_at >= 0) drafts[static_cast<std::size_t>(b * k + rows[b].close_at)] = kClose;
+        if (b == 7) drafts[static_cast<std::size_t>(b * k + 5)] = kClose;
+        anchors.push_back(500 + b);
+        bases.push_back(100 * b);
+        extents.push_back(rows[b].extent);
+        configs[static_cast<std::size_t>(b)].temperature        = 1.0F;
+        configs[static_cast<std::size_t>(b)].phase_switch_token = kClose;
+        configs[static_cast<std::size_t>(b)].phase_switch_armed = rows[b].armed;
+    }
+    configs[5] = ops::SamplingConfig{}; // an unarmed default config: the token field is -1 and never read
+    int failures = 0;
+    for (const bool with_configs : {false, true}) {
+        DeviceBuffer d_drafts  = to_device(drafts);
+        DeviceBuffer d_anchors = to_device(anchors);
+        DeviceBuffer d_bases   = to_device(bases);
+        DeviceBuffer d_extents = to_device(extents);
+        DeviceBuffer d_configs = to_device(configs);
+        GuardedDeviceBuffer d_verify(static_cast<std::size_t>((k + 1) * batch) * sizeof(std::int32_t));
+        GuardedDeviceBuffer d_positions(static_cast<std::size_t>((k + 1) * batch) * sizeof(std::int32_t));
+        Tensor draft_tensor(d_drafts.p, DType::I32, {k, batch});
+        Tensor anchor_tensor(d_anchors.p, DType::I32, {batch});
+        Tensor base_tensor(d_bases.p, DType::I32, {batch});
+        Tensor extent_tensor(d_extents.p, DType::I32, {batch});
+        Tensor verify(d_verify.data(), DType::I32, {k + 1, batch});
+        Tensor positions(d_positions.data(), DType::I32, {k + 1, batch});
+        ops::speculative_prepare_verify_inputs(anchor_tensor, draft_tensor, base_tensor, extent_tensor, verify, positions,
+                                               nullptr,
+                                               with_configs ? static_cast<const ops::SamplingConfig*>(d_configs.p)
+                                                            : nullptr);
+        cuda_synchronize();
+        std::vector<std::int32_t> want_extents, want_ids, want_positions;
+        for (int b = 0; b < batch; ++b) {
+            // The accept's extent is cut; the verify's shape is not: ids up to the cut are the drafts, the anchor
+            // after it, and positions run sequentially over the UNCUT extent (the host stages valid columns
+            // extent + 1 and RoPE frontier + min(j, extent) from it), so no two valid columns share a cache row.
+            const int e = with_configs ? rows[b].expected : rows[b].extent;
+            const int uncut = rows[b].extent;
+            want_extents.push_back(e);
+            for (int j = 0; j <= k; ++j) {
+                want_ids.push_back(j == 0 ? anchors[b] : (j <= e ? drafts[static_cast<std::size_t>(b * k + j - 1)] : anchors[b]));
+                want_positions.push_back(bases[b] + (j <= uncut ? j : uncut));
+            }
+            // The MTP verify contract over the valid columns [0, uncut]: positions strictly sequential.
+            for (int j = 1; j <= uncut; ++j) {
+                if (want_positions[want_positions.size() - static_cast<std::size_t>(k + 1) + static_cast<std::size_t>(j)] !=
+                    bases[b] + j) {
+                    std::cerr << "phase cut oracle: valid columns are not sequential\n";
+                    ++failures;
+                }
+            }
+        }
+        const std::string label = with_configs ? "phase cut" : "phase cut, null configs";
+        failures += verify_exact((label + " extents").c_str(), from_device<std::int32_t>(d_extents, extents.size()),
+                                 want_extents);
+        failures += verify_exact((label + " verify ids").c_str(), read<std::int32_t>(d_verify, want_ids.size()), want_ids);
+        failures += verify_exact((label + " positions").c_str(), read<std::int32_t>(d_positions, want_positions.size()),
+                                 want_positions);
+        failures += verify_exact((label + " drafts unchanged").c_str(),
+                                 from_device<std::int32_t>(d_drafts, drafts.size()), drafts);
+    }
+    return failures;
+}
+
 struct AcceptExpected {
     std::vector<std::int32_t> sampled;
     std::int32_t num_sampled;
@@ -550,6 +638,7 @@ int main() {
         ++failures;
     } catch (const std::invalid_argument&) {}
     for (const int k : {1, 5, 15}) failures += prepare_verify_case(k);
+    failures += phase_cut_case();
     failures += greedy_accept_case(0, 0);
     for (const int domain : {257, 32769}) {
         for (const int top_k : {1, 64, 0}) {

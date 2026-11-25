@@ -15,21 +15,51 @@
 
 namespace sinfer::ops {
 
+// Reply-phase sampler (SamplingConfig::phase_switch_armed): the drafts a row may verify. 1 (in its thought): those
+// before its first drafted close token (phase_switch_token); 2 (its output has not yet said whether it thinks): none.
+// 0 (every other row): all of them. Idempotent: the cut of a cut extent is itself.
+__device__ inline int speculative_phase_cut(const std::int32_t* row_drafts, int extent, const SamplingConfig* configs,
+                                            int row) {
+    if (configs == nullptr) { return extent; }
+    const SamplingConfig& cfg = configs[row];
+    if (cfg.phase_switch_armed == 0) { return extent; }
+    if (cfg.phase_switch_armed == 2) { return 0; }
+    for (int i = 0; i < extent; ++i) {
+        if (row_drafts[i] == cfg.phase_switch_token) { return i; }
+    }
+    return extent;
+}
+
 __global__ void speculative_prepare_verify_inputs_kernel(const std::int32_t* anchors,
                                                          const std::int32_t* drafts,
                                                          const std::int32_t* base_positions,
-                                                         const std::int32_t* current_extents,
+                                                         std::int32_t* current_extents,
                                                          std::int32_t* verify_ids,
-                                                         std::int32_t* positions, std::int32_t k) {
+                                                         std::int32_t* positions, std::int32_t k,
+                                                         const SamplingConfig* configs) {
+    // One block per row (the launcher's grid is (1, B)): the write-back below follows every thread's read.
     const int row = static_cast<int>(blockIdx.y);
     const int T   = k + 1;
     int extent    = current_extents[row];
     extent        = extent < 0 ? 0 : (extent > k ? k : extent);
-    for (int j = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x; j < T;
-         j += blockDim.x * gridDim.x) {
+    // Reply-phase cut: the accept reads the cut extent, but the verify keeps the round's shape -- its positions run
+    // sequentially over the uncut extent, as the host staged the valid columns and RoPE positions -- and only the ids
+    // past the cut are the anchor (a token sequence like any other, at its own positions and cache rows). So the
+    // forward of every column up to the cut is exactly the option-off forward, and no cache row is written twice.
+    int cut = extent;
+    if (configs != nullptr && configs[row].phase_switch_armed != 0) {
+        cut = speculative_phase_cut(drafts + row * k, extent, configs, row);
+    }
+    if (cut != extent) {
+        __syncthreads();
+        // No device printf here: a kernel that can print makes the runtime set up its printf buffer, which lands in
+        // the CUDA Graph preparation window (+52 MiB measured) and can exceed the planned graph allowance.
+        if (threadIdx.x == 0) { current_extents[row] = cut; }
+    }
+    for (int j = static_cast<int>(threadIdx.x); j < T; j += blockDim.x) {
         const int off = row * T + j;
         verify_ids[off] =
-            j == 0 ? anchors[row] : (j <= extent ? drafts[row * k + j - 1] : anchors[row]);
+            j == 0 ? anchors[row] : (j <= cut ? drafts[row * k + j - 1] : anchors[row]);
         if (positions != nullptr) {
             positions[off] = base_positions[row] + (j <= extent ? j : extent);
         }

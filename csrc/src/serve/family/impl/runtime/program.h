@@ -5,6 +5,7 @@
 #include <api/family/text_geometry.h>
 
 #include "runtime/contract/round_lifecycle.h"
+#include "runtime/contract/reply_phase.h"
 #include "family/impl/runtime/instance.h"
 // Qwen3.6 family runtime implementation; instantiated only by exact variants.
 
@@ -127,6 +128,9 @@ struct RequestBasePlanImpl<SINFER_FAMILY_VARIANT> {
     /// into RequestControl at admit, where the per-round staging reads them.
     std::uint32_t min_tokens         = 0;
     std::uint32_t stop_barrier_count = 0;
+    /// Reply-phase sampler (runtime/contract/reply_phase.h): armed, close token and reply values; copied into
+    /// RequestControl at admit.
+    runtime::ReplyPhase reply;
 };
 
 template <>
@@ -173,6 +177,7 @@ struct RequestPlanImpl<SINFER_FAMILY_VARIANT> {
     std::int32_t lora_slot = -1;
     std::uint32_t min_tokens         = 0;
     std::uint32_t stop_barrier_count = 0;
+    runtime::ReplyPhase reply;
 };
 
 } // namespace sinfer::family::detail
@@ -447,6 +452,12 @@ struct RequestControl {
     /// means the request asked for no minimum and nothing is ever barred.
     std::uint32_t min_tokens         = 0;
     std::uint32_t stop_barrier_count = 0;
+    /// Reply-phase sampler: the thought is drawn with `sampling_host`, the answer with its reply values
+    /// (runtime/contract/reply_phase.h); staged_sampling() and install_sampling() apply it. Off for every request
+    /// without reply values.
+    runtime::ReplyPhase reply;
+    /// install_sampling's copy source for a reply-phase request (kept alive with the request).
+    ops::SamplingConfig sampling_installed;
     std::uint32_t prompt_tokens      = 0;
     /// Trailing prompt tokens this request generated before a KV preemption (0 otherwise):
     /// its own prompt is the first `prompt_tokens` of the prefill's.

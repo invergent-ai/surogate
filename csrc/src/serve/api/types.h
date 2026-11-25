@@ -395,6 +395,41 @@ struct SamplingOverrides {
     std::optional<float> frequency_penalty;
     std::optional<std::uint64_t> seed;
     std::unordered_map<TokenId, float> logit_bias;
+    /// Reply-phase sampler (off unless one of these is set): the tokens a request generates after
+    /// its thought has closed -- the answer -- are drawn with these values instead of the four
+    /// above; the thought itself is drawn exactly as without them (same values, same random
+    /// stream). A reply field left unset takes the request's own resolved value of that field.
+    /// A request whose output does not open with a thought (the prompt opens none and the model
+    /// does not open one itself) draws every token with them.
+    std::optional<float> reply_temperature;
+    std::optional<std::int32_t> reply_top_k;
+    std::optional<float> reply_top_p;
+    std::optional<float> reply_min_p;
+
+    [[nodiscard]] bool has_reply() const noexcept {
+        return reply_temperature || reply_top_k || reply_top_p || reply_min_p;
+    }
+};
+
+/// What a model's vocabulary says about where its thought ends (Frontend::reply_phase_vocabulary).
+struct ReplyPhaseVocabulary {
+    /// The model writes its thought's opening marker itself (Inkling-2, Gemma 4), rather than the prompt opening it.
+    bool model_opens = false;
+    /// The single token that closes a thought (Inkling-2: <|end_message|>; Qwen: </think>), when there is one and the
+    /// reasoning is a span rather than a message channel.
+    std::optional<TokenId> close;
+    /// The single token that opens a thought the model writes itself (Inkling-2: <|content_thinking|>).
+    std::optional<TokenId> open;
+    /// Tokens an output may start with before it shows whether it thinks (Inkling-2: <|message_model|>).
+    std::array<TokenId, 2> headers{-1, -1};
+};
+
+/// The answer-phase values of SamplingOverrides::reply_*, resolved (SamplingOverrides).
+struct ReplySamplingParameters {
+    float temperature  = 0.0F;
+    std::int32_t top_k = 0;
+    float top_p        = 1.0F;
+    float min_p        = 0.0F;
 };
 
 // Complete parameters after Engine resolution. Target runtimes consume only this type.
@@ -409,6 +444,8 @@ struct ResolvedSamplingParameters {
     float repetition_penalty = 1.0F;
     std::uint64_t seed      = 0;
     std::unordered_map<TokenId, float> logit_bias;
+    /// The reply-phase values (SamplingOverrides::reply_*), or none: every token drawn with the above.
+    std::optional<ReplySamplingParameters> reply;
 };
 
 enum class OutputChannel : std::uint8_t {

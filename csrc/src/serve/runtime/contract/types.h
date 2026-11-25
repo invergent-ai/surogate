@@ -2,6 +2,7 @@
 
 #include <array>
 #include "api/types.h"
+#include "runtime/contract/reply_phase.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -55,6 +56,9 @@ struct ResolvedExecutionOptions {
     std::uint32_t min_tokens         = 0;
     std::array<TokenId, 4> stop_barrier{};
     std::uint32_t stop_barrier_count = 0;
+    /// Reply-phase sampler (sampling.reply): armed by Engine::submit (runtime::plan_reply_phase) with the state the
+    /// output starts in and the model's markers; off (armed false) for every other request.
+    ReplyPhase reply_phase;
     /// Set by the executor when it re-admits a request it preempted (--kv-admission ondemand):
     /// the prompt then ends with the tokens this request already generated.
     std::shared_ptr<const KvResumeState> resume;

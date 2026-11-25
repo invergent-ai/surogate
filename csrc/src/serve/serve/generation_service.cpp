@@ -995,6 +995,10 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& original,
             sampling.top_k = 0;
             sampling.top_p = 1;
             sampling.min_p = 0;
+            sampling.reply_temperature.reset();
+            sampling.reply_top_k.reset();
+            sampling.reply_top_p.reset();
+            sampling.reply_min_p.reset();
             sampling.presence_penalty = 0;
             sampling.frequency_penalty = 0;
             sampling.repetition_penalty = 1;

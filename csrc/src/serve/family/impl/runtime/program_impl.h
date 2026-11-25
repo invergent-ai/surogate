@@ -934,6 +934,15 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
     request.min_tokens        = request_plan.min_tokens;
     request.stop_barrier_count = request_plan.stop_barrier_count;
     request.resumed_tokens     = request_plan.resume ? request_plan.resume->generated_tokens : 0U;
+    // Reply-phase sampler: the walk for the close token starts at the end of the request's own prompt, so a request
+    // resumed after a KV preemption whose generated tokens already hold the close answers with the reply values from
+    // its prefill's own draw on.
+    request.reply = request_plan.reply;
+    if (request.reply.pending()) {
+        request.reply.frontier = prompt.token_ids.size() - std::min<std::size_t>(request.resumed_tokens,
+                                                                                 prompt.token_ids.size());
+        (void)request.reply.advance(prompt.token_ids);
+    }
     request.text_kv_page_limit = request_plan.summary.on_demand_kv ? request_plan.text_kv_page_limit : 0U;
     request.backend_kv_page_limit =
         request_plan.summary.on_demand_kv ? request_plan.backend_kv_page_limit : 0U;
@@ -2956,7 +2965,22 @@ void ProgramImplCore::prepare_graphs() {
 ops::SamplingConfig ProgramImplCore::staged_sampling(RequestControl& request,
                                                      const SequenceState& sequence) const {
     update_constraint(sequence, request);
-    ops::SamplingConfig staged = request.sampling_host;
+    // Reply-phase sampler: from the round after the model's close token the draws take the reply values; until then
+    // the config is the request's own with the verify's draft cut armed (runtime/contract/reply_phase.h).
+    if (request.reply.advance(sequence.ledger)) {
+        static const bool trace = [] {
+            const char* raw = std::getenv("SUROGATE_SERVE_TRACE_REPLY_PHASE");
+            return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+        }();
+        if (trace) {
+            // The switch token (the close, or a first content marker) is the last of its round when the verify cut the
+            // drafts after it.
+            std::fprintf(stderr, "reply-phase: lane=%u answer starts after generated token %zu, ledger %zu, round ended there: %s\n",
+                         sequence.lane, request.reply.frontier - 1 - request.prompt_tokens, sequence.ledger.size(),
+                         request.reply.frontier == sequence.ledger.size() ? "yes" : "no");
+        }
+    }
+    ops::SamplingConfig staged = request.reply.apply(request.sampling_host);
     if (request.stop_barrier_count == 0) { return staged; }
     const std::size_t ledger   = sequence.ledger.size();
     const std::size_t produced = ledger > request.prompt_tokens ? ledger - request.prompt_tokens : 0;
@@ -3013,8 +3037,13 @@ void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& 
     request.sampling_host.token_counts =
         penalties ? static_cast<std::int32_t*>(counts.data) : nullptr;
     Tensor config_lane = sampling_config.slice(1, static_cast<std::int32_t>(sequence.lane), 1);
-    CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &request.sampling_host,
-                               sizeof(request.sampling_host), cudaMemcpyHostToDevice,
+    // The lane's config read by the prefill's draw: the request's own, or -- reply-phase sampler -- its phase's
+    // (start_prefill_lane has walked the prompt for the close token). A request without reply values copies
+    // sampling_host itself, as before.
+    request.sampling_installed = request.reply.apply(request.sampling_host);
+    const ops::SamplingConfig& installed = request.reply.armed ? request.sampling_installed : request.sampling_host;
+    CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &installed,
+                               sizeof(installed), cudaMemcpyHostToDevice,
                                device.stream));
 }
 
@@ -3564,8 +3593,13 @@ ProgramImplCore::launch_ordinary_round(std::span<const std::uint32_t> lanes,
         for (const auto lane : lanes) {
             burst = std::min(burst, dspark_barrier_draws_if<Variant>(requests[lane], sequences[lane]));
         }
-        if (burst == 0 || pipeline_stage() || std::any_of(lanes.begin(), lanes.end(),
-            [&](auto lane) { return requests[lane].constraint != nullptr; })) { burst = 1; }
+        // A chained burst stages each row's config once, so a reply-phase row before its answer takes one round at a
+        // time and the round after its switch is staged with the reply values. BATCH-WIDE, like a constrained row:
+        // while any such row is in this ordinary round, the whole batch runs unchained (speculative rounds -- MTP,
+        // DFlash -- do not chain and are not affected).
+        if (burst == 0 || pipeline_stage() || std::any_of(lanes.begin(), lanes.end(), [&](auto lane) {
+                return requests[lane].constraint != nullptr || requests[lane].reply.pending();
+            })) { burst = 1; }
 
         DecodeGraphExecutable* executable = nullptr;
         DecodeGraphExecutable* chained    = nullptr;
