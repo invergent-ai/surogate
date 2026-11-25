@@ -109,6 +109,8 @@ public:
     [[nodiscard]] bool valid() const noexcept { return cache_ != nullptr; }
 
     [[nodiscard]] std::uint32_t max_context() const noexcept;
+    /// The cache's layer (plane) count; 0 for an empty view.
+    [[nodiscard]] std::uint32_t layers() const noexcept;
     [[nodiscard]] PagedKVLayerView layer_view(std::uint32_t layer) const;
 
 private:

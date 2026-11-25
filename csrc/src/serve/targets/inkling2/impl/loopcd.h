@@ -11,7 +11,7 @@
 // How it runs (the target's own schedule, nothing in the family runtime changes):
 // - The reference: pass 0's state, i.e. the AttnRes stack [0, 1, 2, 3] after visit 17 (slots 2-3 hold pass 0's
 //   blocks until pass 2 overwrites them). Right after visit 17 the coda's six layers run on it as six REFERENCE
-//   visits with their own KV planes (text-pool planes after the drafter's, `extra_kv_planes`) and their own conv
+//   visits with their own KV planes (the text pool's LAST six planes, after the drafter's: `extra_kv_planes`) and their own conv
 //   states (state layers 48..53), exactly the slot pattern of visits 42..47; the output mix (output query + final
 //   norm) of that state is written to slot 6, which nothing reads before visit 42. After visit 41 it moves to slot 5
 //   (pass 1's second block, dead once pass 2 has read its messages).
@@ -24,6 +24,7 @@
 // - One card only (a pipeline split refuses), text only (the vision path checks the hidden width).
 
 #include "targets/inkling2/impl/config.h"
+#include "targets/inkling2/impl/loopcd_combine.h"
 
 #include <cuda_runtime.h>
 
@@ -48,19 +49,12 @@ inline constexpr int kLoopcdHiddenSlot = 5;   ///< where finish() finds the refe
 /// Conv-state layers with LoopCD on: the 48 visits + the 6 reference visits.
 [[nodiscard]] int loopcd_state_layers();
 
-/// The first reference KV plane in the text pool (set when the layout asks `extra_kv_planes`); -1 before.
-void loopcd_set_first_plane(int plane);
-[[nodiscard]] int loopcd_first_plane();
-
-/// Head columns per chunk of the LoopCD head (each token = 2 columns) and its FP32 scratch.
-inline constexpr int kLoopcdHeadTokens = 32;
+/// Head tokens per pass of the LoopCD head (each token = 2 columns) and its FP32 scratch (one per loaded model: the
+/// head runs on the card's one compute stream). 64 = the widest decode / verify round of 8 lanes x (7 drafts + 1) in one
+/// pass of the head weights (103 MB); wider rounds (prefill tails of many segments) take more passes.
+inline constexpr int kLoopcdHeadTokens = 64;
 [[nodiscard]] constexpr std::size_t loopcd_head_scratch_bytes() {
     return static_cast<std::size_t>(TextConfig::output_rows) * 2 * kLoopcdHeadTokens * sizeof(float);
 }
-
-/// logits[:, t] (ld `ldo`) from the softcapped head columns `pairs` FP32 [rows, 2 n] (column 2t = z, 2t + 1 = z_ref):
-/// z + w (z - z_ref) over the first `domain` rows, z beyond (padded rows).
-void loopcd_combine(const float* pairs, std::int32_t rows, std::int32_t domain, std::int32_t n, bool adaptive,
-                    float strength, float* logits, std::int32_t ldo, cudaStream_t stream);
 
 } // namespace sinfer::targets::inkling2::detail

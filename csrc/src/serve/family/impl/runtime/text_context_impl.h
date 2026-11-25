@@ -1918,6 +1918,8 @@ void debug_next_token_nll(const Tensor& hidden_all, const Tensor& ids, std::int3
                           float logit_softcap, float logit_scale, Arena& work, cudaStream_t stream) {
     static const char* path = std::getenv("SUROGATE_SERVE_NLL_DUMP");
     if (path == nullptr || columns < 2) { return; }
+    // A target whose round hidden is wider than the head's input (Inkling LoopCD's [h ; h_ref]): not this probe's head.
+    if (hidden_all.ne[0] != static_cast<std::int64_t>(head.k)) { return; }
     // The token domain is the family's (the rows `ops::sample` scores); a smaller model of the
     // family has fewer rows than that, and the probe scores what the head actually has.
     token_domain = std::min(token_domain, vocab);

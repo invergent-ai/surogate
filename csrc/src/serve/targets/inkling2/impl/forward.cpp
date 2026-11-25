@@ -828,7 +828,10 @@ void run_visit(Round& rd, int v, int state_v = -1, int plane_v = -1) {
 /// LoopCD (loopcd.h): the coda's six layers on pass 0's state (slots 2-3 hold pass 0's blocks after visit 17), each
 /// with its own conv-state layer (48 + j) and KV plane, then the output mix of that state into slot 6.
 void run_loopcd_reference(Round& rd) {
-    const int first_plane = loopcd_first_plane();
+    // The reference planes are the text pool's last six (extra_kv_planes appends them after the drafter's).
+    const std::uint32_t planes = rd.r.sequence_kv.valid() ? rd.r.sequence_kv.layers() : rd.r.text_kv->layers();
+    const int first_plane      = static_cast<int>(planes) - kLoopcdVisits;
+    if (first_plane < C::layers) { throw std::logic_error("inkling2: the KV pool has no LoopCD reference planes"); }
     for (int j = 0; j < kLoopcdVisits; ++j) {
         run_visit(rd, C::layers - kLoopcdVisits + j, C::layers + j, first_plane + j);
     }
@@ -964,7 +967,7 @@ void Variant::run_visits(const ModelView& model, family::VisitRound& r) {
     }();
     d.active = d.dir != nullptr && !dumped && capturing == cudaStreamCaptureStatusNone && !r.segments.empty() &&
                rd.T >= min_columns;
-    if (loopcd && (r.first_visit != 0 || r.last_visit != C::layers || loopcd_first_plane() < 0)) {
+    if (loopcd && (r.first_visit != 0 || r.last_visit != C::layers)) {
         throw std::logic_error("inkling2: LoopCD runs on one card only (no pipeline split)");
     }
     for (int v = r.first_visit; v < r.last_visit; ++v) {

@@ -241,6 +241,8 @@ std::uint32_t PagedKVCacheView::max_context() const noexcept {
     return cache_ == nullptr ? 0 : cache_->max_context();
 }
 
+std::uint32_t PagedKVCacheView::layers() const noexcept { return cache_ == nullptr ? 0 : cache_->layers(); }
+
 PagedKVLayerView PagedKVCacheView::layer_view(std::uint32_t layer) const {
     if (cache_ == nullptr) { throw std::logic_error("Paged KV execution view is empty"); }
     return cache_->layer_view(layer, block_table_, window_block_table_);

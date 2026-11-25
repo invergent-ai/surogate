@@ -2,7 +2,6 @@
 
 #include "targets/inkling2/impl/loopcd.h"
 
-#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
@@ -34,8 +33,6 @@ LoopcdSettings parse(const char* raw) {
     return s;
 }
 
-std::atomic<int> g_first_plane{-1};
-
 } // namespace
 
 const LoopcdSettings& loopcd_settings() {
@@ -44,6 +41,8 @@ const LoopcdSettings& loopcd_settings() {
         if (s.enabled) {
             std::fprintf(stderr, "inkling2: LoopCD-Logits ON (%s strength %.3f; reference = pass 0)\n",
                          s.adaptive ? "adaptive, max" : "fixed", static_cast<double>(s.strength));
+            std::fprintf(stderr, "inkling2: LoopCD: sampled tokens and returned logprobs follow the contrasted "
+                                 "distribution, not the model's own (not for RL rollouts scored by a trainer)\n");
         }
         return s;
     }();
@@ -51,9 +50,5 @@ const LoopcdSettings& loopcd_settings() {
 }
 
 int loopcd_state_layers() { return TextConfig::layers + (loopcd_settings().enabled ? kLoopcdVisits : 0); }
-
-void loopcd_set_first_plane(int plane) { g_first_plane.store(plane); }
-
-int loopcd_first_plane() { return g_first_plane.load(); }
 
 } // namespace sinfer::targets::inkling2::detail
