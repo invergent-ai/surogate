@@ -2,6 +2,7 @@
 // leaves; the instantiation of the family runtime over this Variant (target design notes, 1).
 
 #include "targets/inkling2/impl/variant.h"
+#include "family/inkling_vision_ops.h"
 #include "targets/inkling2/impl/visits.h"
 
 #include "api/ops/inkling_mix.h"
@@ -86,6 +87,14 @@ void Variant::embed_residual(const ModelView& model, const Tensor& ids, Tensor& 
     const InklingModel& im = model_of(model);
     ops::inkling_embed(ids, model.token_embedding.qdata, model.token_embedding.n, im.weights->globals.embedding_norm,
                        C::rms_epsilon, slot_plane(residual, 0), stream);
+}
+
+void Variant::scatter_visual(const ModelView&, const Tensor& visual, const Tensor& indices, Tensor& residual,
+                             cudaStream_t stream) {
+    if (visual.ne[0] != C::hidden || residual.ne[0] != C::residual || !residual.is_contiguous()) {
+        throw std::logic_error("inkling2: visual columns are [2304, V] into the [7 x 2304, T] stack");
+    }
+    family::inkling_scatter_columns(visual, indices, residual.data, C::residual, stream);
 }
 
 void Variant::final_residual_mix(const ModelView& model, const Tensor& residual, Tensor& hidden, WorkspaceArena&,

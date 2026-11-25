@@ -7,9 +7,10 @@ its sources through an independent decode, so the mapping is stated exactly once
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
-from .checkpoint import MAIN_PREFIX, Geometry
+from .checkpoint import MAIN_PREFIX, VISION_PREFIX, Geometry
 from .fp8_attention import SCHEMES, STORAGE_FORMAT
 
 CONTIGUOUS = "contiguous-le-v1"
@@ -62,8 +63,61 @@ def parse_attention(option: str) -> tuple[str, ...]:
     return tuple(schemes)
 
 
+def vision_geometry(vision: Mapping, text_hidden: int) -> dict[str, int | float]:
+    """The root ``vision_geometry`` member for the checkpoint's ``vision_config`` (a PE-style ViT, a 2 x 2 merge)."""
+    hidden, heads = int(vision["hidden_size"]), int(vision["num_attention_heads"])
+    patch, merge = int(vision["native_patch_size"]), int(vision["adapter_merge_size"])
+    grid = int(vision["posemb_grid_size"])
+    if (int(vision["text_hidden_size"]) != text_hidden or merge != 2 or vision.get("projector_bias", False) or
+            int(vision.get("temporal_patch_size", 2)) != 2 or hidden % heads or (hidden // heads) % 4):
+        raise ValueError(f"unsupported Inkling-2 vision_config: {dict(vision)}")
+    return {
+        "inkling": 1, "layers": int(vision["num_hidden_layers"]), "hidden": hidden,
+        "intermediate": int(hidden * float(vision["mlp_ratio"])), "heads": heads,
+        "patch_dim": 3 * patch * patch, "merge": merge, "position_embeddings": grid * grid,
+        # 2D RoPE over the whole head: x on the first half of its pairs, y on the second (vLLM's apply_rotary_qk_).
+        "rotary_dim": hidden // heads, "rope_theta": 10000.0,
+        "projector_hidden": int(vision["projection_hidden_dim"]), "output_hidden": text_hidden,
+        # vLLM's per-image encoder-cache cap at --max-num-batched-tokens 4096 (inkling_vision.h).
+        "max_image_tokens": 4096, "norm_epsilon": float(vision["layer_norm_eps"]),
+    }
+
+
+def _v(name: str) -> str:
+    return VISION_PREFIX + name
+
+
+def vision_entries(e: list[Entry], vision: Mapping, text_hidden: int) -> None:
+    """``vision/*``: every ``model.visual.*`` tensor, BF16 bit copies (q / k / v stay separate)."""
+    vg = vision_geometry(vision, text_hidden)
+    h, m = vg["hidden"], vg["intermediate"]
+    b = "backbone."
+    _direct(e, "vision/patch_embedding", (h, vg["patch_dim"]), [_v(b + "embeddings.patch_embedding.weight")])
+    _direct(e, "vision/position_embedding", (vg["position_embeddings"], h), [_v(b + "embeddings.position_embedding")])
+    _direct(e, "vision/class_embedding", (h,), [_v(b + "embeddings.class_embedding")])
+    _direct(e, "vision/cls_position_embedding", (h,), [_v(b + "embeddings.cls_position_embedding")])
+    for part in ("weight", "bias"):
+        _direct(e, f"vision/pre_norm/{part}", (h,), [_v(b + f"ln_pre.{part}")])
+    for i in range(vg["layers"]):
+        p, src = f"vision/layers/{i}/", _v(b + f"layers.{i}.")
+        for norm, source in (("norm1", "ln_1"), ("norm2", "ln_2")):
+            for part in ("weight", "bias"):
+                _direct(e, p + f"{norm}/{part}", (h,), [src + f"{source}.{part}"])
+        for role, source in (("query", "q_proj"), ("key", "k_proj"), ("value", "v_proj"), ("output", "out_proj")):
+            _direct(e, p + f"attention/{role}", (h, h), [src + f"self_attn.{source}.weight"])
+            _direct(e, p + f"attention/{role}_bias", (h,), [src + f"self_attn.{source}.bias"])
+        _direct(e, p + "mlp/fc1", (m, h), [src + "mlp.c_fc.weight"])
+        _direct(e, p + "mlp/fc1_bias", (m,), [src + "mlp.c_fc.bias"])
+        _direct(e, p + "mlp/fc2", (h, m), [src + "mlp.c_proj.weight"])
+        _direct(e, p + "mlp/fc2_bias", (h,), [src + "mlp.c_proj.bias"])
+        _direct(e, p + "ls1", (h,), [src + "ls_1.gamma"])
+        _direct(e, p + "ls2", (h,), [src + "ls_2.gamma"])
+    _direct(e, "vision/projector/in", (vg["projector_hidden"], 4 * h), [_v("proj_in.weight")])
+    _direct(e, "vision/projector/out", (text_hidden, vg["projector_hidden"]), [_v("proj_out.weight")])
+
+
 def build_inventory(g: Geometry, *, fp8_schemes: tuple[str, ...] = (), gate_up_order: str = "interleaved",
-                    mtp: bool = True) -> list[Entry]:
+                    mtp: bool = True, vision: Mapping | None = None) -> list[Entry]:
     if gate_up_order not in GATE_UP_ORDERS:
         raise ValueError(f"gate_up_order must be one of {GATE_UP_ORDERS}")
     h, e = g.hidden, []
@@ -174,6 +228,8 @@ def build_inventory(g: Geometry, *, fp8_schemes: tuple[str, ...] = (), gate_up_o
         _direct(e, "mtp/markov/w1", (g.vocab_padded, r), [MTP + "markov_head.markov_w1.weight"])
         _direct(e, "mtp/markov/rnn_proj", (3 * r, 2 * r + 2 * d.hidden), [MTP + "markov_head.rnn_proj.weight"])
         _direct(e, "mtp/markov/rnn_proj_bias", (3 * r,), [MTP + "markov_head.rnn_proj.bias"])
+    if vision is not None:
+        vision_entries(e, vision, h)
     return e
 
 
@@ -183,4 +239,4 @@ def covered_sources(entries: list[Entry]) -> list[str]:
 
 
 __all__ = ["Entry", "GATE_UP_ORDERS", "LAYOUT_OF", "LOOP_STREAMS", "MTP", "build_inventory",
-           "covered_sources", "parse_attention"]
+           "covered_sources", "parse_attention", "vision_entries", "vision_geometry"]

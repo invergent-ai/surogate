@@ -28,6 +28,8 @@ target_sources(sinfer_engine PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/vision/control.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/muse_vision.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/muse_vision_ops.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/inkling_vision.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/inkling_vision_ops.cu
   ${CMAKE_CURRENT_SOURCE_DIR}/gemma_vision.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/gemma_vision_ops.cu
   ${CMAKE_CURRENT_SOURCE_DIR}/vision_tower.cpp

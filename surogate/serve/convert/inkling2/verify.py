@@ -36,9 +36,9 @@ from surogate.serve.artifact.layouts import (
 )
 
 from .checkpoint import Checkpoint
-from .convert import CONFIG_RESOURCE, FRONTEND_RESOURCES, layer_types, text_geometry
+from .convert import CONFIG_RESOURCE, FRONTEND_RESOURCES, layer_types, text_geometry, vision_config
 from .fp8_attention import quantize_slices
-from .inventory import MTP, build_inventory
+from .inventory import MTP, build_inventory, vision_geometry
 
 _E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
                       -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0], dtype=torch.float32)
@@ -180,10 +180,11 @@ class Verifier:
 
     # -- whole artifact --------------------------------------------------------------------
 
-    def run(self, *, fp8_schemes, gate_up_order, mtp) -> dict:
+    def run(self, *, fp8_schemes, gate_up_order, mtp, vision=None) -> dict:
         started = time.time()
         g = self.c.geometry
-        entries = build_inventory(g, fp8_schemes=fp8_schemes, gate_up_order=gate_up_order, mtp=mtp)
+        vc = vision_config(self.c, vision)
+        entries = build_inventory(g, fp8_schemes=fp8_schemes, gate_up_order=gate_up_order, mtp=mtp, vision=vc)
         tensors = [o for o in self.a.objects if isinstance(o, TensorObject)]
         resources = [o for o in self.a.objects if not isinstance(o, TensorObject)]
         _require([o.name for o in tensors] == [e.name for e in entries],
@@ -197,6 +198,10 @@ class Verifier:
         _require(self.a.geometry == {k: (float(v) if isinstance(v, float) else v)
                                      for k, v in expected_geometry.items()}, "root geometry differs")
         _require(self.a.layer_types == layer_types(g), "layer_types differ")
+        _require(self.a.vision_geometry == ({} if vc is None else
+                                            {k: (float(v) if isinstance(v, float) else v)
+                                             for k, v in vision_geometry(vc, g.hidden).items()}),
+                 "vision geometry differs")
         names = {o.name for o in resources}
         for name, file, required in FRONTEND_RESOURCES:
             path = self.c.dir / file
@@ -225,6 +230,7 @@ def main(argv=None) -> int:
     parser.add_argument("--attention", default="bf16")
     parser.add_argument("--gate-up-order", default="interleaved")
     parser.add_argument("--no-mtp", action="store_true")
+    parser.add_argument("--no-vision", action="store_true")
     parser.add_argument("--threads", type=int, default=16)
     args = parser.parse_args(argv)
     torch.set_num_threads(args.threads)
@@ -233,7 +239,7 @@ def main(argv=None) -> int:
     with Artifact(args.artifact) as artifact:
         stats = Verifier(artifact, ckpt, log=lambda m: print(m, flush=True)).run(
             fp8_schemes=parse_attention(args.attention), gate_up_order=args.gate_up_order,
-            mtp=not args.no_mtp)
+            mtp=not args.no_mtp, vision=False if args.no_vision else None)
     print("PASS", json.dumps(stats, sort_keys=True), flush=True)
     return 0
 

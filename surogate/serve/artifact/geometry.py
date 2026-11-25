@@ -87,6 +87,7 @@ TEXT_FLOAT_FIELDS = (
 
 VISION_INT_FIELDS = (
     "muse_glimmer",
+    "inkling",
     "gemma_version", "gemma_pad_token", "encoder_free", "clipped_linears", "standardize", "attention_mode", "max_image_tokens",
     "deepstack_layers",
     "siglip2",

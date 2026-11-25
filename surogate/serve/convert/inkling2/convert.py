@@ -34,7 +34,7 @@ from surogate.serve.artifact.layouts import (
 
 from .checkpoint import Checkpoint, Geometry
 from .fp8_attention import RULE, STORAGE_FORMAT, quantize_slices
-from .inventory import MTP, LOOP_STREAMS, Entry, build_inventory, covered_sources
+from .inventory import MTP, LOOP_STREAMS, Entry, build_inventory, covered_sources, vision_geometry
 
 ARCHITECTURE = "inkling2"
 SCHEMA = "inkling2-artifact/1"
@@ -84,7 +84,23 @@ def layer_types(g: Geometry) -> list[str]:
     return ["full_attention" if g.is_global(l) else "sliding_attention" for l in range(g.layers)]
 
 
-def config_document(ckpt: Checkpoint, *, fp8_schemes, gate_up_order, mtp, sha256: dict[str, str]) -> dict:
+def vision_config(ckpt: Checkpoint, vision: bool | None):
+    """The checkpoint's ``vision_config`` when the vision tower is carried, else None.
+
+    ``vision`` None carries the tower when the checkpoint has one; True requires it; False leaves it out.
+    """
+    if vision is False:
+        return None
+    config = ckpt.config.get("vision_config")
+    if config is None or not ckpt.vision_names():
+        if vision:
+            raise ValueError("the checkpoint has no vision tower")
+        return None
+    return config
+
+
+def config_document(ckpt: Checkpoint, *, fp8_schemes, gate_up_order, mtp, sha256: dict[str, str],
+                    vision: bool = False) -> dict:
     g, t = ckpt.geometry, ckpt.geometry.text
     files = {}
     for name in ckpt.source_files():
@@ -95,7 +111,8 @@ def config_document(ckpt: Checkpoint, *, fp8_schemes, gate_up_order, mtp, sha256
         "source": {"repo": "thinkingmachines/Inkling-2-Mini", "revision": "ed40e7da", "files": files},
         "converter": {"module": "surogate.serve.convert.inkling2", "git_commit": _git_commit(),
                       "options": {"attention": ["bf16", *(f"fp8-{s}" for s in fp8_schemes)],
-                                  "gate_up_order": gate_up_order, "mtp": bool(mtp)}},
+                                  "gate_up_order": gate_up_order, "mtp": bool(mtp),
+                                  "vision": bool(vision)}},
         "text": {
             "hidden": g.hidden, "layers": g.layers, "vocab_padded": g.vocab_padded, "vocab": g.vocab,
             "query_heads": g.query_heads, "kv_heads": g.kv_heads, "head_dim": g.head_dim,
@@ -166,7 +183,7 @@ def _expert_rows(tensor: torch.Tensor, entry: Entry) -> torch.Tensor:
 
 
 def preflight(ckpt: Checkpoint, entries: list[Entry]) -> None:
-    """Every text / MTP checkpoint tensor is read exactly once and has the declared signature."""
+    """Every text / MTP (/ vision, when carried) checkpoint tensor is read exactly once and has the declared signature."""
     problems = []
     counts: dict[str, int] = {}
     for name in covered_sources(entries):
@@ -178,6 +195,8 @@ def preflight(ckpt: Checkpoint, entries: list[Entry]) -> None:
     mtp_entries = any(e.name.startswith("mtp/") for e in entries)
     if not mtp_entries:
         expected = {n for n in expected if not n.startswith(MTP)}
+    if any(e.name.startswith("vision/") for e in entries):
+        expected |= set(ckpt.vision_names())
     missing = sorted(expected - set(counts))
     extra = sorted(set(counts) - expected)
     problems += [f"checkpoint tensor not carried: {n}" for n in missing]
@@ -248,15 +267,16 @@ def read_sha256_file(path: str | Path | None) -> dict[str, str]:
 
 
 def convert(model_dir: str | Path, out_path: str | Path, *, fp8_schemes: tuple[str, ...] = (),
-            gate_up_order: str = "interleaved", mtp: bool = True, sha256_file: str | None = None,
-            log=print) -> dict:
+            gate_up_order: str = "interleaved", mtp: bool = True, vision: bool | None = None,
+            sha256_file: str | None = None, log=print) -> dict:
     started = time.time()
     ckpt = Checkpoint(model_dir)
     g = ckpt.geometry
-    entries = build_inventory(g, fp8_schemes=fp8_schemes, gate_up_order=gate_up_order, mtp=mtp)
+    vc = vision_config(ckpt, vision)
+    entries = build_inventory(g, fp8_schemes=fp8_schemes, gate_up_order=gate_up_order, mtp=mtp, vision=vc)
     preflight(ckpt, entries)
     doc = config_document(ckpt, fp8_schemes=fp8_schemes, gate_up_order=gate_up_order, mtp=mtp,
-                          sha256=read_sha256_file(sha256_file))
+                          sha256=read_sha256_file(sha256_file), vision=vc is not None)
     resources: list[tuple[str, bytes]] = [
         (CONFIG_RESOURCE, (json.dumps(doc, sort_keys=True, indent=1) + "\n").encode("utf-8"))]
     for name, file, required in FRONTEND_RESOURCES:
@@ -277,8 +297,8 @@ def convert(model_dir: str | Path, out_path: str | Path, *, fp8_schemes: tuple[s
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     partial = out.with_name(out.name + ".partial")
-    with ArtifactWriter(partial, identity, specs, geometry=text_geometry(g),
-                        layer_types=layer_types(g)) as writer:
+    with ArtifactWriter(partial, identity, specs, geometry=text_geometry(g), layer_types=layer_types(g),
+                        vision_geometry=None if vc is None else vision_geometry(vc, g.hidden)) as writer:
         for name, data in resources:
             writer.write(name, data)
         for i, entry in enumerate(entries):
@@ -293,4 +313,5 @@ def convert(model_dir: str | Path, out_path: str | Path, *, fp8_schemes: tuple[s
 
 
 __all__ = ["ARCHITECTURE", "CONFIG_RESOURCE", "FRONTEND_RESOURCES", "SCHEMA", "config_document",
-           "convert", "gate_up_permutation", "layer_types", "payload", "preflight", "text_geometry"]
+           "convert", "gate_up_permutation", "layer_types", "payload", "preflight", "text_geometry",
+           "vision_config"]

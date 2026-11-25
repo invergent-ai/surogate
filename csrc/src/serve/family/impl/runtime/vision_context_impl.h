@@ -157,7 +157,7 @@ bool VisionPrefillSession::advance_encoding(std::uint32_t begin, std::uint32_t n
         encoding_item_ = active->item_index;
         encoding_ = family::VisionEncodeState{};
         encoding_.residual = Tensor(static_cast<std::byte*>(transient_.data) + output_bytes,
-                                    DType::BF16, {g.hidden, static_cast<std::int32_t>(control.patch_count)});
+                                    DType::BF16, {g.hidden, static_cast<std::int32_t>(control.patch_count) + (g.inkling ? 1 : 0)});
     } else if (*encoding_item_ != active->item_index) {
         throw std::logic_error("Vision encoding changed items before completion");
     }

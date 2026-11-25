@@ -185,6 +185,8 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     runtime.geometry        = plan.geometry;
     runtime.weights_arena   = &backing.device_arena();
     runtime.features        = plan.features;
+    runtime.vision_geometry = plan.plan.vision.vision_geometry;
+    if (plan.features.vision) { runtime.vision = family::materialize_gemma_vision(backing, plan.plan.vision); }
     if (plan.features.dflash()) {
         // The 2-card split keeps the drafter on the stage with the head (package.cpp); a stage without the head runs
         // the DFlash round's target half only (verify columns from the drafter stage) and binds no drafter.

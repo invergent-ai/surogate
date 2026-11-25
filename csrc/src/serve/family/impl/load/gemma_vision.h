@@ -152,6 +152,62 @@ inline void bind_muse_vision(artifact::Binder& binder, GemmaVisionPlan& out,
     }
 }
 
+/// Inkling-2's tower (converter: surogate/serve/convert/inkling2/inventory.py vision_entries). `enabled` false
+/// validates the objects without placing them, so a text-only engine still accepts an artifact that carries them;
+/// enabled, they take `placement` (a pipeline stage that does not embed validates them only).
+inline void bind_inkling_vision(artifact::Binder& binder, GemmaVisionPlan& out, std::int32_t text_hidden,
+                                bool enabled,
+                                artifact::TensorPlacement placement = artifact::TensorPlacement::Device) {
+    if (!binder.has("vision/patch_embedding")) {
+        if (enabled) {
+            throw std::invalid_argument(
+                "this Inkling-2 artifact carries no vision tower; reconvert it without --no-vision");
+        }
+        return;
+    }
+    out.vision_geometry = VisionGeometry::resolved(binder.reader().vision_geometry());
+    const auto& g       = out.vision_geometry;
+    if (!g.inkling || g.output_hidden != text_hidden) {
+        throw std::invalid_argument("Inkling-2 vision geometry disagrees with the decoder");
+    }
+    const auto place = enabled ? placement : artifact::TensorPlacement::ValidateOnly;
+    const auto linear = [&](const std::string& name, int rows, int cols) {
+        out.vision_linears[name] = {artifact::bind_linear(binder, "vision/" + name, rows, cols, place), rows, cols};
+    };
+    const auto tensor = [&](const std::string& name, std::initializer_list<std::uint64_t> shape) {
+        out.vision_tensors[name] = {artifact::bind_tensor(binder, "vision/" + name, artifact::NumericFormat::BF16,
+                                                          shape, place),
+                                    artifact::NumericFormat::BF16, shape};
+    };
+    const auto h = static_cast<std::uint64_t>(g.hidden);
+    const auto m = static_cast<std::uint64_t>(g.intermediate);
+    linear("patch_embedding", g.hidden, g.patch_dim);
+    tensor("position_embedding", {static_cast<std::uint64_t>(g.position_embeddings), h});
+    tensor("class_embedding", {h});
+    tensor("cls_position_embedding", {h});
+    tensor("pre_norm/weight", {h});
+    tensor("pre_norm/bias", {h});
+    for (int i = 0; i < g.layers; ++i) {
+        const auto p = "layers/" + std::to_string(i) + "/";
+        for (const auto* norm : {"norm1", "norm2"}) {
+            tensor(p + norm + "/weight", {h});
+            tensor(p + norm + "/bias", {h});
+        }
+        for (const auto* role : {"attention/query", "attention/key", "attention/value", "attention/output"}) {
+            linear(p + role, g.hidden, g.hidden);
+            tensor(p + role + "_bias", {h});
+        }
+        linear(p + "mlp/fc1", g.intermediate, g.hidden);
+        tensor(p + "mlp/fc1_bias", {m});
+        linear(p + "mlp/fc2", g.hidden, g.intermediate);
+        tensor(p + "mlp/fc2_bias", {h});
+        tensor(p + "ls1", {h});
+        tensor(p + "ls2", {h});
+    }
+    linear("projector/in", g.projector_hidden, g.merger_hidden());
+    linear("projector/out", g.output_hidden, g.projector_hidden);
+}
+
 inline VisionWeights materialize_gemma_vision(const artifact::MaterializedArtifact& backing,
                                               const GemmaVisionPlan& plan) {
     VisionWeights result;

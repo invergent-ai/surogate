@@ -105,6 +105,10 @@ struct Variant {
     /// Slot 0 of the stack = embed_norm(embed[ids]); the other slots are written by the visits.
     static void embed_residual(const ModelView& model, const Tensor& ids, Tensor& residual,
                                WorkspaceArena& workspace, cudaStream_t stream);
+    /// Visual embeddings replace slot 0 (the normalized token embedding) of their columns, as vLLM's
+    /// _merge_multimodal_embeddings replaces embed_norm(embed[ids]); slots 1-6 are the visits'.
+    static void scatter_visual(const ModelView& model, const Tensor& visual, const Tensor& indices, Tensor& residual,
+                               cudaStream_t stream);
     /// The final output mix: AttnRes over slots [0, 1, 2, 3] + slot 6 with the output query and the final norm.
     static void final_residual_mix(const ModelView& model, const Tensor& residual, Tensor& hidden,
                                    WorkspaceArena& workspace, cudaStream_t stream);

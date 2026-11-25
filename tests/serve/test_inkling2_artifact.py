@@ -74,7 +74,37 @@ def _bf16(*shape, gen):
     return (torch.randn(*shape, generator=gen) * 0.05).to(torch.bfloat16)
 
 
-def _checkpoint(tmp_path, seed=0):
+VH, VHEADS, VLAYERS, VGRID, VPROJ = 64, 4, 2, 4, 96
+
+
+def _vision_config() -> dict:
+    return {"model_type": "inkling2_vision", "text_hidden_size": H, "temporal_patch_size": 2, "native_patch_size": 20,
+            "adapter_merge_size": 2, "projection_hidden_dim": VPROJ, "projector_bias": False, "hidden_size": VH,
+            "num_hidden_layers": VLAYERS, "num_attention_heads": VHEADS, "mlp_ratio": 2.0,
+            "posemb_grid_size": VGRID, "layer_norm_eps": 1e-05}
+
+
+def _vision_tensors(gen) -> dict[str, torch.Tensor]:
+    v, b = "model.visual.", "model.visual.backbone."
+    t = {b + "embeddings.class_embedding": _bf16(VH, gen=gen),
+         b + "embeddings.cls_position_embedding": _bf16(VH, gen=gen),
+         b + "embeddings.patch_embedding.weight": _bf16(VH, 1200, gen=gen),
+         b + "embeddings.position_embedding": _bf16(VGRID * VGRID, VH, gen=gen),
+         b + "ln_pre.weight": _bf16(VH, gen=gen), b + "ln_pre.bias": _bf16(VH, gen=gen),
+         v + "proj_in.weight": _bf16(VPROJ, 4 * VH, gen=gen), v + "proj_out.weight": _bf16(H, VPROJ, gen=gen)}
+    for i in range(VLAYERS):
+        p = b + f"layers.{i}."
+        for norm in ("ln_1", "ln_2"):
+            t[p + f"{norm}.weight"], t[p + f"{norm}.bias"] = _bf16(VH, gen=gen), _bf16(VH, gen=gen)
+        for proj in ("q_proj", "k_proj", "v_proj", "out_proj"):
+            t[p + f"self_attn.{proj}.weight"], t[p + f"self_attn.{proj}.bias"] = _bf16(VH, VH, gen=gen), _bf16(VH, gen=gen)
+        t[p + "mlp.c_fc.weight"], t[p + "mlp.c_fc.bias"] = _bf16(2 * VH, VH, gen=gen), _bf16(2 * VH, gen=gen)
+        t[p + "mlp.c_proj.weight"], t[p + "mlp.c_proj.bias"] = _bf16(VH, 2 * VH, gen=gen), _bf16(VH, gen=gen)
+        t[p + "ls_1.gamma"], t[p + "ls_2.gamma"] = _bf16(VH, gen=gen), _bf16(VH, gen=gen)
+    return t
+
+
+def _checkpoint(tmp_path, seed=0, vision=False):
     gen = torch.Generator().manual_seed(seed)
     t: dict[str, torch.Tensor] = {}
     p = "model.llm."
@@ -160,12 +190,17 @@ def _checkpoint(tmp_path, seed=0):
     m["markov_head.rnn_proj.weight"] = _bf16(3 * RANK, 2 * RANK + 2 * H, gen=gen)
     m["markov_head.rnn_proj.bias"] = _bf16(3 * RANK, gen=gen)
 
+    config = _config()
+    if vision:
+        t.update(_vision_tensors(gen))
+        config["vision_config"] = _vision_config()
+
     model = tmp_path / "model"
     model.mkdir()
     save_file({k: v.contiguous() for k, v in t.items()}, str(model / "model-00001-of-00001.safetensors"),
               metadata={"format": "pt"})
     save_file({k: v.contiguous() for k, v in m.items()}, str(model / "mtp.safetensors"), metadata={"format": "pt"})
-    (model / "config.json").write_text(json.dumps(_config()))
+    (model / "config.json").write_text(json.dumps(config))
     groups = [{"compute_dtype": "nvfp4", "tensors": quant_groups["nvfp4"]},
               {"compute_dtype": "mxfp8", "tensors": quant_groups["mxfp8"]}]
     (model / "hf_quant_config.json").write_text(json.dumps({"model": {"parameter_groups": groups},
@@ -210,6 +245,34 @@ def test_convert_and_verify_every_object(tmp_path, gate_up_order):
         assert payload[sink_row * k: (sink_row + 1) * k] == bytes(k)
         offset = (n * k + 255) // 256 * 256
         assert struct.unpack_from("<f", payload, offset + 4 * sink_row)[0] == 1.0
+
+
+def test_vision_tower_is_carried_and_verified(tmp_path):
+    model, tensors, _ = _checkpoint(tmp_path, vision=True)
+    out = tmp_path / "tiny-vl.sinfer"
+    convert(model, out, log=lambda m: None)
+    with Artifact(out) as artifact:
+        stats = Verifier(artifact, Checkpoint(model), chunk_rows=64, log=lambda m: None).run(
+            fp8_schemes=(), gate_up_order="interleaved", mtp=True)
+        names = [o.name for o in artifact.objects if o.name.startswith("vision/")]
+        # 6 globals + 18 per layer + the two projector matrices: every model.visual.* tensor, once.
+        assert len(names) == 6 + 18 * VLAYERS + 2
+        assert artifact.vision_geometry == {
+            "inkling": 1, "layers": VLAYERS, "hidden": VH, "intermediate": 2 * VH, "heads": VHEADS,
+            "patch_dim": 1200, "merge": 2, "position_embeddings": VGRID * VGRID, "rotary_dim": VH // VHEADS,
+            "rope_theta": 10000.0, "projector_hidden": VPROJ, "output_hidden": H, "max_image_tokens": 4096,
+            "norm_epsilon": 1e-05}
+        q = artifact.find("vision/layers/1/attention/query")
+        assert bytes(artifact.payload(q)) == tensors["model.visual.backbone.layers.1.self_attn.q_proj.weight"] \
+            .view(torch.int16).numpy().tobytes()
+        assert stats["objects_direct"] >= len(names)
+    text_only = tmp_path / "tiny-text.sinfer"
+    convert(model, text_only, vision=False, log=lambda m: None)
+    with Artifact(text_only) as artifact:
+        assert not any(o.name.startswith("vision/") for o in artifact.objects)
+        assert artifact.vision_geometry == {}
+        Verifier(artifact, Checkpoint(model), chunk_rows=64, log=lambda m: None).run(
+            fp8_schemes=(), gate_up_order="interleaved", mtp=True, vision=False)
 
 
 def test_verifier_catches_a_flipped_word(tmp_path):
