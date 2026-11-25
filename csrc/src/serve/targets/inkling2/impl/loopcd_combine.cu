@@ -2,9 +2,10 @@
 // Adaptive strength: w = w_max (1 - (p1 - p2)) with p = softmax(z) over the token domain; p1 - p2 =
 // (1 - exp(z2 - z1)) / sum_v exp(z_v - z1), z1 >= z2 the two largest logits (a tie gives p1 - p2 = 0).
 
-#include "targets/inkling2/impl/loopcd.h"
-
+// Not loopcd.h: it pulls the target config (host-only family headers) into nvcc; the declaration there matches this one.
 #include "core/device.h"
+
+#include <cuda_runtime.h>
 
 #include <cfloat>
 #include <cstdint>
