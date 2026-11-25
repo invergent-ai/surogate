@@ -1295,6 +1295,8 @@ public:
         std::uint64_t vision_tokens    = 0;
         std::size_t patch_bytes        = 0;
         double media_seconds           = 0.0;
+        /// The token boundary this conversation's next turn still shares (see prepare_inkling); 0 = none.
+        std::uint32_t turn_closure     = 0;
     };
 
     /// Inkling-2's prompt for the request body the serving layer handed over: vLLM's renderer, token for token, and
@@ -1428,12 +1430,36 @@ public:
             permit.reset();
             out.media_seconds = std::chrono::duration<double>(Clock::now() - started).count();
         }
-        out.ids = fi::inkling::render_chat(
-            request,
-            [this](std::string_view text) {
-                return tokenizer->encode(text, {.parse_added_tokens = false, .add_bos = false});
-            },
-            *inkling, image_tokens);
+        const auto encode_text = [this](std::string_view text) {
+            return tokenizer->encode(text, {.parse_added_tokens = false, .add_bos = false});
+        };
+        out.ids = fi::inkling::render_chat(request, encode_text, *inkling, image_tokens);
+        // Where the next turn stops sharing this prompt, as the generic chat path asks its template
+        // (TurnClosure): render this conversation with one more assistant reply and user message and keep the
+        // common token prefix. Inkling's conv state resumes only at the last frontier or at such a checkpoint, and
+        // the rendered history of a reply is not the token stream the model wrote (its thinking is dropped), so
+        // without it every turn of a conversation prefills from scratch.
+        if (request.messages.is_array()) {
+            try {
+                fi::inkling::ChatRequest next = request;
+                const auto message = [](const char* role, const char* content) {
+                    fi::inkling::PyValue m = fi::inkling::PyValue::object();
+                    m.set("role", fi::inkling::PyValue::from_string(role));
+                    m.set("content", fi::inkling::PyValue::from_string(content));
+                    return m;
+                };
+                fi::inkling::PyValue reply = message("assistant", "cache boundary answer");
+                reply.set("reasoning", fi::inkling::PyValue::from_string("cache boundary reasoning"));
+                next.messages.items.push_back(std::move(reply));
+                next.messages.items.push_back(message("user", "cache boundary next question"));
+                const std::vector<int> future = fi::inkling::render_chat(next, encode_text, *inkling, image_tokens);
+                const auto common = static_cast<std::size_t>(
+                    std::mismatch(out.ids.begin(), out.ids.end(), future.begin(), future.end()).first - out.ids.begin());
+                out.turn_closure = static_cast<std::uint32_t>(common);
+            } catch (const std::exception&) {
+                // A request the hypothetical turn cannot extend still renders and runs; it just leaves no boundary.
+            }
+        }
         // Each image's pads are one run (payload text never encodes to a special token), in image order.
         std::size_t image = 0;
         for (std::size_t i = 0; i < out.ids.size();) {
@@ -1969,6 +1995,10 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
             result.prepare.reused_patch_bytes       = inkling.cache.reused_patch_bytes;
             result.prepare.media_preprocess_seconds = inkling.media_seconds;
             result.prepare.media_preprocess_work_seconds = inkling.cache.build_seconds;
+        }
+        if (inkling.turn_closure > 0) {
+            result.identity.rewrite_checkpoint =
+                RewriteCheckpointSpec{.kind = RewriteCheckpointKind::TurnClosure, .frontier = inkling.turn_closure};
         }
         result.identity.reusable   = true;
         // The model writes `<|message_model|><|content_thinking|>` itself: a prompt never ends in a thought.
