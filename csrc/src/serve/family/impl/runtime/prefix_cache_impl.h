@@ -96,13 +96,18 @@ std::vector<Tensor> ProgramImplCore::prefix_state_tensors(const SequenceState& s
         // per visit in the linear-attention pool, target design notes, section 2): the state
         // layers are the served layers. No other target gets here: a hybrid stack has layers that
         // do not attend, a pure attention stack has no state layers.
-        if (decoder->linear_attention.layer_count() != static_cast<std::uint32_t>(cfg.layers)) {
+        // A target may keep state layers past the served ones (Inkling's LoopCD reference visits, state layers 48..53):
+        // they belong to the stage that runs the last visit.
+        const auto state_layers = decoder->linear_attention.layer_count();
+        if (state_layers < static_cast<std::uint32_t>(cfg.layers)) {
             throw std::logic_error("per-layer conv state does not match the served layers");
         }
-        for (int layer = first; layer < last; ++layer) {
-            tensors.push_back(decoder->linear_attention.conv_slot(static_cast<std::uint32_t>(layer), slot));
+        const std::uint32_t state_last =
+            last == cfg.layers ? state_layers : static_cast<std::uint32_t>(last);
+        for (std::uint32_t layer = static_cast<std::uint32_t>(first); layer < state_last; ++layer) {
+            tensors.push_back(decoder->linear_attention.conv_slot(layer, slot));
             if (decoder->linear_attention.spec.has_recurrent()) {
-                tensors.push_back(decoder->linear_attention.recurrent_slot(static_cast<std::uint32_t>(layer), slot));
+                tensors.push_back(decoder->linear_attention.recurrent_slot(layer, slot));
             }
         }
     }
