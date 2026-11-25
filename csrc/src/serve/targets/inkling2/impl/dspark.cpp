@@ -3,6 +3,7 @@
 #include "targets/inkling2/impl/dspark.h"
 #include "targets/inkling2/impl/variant.h"
 #include "targets/inkling2/impl/visits.h"
+#include "targets/inkling2/impl/loopcd.h"
 
 #include "api/ops/inkling_mix.h"
 #include "api/ops/inkling_attention.h"
@@ -533,8 +534,19 @@ void dspark_propose(const load::InklingWeights& w, const DSparkDerived& d, const
 
 std::vector<std::int32_t> Variant::extra_kv_planes(const family::TextGeometry& geometry,
                                                    const family::StartupFeatures& features) {
-    if (!features.dflash() || geometry.dflash.layers <= 0) { return {}; }
-    return {G::kBlockWindow, 0, G::kBlockWindow};
+    std::vector<std::int32_t> planes;
+    if (features.dflash() && geometry.dflash.layers > 0) { planes = {G::kBlockWindow, 0, G::kBlockWindow}; }
+    if (loopcd_settings().enabled) {
+        // LoopCD's reference visits (loopcd.h): the coda's six layers again, after the drafter's planes, with the
+        // windows of visits 42..47.
+        loopcd_set_first_plane(TextConfig::layers + static_cast<int>(planes.size()));
+        for (int j = 0; j < kLoopcdVisits; ++j) {
+            planes.push_back(kVisits[static_cast<std::size_t>(TextConfig::layers - kLoopcdVisits + j)].global
+                                 ? 0
+                                 : TextConfig::window);
+        }
+    }
+    return planes;
 }
 
 namespace {

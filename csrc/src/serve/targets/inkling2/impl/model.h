@@ -47,6 +47,7 @@ struct InklingModel {
     const load::InklingWeights* weights   = nullptr;
     const DerivedQueries* queries         = nullptr;
     const DSparkDerived* dspark           = nullptr; ///< set when the drafter is bound (DSpark)
+    float* loopcd_scratch                 = nullptr; ///< LoopCD head scratch (loopcd.h); null with LoopCD off
 };
 
 /// The `FullAttentionProjectionWeights` of a visit: its physical layer and where it sits in the schedule.
@@ -99,6 +100,7 @@ public:
     load::InklingWeights weights;
     DerivedQueries queries;
     DSparkDerived dspark; ///< the drafter's load-time derivations (DSpark); empty without `--speculative dflash`
+    DeviceBuffer loopcd_scratch; ///< FP32 [201024, 2 x 32] for the LoopCD head (loopcd.h); empty with LoopCD off
     InklingModel model;
     RuntimeModelView runtime;
 };

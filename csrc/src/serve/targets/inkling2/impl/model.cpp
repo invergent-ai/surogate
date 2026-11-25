@@ -3,6 +3,7 @@
 
 #include "targets/inkling2/impl/model.h"
 #include "targets/inkling2/impl/visits.h"
+#include "targets/inkling2/impl/loopcd.h"
 
 #include "api/ops/inkling_attention.h"
 #include "artifact/reader.h"
@@ -119,6 +120,8 @@ family::TextGeometry visit_geometry(const artifact::Reader& reader) {
         g.token_domain != C::token_domain || g.experts != C::experts || g.experts_per_token != C::experts_per_token) {
         throw std::invalid_argument("inkling2: the artifact's geometry is not Inkling-2-Mini's");
     }
+    // LoopCD (loopcd.h): the hidden that crosses a round boundary carries [h ; h_ref] per column.
+    if (loopcd_settings().enabled) { g.hidden = 2 * C::hidden; }
     return g;
 }
 
@@ -138,6 +141,10 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     derive_rel_tables(weights, queries);
     model.weights = &weights;
     model.queries = &queries;
+    if (loopcd_settings().enabled) {
+        loopcd_scratch       = DeviceBuffer(loopcd_head_scratch_bytes());
+        model.loopcd_scratch = static_cast<float*>(loopcd_scratch.data());
+    }
     if (weights.has_draft) {
         // DSpark: the fold and the drafter's derived weights; the runtime's DFlash guards need a payload.
         derive_dspark(weights, dspark, plan.plan.options.draft_linears_host, dspark_fp8_fold_requested());

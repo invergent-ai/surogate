@@ -7,6 +7,7 @@
 
 #include "targets/inkling2/impl/variant.h"
 #include "targets/inkling2/impl/visits.h"
+#include "targets/inkling2/impl/loopcd.h"
 #include "targets/inkling2/impl/naive/naive.h"
 
 #include "api/ops/inkling_attention.h"
@@ -491,13 +492,24 @@ ops::InklingMoeWeights moe_weights(const load::InklingLayerWeights& L) {
     return w;
 }
 
-void run_visit(Round& rd, int v) {
+/// Visit `v` (its VisitInfo and physical layer). A LoopCD reference visit (loopcd.h) runs visit `v`'s layer and slot
+/// pattern on its own conv-state layer `state_v` and KV plane `plane_v`, and captures no routing, feature or dump.
+void run_visit(Round& rd, int v, int state_v = -1, int plane_v = -1) {
+    const bool primary = state_v < 0;
+    const int sv       = primary ? v : state_v;
+    const int pv       = primary ? v : plane_v;
+    struct DumpGuard {
+        Dump& d;
+        bool was;
+        ~DumpGuard() { d.active = was; }
+    } dump_guard{dump_state(), dump_state().active};
+    if (!primary) { dump_guard.d.active = false; }
     const VisitInfo& vi                 = kVisits[static_cast<std::size_t>(v)];
     const load::InklingLayerWeights& L  = *rd.model.full_layers.at(static_cast<std::size_t>(v)).projection.layer;
     const int T                         = rd.T;
     cudaStream_t s                      = rd.s;
     auto scope                          = rd.work.scope();
-    if (vi.feature >= 0 && rd.r.features.active()) {
+    if (primary && vi.feature >= 0 && rd.r.features.active()) {
         // DSpark: a contiguous [2304, T] copy -- the sink's verify path views the value it is given.
         Tensor feature   = rd.work.alloc(DType::BF16, {D, T});
         const Tensor src = slot_tensor(rd.r.x, vi.partial, T);
@@ -600,11 +612,11 @@ void run_visit(Round& rd, int v) {
     // 3. attention per group: the invariant attention op (prologue: K / V conv + cache write; relative attention; gate and
     //    sink). The K / V conv state is its: in place, recorded (verify), or captured at a rewrite checkpoint.
     Tensor gated = rd.work.alloc(DType::BF16, {C::attn_width, T});
-    const ops::InklingConvStateView state = state_view(rd, v);
+    const ops::InklingConvStateView state = state_view(rd, sv);
     if (use_naive()) {
         Tensor q_out = rd.work.alloc(DType::BF16, {C::attn_width, T});
         Tensor r_out = rd.work.alloc(DType::BF16, {C::query_heads * C::d_rel, T});
-        const PlaneView plane                 = plane_view(rd, v);
+        const PlaneView plane                 = plane_view(rd, pv);
         const auto kv_input = [&](int column, int row_base) {
             return ops::InklingPlane{bf16_ptr(qkvr) + static_cast<std::int64_t>(column) * C::qkvr_rows + row_base,
                                      DType::BF16, C::qkvr_rows};
@@ -646,9 +658,9 @@ void run_visit(Round& rd, int v) {
             call.out         = bf16_ptr(gated) + static_cast<std::int64_t>(g.column) * C::attn_width;
             naive::attention(call, s);
             if (g.record) {
-                ops::inkling_conv_record(kv_input(g.column, C::qkvr_k_begin), 1024, g.width, g.batch, v, G::kStreamK,
+                ops::inkling_conv_record(kv_input(g.column, C::qkvr_k_begin), 1024, g.width, g.batch, sv, G::kStreamK,
                                          rd.records, s);
-                ops::inkling_conv_record(kv_input(g.column, C::qkvr_v_begin), 1024, g.width, g.batch, v, G::kStreamV,
+                ops::inkling_conv_record(kv_input(g.column, C::qkvr_v_begin), 1024, g.width, g.batch, sv, G::kStreamV,
                                          rd.records, s);
             }
             ops::inkling_conv_update_window(kv_input(g.column, C::qkvr_k_begin), 1024, rows, state, G::kStreamK, s);
@@ -660,8 +672,8 @@ void run_visit(Round& rd, int v) {
     } else {
         const ops::InklingAttentionWeights aw = attention_weights(rd, L);
         const ops::InklingLayerKind kind      = vi.global ? ops::InklingLayerKind::Global : ops::InklingLayerKind::Local;
-        const PagedKVBatchLayerView cache     = kv_batch_view(rd, v);
-        Tensor states                         = rd.r.state->conv.at(static_cast<std::size_t>(v));
+        const PagedKVBatchLayerView cache     = kv_batch_view(rd, pv);
+        Tensor states                         = rd.r.state->conv.at(static_cast<std::size_t>(sv));
         using AG                              = ops::InklingAttentionGeometry;
         for (const Group& g : rd.groups) {
             const family::VisitSegment* seg = g.segment;
@@ -703,7 +715,7 @@ void run_visit(Round& rd, int v) {
             conv.states = states;
             conv.slots  = g.slots;
             conv.mode   = g.record ? ops::InklingConvMode::Record : ops::InklingConvMode::InPlace;
-            if (g.record) { conv.records = records_view(rd, v, g.batch); }
+            if (g.record) { conv.records = records_view(rd, sv, g.batch); }
             if (seg != nullptr && seg->checkpoint_slot >= 0) {
                 conv.capture_column = seg->checkpoint_column;
                 conv.capture_slot   = seg->checkpoint_slot;
@@ -737,7 +749,7 @@ void run_visit(Round& rd, int v) {
     for (const Group& g : rd.groups) {
         const family::VisitSegment* seg = g.segment;
         if (g.record) {
-            ops::inkling_conv_record(packed(attn_partial, g.column), D, g.width, g.batch, v, G::kStreamAttn, rd.records, s);
+            ops::inkling_conv_record(packed(attn_partial, g.column), D, g.width, g.batch, sv, G::kStreamAttn, rd.records, s);
         }
         ops::inkling_short_conv(packed(attn_partial, g.column), D, L.attn_out_conv, g.rows(), state, G::kStreamAttn,
                                 nullptr, nullptr, packed(attn_out, g.column), s,
@@ -773,14 +785,14 @@ void run_visit(Round& rd, int v) {
         moe.tokens = T;
         moe.layer  = moe_layer(L);
         moe.out    = moe_out.data;
-        if (rd.r.routing.ids != nullptr && T <= rd.r.routing.columns) {
+        if (primary && rd.r.routing.ids != nullptr && T <= rd.r.routing.columns) {
             moe.capture = rd.r.routing.ids + static_cast<std::int64_t>(v) * rd.r.routing.columns * rd.r.routing.top_k;
         }
         naive::moe(moe, rd.work, s);
     } else {
         ops::InklingMoeCapture capture;
         ops::InklingMoeOptions options;
-        if (rd.r.routing.ids != nullptr && T <= rd.r.routing.columns) {
+        if (primary && rd.r.routing.ids != nullptr && T <= rd.r.routing.columns) {
             capture.ids             = rd.r.routing.ids + static_cast<std::int64_t>(v) * rd.r.routing.columns * rd.r.routing.top_k;
             capture.capacity_tokens = rd.r.routing.columns;
             capture.first_token     = 0;
@@ -799,7 +811,7 @@ void run_visit(Round& rd, int v) {
     for (const Group& g : rd.groups) {
         const family::VisitSegment* seg = g.segment;
         if (g.record) {
-            ops::inkling_conv_record(packed(moe_out, g.column), D, g.width, g.batch, v, G::kStreamMlp, rd.records, s);
+            ops::inkling_conv_record(packed(moe_out, g.column), D, g.width, g.batch, sv, G::kStreamMlp, rd.records, s);
         }
         const ops::InklingPlane residual = slot_plane(rd.r.x, vi.partial, g.column);
         const ops::InklingPlane addend   = packed(attn_out, g.column);
@@ -811,6 +823,27 @@ void run_visit(Round& rd, int v) {
         }
     }
     dump("partial", v, bf16_ptr(rd.r.x) + static_cast<std::int64_t>(vi.next_partial) * D, DType::BF16, kColumn, D, T, 1, s);
+}
+
+/// LoopCD (loopcd.h): the coda's six layers on pass 0's state (slots 2-3 hold pass 0's blocks after visit 17), each
+/// with its own conv-state layer (48 + j) and KV plane, then the output mix of that state into slot 6.
+void run_loopcd_reference(Round& rd) {
+    const int first_plane = loopcd_first_plane();
+    for (int j = 0; j < kLoopcdVisits; ++j) {
+        run_visit(rd, C::layers - kLoopcdVisits + j, C::layers + j, first_plane + j);
+    }
+    auto scope = rd.work.scope();
+    ops::InklingAttnResSources src;
+    src.stack_count = static_cast<std::int32_t>(kFinalStack.size());
+    for (std::size_t i = 0; i < kFinalStack.size(); ++i) { src.stack[i] = slot_plane(rd.r.x, kFinalStack[i]); }
+    src.last = slot_plane(rd.r.x, kFinalPartial);
+    const Tensor norm(rd.im.weights->globals.final_norm.data, DType::BF16, {D, 1});
+    Tensor out = rd.work.alloc(DType::BF16, {D, rd.T, 1});
+    ops::inkling_attn_res(src, rd.T, rd.q.output, &norm, C::rms_epsilon, out, rd.s);
+    const ops::InklingPlane to = slot_plane(rd.r.x, kFinalPartial);
+    CUDA_CHECK(cudaMemcpy2DAsync(to.data, static_cast<std::size_t>(kColumn) * 2, out.data, static_cast<std::size_t>(D) * 2,
+                                 static_cast<std::size_t>(D) * 2, static_cast<std::size_t>(rd.T), cudaMemcpyDeviceToDevice,
+                                 rd.s));
 }
 
 const InklingModel& model_of(const RuntimeModelView& model) {
@@ -826,7 +859,8 @@ void Variant::run_visits(const ModelView& model, family::VisitRound& r) {
     if (r.work == nullptr || r.state == nullptr || r.x.data == nullptr || r.positions.data == nullptr) {
         throw std::logic_error("inkling2: incomplete visit round");
     }
-    if (r.x.ne[0] != C::residual || r.state->conv.size() != static_cast<std::size_t>(C::layers)) {
+    const bool loopcd = loopcd_settings().enabled;
+    if (r.x.ne[0] != C::residual || r.state->conv.size() != static_cast<std::size_t>(loopcd_state_layers())) {
         throw std::logic_error("inkling2: the residual or the conv-state pool does not have the visit layout");
     }
     if (!r.sequence_kv.valid() && r.text_kv == nullptr) {
@@ -907,7 +941,7 @@ void Variant::run_visits(const ModelView& model, family::VisitRound& r) {
     const auto& conv = r.state->conv;
     rd.pool = ops::InklingConvPool{conv[0].data,
                                    (static_cast<const std::byte*>(conv[1].data) - static_cast<const std::byte*>(conv[0].data)) / 2,
-                                   static_cast<std::int64_t>(kConvChannels) * 3, C::layers};
+                                   static_cast<std::int64_t>(kConvChannels) * 3, loopcd_state_layers()};
     for (const Group& g : rd.groups) {
         if (!g.record) { continue; }
         if (r.records.old == nullptr || g.width > r.records.width_max || g.batch > r.records.batch_max) {
@@ -930,7 +964,20 @@ void Variant::run_visits(const ModelView& model, family::VisitRound& r) {
     }();
     d.active = d.dir != nullptr && !dumped && capturing == cudaStreamCaptureStatusNone && !r.segments.empty() &&
                rd.T >= min_columns;
-    for (int v = r.first_visit; v < r.last_visit; ++v) { run_visit(rd, v); }
+    if (loopcd && (r.first_visit != 0 || r.last_visit != C::layers || loopcd_first_plane() < 0)) {
+        throw std::logic_error("inkling2: LoopCD runs on one card only (no pipeline split)");
+    }
+    for (int v = r.first_visit; v < r.last_visit; ++v) {
+        run_visit(rd, v);
+        if (loopcd && v == kLoopcdAfterVisit) { run_loopcd_reference(rd); }
+        if (loopcd && v == kLoopcdMoveVisit) {
+            const ops::InklingPlane from = slot_plane(rd.r.x, kFinalPartial);
+            const ops::InklingPlane to   = slot_plane(rd.r.x, kLoopcdHiddenSlot);
+            CUDA_CHECK(cudaMemcpy2DAsync(to.data, static_cast<std::size_t>(kColumn) * 2, from.data,
+                                         static_cast<std::size_t>(kColumn) * 2, static_cast<std::size_t>(D) * 2,
+                                         static_cast<std::size_t>(rd.T), cudaMemcpyDeviceToDevice, rd.s));
+        }
+    }
     // DSpark's fourth feature: the final-norm output, the BF16 hidden the LM head reads, captured before the
     // runtime checks the round's features are complete; the same invariant mix finish() runs.
     if (r.features.active() && r.last_visit == C::layers) {
@@ -961,6 +1008,7 @@ std::size_t Variant::visit_workspace_capacity_bytes(const family::TextGeometry&,
     bytes += up(T * C::attn_width * 2) * 2 + up(T * 384 * 2); // q_out, gated, r_out
     bytes += up(T * D * 2) * 4;                              // attn_partial, attn_out, mlp_in, moe_out
     bytes += up(T * D * 2);                                  // a DSpark feature copy
+    if (loopcd_settings().enabled) { bytes += up(T * D * 2); } // LoopCD: the reference's output mix
     // the looped blend tile: dest + msg fp32, pair, h, gf fp32, blended
     bytes += up(tile * D * 3 * 4) + up(tile * D * 3 * 4) + up(tile * 2 * D * 3 * 2) + up(tile * C::gate_rank * 3 * 2) +
              up(tile * 2 * D * 3 * 4) + up(tile * D * 3 * 2);

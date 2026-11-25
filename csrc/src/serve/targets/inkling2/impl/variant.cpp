@@ -3,11 +3,13 @@
 
 #include "targets/inkling2/impl/variant.h"
 #include "targets/inkling2/impl/visits.h"
+#include "targets/inkling2/impl/loopcd.h"
 
 #include "api/ops/inkling_mix.h"
 #include "core/device.h"
 #include "family/impl/runtime/target_support.h"
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -66,7 +68,7 @@ std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t 
 LinearAttentionStatePoolSpec Variant::visit_state_spec(const family::TextGeometry& geometry, std::int32_t slots) {
     if (geometry.layers != C::layers) { throw std::logic_error("inkling2: the served geometry is not the visit one"); }
     LinearAttentionStatePoolSpec spec;
-    spec.layers        = static_cast<std::uint32_t>(C::layers);
+    spec.layers        = static_cast<std::uint32_t>(loopcd_state_layers()); // + LoopCD's reference visits
     spec.conv_channels = ops::InklingMixGeometry::kConvChannels;
     spec.conv_width    = ops::InklingMixGeometry::kConvHistory;
     spec.slot_count    = slots;
@@ -88,7 +90,7 @@ void Variant::embed_residual(const ModelView& model, const Tensor& ids, Tensor& 
                        C::rms_epsilon, slot_plane(residual, 0), stream);
 }
 
-void Variant::final_residual_mix(const ModelView& model, const Tensor& residual, Tensor& hidden, WorkspaceArena&,
+void Variant::final_residual_mix(const ModelView& model, const Tensor& residual, Tensor& hidden, WorkspaceArena& work,
                                  cudaStream_t stream) {
     const InklingModel& im = model_of(model);
     ops::InklingAttnResSources src;
@@ -96,16 +98,53 @@ void Variant::final_residual_mix(const ModelView& model, const Tensor& residual,
     for (std::size_t i = 0; i < kFinalStack.size(); ++i) { src.stack[i] = slot_plane(residual, kFinalStack[i]); }
     src.last = slot_plane(residual, kFinalPartial);
     const Tensor norm(im.weights->globals.final_norm.data, DType::BF16, {C::hidden, 1});
-    Tensor out(hidden.data, DType::BF16, {C::hidden, residual.ne[1], 1});
-    ops::inkling_attn_res(src, residual.ne[1], im.queries->output, &norm, C::rms_epsilon, out, stream);
+    const std::int32_t T = residual.ne[1];
+    if (hidden.ne[0] != 2 * C::hidden) {
+        Tensor out(hidden.data, DType::BF16, {C::hidden, T, 1});
+        ops::inkling_attn_res(src, T, im.queries->output, &norm, C::rms_epsilon, out, stream);
+        return;
+    }
+    // LoopCD (loopcd.h): [h ; h_ref] per column. h is the same mix as above (computed contiguous, then placed); h_ref
+    // is the reference's output mix, already in slot kLoopcdHiddenSlot.
+    if (!loopcd_settings().enabled) { throw std::logic_error("inkling2: a 2 x 2304 hidden without LoopCD"); }
+    auto scope = work.scope();
+    Tensor out = work.alloc(DType::BF16, {C::hidden, T, 1});
+    ops::inkling_attn_res(src, T, im.queries->output, &norm, C::rms_epsilon, out, stream);
+    constexpr std::size_t row = static_cast<std::size_t>(C::hidden) * 2;
+    auto* dst = static_cast<std::uint16_t*>(hidden.data);
+    CUDA_CHECK(cudaMemcpy2DAsync(dst, 2 * row, out.data, row, row, static_cast<std::size_t>(T),
+                                 cudaMemcpyDeviceToDevice, stream));
+    const ops::InklingPlane ref = slot_plane(residual, kLoopcdHiddenSlot);
+    CUDA_CHECK(cudaMemcpy2DAsync(dst + C::hidden, 2 * row, ref.data, static_cast<std::size_t>(C::residual) * 2, row,
+                                 static_cast<std::size_t>(T), cudaMemcpyDeviceToDevice, stream));
 }
 
 void Variant::lm_head(const ModelView& model, const Tensor& hidden, Tensor& logits, cudaStream_t stream) {
-    if (logits.dtype != DType::FP32 || logits.ne[0] != C::output_rows || hidden.ne[0] != C::hidden ||
+    if (logits.dtype != DType::FP32 || logits.ne[0] != C::output_rows ||
+        (hidden.ne[0] != C::hidden && hidden.ne[0] != 2 * C::hidden) ||
         logits.ne[1] * logits.ne[2] != hidden.ne[1] * hidden.ne[2]) {
         throw std::logic_error("inkling2: the LM head writes FP32 [201024, T] logits from a [2304, T] hidden");
     }
     const std::int32_t tokens = hidden.ne[1] * hidden.ne[2];
+    if (hidden.ne[0] == 2 * C::hidden) {
+        // LoopCD (loopcd.h): the [h ; h_ref] columns are a [2304, 2T] matrix (column 2t = h_t, 2t + 1 = h_ref_t); the
+        // invariant head over a chunk of them, its softcap, then the contrast into the logits.
+        const LoopcdSettings& lc = loopcd_settings();
+        float* pairs             = model_of(model).loopcd_scratch;
+        if (!lc.enabled || pairs == nullptr) { throw std::logic_error("inkling2: a 2 x 2304 hidden without LoopCD"); }
+        const auto* h = static_cast<const std::uint16_t*>(hidden.data);
+        for (std::int32_t c = 0; c < tokens; c += kLoopcdHeadTokens) {
+            const std::int32_t n = std::min<std::int32_t>(kLoopcdHeadTokens, tokens - c);
+            ops::inkling_gemm_inv(model.output_head.qdata, C::output_rows, C::hidden,
+                                  h + static_cast<std::int64_t>(c) * 2 * C::hidden, 2 * n, pairs, DType::FP32,
+                                  C::output_rows, {}, nullptr, 0, stream);
+            ops::inkling_softcap_f32(pairs, C::output_rows, 2 * n, C::output_rows, C::logit_softcap, stream);
+            loopcd_combine(pairs, C::output_rows, C::token_domain, n, lc.adaptive, lc.strength,
+                           static_cast<float*>(logits.data) + static_cast<std::int64_t>(c) * C::output_rows,
+                           C::output_rows, stream);
+        }
+        return;
+    }
     // The invariant GEMM: a column's logits do not depend on how many columns share the head.
     ops::inkling_gemm_inv(model.output_head.qdata, C::output_rows, C::hidden, hidden.data, tokens, logits.data,
                           DType::FP32, C::output_rows, {}, nullptr, 0, stream);
