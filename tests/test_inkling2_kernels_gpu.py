@@ -1,15 +1,15 @@
-"""M3 GPU op tests of lane g2's Inkling-2 trainer kernels against the fp64 references (ENGINE-INKLING, lane g2).
+"""GPU op tests of the Inkling-2 trainer kernels (csrc/src/kernels/inkling) against the fp64 references.
 
-Rules: the pre-registered tolerances of lanes/g2/DESIGN-kernels.md section C (lanes/g2/ref/tolerance.py):
+Rules: the tolerances of tests/inkling_ref/tolerance.py:
 C.1 bf16 / e4m3 outputs, C.2 attention vs the fp32 "pt" emulation, C.3 fp32 paths, C.5 determinism (bit-exact reruns).
 Production dims: Hq 24, Hkv 8, head 128, rel extent / window 1024, C 2304, k/v channels 1024; T = 4,096 rows packed
 as 3 documents (2,500 / 1,000 / 596) + a key-prefix (chunk) case for the attention parts.
 
 Kernels are called through the flat C entry points of csrc/src/kernels/inkling/inkling_capi.cpp, loaded with ctypes
-from the trainer package's libsurogate-common.so (env INKLING_LIB, default: the g2 package on gpubox2). References run
+from libsinfer_inkling_bwd.so (env INKLING_LIB). References run
 on the CPU in fp64 (attention per KV-head group to bound memory).
 
-Run (gpubox2, one card): CUDA_VISIBLE_DEVICES=7 python tests/test_inkling2_kernels_gpu.py [--only name,...]
+Run (one card): CUDA_VISIBLE_DEVICES=0 INKLING_LIB=/path/libsinfer_inkling_bwd.so python tests/test_inkling2_kernels_gpu.py [--only name,...]
 Exit code 0 = all PASS. A JSON report goes to $INKLING_REPORT (default ./inkling2_kernels_gpu_report.json).
 """
 
@@ -25,12 +25,12 @@ import time
 
 import torch
 
-REF_DIR = os.environ.get("INKLING_G2_REF", "/mnt/data/work/rl/engine-inkling-2026-11-21/lanes/g2/ref")
+REF_DIR = os.environ.get("INKLING_G2_REF", os.path.join(os.path.dirname(os.path.abspath(__file__)), "inkling_ref"))
 sys.path.insert(0, REF_DIR)
 import inkling_kernels_ref as R  # noqa: E402
 import tolerance as TOL  # noqa: E402
 
-LIB = os.environ.get("INKLING_LIB", "/home/densemax2/effrl/build-inkling/lanes/g2/pkg/surogate/libsurogate-common.so")
+LIB = os.environ.get("INKLING_LIB", "libsinfer_inkling_bwd.so")
 F64, F32, BF16 = torch.float64, torch.float32, torch.bfloat16
 # INKLING_DRY=1: CPU plumbing check of this script (no kernels: every call is a no-op, the checks then FAIL);
 # INKLING_SMALL=1: small shapes (documents 250 / 100 / 60, prefix case 128 queries over 1,500 keys).

@@ -3,7 +3,7 @@
 
 Every change is an anchored text patch (the anchor must occur the stated number of times), so the fork can be
 re-derived and reviewed against upstream. Run from anywhere: `python3 make_fork.py`; writes the patched headers next
-to this script (committed). Design: rl/engine-inkling-2026-11-21/lanes/g2/DESIGN-kernels.md A.1.
+to this script (committed).
 
 Forward (this file, step 1):
   F1 relative bias in the Has_alibi slot of `Mask` (rel[row, h, d] bf16 at distance d = row + k_len - q_len - col,
@@ -11,6 +11,11 @@ Forward (this file, step 1):
   F2 fp32 O written straight from the accumulator (no bf16 rounding before the LSE merge);
   F3 rows without keys: O = 0 and lse = -inf (upstream writes +inf), so the merge treats them as an empty part;
   F4 params: rel_ptr / rel_row_stride / rel_extent (+ backward fields, step 2).
+
+NOT reproduced by this script yet: two later hand edits of the generated headers, marked "inkling:" in place: the LOW
+part of the probabilities in flash_fwd_kernel.h (a second P . V product) and of the score cotangent in
+flash_bwd_kernel.h (second dS . K and dS^T . Q products, with the dK product moved before the dQ write). Re-running the
+script without carrying them over would drop them.
 """
 
 from __future__ import annotations

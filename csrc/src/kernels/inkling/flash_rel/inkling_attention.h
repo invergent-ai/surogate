@@ -8,7 +8,7 @@
 // Geometry = the executor's chunk segment form (backend_kvprefix): segment s has queries cu_q[s] .. cu_q[s+1] (rows of
 // q) and keys cu_k[s] .. cu_k[s+1] (rows of k / v); query i of a segment sits at key index k_len - q_len + i.
 // Outputs: out fp32 [total_q, Hq, 128] normalised over the part's keys, lse fp32 [Hq, total_q] (natural log; -inf =
-// no keys). References: lanes/g2/ref/inkling_kernels_ref.py attn_part_fwd / attn_part_bwd(_std).
+// no keys). References: tests/inkling_ref/inkling_kernels_ref.py attn_part_fwd / attn_part_bwd(_std).
 
 #pragma once
 

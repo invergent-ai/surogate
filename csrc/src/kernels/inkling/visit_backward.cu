@@ -1,8 +1,8 @@
 // Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: Apache-2.0
 //
-// Inkling-2 trainer, lane g2: backward-only entry points of the engine-op IR (see visit_backward.h). Composes the
-// kernels of inkling.h and the FA2-fork backward (flash_rel/); references: lanes/g2/ref/inkling_kernels_ref.py
+// Inkling-2 trainer: backward-only entry points of the engine-op IR (see visit_backward.h). Composes the
+// kernels of inkling.h and the FA2-fork backward (flash_rel/); references: tests/inkling_ref/inkling_kernels_ref.py
 // (merge_bwd, attn_part_bwd, qkv_norm_bwd, short_conv_bwd, dynamic_conv_bwd).
 
 #include "kernels/inkling/visit_backward.h"

@@ -1,9 +1,9 @@
 // Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: Apache-2.0
 //
-// Inkling-2 trainer kernels (lane g2): row / elementwise ops -- tau, q/r/k/v norms, short convs, attention merge,
+// Inkling-2 trainer kernels: row / elementwise ops -- tau, q/r/k/v norms, short convs, attention merge,
 // softcapped SwiGLU, MoE combine. Forward numerics: the engine's (inkling_common.cuh); references:
-// lanes/g2/ref/inkling_kernels_ref.py.
+// tests/inkling_ref/inkling_kernels_ref.py.
 
 #include <cmath>
 #include <cstdint>

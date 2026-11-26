@@ -1,8 +1,7 @@
 // Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: Apache-2.0
 //
-// Inkling-2 trainer, lane g2: BACKWARD-ONLY entry points for the engine-op IR (DESIGN.md section 11: the trainer's
-// forward is the engine's ops; lanes/g1/NOTES.md "ENGINE-OP IR" items 1-7 and their save lists). The coarse IR op
+// Inkling-2 trainer: BACKWARD-ONLY entry points (the trainer's forward is the engine's own ops). The coarse op
 // `ink_attention` (engine: prologue + relative attention + gate / sink) gets its backward from two calls:
 //   attention_visit_bwd  -- from the engine's saved o (before sink and gate) and l (natural lse, no sink): the
 //                           union-form backward of near (+ far) + merge + sink + gate -> dq, dk, dv, d_r, d_sink, d_gate;
@@ -26,7 +25,7 @@ namespace inkling {
 
 /// Keys [pos0, pos0 + rows) of one row of the engine's paged e4m3 plane -> contiguous bf16 [rows, Hkv, 128] (exact).
 /// Element offset of (head, pos, d): 128 * 64 * (head + Hkv * page) + 128 * (pos & 63) + d, page = block_table[pos >> 6]
-/// (lane c DESIGN-attention 2, `paged_kv_element_offset<128, 8>`).
+/// (`paged_kv_element_offset<128, 8>`).
 void kv_plane_gather_bf16(nv_bfloat16* dst, const std::uint8_t* plane, const int* block_table, long pos0, long rows,
                           int Hkv, cudaStream_t stream);
 

@@ -1,10 +1,10 @@
 // Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: Apache-2.0
 //
-// Inkling-2 trainer kernels (lane g2): block AttnRes mix (fwd / bwd) and the loop controllers' elementwise parts.
+// Inkling-2 trainer kernels: block AttnRes mix (fwd / bwd) and the loop controllers' elementwise parts.
 // Forward fp32 order as `ops/attn_res.py` `_attn_res_kernel` and `ops/loop.py` (fma where Triton fuses, explicit
 // rn ops where it compiles with enable_fp_fusion=False); reductions: fixed order (inkling_common.cuh block_sum).
-// References: lanes/g2/ref/inkling_kernels_ref.py attn_res_*, loop_blend_*.
+// References: tests/inkling_ref/inkling_kernels_ref.py attn_res_*, loop_blend_*.
 
 #include <stdexcept>
 #include <string>

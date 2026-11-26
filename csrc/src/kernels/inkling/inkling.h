@@ -1,9 +1,8 @@
 // Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: Apache-2.0
 //
-// Inkling-2 trainer kernels (lane g2): forward + backward of the ops of lane g1's DSL family (`inkling_*` graph ops,
-// lanes/g1/DESIGN-trainer.md D + B.4). Semantics and the backward formulas: the fp64 references
-// rl/engine-inkling-2026-11-21/lanes/g2/ref/inkling_kernels_ref.py (same function names, minus `_fwd` / `_bwd`).
+// Inkling-2 trainer kernels: forward + backward of the visit's ops. Semantics and the backward formulas: the fp64
+// references tests/inkling_ref/inkling_kernels_ref.py (same function names, minus `_fwd` / `_bwd`).
 // Layouts: token-major; T = tokens of the chunk; attention lse [H, T]; positions int32 = position within the document
 // (a chunk's documents are told apart by positions alone in the convolutions). All gradients fp32 unless stated.
 // No kernel here allocates; every reduction has a fixed order (bitwise reproducible).

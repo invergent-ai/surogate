@@ -1,7 +1,7 @@
 // Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: Apache-2.0
 //
-// Inkling-2 trainer kernels (lane g2): a flat C entry point per kernel, for the GPU op tests only
+// Inkling-2 trainer kernels: a flat C entry point per kernel, for the GPU op tests only
 // (tests/test_inkling2_kernels_gpu.py loads libsurogate-common.so with ctypes and passes torch device pointers).
 // Every call runs on the given stream (0 = legacy default), returns 0 on success and 1 on error (message:
 // inkling_capi_last_error). No production code calls these.

@@ -1,7 +1,7 @@
 // Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: Apache-2.0
 //
-// Inkling-2 trainer kernels (lane g2): device helpers shared by the forward / backward kernels.
+// Inkling-2 trainer kernels: device helpers shared by the forward / backward kernels.
 //
 // Forward kernels reproduce the serving engine's (and vLLM's sm_120 reference's) fp32 operations instruction for
 // instruction: the same approximate PTX (rsqrt.approx, ex2.approx, rcp.approx, tanh.approx), IEEE division where

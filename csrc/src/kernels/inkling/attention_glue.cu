@@ -1,7 +1,7 @@
 // Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: Apache-2.0
 //
-// Inkling-2 trainer kernels (lane g2): small glue kernels of the inkling_attention op wrapper -- the FP8-KV emulation
+// Inkling-2 trainer kernels: small glue kernels of the inkling_attention op wrapper -- the FP8-KV emulation
 // (e4m3 round trip of K / V), segment offsets for uniform rows and for the window-bounded chunk key buffer.
 
 #include <stdexcept>
