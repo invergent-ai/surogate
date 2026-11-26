@@ -8,6 +8,7 @@
 #include "targets/inkling2/impl/variant.h"
 #include "targets/inkling2/impl/visits.h"
 #include "targets/inkling2/impl/naive/naive.h"
+#include "targets/inkling2/impl/decision/round.h"
 
 #include "api/ops/inkling_attention.h"
 #include "api/ops/inkling_mix.h"
@@ -127,6 +128,10 @@ struct Round {
     ops::InklingConvPool pool{};
     /// The segments' ints went in one host copy this round: everything the step wrote before is complete.
     bool seg_barrier = false;
+    /// A decision round's private state (decision/round.h): one KV plane and one conv slot for every visit, instead
+    /// of the round's per-visit planes. Null / empty on the chat path.
+    const PagedKVBatchLayerView* kv_override = nullptr;
+    Tensor conv_override{};
 };
 
 /// S10 attention LoRA: the round's adapter selection on the bank table registered under `key` (a layer's qkvr or
@@ -194,7 +199,8 @@ std::size_t moe_state_span() { return (ops::inkling_moe_state_bytes() + 255U) & 
 constexpr ops::InklingKeyGroups kKeyGroups = ops::InklingKeyGroups::P3;
 
 ops::InklingConvStateView state_view(const Round& rd, int visit) {
-    const Tensor& conv = rd.r.state->conv.at(static_cast<std::size_t>(visit));
+    const Tensor& conv = rd.conv_override.data != nullptr ? rd.conv_override
+                                                          : rd.r.state->conv.at(static_cast<std::size_t>(visit));
     return {conv.data, static_cast<std::int64_t>(kConvChannels) * 3, kConvChannels};
 }
 
@@ -328,7 +334,13 @@ struct PlaneView {
 PlaneView plane_view(const Round& rd, int visit) {
     PlaneView out;
     DType dtype = DType::BF16;
-    if (rd.r.sequence_kv.valid()) {
+    if (rd.kv_override != nullptr) {
+        out.block_tables = static_cast<const std::int32_t*>(rd.kv_override->block_tables.data);
+        out.table_stride = rd.kv_override->block_tables.ne[0];
+        out.k_pages      = rd.kv_override->k_pages.data;
+        out.v_pages      = rd.kv_override->v_pages.data;
+        dtype            = rd.kv_override->dtype;
+    } else if (rd.r.sequence_kv.valid()) {
         const PagedKVLayerView view = rd.r.sequence_kv.layer_view(static_cast<std::uint32_t>(visit));
         out.block_tables = static_cast<const std::int32_t*>(view.block_table.data);
         out.table_stride = view.block_table.ne[0];
@@ -445,6 +457,7 @@ ops::InklingAttentionWeights attention_weights(const Round& rd, const load::Inkl
 
 /// The visit's KV plane as the attention's batch view (a single-sequence prefill's one block table as a 1-row matrix).
 PagedKVBatchLayerView kv_batch_view(const Round& rd, int visit) {
+    if (rd.kv_override != nullptr) { return *rd.kv_override; }
     if (!rd.r.sequence_kv.valid()) { return rd.r.text_kv->batch_layer_view(static_cast<std::uint32_t>(visit)); }
     const PagedKVLayerView v = rd.r.sequence_kv.layer_view(static_cast<std::uint32_t>(visit));
     PagedKVBatchLayerView out;
@@ -491,9 +504,10 @@ ops::InklingMoeWeights moe_weights(const load::InklingLayerWeights& L) {
     return w;
 }
 
-void run_visit(Round& rd, int v) {
-    const VisitInfo& vi                 = kVisits[static_cast<std::size_t>(v)];
-    const load::InklingLayerWeights& L  = *rd.model.full_layers.at(static_cast<std::size_t>(v)).projection.layer;
+/// One visit. `v` labels it (dumps, the routing capture, the verify records: the chat table's visit index); `vi` and
+/// `L` are its schedule entry and layer weights; `plane` is the KV plane and conv-state entry it reads and writes (`v`
+/// on the chat path; a decision round reuses one entry for every visit, see decision.cpp).
+void run_visit_on(Round& rd, int v, const VisitInfo& vi, const load::InklingLayerWeights& L, int plane) {
     const int T                         = rd.T;
     cudaStream_t s                      = rd.s;
     auto scope                          = rd.work.scope();
@@ -600,11 +614,11 @@ void run_visit(Round& rd, int v) {
     // 3. attention per group: the invariant attention op (prologue: K / V conv + cache write; relative attention; gate and
     //    sink). The K / V conv state is its: in place, recorded (verify), or captured at a rewrite checkpoint.
     Tensor gated = rd.work.alloc(DType::BF16, {C::attn_width, T});
-    const ops::InklingConvStateView state = state_view(rd, v);
+    const ops::InklingConvStateView state = state_view(rd, plane);
     if (use_naive()) {
         Tensor q_out = rd.work.alloc(DType::BF16, {C::attn_width, T});
         Tensor r_out = rd.work.alloc(DType::BF16, {C::query_heads * C::d_rel, T});
-        const PlaneView plane                 = plane_view(rd, v);
+        const PlaneView plane_kv              = plane_view(rd, plane);
         const auto kv_input = [&](int column, int row_base) {
             return ops::InklingPlane{bf16_ptr(qkvr) + static_cast<std::int64_t>(column) * C::qkvr_rows + row_base,
                                      DType::BF16, C::qkvr_rows};
@@ -626,11 +640,11 @@ void run_visit(Round& rd, int v) {
             call.positions    = static_cast<const std::int32_t*>(g.positions.data);
             call.valid        = static_cast<const std::int32_t*>(g.valid.data);
             call.table_rows   = static_cast<const std::int32_t*>(g.table_rows.data);
-            call.block_tables = plane.block_tables;
-            call.table_stride = plane.table_stride;
-            call.k_pages      = plane.k_pages;
-            call.v_pages      = plane.v_pages;
-            call.fp8          = plane.fp8;
+            call.block_tables = plane_kv.block_tables;
+            call.table_stride = plane_kv.table_stride;
+            call.k_pages      = plane_kv.k_pages;
+            call.v_pages      = plane_kv.v_pages;
+            call.fp8          = plane_kv.fp8;
             call.layer        = attention_layer(L);
             if (vi.global) {
                 call.k_dyn      = bf16_ptr(k_dyn) + static_cast<std::int64_t>(g.column) * 32;
@@ -660,8 +674,9 @@ void run_visit(Round& rd, int v) {
     } else {
         const ops::InklingAttentionWeights aw = attention_weights(rd, L);
         const ops::InklingLayerKind kind      = vi.global ? ops::InklingLayerKind::Global : ops::InklingLayerKind::Local;
-        const PagedKVBatchLayerView cache     = kv_batch_view(rd, v);
-        Tensor states                         = rd.r.state->conv.at(static_cast<std::size_t>(v));
+        const PagedKVBatchLayerView cache     = kv_batch_view(rd, plane);
+        Tensor states = rd.conv_override.data != nullptr ? rd.conv_override
+                                                         : rd.r.state->conv.at(static_cast<std::size_t>(plane));
         using AG                              = ops::InklingAttentionGeometry;
         for (const Group& g : rd.groups) {
             const family::VisitSegment* seg = g.segment;
@@ -813,6 +828,11 @@ void run_visit(Round& rd, int v) {
     dump("partial", v, bf16_ptr(rd.r.x) + static_cast<std::int64_t>(vi.next_partial) * D, DType::BF16, kColumn, D, T, 1, s);
 }
 
+void run_visit(Round& rd, int v) {
+    run_visit_on(rd, v, kVisits[static_cast<std::size_t>(v)],
+                 *rd.model.full_layers.at(static_cast<std::size_t>(v)).projection.layer, v);
+}
+
 const InklingModel& model_of(const RuntimeModelView& model) {
     if (model.full_layers.empty() || model.full_layers.front().projection.model == nullptr) {
         throw std::logic_error("inkling2: the model view carries no visits");
@@ -821,6 +841,77 @@ const InklingModel& model_of(const RuntimeModelView& model) {
 }
 
 } // namespace
+
+namespace decision {
+
+namespace {
+
+/// The decision round's Round: one prompt segment (B = 1, column 0, positions 0..T-1) over the private plane / slot.
+struct DecisionRound {
+    family::VisitRound r;
+    family::VisitSegment segment;
+    Round rd;
+
+    explicit DecisionRound(const RoundIO& io)
+        : r(make_round(io)), rd{*io.model, r, *io.im, *io.queries, *io.work, io.stream, io.x.ne[1], {}, {}, {}} {
+        const std::int32_t T = io.x.ne[1];
+        segment.column       = 0;
+        segment.count        = T;
+        Group g;
+        g.column        = 0;
+        g.width         = T;
+        g.batch         = 1;
+        g.positions     = Tensor(io.positions.data, DType::I32, {T, 1});
+        g.table_rows    = Tensor(io.meta.data, DType::I32, {1});
+        g.slots         = Tensor(static_cast<std::int32_t*>(io.meta.data) + 4, DType::I32, {1});
+        g.segment       = &segment;
+        rd.groups.push_back(g);
+        rd.kv_override   = &io.kv;
+        rd.conv_override = io.conv;
+    }
+
+    static family::VisitRound make_round(const RoundIO& io) {
+        if (io.model == nullptr || io.im == nullptr || io.queries == nullptr || io.work == nullptr ||
+            io.x.data == nullptr || io.x.ne[0] != C::residual || io.positions.data == nullptr ||
+            io.meta.data == nullptr || io.conv.data == nullptr || io.kv.k_pages.data == nullptr) {
+            throw std::logic_error("inkling2 decision: incomplete round");
+        }
+        family::VisitRound r;
+        r.phase            = family::TextPhase::Prefill;
+        r.x                = io.x;
+        r.positions        = io.positions;
+        r.max_visible_keys = static_cast<std::uint32_t>(io.x.ne[1]);
+        r.target_state     = io.target_state;
+        r.work             = io.work;
+        r.stream           = io.stream;
+        return r;
+    }
+};
+
+} // namespace
+
+void embed(const RoundIO& io, const Tensor& ids) {
+    ops::inkling_embed(ids, io.model->token_embedding.qdata, io.model->token_embedding.n,
+                       io.im->weights->globals.embedding_norm, C::rms_epsilon, slot_plane(io.x, 0), io.stream);
+}
+
+void run_visit(const RoundIO& io, const VisitInfo& vi, const load::InklingLayerWeights& L, int label) {
+    DecisionRound round(io);
+    run_visit_on(round.rd, label, vi, L, 0);
+}
+
+void final_mix(const RoundIO& io, const std::array<std::int8_t, 4>& final_stack, const Tensor& output_query,
+               Tensor& hidden) {
+    ops::InklingAttnResSources src;
+    src.stack_count = static_cast<std::int32_t>(final_stack.size());
+    for (std::size_t i = 0; i < final_stack.size(); ++i) { src.stack[i] = slot_plane(io.x, final_stack[i]); }
+    src.last = slot_plane(io.x, kFinalPartial);
+    const Tensor norm(io.im->weights->globals.final_norm.data, DType::BF16, {C::hidden, 1});
+    Tensor out(hidden.data, DType::BF16, {C::hidden, io.x.ne[1], 1});
+    ops::inkling_attn_res(src, io.x.ne[1], output_query, &norm, C::rms_epsilon, out, io.stream);
+}
+
+} // namespace decision
 
 void Variant::run_visits(const ModelView& model, family::VisitRound& r) {
     if (r.work == nullptr || r.state == nullptr || r.x.data == nullptr || r.positions.data == nullptr) {
