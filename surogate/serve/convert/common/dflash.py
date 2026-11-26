@@ -31,6 +31,9 @@ class Geometry:
     conv_group: int = 0
     selector_rank: int = 0
     selector_top_k: int = 0
+    # How many target feature positions `target_feature_layers` index, where that is not the target's layer count
+    # (inkling2: 48 layer visits and the final-norm output after them, 49); 0 = the target's layers.
+    feature_extent: int = 0
 
     @property
     def query_size(self):
@@ -66,7 +69,9 @@ class Geometry:
         })
 
 
-def geometry_from_config(config: Mapping, target) -> Geometry:
+def geometry_from_config(config: Mapping, target, *, feature_extent: int | None = None) -> Geometry:
+    """``feature_extent``: the target feature positions the drafter's ``target_layer_ids`` may name when that is not
+    ``target.layers`` (stored in the artifact so the engine and the reader check the same bound)."""
     for name in ("hidden_size", "num_hidden_layers", "intermediate_size", "head_dim",
                  "num_attention_heads", "num_key_value_heads", "sliding_window",
                  "max_position_embeddings", "vocab_size", "num_target_layers"):
@@ -127,14 +132,16 @@ def geometry_from_config(config: Mapping, target) -> Geometry:
     if isinstance(mask, bool) or not isinstance(mask, int) or not 0 <= mask < target.vocab:
         raise ValueError("DFlash mask_token_id must index the target embedding")
     targets = draft.get("target_layer_ids")
+    extent = target.layers if feature_extent is None else feature_extent
     if not isinstance(targets, list) or not targets or any(
-        isinstance(i, bool) or not isinstance(i, int) or not 0 <= i < target.layers for i in targets
+        isinstance(i, bool) or not isinstance(i, int) or not 0 <= i < extent for i in targets
     ) or len(set(targets)) != len(targets):
         raise ValueError("DFlash target_layer_ids must be distinct valid target layer indices")
     g = Geometry(target.hidden, layers, config["intermediate_size"], config["num_attention_heads"],
                  config["num_key_value_heads"], config["head_dim"], config["sliding_window"], mask,
                  block, config["max_position_embeddings"], config["rms_norm_eps"], rope["rope_theta"],
-                 tuple(schedule), tuple(targets), conv_kernel, conv_group, selector_rank, selector_top_k)
+                 tuple(schedule), tuple(targets), conv_kernel, conv_group, selector_rank, selector_top_k,
+                 0 if feature_extent is None else feature_extent)
     if max(g.query_size + 2 * g.kv_size, g.feature_rows, 2 * g.intermediate) > 2147483647:
         raise ValueError("DFlash projection dimensions exceed int32")
     return g
@@ -152,6 +159,8 @@ def geometry_block(g: Geometry):
         block.update(conv_kernel=g.conv_kernel, conv_group=g.conv_group)
     if g.selector_rank:
         block.update(selector_rank=g.selector_rank, selector_top_k=g.selector_top_k)
+    if g.feature_extent:
+        block.update(feature_extent=g.feature_extent)
     return block
 
 

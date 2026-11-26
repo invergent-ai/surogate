@@ -490,8 +490,15 @@ struct Reader::Impl {
                 }
             }
             if (directory.contains("dflash_geometry") || directory.contains("dflash_target_layers")) {
+                // The feature positions the target layers may name: the artifact's `feature_extent` where it states
+                // one (inkling2: 48 visits + the final-norm output over 24 physical layers; the target checks it
+                // against its own), else the text layers -- as the Python reader validates it.
+                const auto extent = dflash_geometry.find("feature_extent");
+                const int feature_positions = extent != dflash_geometry.end() && extent->second > 0
+                                                  ? static_cast<int>(extent->second)
+                                                  : text.layers;
                 (void)family::DFlashGeometry::resolved(dflash_geometry, dflash_target_layers,
-                                                       text.hidden, text.layers, text.output_rows);
+                                                       text.hidden, feature_positions, text.output_rows);
             }
             if (directory.contains("layer_types")) {
                 const auto& raw = directory.at("layer_types");

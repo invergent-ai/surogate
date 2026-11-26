@@ -338,3 +338,84 @@ def test_fp8_grid_layout_and_quantiser():
     grid = quantize(w, "b128").grid
     assert torch.equal(grid, grid[:1].expand_as(grid))
     assert torch.equal(grid[0], quantize(w, "g1x128").grid.amax(dim=0))
+
+
+# ---- A DFlash checkpoint drafter (``--dflash-model``, convert/inkling2/dflash.py) ----
+
+DF_LAYERS, DF_QH, DF_KVH, DF_HD, DF_INTER, DF_GROUP, DF_RANK, DF_TOPK = 2, 2, 1, 64, 96, 16, 32, 4
+
+
+def _dflash_drafter(tmp_path, targets=(1, 4, 6), seed=1):
+    gen = torch.Generator().manual_seed(seed)
+    visits = 6  # the tiny loop's visits: layers 0, 1, 2, 1, 2, 3
+    config = {
+        "architectures": ["DFlash2DraftModel"], "model_type": "qwen3", "hidden_size": H,
+        "num_hidden_layers": DF_LAYERS, "intermediate_size": DF_INTER, "head_dim": DF_HD,
+        "num_attention_heads": DF_QH, "num_key_value_heads": DF_KVH, "sliding_window": WIN,
+        "max_position_embeddings": 4096, "vocab_size": VOCAB, "num_target_layers": visits,
+        "rms_norm_eps": 1e-6, "hidden_act": "silu", "attention_bias": False,
+        "layer_types": ["sliding_attention"] * DF_LAYERS,
+        "rope_parameters": {"rope_type": "default", "rope_theta": 10000.0},
+        "dflash_config": {"block_size": 4, "conv_kernel_size": 2, "conv_group_size": DF_GROUP,
+                          "selector_rank": DF_RANK, "selector_top_k": DF_TOPK, "mask_token_id": 248,
+                          "target_layer_ids": list(targets), "final_logit_softcapping": 30.0},
+    }
+    rows = 2 * 2 * (H // DF_GROUP)
+    t = {"fc.weight": _bf16(H, len(targets) * H, gen=gen), "hidden_norm.weight": _bf16(H, gen=gen),
+         "norm.weight": _bf16(H, gen=gen),
+         "candidate_selector.hidden_projection.weight": _bf16(DF_RANK, H, gen=gen),
+         "candidate_selector.predecessor_codebook": _bf16(VOCAB, DF_RANK, gen=gen),
+         "candidate_selector.successor_codebook": _bf16(VOCAB, DF_RANK, gen=gen)}
+    for layer in range(DF_LAYERS):
+        p = f"layers.{layer}."
+        for name, shape in (("input_layernorm.weight", (H,)), ("post_attention_layernorm.weight", (H,)),
+                            ("self_attn.q_proj.weight", (DF_QH * DF_HD, H)),
+                            ("self_attn.k_proj.weight", (DF_KVH * DF_HD, H)),
+                            ("self_attn.v_proj.weight", (DF_KVH * DF_HD, H)),
+                            ("self_attn.o_proj.weight", (H, DF_QH * DF_HD)),
+                            ("self_attn.q_norm.weight", (DF_HD,)), ("self_attn.k_norm.weight", (DF_HD,)),
+                            ("mlp.gate_proj.weight", (DF_INTER, H)), ("mlp.up_proj.weight", (DF_INTER, H)),
+                            ("mlp.down_proj.weight", (H, DF_INTER)),
+                            ("attention_conv.base_kernel", (2, 2, H)), ("mlp_conv.base_kernel", (2, 2, H)),
+                            ("attention_conv.kernel_projection.weight", (rows, H)),
+                            ("mlp_conv.kernel_projection.weight", (rows, H))):
+            t[p + name] = _bf16(*shape, gen=gen)
+    drafter = tmp_path / "drafter"
+    drafter.mkdir()
+    save_file({k: v.contiguous() for k, v in t.items()}, str(drafter / "model.safetensors"))
+    (drafter / "config.json").write_text(json.dumps(config))
+    return drafter, t
+
+
+def test_dflash_drafter_is_carried_with_its_feature_extent(tmp_path):
+    model, _, _ = _checkpoint(tmp_path)
+    drafter, t = _dflash_drafter(tmp_path)
+    out = tmp_path / "tiny-dflash.sinfer"
+    convert(model, out, dflash_model=drafter, log=lambda m: None)
+    with Artifact(out) as artifact:
+        g = artifact.dflash_geometry
+        # DSpark's features (visits 1 / 4 and the final-norm output, 6): positions run to 7, past the 6 visits
+        # and the 4 physical layers.
+        assert artifact.dflash_target_layers == [1, 4, 6]
+        assert g["feature_extent"] == 7 and g["feature_layers"] == 3 and g["feature_rows"] == 3 * H
+        assert (g["layers"], g["local_layers"], g["mask_token"], g["block_size"]) == (DF_LAYERS, DF_LAYERS, 248, 4)
+        assert (g["conv_kernel"], g["conv_group"], g["selector_rank"], g["selector_top_k"]) == (2, DF_GROUP,
+                                                                                               DF_RANK, DF_TOPK)
+        qkv = artifact.find("dflash/layers/1/attention/query_key_value")
+        assert tuple(qkv.shape) == ((DF_QH + 2 * DF_KVH) * DF_HD, H) and qkv.format == "W8G32_F16S"
+        assert tuple(artifact.find("dflash/layers/0/mlp/gate_up").shape) == (2 * DF_INTER, H)
+        assert tuple(artifact.find("dflash/feature_projection").shape) == (H, 3 * H)
+        # BF16 objects are bit copies.
+        for name, source in (("dflash/context_norm", "hidden_norm.weight"),
+                             ("dflash/layers/1/mlp_conv/base_kernel", "layers.1.mlp_conv.base_kernel"),
+                             ("dflash/selector/successor_codebook", "candidate_selector.successor_codebook")):
+            assert bytes(artifact.payload(name)) == t[source].contiguous().view(torch.uint8).numpy().tobytes()
+        # The release's DSpark drafter is still carried beside it.
+        assert any(o.name.startswith("mtp/") for o in artifact.objects)
+
+
+def test_dflash_drafter_must_read_dsparks_features(tmp_path):
+    model, _, _ = _checkpoint(tmp_path)
+    drafter, _ = _dflash_drafter(tmp_path, targets=(1, 4, 5))
+    with pytest.raises(ValueError, match="DSpark's features"):
+        convert(model, tmp_path / "bad.sinfer", dflash_model=drafter, log=lambda m: None)

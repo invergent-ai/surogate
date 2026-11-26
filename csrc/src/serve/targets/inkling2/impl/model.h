@@ -23,6 +23,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 
 namespace sinfer::targets::inkling2::detail {
 
@@ -81,8 +82,17 @@ struct ArtifactLoadPlan {
     artifact::MaterializationPlan materialization;
 };
 
-/// The 48-visit geometry over an artifact's root geometry (DESIGN-target.md 0.2).
+/// The 48-visit geometry over an artifact's root geometry (DESIGN-target.md 0.2). Its DFlash geometry is the served
+/// drafter's: a DFlash checkpoint's when the artifact carries one (dflash_checkpoint_geometry), else the release's DSpark
+/// drafter's (dspark_dflash_geometry, `dspark` set); SUROGATE_SERVE_INKLING_DRAFTER=dspark keeps DSpark.
 [[nodiscard]] family::TextGeometry visit_geometry(const artifact::Reader& reader);
+/// A DFlash checkpoint's geometry over the 48-visit target, or nullopt when the artifact carries none. The checkpoint
+/// names DSpark's four features (visits 5 / 23 / 41 and the final-norm output, 48: SGLang's Inkling DFlash capture is
+/// DSpark's); they are relabelled to the visit labels the forward captures them under (visits.h kFeatureLabels).
+[[nodiscard]] std::optional<family::DFlashGeometry> dflash_checkpoint_geometry(const artifact::Reader& reader);
+/// SUROGATE_SERVE_INKLING_DRAFTER (read once): "dspark" serves the release's DSpark drafter even when the artifact
+/// carries a DFlash checkpoint; empty or "dflash" serves the checkpoint when there is one.
+[[nodiscard]] bool inkling_dspark_forced();
 
 class LoadedModelData {
 public:

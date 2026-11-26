@@ -46,7 +46,7 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
         execution.work, execution.device.stream, frame.ids.ne[0] == 1,
         // the split routes of untruncated sampled rows (exact split / coupled): DSpark targets only; every other
         // target runs M7's accept launches exactly
-        family::dspark_drafter<Variant>());
+        family::dspark_drafter<Variant>(execution.model.geometry));
     ops::speculative_select_accepted_hidden(frame.target_hidden, frame.accepted_drafts,
                                             frame.selected_hidden, execution.device.stream);
     ops::scatter(frame.selected_hidden, frame.lanes, continuation_hidden_store,

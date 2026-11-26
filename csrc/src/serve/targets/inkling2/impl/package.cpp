@@ -160,8 +160,18 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
     if (bind.attention.fp8 != (weights_profile == WeightsProfile::Fp8Attention)) {
         throw std::logic_error("inkling2: the weights profile and the attention choice disagree");
     }
-    // DSpark: `--speculative dflash` binds the artifact's drafter and runs it through the DFlash runtime.
-    bind.draft = options.speculative.backend == SpeculativeBackend::DFlash;
+    // The served drafter (model.h visit_geometry): the release's DSpark drafter, bound under `--speculative dflash` and
+    // run through the DFlash runtime; or a DFlash checkpoint the converter added, bound below (DSpark's objects are
+    // then validated only).
+    const family::TextGeometry geometry = detail::visit_geometry(binder.reader());
+    const bool speculative_dflash       = options.speculative.backend == SpeculativeBackend::DFlash;
+    const bool checkpoint_drafter       = geometry.dflash.layers > 0 && !geometry.dflash.dspark;
+    if (speculative_dflash && checkpoint_drafter &&
+        (options.pipeline_stage_first != 0 || options.pipeline_stage_last != 0)) {
+        throw std::invalid_argument("inkling2: a DFlash checkpoint drafter is served on one card only");
+    }
+    bind.draft  = speculative_dflash && !checkpoint_drafter;
+    bind.dflash = speculative_dflash && checkpoint_drafter;
     // BF16 drafter weights by default since M9 (h2's A/B: the FP8 route is ~9.5 % slower at 8 streams); with
     // SUROGATE_SERVE_DSPARK_FP8_WEIGHTS=1 the BF16 dense linears sit in the host bank (attached in LoadedModelData,
     // released after derive) and are re-quantised at load. Not on a drafter-less pipeline stage.
@@ -169,7 +179,7 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
                               bind.draft_placement != artifact::TensorPlacement::ValidateOnly;
     detail::ArtifactLoadPlan plan;
     plan.bindings.plan     = load::bind_artifact(binder, bind);
-    plan.bindings.geometry = detail::visit_geometry(binder.reader());
+    plan.bindings.geometry = geometry;
     plan.bindings.features = family::startup_features(options);
     plan.materialization   = binder.finish();
     plan.bindings.host_bank = family::collect_host_bank(binder, plan.materialization);

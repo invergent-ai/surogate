@@ -5511,3 +5511,32 @@ restore like any other (`RequestPlanSummary::host_restore`), and the executor re
 turn is bit-identical to the same turn resumed from the GPU lane (`test_host_kv_tier`). Without the flag nothing
 changes except that an eviction no longer clears the archive. `/metrics` gains the pool, reuse by tier, copy times and
 request TTFT and queue-wait histograms.
+
+## 155
+
+**Inkling-2-Mini serves a DFlash 2 drafter beside DSpark (2026-11-26).** The `inkling2` target ran only its own DSpark
+drafter: `Variant::dspark_drafter` was a compile-time switch, so every DFlash round of the target took DSpark's leaves.
+[incoai/Inkling-2-Mini-DFlash2](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2), a 5-layer DFlash 2 drafter
+trained on Inkling's DSpark features (visits 5 / 23 / 41 and the final-norm output, "48"), needed the family's DFlash
+bodies instead.
+
+- **Converter** (`convert/inkling2/dflash.py`, `--dflash-model`): the shared `dflash/*` objects beside the release's
+  `mtp/*` DSpark drafter. The drafter's features run one past the 48 visits, so `dflash_geometry` gains the optional
+  `feature_extent` (49 here; absent elsewhere, where the target's layers bound the feature ids as before), which the
+  Python and C++ readers check the target layers against.
+- **Runtime**: `family::dspark_capable<V>()` is the compile-time capability (the Variant declares DSpark's leaves);
+  `family::dspark_drafter<V>(geometry)` is the per-model choice, `DFlashGeometry::dspark`, set by the target's own
+  `dspark_dflash_geometry` and never read from an artifact. Every DSpark branch of the DFlash round, the layouts, the
+  request plan and the verify asks the geometry; a target that serves a DFlash checkpoint runs the family's bodies.
+  Other targets compile as before (no `dspark_drafter` member: both are false).
+- **inkling2**: the served drafter is the checkpoint when the artifact carries one (`SUROGATE_SERVE_INKLING_DRAFTER=dspark`
+  keeps DSpark); its features are relabelled to the visit labels the forward captures them under (`kFeatureLabels`),
+  DSpark's text-pool draft planes are planned only for DSpark, and the unused drafter's objects are validated only.
+  The block rows are `embed_norm(embed[ids])` (`Variant::dflash_block_embedding`): 6.8 tokens a round with the norm,
+  1.02 with the bare table rows (`SUROGATE_SERVE_INKLING_DFLASH_EMBED=raw`, A/B only).
+- Measured on a DGX Spark, Surogate3.8-26B-A3B (Inkling-2-Mini + a writing LoRA), one artifact, eight prompts x 2:
+  greedy 54.9 tokens/s (DFlash 2, k 7) against 44.0 (DSpark, `--spec-adaptive`, the served setting) and 38.9 (DSpark,
+  k 7); at temperature 1, 46.3 against 42.7; four streams at temperature 1, 101.5 against 91.7 tokens/s in total.
+  Greedy outputs equal the served DSpark setting's on 16 of 16 requests. The DSpark path on the old artifact is
+  unchanged (44.0 tokens/s, the same as before). `test_inkling2_artifact` covers the conversion and the refusal of a
+  drafter that reads other features.

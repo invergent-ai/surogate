@@ -102,12 +102,39 @@ void test_one_card_and_two_stages(const Reader& reader, const load::ArtifactConf
     for (const auto& object : reader.objects()) {
         const auto* t = std::get_if<TensorDescriptor>(&object);
         if (t == nullptr || t->name.find("/attn/fp8-") != std::string::npos) { continue; }
+        // A DFlash checkpoint drafter (converter --dflash-model) is validated only while DSpark is the drafter.
+        if (starts(t->name, "dflash/")) {
+            require(card.device.count(t->name) == 0, "DSpark plan leaves the DFlash checkpoint off: " + t->name);
+            continue;
+        }
         require(card.device.count(t->name) == 1, "1-card plan places " + t->name);
         expected += t->bytes;
         if (starts(t->name, "vision/")) { vision_bytes += t->bytes; }
         ++tensors;
     }
     require(card.device.size() == tensors && card.bytes == expected, "1-card plan = every non-FP8 tensor");
+    if (!reader.dflash_geometry().empty()) {
+        // The DFlash checkpoint served instead: its objects on the device, DSpark's validated only.
+        load::BindOptions checkpoint = one;
+        checkpoint.draft             = false;
+        checkpoint.dflash            = true;
+        const Placed served = place(reader, checkpoint);
+        std::size_t dflash_objects = 0;
+        for (const auto& object : reader.objects()) {
+            const auto* t = std::get_if<TensorDescriptor>(&object);
+            if (t == nullptr) { continue; }
+            if (starts(t->name, "dflash/")) {
+                require(served.device.count(t->name) == 1, "DFlash plan places " + t->name);
+                ++dflash_objects;
+            }
+            if (starts(t->name, "mtp/")) {
+                require(served.device.count(t->name) == 0, "DFlash plan leaves DSpark off: " + t->name);
+            }
+        }
+        require(dflash_objects > 0, "the DFlash checkpoint has objects");
+        std::printf("DFlash checkpoint plan: %zu dflash objects on the device, DSpark validated only\n",
+                    dflash_objects);
+    }
     require(card.bytes - vision_bytes == 19525154400ULL, "1-card text device bytes unchanged by the split (19,525,154,400)");
     if (vision) {
         // Without --vision the tower is validated only.

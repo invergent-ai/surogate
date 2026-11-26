@@ -32,6 +32,7 @@ from surogate.serve.artifact.layouts import (
     encode_nvfp4,
 )
 
+from . import dflash as dflash_drafter
 from .checkpoint import Checkpoint, Geometry
 from .fp8_attention import RULE, STORAGE_FORMAT, quantize_slices
 from .inventory import MTP, LOOP_STREAMS, Entry, build_inventory, covered_sources, vision_geometry
@@ -268,13 +269,22 @@ def read_sha256_file(path: str | Path | None) -> dict[str, str]:
 
 def convert(model_dir: str | Path, out_path: str | Path, *, fp8_schemes: tuple[str, ...] = (),
             gate_up_order: str = "interleaved", mtp: bool = True, vision: bool | None = None,
-            sha256_file: str | None = None, log=print) -> dict:
+            sha256_file: str | None = None, dflash_model: str | Path | None = None, log=print) -> dict:
+    """``dflash_model``: a DFlash checkpoint drafter (e.g. incoai/Inkling-2-Mini-DFlash2) to carry as ``dflash/*``
+    beside the release's DSpark drafter (``dflash.py``); the engine serves it under ``--spec dflash``."""
     started = time.time()
     ckpt = Checkpoint(model_dir)
     g = ckpt.geometry
     vc = vision_config(ckpt, vision)
     entries = build_inventory(g, fp8_schemes=fp8_schemes, gate_up_order=gate_up_order, mtp=mtp, vision=vc)
     preflight(ckpt, entries)
+    drafter = drafter_reader = None
+    drafter_objects: list = []
+    if dflash_model is not None:
+        drafter = dflash_drafter.geometry(dflash_model, g)
+        drafter_objects = dflash_drafter.objects(drafter, g)
+        drafter_reader = dflash_drafter.Reader(dflash_model)
+        dflash_drafter.preflight(drafter_reader, drafter_objects)
     doc = config_document(ckpt, fp8_schemes=fp8_schemes, gate_up_order=gate_up_order, mtp=mtp,
                           sha256=read_sha256_file(sha256_file), vision=vc is not None)
     resources: list[tuple[str, bytes]] = [
@@ -291,14 +301,19 @@ def convert(model_dir: str | Path, out_path: str | Path, *, fp8_schemes: tuple[s
         resources.append((name, data))
     specs = [ResourceSpec(name, RAW_BYTES_V1, len(data)) for name, data in resources]
     specs += [TensorSpec(e.name, e.shape, e.format, e.layout) for e in entries]
+    specs += [o.spec for o in drafter_objects]
     variant = "bf16" + "".join(f"+fp8-{s}" for s in fp8_schemes)
     identity = ArtifactIdentity(model_id="thinkingmachines/Inkling-2-Mini@ed40e7da",
                                 weights_id=f"release+attn-{variant}", architecture=ARCHITECTURE)
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     partial = out.with_name(out.name + ".partial")
+    dflash_metadata = {} if drafter is None else {
+        "dflash_geometry": dflash_drafter.common.geometry_block(drafter),
+        "dflash_target_layers": list(drafter.target_feature_layers)}
     with ArtifactWriter(partial, identity, specs, geometry=text_geometry(g), layer_types=layer_types(g),
-                        vision_geometry=None if vc is None else vision_geometry(vc, g.hidden)) as writer:
+                        vision_geometry=None if vc is None else vision_geometry(vc, g.hidden),
+                        **dflash_metadata) as writer:
         for name, data in resources:
             writer.write(name, data)
         for i, entry in enumerate(entries):
@@ -306,6 +321,13 @@ def convert(model_dir: str | Path, out_path: str | Path, *, fp8_schemes: tuple[s
             if i % 50 == 0 or entry.kind != "direct":
                 log(f"[{time.time() - started:7.1f}s] {i + 1}/{len(entries)} {entry.name} {entry.format} "
                     f"{list(entry.shape)}")
+        for o in drafter_objects:
+            writer.write(o.spec.name, dflash_drafter.payload(drafter_reader, o))
+        if drafter_objects:
+            if drafter_reader.unread:
+                raise ValueError(f"drafter tensors not written: {sorted(drafter_reader.unread)[:5]}")
+            log(f"[{time.time() - started:7.1f}s] DFlash drafter {dflash_model}: {len(drafter_objects)} objects, "
+                f"{drafter.layers} layers, features {list(drafter.target_feature_layers)}")
     partial.replace(out)
     log(f"wrote {out} ({out.stat().st_size} bytes) in {time.time() - started:.1f}s")
     return {"objects": len(specs), "tensors": len(entries), "resources": len(resources),

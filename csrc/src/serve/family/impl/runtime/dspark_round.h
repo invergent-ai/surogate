@@ -1,7 +1,8 @@
 #pragma once
 
 // DSpark (Inkling-2-Mini's MTP drafter) through the family's DFlash runtime
-// (DSpark design notes, section 12). A target that declares `dspark_drafter` keeps the DFlash
+// (DSpark design notes, section 12). A target that declares `dspark_drafter` (and serves its own drafter: the
+// model's DFlash geometry says `dspark`, see dspark_drafter(geometry) below) keeps the DFlash
 // round structure -- feature sink, pending features, context append, one parallel proposal, the shared verify / accept,
 // graphs, adaptive k -- but runs its own drafter: the runtime hands the context append and the proposal to the
 // Variant's `dspark_append` / `dspark_propose` leaves instead of the DFlash bodies. Its draft KV lives in extra planes
@@ -23,12 +24,26 @@
 
 namespace sinfer::family {
 
-/// Whether `Variant` runs the DSpark drafter through the DFlash runtime. False for every target that declares nothing.
+/// Whether `Variant` CAN run its own DSpark drafter through the DFlash runtime (it declares the DSpark leaves). False
+/// for every target that declares nothing. Compile-time: guards the code that names the Variant's DSpark leaves.
 template <class Variant>
-[[nodiscard]] constexpr bool dspark_drafter() {
+[[nodiscard]] constexpr bool dspark_capable() {
     if constexpr (requires { Variant::dspark_drafter; }) {
         return Variant::dspark_drafter;
     } else {
+        return false;
+    }
+}
+
+/// Whether this model's drafter IS the target's own DSpark drafter: a DSpark-capable target whose served DFlash geometry
+/// is its drafter's (DFlashGeometry::dspark), not a DFlash checkpoint's. A DSpark-capable target that serves a DFlash
+/// checkpoint instead (inkling2 with a DFlash 2 drafter) runs the family's DFlash bodies like every other target.
+template <class Variant>
+[[nodiscard]] constexpr bool dspark_drafter(const TextGeometry& g) {
+    if constexpr (dspark_capable<Variant>()) {
+        return g.dflash.dspark;
+    } else {
+        (void)g;
         return false;
     }
 }
@@ -112,7 +127,7 @@ struct DSparkProposeArgs {
 
 template <class V>
 [[nodiscard]] std::size_t dspark_append_workspace_bytes_if(std::int32_t columns) {
-    if constexpr (dspark_drafter<V>()) {
+    if constexpr (dspark_capable<V>()) {
         return V::dspark_append_workspace_bytes(columns);
     } else {
         (void)columns;
@@ -122,7 +137,7 @@ template <class V>
 
 template <class V>
 [[nodiscard]] std::size_t dspark_propose_workspace_bytes_if(std::int32_t batch, std::uint32_t max_visible_keys) {
-    if constexpr (dspark_drafter<V>()) {
+    if constexpr (dspark_capable<V>()) {
         return V::dspark_propose_workspace_bytes(batch, max_visible_keys);
     } else {
         (void)batch;
@@ -133,7 +148,7 @@ template <class V>
 
 template <class V, class Model>
 void dspark_append_if(const Model& model, const DSparkRuntime& runtime, const DSparkAppendArgs& args) {
-    if constexpr (dspark_drafter<V>()) {
+    if constexpr (dspark_capable<V>()) {
         V::dspark_append(model, runtime, args);
     } else {
         (void)model; (void)runtime; (void)args;
@@ -142,7 +157,7 @@ void dspark_append_if(const Model& model, const DSparkRuntime& runtime, const DS
 
 template <class V, class Model>
 void dspark_propose_if(const Model& model, const DSparkRuntime& runtime, const DSparkProposeArgs& args) {
-    if constexpr (dspark_drafter<V>()) {
+    if constexpr (dspark_capable<V>()) {
         V::dspark_propose(model, runtime, args);
     } else {
         (void)model; (void)runtime; (void)args;
