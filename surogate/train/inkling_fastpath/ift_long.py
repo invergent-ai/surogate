@@ -126,15 +126,23 @@ class TokenChunked(torch.autograd.Function):
         pgr = [None] * len(params)
         tick = B._tick("bwd.tc." + getattr(ctx.fn, "__name__", "fn"))
         tick.__enter__()
-        vjp = getattr(ctx.fn, "cuda_vjp", None) if (STAGE_CUDA and not params) else None
+        # the stage's hand-written backward; with parameters only where the stage says it returns their gradients too
+        vjp = getattr(ctx.fn, "cuda_vjp", None) if (STAGE_CUDA and (not params or getattr(ctx.fn, "cuda_vjp_params", False))) else None
         for c0 in range(0, T, chunk):
             n = min(chunk, T - c0)
-            if vjp is not None:  # the stage's hand-written backward (no parameters)
+            if vjp is not None:
                 if all(gj is None for gj in gouts):
                     continue
                 with torch.no_grad():
                     vals_c = [chunk_of(i, c0, n) for i in range(n_tok)]
-                    got = vjp(vals_c, [None if gj is None else gj.narrow(tdo[j], c0, n) for j, gj in enumerate(gouts)])
+                    gouts_c = [None if gj is None else gj.narrow(tdo[j], c0, n) for j, gj in enumerate(gouts)]
+                    if params:
+                        got, pg = vjp(vals_c, gouts_c, list(params_saved))
+                        for i, g in enumerate(pg):
+                            if g is not None and params[i].requires_grad:
+                                pgr[i] = g if pgr[i] is None else pgr[i] + g
+                    else:
+                        got = vjp(vals_c, gouts_c)
                 for i in range(n_tok):
                     if got[i] is None or not (gin[i] is not None or sinks[i] is not None):
                         continue
@@ -957,6 +965,13 @@ def visit_torch_long(W: B.EngineWeights, vi, stack, partial, bank, ids, lora, ch
 
     def f_gw(o, l, gt, sk):
         return RA.rb(RA.mm(RA.inkling_gate_sink(o, l, gt, sk), L.wo))
+
+    def f_gw_vjp(ins, gouts):  # the stage's hand-written backward (STAGE_CUDA)
+        import cuda_bwd as CB
+
+        return CB.gate_sink_wo_vjp(L, ins, gouts)
+
+    f_gw.cuda_vjp = f_gw_vjp
 
     with B._tick("fwd.wo"):
         attn_partial = tc(f_gw, [out, lse, gate, sink], [0, 0, 0, 0], [0], store_bf16=[False, False, True, True],

@@ -54,6 +54,13 @@ _FLAG_ATTR = {"IFT_MOE_GM": "MOE_GM", "IFT_MOE_DET": "MOE_DET", "IFT_FAST_GEMM":
 # not run. The forward, the gates, the divisor and the sketch counters are unchanged, and so are the sums (adding zeros changes no bit).
 # Not applied when segment sums are kept (there a zero row still leaves its zero entries). False = always run the backward.
 SKIP_ZERO_SEED_PARTS = True
+TIMING = os.environ.get("T8_TIMING", "0") == "1"      # per-row and per-step time split in the metrics (adds card synchronisations)
+
+
+def _sync_now() -> float:
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    return time.time()
 
 # Bin edges of the per-row histogram of |log ratio| over the loss tokens ("ppo" mode): [0, 1e-6), then ten bins per decade up to 10^1.5, then
 # everything above. A report only: nothing in the step reads it.
@@ -101,6 +108,11 @@ class T8Config:
     attn_alpha: float = 32.0        # scale alpha / rank (0.5 at rank 64)
     allow_lagged: bool = False      # False: a row sampled by another adapter version stops the step (its replay gate could not run)
     row_timeout_s: float = 3600.0   # a worker that answers no request for this long ends the step
+    device_sum: bool = os.environ.get("T8_DEVICE_SUM", "1" if os.environ.get("T8_STACK", "A0") == "C1" else "0") == "1"   # (on with stack C1)
+                                    # a row's gradient sums and the worker's step sum stay on the card and come to
+                                    # the host once per step (the same fp32 additions in the same order, bitwise); rows above
+                                    # device_sum_max_tokens, segment sums, sketches and lean_host keep the host path.
+    device_sum_max_tokens: int = 16384
     lean_host: bool = False         # S4 (a): no per-row copy of a visited-once layer's gradient (added straight into the worker's sum; looped
                                     # layers keep their per-row sum until their last visit: same additions in the same order, bitwise).
                                     # A row that runs out of card memory after its first add is NOT retried: the step fails (STOP, masters restored).
@@ -284,6 +296,8 @@ def accumulate_row(w, run, T: int, part: str, qb: int, visit_layers: list, empty
     lean_host: a tensor's row sum goes into w.flat at its layer's LAST visit (the same fp32 additions in the same order as the default); a row
     that runs out of memory AFTER its first such addition raises (no retry: w.flat now holds part of the row; the step must fail, never go on)."""
     lean = bool(w.cfg.lean_host)
+    dev = (bool(getattr(w.cfg, "device_sum", False)) and not lean and row_sk is None and not w.seg_keys
+           and T <= int(getattr(w.cfg, "device_sum_max_tokens", 0)))
     last = {}
     for v in range(w.v_first, len(visit_layers)):
         L = visit_layers[v]
@@ -296,6 +310,12 @@ def accumulate_row(w, run, T: int, part: str, qb: int, visit_layers: list, empty
 
         def on_grad(v, layer, j, gj):
             if (layer, j) not in w.layout.index:
+                return
+            if dev:                                          # the row's sums stay on the card: the same fp32 additions in the same order
+                if (layer, j) not in pg:
+                    pg[(layer, j)] = gj.detach().to(torch.float32, copy=True)
+                else:
+                    pg[(layer, j)].add_(gj.detach().to(torch.float32))
                 return
             if lean and not bool(torch.isfinite(gj).all()):
                 raise T8GateError(f"FINITE GATE: T {T}: layer {layer} {w.layout.keys[j]} (visit {v}) holds non-finite values")
@@ -318,8 +338,14 @@ def accumulate_row(w, run, T: int, part: str, qb: int, visit_layers: list, empty
                 added[0] = True
 
         oom = False
+        cb = on_grad
+        if TIMING:
+            def cb(v, layer, j, gj):                          # the hand-over's own time: the card's queued work is finished first
+                t = _sync_now()
+                on_grad(v, layer, j, gj)
+                w._t_hand = getattr(w, "_t_hand", 0.0) + time.time() - t
         try:
-            run(on_grad, qb)
+            run(cb, qb)
         except torch.OutOfMemoryError:
             oom = True
         if not oom:
@@ -353,6 +379,7 @@ class WorkerCore:
 
     def begin_step(self):
         self.flat.zero_()
+        self._dev_flat, self._flat_dirty = None, False
         self.seg_acc = {}
         self.sketch, self.sketch_meta = {}, {}
 
@@ -367,6 +394,9 @@ class WorkerCore:
         version, mode, scale = job["version"], job["seeds"], job["scale"]
         rp, _ = replay_rows(row, self.cfg.visits, self.cfg.top_k)
         lp32, ctx = self._forward(row)                       # fp32 [T - 1]: the engine's log-probs
+        if TIMING:
+            t_fwd = _sync_now()
+            self._t_hand = 0.0
         T = row.T
         mask = row.loss_mask
         lp = np.zeros(T, dtype=np.float64)
@@ -478,13 +508,19 @@ class WorkerCore:
             self._sketch_row(row, rs, mode, scale)
             self._row_sketch = None
         out["zero_seed_parts"] = zero_parts
+        if TIMING:
+            t_bwd = _sync_now()
+        tgt = self._sum_target(next(iter(row_grad.values())).device) if row_grad else self.flat
         for (L, j), t in row_grad.items():
             if not bool(torch.isfinite(t).all()):
                 raise T8GateError(f"FINITE GATE: row {i} (T {T}): layer {L} {self.layout.keys[j]} holds non-finite values")
-            self.layout.view(self.flat, L, j).add_(t)
+            self.layout.view(tgt, L, j).add_(t if t.device == tgt.device else t.to(tgt.device))
         for k, t in row_seg.items():
             self.seg_acc[k] = t if k not in self.seg_acc else self.seg_acc[k].add_(t)
         self._release(ctx)
+        if TIMING:
+            t_end = _sync_now()
+            out["timing"] = {"forward": t_fwd - t0, "backward": t_bwd - t_fwd - self._t_hand, "hand_over": self._t_hand, "row_sum": t_end - t_bwd}
         out.update({"passes": passes, "oom_retries": retries, "q_block": block, "seconds": time.time() - t0,
                     "grad_norm_by_segment": {f"{k[0]}.{k[1]}": v for k, v in self._seg_norms(row_seg).items()}})
         return out
@@ -526,7 +562,29 @@ class WorkerCore:
             y = x / factor
             d[k] = y if k not in d else d[k].add_(y)
 
+    def _sum_target(self, device) -> torch.Tensor:
+        """Where a row's sums are added: the worker's host sum, or (device_sum, a row whose sums are on the card) its copy on the card. One
+        running sum at any time: the copy starts from the host sum and is written back before a host-side row and at the step's end, so the
+        fp32 additions and their order are those of the host path."""
+        if device.type == "cuda":
+            if getattr(self, "_dev_flat", None) is None:
+                try:
+                    self._dev_flat = self.flat.to(device) if self._flat_dirty else torch.zeros(self.flat.shape, dtype=torch.float32, device=device)
+                except torch.OutOfMemoryError:
+                    self._dev_flat = None
+            if self._dev_flat is not None:
+                return self._dev_flat
+        self._flush_device_sum()
+        self._flat_dirty = True
+        return self.flat
+
+    def _flush_device_sum(self) -> None:
+        if getattr(self, "_dev_flat", None) is not None:
+            self.flat.copy_(self._dev_flat)
+            self._dev_flat, self._flat_dirty = None, True
+
     def finish_step(self) -> dict:
+        self._flush_device_sum()
         written = []
         sdir = getattr(self.cfg, "sketch_dir", "")
         if sdir and self.sketch_meta:
@@ -683,10 +741,15 @@ def run_rows(handles: list, rows: list, live: list, job: dict) -> list:
 
 def sum_flats(flats: list) -> torch.Tensor:
     """The workers' fp32 sums added in worker order in fp64, rounded once to fp32."""
-    total = flats[0].double().clone()
-    for f in flats[1:]:
-        total.add_(f.double())
-    return total.float()
+    n = flats[0].numel()
+    total = torch.empty(n, dtype=torch.float32)
+    step = 1 << 20                                            # in cache-sized pieces: the same fp64 additions per element, in worker order
+    for o in range(0, n, step):
+        acc = flats[0][o:o + step].double()
+        for f in flats[1:]:
+            acc.add_(f[o:o + step])                           # fp32 -> fp64 is exact
+        total[o:o + step] = acc.float()
+    return total
 
 
 def write_stop(run_dir: str, why: str) -> None:
@@ -714,13 +777,16 @@ def compute_step(handles: list, layout: ParamLayout, flats: list, shapes: list, 
         check_rows(rows, live, version, cfg)
         for h in handles:
             h.call("begin_step")
+        t_begin = time.time()
         results = run_rows(handles, rows, live, job)
     except Exception as e:                                    # a gate, or a worker failure (e.g. lean_host's no-retry path): STOP, no gradient
         write_stop(cfg.run_dir, f"{type(e).__name__}: {e}"[:2000])
         raise
     wall = time.time() - t0
     fin = [h.call("finish_step") for h in handles]
+    t_fin = time.time()
     total = sum_flats(flats)
+    t_sum = time.time()
     grads = []
     for L, sh in enumerate(shapes):
         for j, k in enumerate(layout.keys):
@@ -760,12 +826,36 @@ def compute_step(handles: list, layout: ParamLayout, flats: list, shapes: list, 
     m["wall_s"] = wall
     m["tok_per_s_per_card"] = tokens / max(wall, 1e-9) / len(handles)
     m["workers"] = [f["stats"] for f in fin]
+    if TIMING:
+        tm = {"begin_step": t_begin - t0, "rows": wall - (t_begin - t0), "finish_step": t_fin - t0 - wall, "sum_flats": t_sum - t_fin, "after_sum": time.time() - t_sum}
+        per = [r["timing"] for r in results if "timing" in r]
+        tm["row_parts_worker_seconds"] = {k: sum(x[k] for x in per) for k in ("forward", "backward", "hand_over", "row_sum")}
+        tm["row_seconds_sum"] = sum(r["seconds"] for r in results)
+        m["timing"] = tm
+        print("T8_TIMING compute " + json.dumps({k: (round(v, 3) if isinstance(v, float) else {a: round(b, 2) for a, b in v.items()}) for k, v in tm.items()}), flush=True)
     m["sketch_files"] = [p for f in fin for p in f.get("sketch_files", [])]
     return StepOut(grads=grads, segments=segments, metrics=m, rows=sorted(results, key=lambda r: r["i"]),
                    sense="ascent" if seeds == "weights" else "descent")
 
 
 # ---------------------------------------------------------------------------------------------------------------------
+def fast_sync(base):
+    """`base` (the kit's MasterAdamW) with the work values' bf16 rounding done by torch's float32 -> bfloat16 conversion instead of the kit's numpy
+    routine: 0.5 s instead of 2.7 s per optimizer step on the expert adapter. The two give the same bits for every finite float32 (compared over
+    all 2^32 - 2^24 finite bit patterns); a non-finite master is refused, as the kit's routine does."""
+
+    class FastSync(base):
+        def sync_work(self) -> None:
+            with torch.no_grad():
+                for p, m in zip(self.work, self.masters):
+                    m = m.detach()
+                    if not bool(torch.isfinite(m).all()):
+                        raise ValueError("adapter values must be finite")
+                    p.copy_(m.to(torch.bfloat16).to(p.device, p.dtype))
+
+    return FastSync
+
+
 # the trainer object the RL loop holds
 # ---------------------------------------------------------------------------------------------------------------------
 class T8Trainer:
@@ -799,7 +889,7 @@ class T8Trainer:
                     A.copy_((torch.rand(A.shape, generator=g) * 2 - 1) / float(A.shape[1]) ** 0.5)
                     d[f"{s}B"].zero_()
         self.work = [torch.nn.Parameter(d[k], requires_grad=True) for d in self.work_layers for k in self.keys]
-        self.opt = MasterAdamW(self.work, lr=5e-5, weight_decay=0.0, max_grad_norm=1.0)  # masters = the exact init; work = bf16(master)
+        self.opt = fast_sync(MasterAdamW)(self.work, lr=5e-5, weight_decay=0.0, max_grad_norm=1.0)  # masters = the exact init; work = bf16(master)
         v_first = cfg.visits - int(cfg.K)
         visits = [SimpleVisit(v) for v in range(cfg.visits)]
         self.layers = TL.trained_layers(visits, v_first)
@@ -852,8 +942,21 @@ class T8Trainer:
 
     # ------------------------------------------------------------------ adapter
     def _refresh(self):
-        for h in self.handles:
-            h.call("refresh")
+        errs = []
+
+        def one(h):
+            try:
+                h.call("refresh")
+            except Exception as e:
+                errs.append(e)
+
+        th = [threading.Thread(target=one, args=(h,), daemon=True) for h in self.handles]   # every worker reads the same shared work values
+        for t in th:
+            t.start()
+        for t in th:
+            t.join()
+        if errs:
+            raise errs[0]
 
     def masters(self) -> list:
         """The current fp32 masters in the rig layout (copies)."""
@@ -940,8 +1043,12 @@ class T8Trainer:
             g["lr"] = lr
         for p, g in zip(self.work, out.grads):
             p.grad = g
+        t0 = time.time()
         norm = self.opt.step()
+        t1 = time.time()
         self._refresh()
+        if TIMING:
+            print("T8_TIMING apply " + json.dumps({"optimizer": round(t1 - t0, 3), "refresh": round(time.time() - t1, 3)}), flush=True)
         return norm
 
     def close(self) -> None:

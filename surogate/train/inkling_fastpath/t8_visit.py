@@ -122,12 +122,12 @@ def visit_torch_t8(W: B.EngineWeights, vi, stack, partial, bank, ids, lora, chun
         ain = f_ain(*a[:len(act)])
         return f_proj(ain, *a[len(act):])
 
-    def f_ain_proj_vjp(ins, gouts):  # the stage's hand-written backward on the kernel library (STAGE_CUDA; no attention adapter)
+    def f_ain_proj_vjp(ins, gouts, params=None):  # the stage's hand-written backward on the kernel library (STAGE_CUDA)
         import cuda_bwd as CB
 
-        return CB.attn_in_proj_vjp(L, v0, vi.looped, n, tau is not None, ins, gouts)
+        return CB.attn_in_proj_vjp(L, v0, vi.looped, n, tau is not None, ins, gouts, params, att_scale)
 
-    f_ain_proj.cuda_vjp = f_ain_proj_vjp
+    f_ain_proj.cuda_vjp, f_ain_proj.cuda_vjp_params = f_ain_proj_vjp, True
 
     with B._tick("fwd.ain_proj"):
         tok = act + ([tau] if tau is not None else [])
@@ -159,6 +159,13 @@ def visit_torch_t8(W: B.EngineWeights, vi, stack, partial, bank, ids, lora, chun
 
     def f_gw(o, l, gt, sk, *lo):
         return wo_raw(L, RA.inkling_gate_sink(o, l, gt, sk), lo if lo else None, att_scale)
+
+    def f_gw_vjp(ins, gouts, params=None):  # the stage's hand-written backward (STAGE_CUDA)
+        import cuda_bwd as CB
+
+        return CB.gate_sink_wo_vjp(L, ins, gouts, params, att_scale)
+
+    f_gw.cuda_vjp, f_gw.cuda_vjp_params = f_gw_vjp, True
 
     with B._tick("fwd.wo"):
         attn_partial = tc(f_gw, [out, lse, gate, sink], [0, 0, 0, 0], [0], params=op, store_bf16=[False, False, True, True],
