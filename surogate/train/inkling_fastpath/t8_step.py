@@ -151,8 +151,6 @@ def validate_config(cfg: T8Config) -> None:
         v = getattr(cfg, name)
         if not isinstance(v, int) or isinstance(v, bool) or not 0 <= v <= int(cfg.visits):
             raise ValueError(f"{name} {v!r}: a visit index 0..{cfg.visits}")
-    if cfg.gate_grad_from and STACKS[cfg.stack].get("IFT_MOE_GM", "1") != "0":
-        raise ValueError("gate_grad_from needs the plain expert backward (a stack with IFT_MOE_GM=0)")
     if cfg.bank_grad_from and cfg.lean_host:
         raise ValueError("bank_grad_from skips visits of the looped layers: lean_host adds a layer's sum at its last visit and would not fire")
     if cfg.lean_host and cfg.split_final:

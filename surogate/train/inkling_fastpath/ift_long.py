@@ -360,10 +360,8 @@ ATTN_CUDA = int(os.environ.get("IFT_ATTN_CUDA", "0"))  # 1: the cotangent of the
 
 
 def rel_attention(q, k, v, r_out, rel_proj, window, q_block):
-    """The visit's relative attention: RelAttentionR, or the kernel library's with ATTN_CUDA (exact pattern gradient only)."""
+    """The visit's relative attention: RelAttentionR, or the kernel library's with ATTN_CUDA (both read PATTERN_GRAD in their backward)."""
     if ATTN_CUDA:
-        if not PATTERN_GRAD["on"]:
-            raise ValueError("ATTN_CUDA has no constant-pattern backward (pattern_grad_from needs IFT_ATTN_CUDA=0)")
         import cuda_bwd as CB
 
         return CB.RelAttentionCuda.apply(q, k, v, r_out, rel_proj, window, ATTN_CUDA)
@@ -777,13 +775,15 @@ class MoEGM(torch.autograd.Function):
             del u13, u2
         if dx.dtype != F32:
             dx = dx.float()
-        # the routing weights' path back into x (router logits from x, ids fixed)
-        dgam = torch.zeros(T, topk, dtype=F32, device=dev)
-        dgam[tok, slot] = dgam_r
-        with torch.enable_grad(), B._tick("bwd.moe.router"):
-            xl = x.detach().requires_grad_()
-            gm = RA.route_weights(RA._router_logits(xl, w.gate_w), ids)
-            dx += torch.autograd.grad(gm, xl, dgam)[0]
+        # the routing weights' path back into x (router logits from x, ids fixed); with GATE_GRAD off the gate weights are constants
+        # of the backward (ift_backward.moe_vec's switch, set per visit by backward_row's gate_grad_from)
+        if B.GATE_GRAD["on"]:
+            dgam = torch.zeros(T, topk, dtype=F32, device=dev)
+            dgam[tok, slot] = dgam_r
+            with torch.enable_grad(), B._tick("bwd.moe.router"):
+                xl = x.detach().requires_grad_()
+                gm = RA.route_weights(RA._router_logits(xl, w.gate_w), ids)
+                dx += torch.autograd.grad(gm, xl, dgam)[0]
         tick.__exit__(None, None, None)
         return (None, None, None, dx, *lgr)
 
