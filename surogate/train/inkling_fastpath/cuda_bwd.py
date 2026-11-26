@@ -13,6 +13,15 @@ import os
 import torch
 
 F32, BF16 = torch.float32, torch.bfloat16
+
+
+def _tick(name):
+    """ift_backward's profiling section timer (IFT_PROFILE=1), imported late: this module has no import-time dependency on it."""
+    import ift_backward as B
+
+    return B._tick(name)
+
+
 EG = 16  # experts decoded and handled per call (ift_backward.EG)
 
 _LIB = None
@@ -76,8 +85,9 @@ def moe_groups(w, x16, g, tok, gam_r, starts, cnt, lora, scale, dx, dgam_r, lgr,
         if r1 == r0:
             continue
         ng = g1 - g0
-        u13, f13 = w.eng.decode_experts(w.layer, "w13", g0, ng)
-        u2, f2 = w.eng.decode_experts(w.layer, "w2", g0, ng)
+        with _tick("bwd.moe.cuda.decode"):
+            u13, f13 = w.eng.decode_experts(w.layer, "w13", g0, ng)
+            u2, f2 = w.eng.decode_experts(w.layer, "w2", g0, ng)
         if w.fmt == "nvfp4":
             f13h, f2h = f13.tolist(), f2.tolist()
         else:
@@ -89,8 +99,9 @@ def moe_groups(w, x16, g, tok, gam_r, starts, cnt, lora, scale, dx, dgam_r, lgr,
         ints = (ctypes.c_int * 6)(T, D, I, ng, rank, cap)
         ptrs = (ctypes.c_void_p * 17)(_ptr(x16), _ptr(g), _ptr(tok32), _ptr(gam_r), _ptr(u13), _ptr(u2), *[_ptr(t) for t in lo],
                                        _ptr(dx), _ptr(dgam_r), *[_ptr(t) for t in gr], _ptr(ws))
-        rc = L.inkling_capi_moe_group_bwd(ints, ptrs, seg, (ctypes.c_float * ng)(*f13h), (ctypes.c_float * ng)(*f2h),
-                                          ctypes.c_float(float(scale) if scale is not None else 0.0), ctypes.c_long(wsb), None)
+        with _tick("bwd.moe.cuda.kernel"):
+            rc = L.inkling_capi_moe_group_bwd(ints, ptrs, seg, (ctypes.c_float * ng)(*f13h), (ctypes.c_float * ng)(*f2h),
+                                              ctypes.c_float(float(scale) if scale is not None else 0.0), ctypes.c_long(wsb), None)
         if rc != 0:
             raise RuntimeError("inkling_capi_moe_group_bwd: " + L.inkling_capi_last_error().decode())
         torch.cuda.synchronize(dev)  # the call has finished before the decoded units go back to the allocator
