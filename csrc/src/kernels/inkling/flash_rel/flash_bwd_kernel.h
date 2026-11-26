@@ -663,6 +663,26 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
                     smem_tiled_copy_dS, smem_tiled_copy_Kt, smem_thr_copy_dS, smem_thr_copy_Kt);
         // if (cute::thread0()) { print(acc_dq); }
 
+        // inkling: dK's product with dS runs here (upstream: after the dQ write below), so that both products can be
+        // repeated with the LOW part of dS. dS sums to about zero over the keys; rounded once to the element type, the
+        // products dS . K and dS^T . Q (small differences of large terms when the keys share a common part) lose about
+        // 1 % on real rows. dS = hi + lo with hi = Element(dS), lo = Element(dS - hi): two passes, error ~2^-17.
+        FLASH_NAMESPACE::gemm(acc_dk, tdKrdSt, tdKrQt, tdKsdSt, tdKsQt, tiled_mma_dkv,
+                    smem_tiled_copy_PdSt, smem_tiled_copy_QdOt, smem_thr_copy_PdSt, smem_thr_copy_QdOt);
+        __syncthreads();  // every thread has read the high part of dS from shared memory
+        #pragma unroll
+        for (int i = 0; i < size(dS_reshaped); ++i) { dS_reshaped(i) -= float(tdSrdS(i)); }
+        {
+            Tensor tdSrdS_lo = FLASH_NAMESPACE::convert_type<Element>(dS_reshaped);
+            Tensor tdSadS_lo = smem_thr_copy_PdS.retile_S(tdSrdS_lo);
+            cute::copy(smem_tiled_copy_PdS, tdSadS_lo, tdSsdS);
+        }
+        __syncthreads();
+        FLASH_NAMESPACE::gemm(acc_dq, tdQrdS, tdQrKt, tdQsdS, tdQsKt, tiled_mma_dq,
+                    smem_tiled_copy_dS, smem_tiled_copy_Kt, smem_thr_copy_dS, smem_thr_copy_Kt);
+        FLASH_NAMESPACE::gemm(acc_dk, tdKrdSt, tdKrQt, tdKsdSt, tdKsQt, tiled_mma_dkv,
+                    smem_tiled_copy_PdSt, smem_tiled_copy_QdOt, smem_thr_copy_PdSt, smem_thr_copy_QdOt);
+
         if (m_block > m_block_min) {
             gLSE.data() = gLSE.data() + (-int(kBlockM));
             #pragma unroll
@@ -712,9 +732,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
             cute::copy(smem_tiled_copy_dQ, taccdQrdQ, taccdQsdQ);
         }
 
-        FLASH_NAMESPACE::gemm(acc_dk, tdKrdSt, tdKrQt, tdKsdSt, tdKsQt, tiled_mma_dkv,
-                    smem_tiled_copy_PdSt, smem_tiled_copy_QdOt, smem_thr_copy_PdSt, smem_thr_copy_QdOt);
-        // if (cute::thread0()) { print(acc_dk); }
+        // inkling: the dK products ran above, with the dQ products (high and low parts of dS)
         if (Double_buffer) {  // Double buffer for sQ
             tdKsQt.data() = tdKsQt.data() + (m_block % 2 == 0 ? size(sQ) : -size(sQ));
         }

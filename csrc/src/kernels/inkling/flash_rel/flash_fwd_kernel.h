@@ -353,6 +353,17 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         Tensor tOrP = make_tensor(rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<typename Kernel_traits::TiledMma>(rP.layout()));
         // if (cute::thread0()) { print(tOrP); }
         FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+
+        // inkling: the LOW part of P. P rounded once to the element type gives an output off by ~2^-9 relative; the
+        // trainer's backward subtracts that output from each key's value (dout . (v_k - out)), a small difference of
+        // large terms on sharply focused heads. P = hi + lo with lo = Element(P - hi): a second product, error ~2^-17.
+        {
+            #pragma unroll
+            for (int i = 0; i < size(acc_s); ++i) { acc_s(i) -= float(rP(i)); }
+            Tensor rP_lo = FLASH_NAMESPACE::convert_type<Element>(acc_s);
+            Tensor tOrP_lo = make_tensor(rP_lo.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<typename Kernel_traits::TiledMma>(rP_lo.layout()));
+            FLASH_NAMESPACE::gemm_rs(acc_o, tOrP_lo, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+        }
         // if (cute::thread0()) { print(scores); }
 
         // This check is at the end of the loop since we always have at least 1 iteration
@@ -414,6 +425,17 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
         Tensor tOrP = make_tensor(rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<typename Kernel_traits::TiledMma>(rP.layout()));
         FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+
+        // inkling: the LOW part of P. P rounded once to the element type gives an output off by ~2^-9 relative; the
+        // trainer's backward subtracts that output from each key's value (dout . (v_k - out)), a small difference of
+        // large terms on sharply focused heads. P = hi + lo with lo = Element(P - hi): a second product, error ~2^-17.
+        {
+            #pragma unroll
+            for (int i = 0; i < size(acc_s); ++i) { acc_s(i) -= float(rP(i)); }
+            Tensor rP_lo = FLASH_NAMESPACE::convert_type<Element>(acc_s);
+            Tensor tOrP_lo = make_tensor(rP_lo.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<typename Kernel_traits::TiledMma>(rP_lo.layout()));
+            FLASH_NAMESPACE::gemm_rs(acc_o, tOrP_lo, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+        }
     }
 
     // Epilogue

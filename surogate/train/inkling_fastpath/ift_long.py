@@ -340,7 +340,7 @@ def rel_attention(q, k, v, r_out, rel_proj, window, q_block):
             raise ValueError("ATTN_CUDA has no constant-pattern backward (pattern_grad_from needs IFT_ATTN_CUDA=0)")
         import cuda_bwd as CB
 
-        return CB.RelAttentionCuda.apply(q, k, v, r_out, rel_proj, window, 2 if ATTN_CUDA == 2 else 1)
+        return CB.RelAttentionCuda.apply(q, k, v, r_out, rel_proj, window, ATTN_CUDA)
     return RelAttentionR.apply(q, k, v, r_out, rel_proj, window, q_block)
 
 

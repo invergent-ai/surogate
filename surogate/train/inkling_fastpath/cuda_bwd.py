@@ -179,6 +179,15 @@ class RelAttentionCuda(torch.autograd.Function):
                 out[b0:b1] = o_n
                 lse[b0:b1] = l_n.T
             del rel, o_n, l_n
+        if passes == 3:  # diagnostic: the recompute's (out, lse) from the torch attention (fp32 probabilities), the backward from the kernels
+            import ift_long as LG
+
+            class _Ctx:
+                def save_for_backward(self, *a):
+                    pass
+
+            out, lse = LG.RelAttentionR.forward(_Ctx(), q16.float(), k16.float(), v16.float(), r16.float(), rel_proj, window,
+                                                LG._q_block(T, window))
         ctx.save_for_backward(q16, k16, v16, r16, out, lse)
         ctx.rel_proj, ctx.is_global = relp, is_global
         return out, lse
