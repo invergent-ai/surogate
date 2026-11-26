@@ -39,6 +39,9 @@ STACKS = {"A0": {"IFT_MOE_GM": "0", "IFT_MOE_DET": "0", "IFT_FAST_GEMM": "0", "I
 # C1 = A0 with the backward on the CUDA kernel library (cuda_bwd; library path in IFT_BWD_LIB): the grouped expert backward, the relative
 # attention and the two hand-written stage backwards. Not a default: selected by T8Config.stack (env T8_STACK for drivers that do not pass it).
 STACKS["C1"] = {**STACKS["A0"], "IFT_MOE_GM": "1", "IFT_MOE_CUDA": "1", "IFT_ATTN_CUDA": "1", "IFT_STAGE_CUDA": "1"}
+# A1 = A0 with the grouped expert backward in torch (deterministic sums): the same mathematics in another order of operations, no kernel
+# library. A control for C1: what a torch-only change of arithmetic does to a training run.
+STACKS["A1"] = {**STACKS["A0"], "IFT_MOE_GM": "1", "IFT_MOE_DET": "1"}
 WORKER_ENV = {"SUROGATE_INKLING_ATTN_EARLY_META": "0", "MALLOC_ARENA_MAX": "2", "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
               "OMP_NUM_THREADS": "8", "PYTHONUNBUFFERED": "1"}
 _FLAG_ATTR = {"IFT_MOE_GM": "MOE_GM", "IFT_MOE_DET": "MOE_DET", "IFT_FAST_GEMM": "FAST_GEMM", "IFT_ATTN_ADAPT": "ATTN_ADAPT", "IFT_CHUNK": "CHUNK",
