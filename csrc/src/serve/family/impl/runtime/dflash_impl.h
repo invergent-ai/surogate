@@ -132,7 +132,7 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
     if constexpr (!V::supports_dflash) {
         throw std::logic_error("DFlash context append is unavailable for this target");
     } else {
-        if constexpr (family::dspark_drafter<V>()) {
+        if (family::dspark_drafter<V>(state.execution.model.geometry)) {
             // DSpark (dspark_round.h): the target's own context append into its draft planes.
             family::dspark_append_if<V>(
                 state.execution.model, dspark_runtime(state),
@@ -263,7 +263,7 @@ void propose_batch_impl(DFlashBatchContext& state, family::DFlashDecodeState& fr
         state.execution.work.reset();
         ops::prepare_masked_block(anchors, frontiers, valid_columns, config.mask_token, ids,
                                   positions, state.execution.device.stream);
-        if constexpr (family::dspark_drafter<V>()) {
+        if (family::dspark_drafter<V>(state.execution.model.geometry)) {
             // DSpark (dspark_round.h): the block's positions above are the verify's cache positions; the target's
             // own drafter runs from the anchor at its frontier and writes k drafts.
             family::dspark_propose_if<V>(state.execution.model, dspark_runtime(state),
@@ -273,8 +273,14 @@ void propose_batch_impl(DFlashBatchContext& state, family::DFlashDecodeState& fr
             return;
         }
         Tensor residual = state.execution.work.alloc(DType::BF16, {config.hidden, columns});
-        ops::embedding(ids.view({columns}), state.execution.model.token_embedding, residual,
-                       state.execution.device.stream);
+        if constexpr (requires { &V::dflash_block_embedding; }) {
+            // A target whose drafter reads its block through the target's own input embedding (inkling2).
+            V::dflash_block_embedding(state.execution.model, ids.view({columns}), residual,
+                                      state.execution.device.stream);
+        } else {
+            ops::embedding(ids.view({columns}), state.execution.model.token_embedding, residual,
+                           state.execution.device.stream);
+        }
 
         for (int layer = 0; layer < config.layers; ++layer) {
             const auto& weight =
@@ -493,7 +499,8 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         // DSpark on a pipeline (dspark_round.h): the drafter stage appended this round's context and proposed its
         // drafts before the first stage launched (dflash_pipeline_propose); no stage appends here. Every other
         // target (and DSpark on one card) appends as before.
-        const bool dspark_split = family::dspark_drafter<Variant>() && stage.features != nullptr;
+        const bool dspark_split =
+            family::dspark_drafter<Variant>(state.execution.model.geometry) && stage.features != nullptr;
         if (!dspark_split) {
             Tensor compact_features = state.execution.work.alloc(
                 DType::BF16, {state.execution.model.geometry.dflash.feature_rows,
@@ -643,10 +650,13 @@ void dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size, std
 
 void dflash_pipeline_propose(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                              DFlashEnvelopes envelopes, void* draft_export) {
-    if constexpr (!family::dspark_drafter<Variant>()) {
+    if constexpr (!family::dspark_capable<Variant>()) {
         (void)state; (void)batch_size; (void)k; (void)envelopes; (void)draft_export;
         throw std::logic_error("only a DSpark target proposes ahead of a pipeline round");
     } else {
+        if (!family::dspark_drafter<Variant>(state.execution.model.geometry)) {
+            throw std::logic_error("only a DSpark drafter proposes ahead of a pipeline round");
+        }
         // The first half of dflash_decode_batch_body, run eagerly on the drafter stage before the round's first stage
         // launches: the ingress, the context append of the lanes' pending columns, the proposal and the verify ids.
         // The same ops on the same inputs as the single-card body; the verify half then skips them (dspark_split).

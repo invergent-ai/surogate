@@ -101,6 +101,12 @@ struct Variant {
                                                         const family::DSparkLaneStats* stats = nullptr);
     [[nodiscard]] static std::size_t dspark_propose_workspace_bytes(std::int32_t batch, std::uint32_t max_visible_keys);
 
+    /// A DFlash checkpoint drafter's block rows (family dflash_impl.h): BF16 [2304, T] = embed_norm(embed[ids]), the
+    /// target's own input rows (SGLang's Inkling get_input_embeddings folds the norm in). Measured on
+    /// incoai/Inkling-2-Mini-DFlash2: 6.8 tokens / round with the norm, 1.02 with the bare rows.
+    /// SUROGATE_SERVE_INKLING_DFLASH_EMBED=raw takes the bare table rows (A/B only).
+    static void dflash_block_embedding(const ModelView& model, const Tensor& ids, Tensor& out, cudaStream_t stream);
+
     // ---- residual hooks (ResidualHooks<Variant>) ----
     /// Slot 0 of the stack = embed_norm(embed[ids]); the other slots are written by the visits.
     static void embed_residual(const ModelView& model, const Tensor& ids, Tensor& residual,

@@ -112,10 +112,12 @@ VISION_FLOAT_FIELDS = (
 DFLASH_INT_FIELDS = (
     "hidden", "layers", "local_layers", "intermediate", "query_heads", "kv_heads", "head_dim",
     "local_capacity", "mask_token", "block_size", "max_context", "feature_layers", "feature_rows",
-    "conv_kernel", "conv_group", "selector_rank", "selector_top_k",
+    "conv_kernel", "conv_group", "selector_rank", "selector_top_k", "feature_extent",
 )
-#: DFlash 2's fields, absent (zero) on a first-generation drafter.
-DFLASH_OPTIONAL_FIELDS = ("conv_kernel", "conv_group", "selector_rank", "selector_top_k")
+#: DFlash 2's fields, absent (zero) on a first-generation drafter; and ``feature_extent``: how many target feature
+#: positions ``dflash_target_layers`` index, stated only where that is not the target's ``layers`` (inkling2: its 48
+#: layer visits and the final-norm output, 49, over 24 physical layers).
+DFLASH_OPTIONAL_FIELDS = ("conv_kernel", "conv_group", "selector_rank", "selector_top_k", "feature_extent")
 DFLASH_FLOAT_FIELDS = ("rms_epsilon", "rope_theta", "attention_scale")
 
 REQUIRED_TEXT_FIELDS = (
@@ -206,7 +208,10 @@ def validate_dflash_geometry(values, targets, text):
     for name in (*DFLASH_INT_FIELDS, *DFLASH_FLOAT_FIELDS):
         if name not in DFLASH_OPTIONAL_FIELDS and (name not in g or (name != "mask_token" and g[name] <= 0)):
             raise ValueError(f"dflash_geometry.{name} is required and must be positive")
-    conv, group, rank, top_k = (g.get(name, 0) for name in DFLASH_OPTIONAL_FIELDS)
+    conv, group, rank, top_k = (g.get(name, 0) for name in ("conv_kernel", "conv_group", "selector_rank",
+                                                             "selector_top_k"))
+    if g.get("feature_extent", 0) < 0:
+        raise ValueError("dflash_geometry.feature_extent must be nonnegative")
     if bool(conv) != bool(group) or (conv and (conv != 2 or g["hidden"] % group)):
         raise ValueError("DFlash 2 convolutions take two taps over whole channel groups")
     if bool(rank) != bool(top_k) or (rank and (rank % 32 or rank > 1024 or top_k > 32)):
@@ -218,8 +223,9 @@ def validate_dflash_geometry(values, targets, text):
         raise ValueError("DFlash hidden width or mask token is incompatible with the target")
     if g["query_heads"] % g["kv_heads"] or g["head_dim"] % 2 or not 2 <= g["block_size"] <= 16:
         raise ValueError("invalid DFlash heads or block size")
+    extent = g.get("feature_extent", 0) or text.get("layers", 0)
     if not isinstance(targets, list) or len(targets) != g["feature_layers"] or any(
-        isinstance(i, bool) or not isinstance(i, int) or not 0 <= i < text.get("layers", 0) for i in targets
+        isinstance(i, bool) or not isinstance(i, int) or not 0 <= i < extent for i in targets
     ) or len(set(targets)) != len(targets):
         raise ValueError("dflash_target_layers must list distinct target layers matching feature_layers")
     if g["feature_rows"] != len(targets) * g["hidden"]:

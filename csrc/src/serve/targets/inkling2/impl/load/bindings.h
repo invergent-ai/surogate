@@ -18,6 +18,7 @@
 #include "core/tensor.h"
 
 #include <api/family/frontend_resources.h>
+#include "family/impl/load/dflash.h"
 #include "family/impl/load/gemma_vision.h"
 
 #include <array>
@@ -179,6 +180,9 @@ struct BindOptions {
     std::optional<artifact::TensorPlacement> small_globals_placement;
     /// The DSpark drafter's objects (`mtp/*`) when `draft` is set. Unset: `head_placement` (it reads the LM head).
     std::optional<artifact::TensorPlacement> draft_placement;
+    /// Bind a DFlash checkpoint drafter (`dflash/*`, converter `--dflash-model`) to the device; otherwise its objects,
+    /// when the artifact carries them, are validated only.
+    bool dflash = false;
 };
 
 struct BindingPlan {
@@ -190,6 +194,8 @@ struct BindingPlan {
     std::vector<LayerPlan> layers;
     bool has_draft = false;
     DraftPlan draft;
+    /// The DFlash checkpoint drafter's objects (empty when the artifact carries none; family::bind_dflash).
+    family::DFlashPlan dflash;
     /// The vision tower, when the artifact carries one (geometry empty otherwise).
     family::GemmaVisionPlan vision;
 };

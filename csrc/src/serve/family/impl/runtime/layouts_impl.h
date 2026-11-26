@@ -176,16 +176,18 @@ template <class V>
 
 constexpr std::size_t kMiB        = 1024ULL * 1024ULL;
 
-/// One DFlash graph topology class's memory allowance: the target's measured bound when it states one
-/// (`dflash_graph_allowance_per_class_bytes`, e.g. inkling2's DSpark rounds), else the family's 64 / 96 MiB.
+/// One DFlash graph topology class's memory allowance: the target's measured bound for its own DSpark rounds when it
+/// states one (`dflash_graph_allowance_per_class_bytes`, inkling2) and serves DSpark, else the family's 64 / 96 MiB --
+/// also for a DSpark-capable target that serves a DFlash checkpoint, whose rounds are the family's.
 template <class V>
-[[nodiscard]] std::uint64_t dflash_graph_class_allowance_bytes(std::uint64_t final_visible) {
+[[nodiscard]] std::uint64_t dflash_graph_class_allowance_bytes(const TextGeometry& geometry,
+                                                               std::uint64_t final_visible) {
     if constexpr (requires { V::dflash_graph_allowance_per_class_bytes; }) {
-        (void)final_visible;
-        return V::dflash_graph_allowance_per_class_bytes;
+        if (family::dspark_drafter<V>(geometry)) { return V::dflash_graph_allowance_per_class_bytes; }
     } else {
-        return (final_visible <= 4096 ? 64ULL : 96ULL) * kMiB;
+        (void)geometry;
     }
+    return (final_visible <= 4096 ? 64ULL : 96ULL) * kMiB;
 }
 constexpr std::size_t kArenaAlign = 256ULL;
 
@@ -526,7 +528,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                                                    static_cast<std::int32_t>(plan.draft_window + 1U),
                                                    static_cast<std::int32_t>(plan.max_concurrency)},
                                                   "DFlash pending target features");
-            if constexpr (family::dspark_drafter<Variant>()) {
+            if (family::dspark_drafter<Variant>(plan.geometry)) {
                 // DSpark: each lane's Markov feature (mix row 3 of its last committed column), read by the proposal.
                 dflash.dspark_f_rnn = add_tensor(builder, DType::BF16,
                                                  {plan.geometry.dflash.hidden,
@@ -1102,7 +1104,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 if (compact_input) {
                     matrix(layout, DType::BF16, plan.geometry.dflash.feature_rows, tokens);
                 }
-                if constexpr (family::dspark_drafter<Variant>()) {
+                if (family::dspark_drafter<Variant>(plan.geometry)) {
                     scratch(layout, family::dspark_append_workspace_bytes_if<Variant>(tokens));
                     return finish(layout);
                 }
@@ -1115,8 +1117,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             };
             const auto dflash_proposal_capacity = [&](std::int32_t width, std::int32_t batch) {
                 WorkspaceLayoutBuilder layout;
-                if constexpr (family::dspark_drafter<Variant>()) {
-                    (void)width;
+                if (family::dspark_drafter<Variant>(plan.geometry)) {
                     scratch(layout, family::dspark_propose_workspace_bytes_if<Variant>(batch, plan.capacity));
                     return finish(layout);
                 }
@@ -1161,7 +1162,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             };
 
             out.dflash_context = dflash_context_capacity(chunk, false);
-            for (auto window : dflash_draft_windows(plan.draft_window, plan.adaptive_dflash, family::dspark_drafter<Variant>())) {
+            for (auto window : dflash_draft_windows(plan.draft_window, plan.adaptive_dflash,
+                                                    family::dspark_drafter<Variant>(plan.geometry))) {
                 const auto round_width = static_cast<std::int32_t>(window + 1);
                 for (std::int32_t batch = 1; batch <= batch_capacity; ++batch) {
                     const std::int32_t aggregate = round_width * batch;
@@ -1175,7 +1177,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     const std::size_t accept =
                         ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
                             plan.geometry.token_domain, window, window, batch, batch,
-                            family::dspark_drafter<Variant>()); // split routes: DSpark targets only
+                            family::dspark_drafter<Variant>(plan.geometry)); // split routes: DSpark targets only
                     const std::size_t proposal =
                         window == 0 ? 0 : dflash_proposal_capacity(round_width, batch);
                     out.dflash_round =
@@ -1419,7 +1421,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                 checked_mul(per_batch_allowance, decode_batch_capacity(impl->max_concurrency, impl->speculative_backend),
                             "MTP exact-b graph allowance");
         } else {
-            for (auto window : dflash_draft_windows(impl->draft_window, impl->adaptive_dflash, family::dspark_drafter<Variant>())) {
+            for (auto window : dflash_draft_windows(impl->draft_window, impl->adaptive_dflash,
+                                                    family::dspark_drafter<Variant>(impl->geometry))) {
                 const auto class_allowance = [&](std::uint32_t batch_size) {
                     const auto profiles = dflash_graph_profiles(impl->capacity, window, batch_size);
                     return graph_topology_allowance(
@@ -1428,7 +1431,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                             const std::uint64_t final_visible = std::min<std::uint64_t>(
                                 impl->capacity,
                                 static_cast<std::uint64_t>(profile.max) + window + 1ULL);
-                            return dflash_graph_class_allowance_bytes<Variant>(final_visible);
+                            return dflash_graph_class_allowance_bytes<Variant>(impl->geometry, final_visible);
                         },
                         "DFlash graph allowance");
                 };

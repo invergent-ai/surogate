@@ -94,6 +94,7 @@ family::DFlashGeometry dspark_dflash_geometry(const load::ArtifactConfig& config
     g.rms_epsilon     = G::kEps;
     g.rope_theta      = G::kRopeTheta;
     g.attention_scale = G::kScale;
+    g.dspark          = true; // the target's own drafter (family::dspark_drafter), not a DFlash checkpoint
     // Features named by the visit that produces them (visits.h kFeatureLabels): on one card a label only names its row;
     // on the 2-card split the family's feature sink uses it to tell which stage captures a feature and which imports it.
     static_assert(G::kFeatures == static_cast<int>(kFeatureLabels.size()));
@@ -533,7 +534,8 @@ void dspark_propose(const load::InklingWeights& w, const DSparkDerived& d, const
 
 std::vector<std::int32_t> Variant::extra_kv_planes(const family::TextGeometry& geometry,
                                                    const family::StartupFeatures& features) {
-    if (!features.dflash() || geometry.dflash.layers <= 0) { return {}; }
+    // Only the target's own drafter keeps its draft KV in text-pool planes; a DFlash checkpoint has the family's pool.
+    if (!features.dflash() || geometry.dflash.layers <= 0 || !geometry.dflash.dspark) { return {}; }
     return {G::kBlockWindow, 0, G::kBlockWindow};
 }
 

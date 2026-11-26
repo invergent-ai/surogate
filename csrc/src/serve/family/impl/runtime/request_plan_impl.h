@@ -223,7 +223,7 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     // DSpark (dspark_round.h) writes its draft block's own K / V at [frontier, frontier + 8) of its text-pool planes
     // every round whatever k is: the reservation covers that block past the last output position. 0 elsewhere.
     const std::uint32_t draft_block_tokens =
-        family::dspark_drafter<Variant>() && speculative_backend == SpeculativeBackend::DFlash
+        family::dspark_drafter<Variant>(cfg) && speculative_backend == SpeculativeBackend::DFlash
             ? static_cast<std::uint32_t>(cfg.dflash.block_size)
             : 0U;
     const std::uint32_t reserved_context_tokens = static_cast<std::uint32_t>(std::min<std::uint64_t>(
@@ -265,7 +265,7 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     // Window KV: a DSpark row whose tokens depend on its drafts (top_p < 1, top_k > 0, min_p, one-hot verification) keeps
     // its whole reservation and is never preempted, unless SUROGATE_SERVE_KV_TRUNCATED_ONDEMAND=1. true for other models.
     const bool recompute_allowed = [&] {
-        if (!family::dspark_drafter<Variant>() || speculative_backend != SpeculativeBackend::DFlash) { return true; }
+        if (!family::dspark_drafter<Variant>(cfg) || speculative_backend != SpeculativeBackend::DFlash) { return true; }
         static const bool truncated_on_demand = [] {
             const char* raw = std::getenv("SUROGATE_SERVE_KV_TRUNCATED_ONDEMAND");
             return raw != nullptr && std::string_view(raw) == "1";

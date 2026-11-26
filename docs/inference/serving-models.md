@@ -474,6 +474,16 @@ token after the one chosen before it. Its blocks are 8 tokens, so serve it with
 `--draft-tokens 7` or fewer. `SUROGATE_SERVE_DFLASH_SELECTOR=0` drafts each position's best token
 instead of walking the candidates, to measure what the selector adds.
 
+Inkling-2-Mini (and its fine-tunes) takes
+[incoai/Inkling-2-Mini-DFlash2](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) the same way, through
+`python -m surogate.serve.convert.inkling2 MODEL OUT.sinfer --dflash-model /path/to/Inkling-2-Mini-DFlash2`. The
+artifact keeps the release's own DSpark drafter beside it; `--spec dflash` then serves the DFlash 2 drafter, and
+`SUROGATE_SERVE_INKLING_DRAFTER=dspark` serves DSpark from the same artifact. The drafter reads DSpark's four target
+features and the target's normalized input embedding. On a DGX Spark with Surogate3.8-26B-A3B (Inkling-2-Mini plus a
+writing LoRA), one stream, eight prompts (code, prose, Romanian, math, tool calls, JSON): greedy 55 tokens/s against
+44 for DSpark with `--spec-adaptive`, 46 against 43 at temperature 1, and 102 against 92 tokens/s in total at four
+streams; `--draft-tokens 7` without `--spec-adaptive` was the fastest DFlash 2 setting.
+
 The drafter was trained against the base model. A fine-tune accepts fewer of its drafts;
 measure acceptance on your own prompts. With real tool calls at 100k-200k tokens of context,
 Surogate3.7-35B-A3B (a fine-tuned merge) accepted 26-27% of the stock Qwen3.6-35B-A3B DFlash 2

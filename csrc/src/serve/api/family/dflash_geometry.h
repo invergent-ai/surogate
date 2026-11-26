@@ -18,6 +18,9 @@ struct DFlashGeometry {
 #undef SINFER_GEOMETRY_INT
 #undef SINFER_GEOMETRY_FLOAT
     std::array<int, 256> target_feature_layers{};
+    /// The target's own DSpark drafter run through the DFlash runtime (inkling2; family::dspark_drafter), not a DFlash
+    /// checkpoint: set by the target when it builds this geometry, never read from an artifact.
+    bool dspark = false;
     [[nodiscard]] constexpr int query_size() const { return query_heads * head_dim; }
     [[nodiscard]] constexpr int kv_size() const { return kv_heads * head_dim; }
     /// DFlash 2: a two-tap dynamic convolution before and after every sublayer of the block.
@@ -31,6 +34,9 @@ struct DFlashGeometry {
     [[nodiscard]] std::span<const int> target_layers() const {
         return {target_feature_layers.data(), static_cast<std::size_t>(feature_layers)};
     }
+    /// `target_layers` is how many feature positions the target can capture: its layers, or more where the target
+    /// names features past them (inkling2: 48 layer visits + the final-norm output = 49). An artifact that states
+    /// `feature_extent` must state exactly that.
     [[nodiscard]] static DFlashGeometry resolved(const std::map<std::string, double>& values,
                                                  std::span<const std::int32_t> targets,
                                                  int target_hidden, int target_layers, int target_vocab) {
@@ -55,7 +61,8 @@ struct DFlashGeometry {
         for (const auto& entry : ints) {
             // DFlash 2's fields; a first-generation drafter states none of them.
             if (entry.name == "conv_kernel" || entry.name == "conv_group" ||
-                entry.name == "selector_rank" || entry.name == "selector_top_k") {
+                entry.name == "selector_rank" || entry.name == "selector_top_k" ||
+                entry.name == "feature_extent") {
                 continue;
             }
             if (!values.contains(std::string(entry.name)) ||
@@ -76,6 +83,9 @@ struct DFlashGeometry {
             (std::int64_t(g.query_heads) + 2LL * g.kv_heads) * g.head_dim > INT32_MAX ||
             std::int64_t(2) * g.intermediate > INT32_MAX) {
             throw std::invalid_argument("inconsistent DFlash checkpoint geometry");
+        }
+        if (g.feature_extent < 0 || (g.feature_extent != 0 && g.feature_extent != target_layers)) {
+            throw std::invalid_argument("DFlash feature_extent disagrees with the target's feature positions");
         }
         if ((g.conv_kernel > 0) != (g.conv_group > 0) ||
             (g.has_conv() && (g.conv_kernel != 2 || g.hidden % g.conv_group != 0)) ||

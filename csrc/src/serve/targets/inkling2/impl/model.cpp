@@ -3,6 +3,7 @@
 
 #include "targets/inkling2/impl/model.h"
 #include "targets/inkling2/impl/visits.h"
+#include "family/impl/load/dflash.h"
 
 #include "api/ops/inkling_attention.h"
 #include "artifact/reader.h"
@@ -10,7 +11,12 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <array>
+#include <cstdlib>
 #include <map>
+#include <optional>
+#include <string_view>
 #include <stdexcept>
 #include <cstdio>
 #include <string>
@@ -99,6 +105,35 @@ void derive_rel_tables(const load::InklingWeights& weights, DerivedQueries& out)
 
 } // namespace
 
+bool inkling_dspark_forced() {
+    static const bool forced = [] {
+        const char* raw = std::getenv("SUROGATE_SERVE_INKLING_DRAFTER");
+        const std::string_view value = raw == nullptr ? std::string_view() : std::string_view(raw);
+        if (value.empty() || value == "dflash") { return false; }
+        if (value == "dspark") { return true; }
+        throw std::invalid_argument("SUROGATE_SERVE_INKLING_DRAFTER must be dspark or dflash");
+    }();
+    return forced;
+}
+
+std::optional<family::DFlashGeometry> dflash_checkpoint_geometry(const artifact::Reader& reader) {
+    if (reader.dflash_geometry().empty()) { return std::nullopt; }
+    // Feature positions the checkpoint may name: the 48 visits and the final-norm output after them.
+    family::DFlashGeometry d = family::DFlashGeometry::resolved(reader.dflash_geometry(), reader.dflash_target_layers(),
+                                                                C::hidden, C::layers + 1, C::output_rows);
+    static constexpr std::array<int, 4> kCheckpointFeatures{5, 23, 41, C::layers};
+    const auto targets = d.target_layers();
+    if (targets.size() != kCheckpointFeatures.size() ||
+        !std::equal(targets.begin(), targets.end(), kCheckpointFeatures.begin())) {
+        throw std::invalid_argument("inkling2: a DFlash checkpoint must read DSpark's features (5, 23, 41, 48)");
+    }
+    for (std::size_t f = 0; f < kFeatureLabels.size(); ++f) { d.target_feature_layers[f] = kFeatureLabels[f]; }
+    if (d.local_layers != d.layers) {
+        throw std::invalid_argument("inkling2: a DFlash checkpoint is served with sliding-window layers only");
+    }
+    return d;
+}
+
 family::TextGeometry visit_geometry(const artifact::Reader& reader) {
     std::map<std::string, double> values = reader.geometry();
     const auto layers = values.find("layers");
@@ -110,10 +145,15 @@ family::TextGeometry visit_geometry(const artifact::Reader& reader) {
     std::vector<std::string> types(C::layers);
     for (int v = 0; v < C::layers; ++v) { types[v] = kVisits[v].global ? "full_attention" : "sliding_attention"; }
     family::TextGeometry g = family::TextGeometry::resolved_moe(values, types);
-    // The DSpark drafter's geometry for the DFlash runtime (DSpark), whenever the artifact carries the drafter; it
-    // is used only under `--speculative dflash`.
+    // The served drafter's geometry for the DFlash runtime, used only under `--speculative dflash`: a DFlash checkpoint
+    // the converter added, else (or with SUROGATE_SERVE_INKLING_DRAFTER=dspark) the release's DSpark drafter.
     const load::ArtifactConfig config = load::parse_artifact_config(reader.payload("inkling2/config.json").data);
-    if (config.dspark) { g.dflash = dspark_dflash_geometry(config); }
+    const std::optional<family::DFlashGeometry> checkpoint = dflash_checkpoint_geometry(reader);
+    if (checkpoint && !(inkling_dspark_forced() && config.dspark)) {
+        g.dflash = *checkpoint;
+    } else if (config.dspark) {
+        g.dflash = dspark_dflash_geometry(config);
+    }
     if (g.hidden != C::hidden || g.query_heads != C::query_heads || g.kv_heads != C::kv_heads ||
         g.head_dim != C::head_dim || g.sliding_window != C::window || g.output_rows != C::output_rows ||
         g.token_domain != C::token_domain || g.experts != C::experts || g.experts_per_token != C::experts_per_token) {
@@ -187,7 +227,10 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     runtime.features        = plan.features;
     runtime.vision_geometry = plan.plan.vision.vision_geometry;
     if (plan.features.vision) { runtime.vision = family::materialize_gemma_vision(backing, plan.plan.vision); }
-    if (plan.features.dflash()) {
+    if (plan.features.dflash() && !plan.geometry.dflash.dspark) {
+        // A DFlash checkpoint: the family's DFlash weights, run by the family's DFlash bodies.
+        runtime.dflash = family::materialize_dflash(plan.plan.dflash, backing, plan.geometry);
+    } else if (plan.features.dflash()) {
         // The 2-card split keeps the drafter on the stage with the head (package.cpp); a stage without the head runs
         // the DFlash round's target half only (verify columns from the drafter stage) and binds no drafter.
         const bool drafter_elsewhere = plan.plan.options.draft_placement.has_value() &&

@@ -1,5 +1,6 @@
 #include "targets/inkling2/impl/load/bindings.h"
 
+#include "family/impl/load/dflash.h"
 #include "family/impl/load/routed_nvfp4.h"
 
 #include <nlohmann/json.hpp>
@@ -410,6 +411,22 @@ BindingPlan bind_artifact(artifact::Binder& binder, const BindOptions& options) 
         m.markov_w1              = b.linear("mtp/markov/w1", c.vocab_padded, r, dp, NumericFormat::BF16);
         m.markov_rnn_proj        = b.linear("mtp/markov/rnn_proj", 3 * r, 2 * r + 2 * Dd, dp, NumericFormat::BF16);
         m.markov_rnn_proj_bias   = b.tensor("mtp/markov/rnn_proj_bias", NumericFormat::BF16, {3 * u64(r)}, dp);
+    }
+
+    // A DFlash checkpoint drafter (converter --dflash-model): the family's `dflash/*` objects, bound on the device when
+    // it is the served drafter, validated only otherwise. Its feature ids run to the visits + the final-norm output.
+    const artifact::Reader& reader = binder.reader();
+    if (!reader.dflash_geometry().empty()) {
+        family::TextGeometry g;
+        g.hidden      = c.hidden;
+        g.output_rows = c.vocab_padded;
+        g.dflash      = family::DFlashGeometry::resolved(reader.dflash_geometry(), reader.dflash_target_layers(), c.hidden,
+                                                         static_cast<int>(c.visits.size()) + 1, c.vocab_padded);
+        family::StartupFeatures features;
+        features.speculative = options.dflash ? SpeculativeBackend::DFlash : SpeculativeBackend::None;
+        out.dflash           = family::bind_dflash(binder, g, features);
+    } else if (options.dflash) {
+        throw ArtifactError("inkling2: a DFlash checkpoint drafter was requested but this artifact carries none");
     }
     return out;
 }

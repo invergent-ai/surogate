@@ -5,11 +5,14 @@
 #include "family/inkling_vision_ops.h"
 #include "targets/inkling2/impl/visits.h"
 
+#include "api/ops/embedding.h"
 #include "api/ops/inkling_mix.h"
 #include "core/device.h"
 #include "family/impl/runtime/target_support.h"
 
+#include <cstdlib>
 #include <stdexcept>
+#include <string_view>
 #include <string>
 #include <vector>
 
@@ -87,6 +90,27 @@ void Variant::embed_residual(const ModelView& model, const Tensor& ids, Tensor& 
     const InklingModel& im = model_of(model);
     ops::inkling_embed(ids, model.token_embedding.qdata, model.token_embedding.n, im.weights->globals.embedding_norm,
                        C::rms_epsilon, slot_plane(residual, 0), stream);
+}
+
+void Variant::dflash_block_embedding(const ModelView& model, const Tensor& ids, Tensor& out, cudaStream_t stream) {
+    static const bool normed = [] {
+        const char* raw = std::getenv("SUROGATE_SERVE_INKLING_DFLASH_EMBED");
+        const std::string_view value = raw == nullptr ? std::string_view() : std::string_view(raw);
+        if (value.empty() || value == "norm") { return true; }
+        if (value == "raw") { return false; }
+        throw std::invalid_argument("SUROGATE_SERVE_INKLING_DFLASH_EMBED must be raw or norm");
+    }();
+    if (normed) {
+        const InklingModel& im = model_of(model);
+        if (out.ne[0] != C::hidden || !out.is_contiguous()) {
+            throw std::logic_error("inkling2: the DFlash block rows are a contiguous [2304, T] plane");
+        }
+        ops::inkling_embed(ids, model.token_embedding.qdata, model.token_embedding.n,
+                           im.weights->globals.embedding_norm, C::rms_epsilon,
+                           ops::InklingPlane{static_cast<std::uint16_t*>(out.data), DType::BF16, C::hidden}, stream);
+    } else {
+        ops::embedding(ids, model.token_embedding, out, stream);
+    }
 }
 
 void Variant::scatter_visual(const ModelView&, const Tensor& visual, const Tensor& indices, Tensor& residual,
