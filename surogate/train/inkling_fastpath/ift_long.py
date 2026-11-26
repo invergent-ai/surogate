@@ -328,6 +328,20 @@ class _Shift:
 # ~2^-16). ATTN_TC is read at call time (tests / lever_check switch it per arm).
 # ---------------------------------------------------------------------------------------------------------------
 ATTN_TC = os.environ.get("IFT_ATTN_TC", "0") == "1"
+# ATTN_CUDA (default OFF until its card check): the relative attention of the recompute and its backward run in the CUDA kernel library
+# (cuda_bwd.RelAttentionCuda: the flash kernels with the relative bias) instead of RelAttentionR's query-block loop.
+ATTN_CUDA = int(os.environ.get("IFT_ATTN_CUDA", "0"))  # 1: the cotangent of the output enters rounded to bf16; 2: as its bf16 high + low parts (two passes)
+
+
+def rel_attention(q, k, v, r_out, rel_proj, window, q_block):
+    """The visit's relative attention: RelAttentionR, or the kernel library's with ATTN_CUDA (exact pattern gradient only)."""
+    if ATTN_CUDA:
+        if not PATTERN_GRAD["on"]:
+            raise ValueError("ATTN_CUDA has no constant-pattern backward (pattern_grad_from needs IFT_ATTN_CUDA=0)")
+        import cuda_bwd as CB
+
+        return CB.RelAttentionCuda.apply(q, k, v, r_out, rel_proj, window, 2 if ATTN_CUDA == 2 else 1)
+    return RelAttentionR.apply(q, k, v, r_out, rel_proj, window, q_block)
 
 
 def _tc_ok(dev):
@@ -912,7 +926,7 @@ def visit_torch_long(W: B.EngineWeights, vi, stack, partial, bank, ids, lora, ch
     # 4. attention (flash, bias from r per block)
     with B._tick("fwd.attention"):
         win = 1024 if L.is_local else 0
-        out, lse = RelAttentionR.apply(q_out, K.float(), V.float(), r_out, L.rel_proj, win, _q_block(T, win))
+        out, lse = rel_attention(q_out, K.float(), V.float(), r_out, L.rel_proj, win, _q_block(T, win))
         del K, V, q_out, r_out
     # 5. gate / sink + wo_ud (per token)
 

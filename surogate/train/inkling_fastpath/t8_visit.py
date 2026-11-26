@@ -146,7 +146,7 @@ def visit_torch_t8(W: B.EngineWeights, vi, stack, partial, bank, ids, lora, chun
     # 4. attention (flash, bias from r per block)
     with B._tick("fwd.attention"):
         win = 1024 if L.is_local else 0
-        out, lse = RelAttentionR.apply(q_out, K.float(), V.float(), r_out, L.rel_proj, win, LG._q_block(T, win))
+        out, lse = LG.rel_attention(q_out, K.float(), V.float(), r_out, L.rel_proj, win, LG._q_block(T, win))
         del K, V, q_out, r_out
     # 5. gate / sink + wo_ud (per token)
 
