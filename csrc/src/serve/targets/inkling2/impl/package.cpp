@@ -11,6 +11,7 @@
 #include "family/impl/lora_bind.h"
 #include "family/impl/lora_bind_inkling.h"
 #include "targets/inkling2/impl/lora_attention.h"
+#include "targets/inkling2/impl/decision/registry.h"
 #include "targets/inkling2/impl/model.h"
 #include "targets/inkling2/impl/variant.h"
 #include "targets/inkling2/impl/visits.h"
@@ -191,6 +192,13 @@ SINFER_TARGET_CONSTRUCT_LOADED_MODEL();
 Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineOptions& options) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
     bind_lora(model.impl_->data, options);
+    // Decision adapters (System 1.5): runners over this base, by name (api/targets/inkling2/decision.h). A decision
+    // round is one whole prompt; SUROGATE_SERVE_INKLING_DECISION_MAX_TOKENS bounds it (default 16384).
+    for (const auto& [name, path] : options.decision_adapters) {
+        const char* raw = std::getenv("SUROGATE_SERVE_INKLING_DECISION_MAX_TOKENS");
+        const std::int32_t max_tokens = raw != nullptr && *raw != '\0' ? std::atoi(raw) : 16384;
+        detail::decision::install(name, model.impl_->data, path, max_tokens);
+    }
     // The frontend renders Inkling prompts natively (inkling_render.h) and, with --vision, preprocesses their images
     // as vLLM's Inkling2ImageProcessor does (inkling_vision.h).
     return family::make_frontend(model.impl_->data.frontend,

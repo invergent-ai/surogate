@@ -118,6 +118,7 @@ private:
     DeviceBuffer scratch_;
     Tensor x_, ids_, positions_, meta_, conv_, hidden_;
     PagedKVBatchLayerView kv_{};
+    Numerics numerics_{};
     void* target_state_ = nullptr;
     DeviceBuffer workspace_;
     std::size_t workspace_bytes_ = 0;

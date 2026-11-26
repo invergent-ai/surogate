@@ -311,6 +311,12 @@ public:
     /// with its options reversed, as one more row of the same readout on the same shared prefix,
     /// and answered from the mean of its two readings' distributions. The request parser refuses
     /// order averaging together with thinking.
+    /// A decisions request whose `model` names a decision adapter (System 1.5; decisions_system15.h): every question's
+    /// prompt in the adapter's protocol, answered by its heads, one question per paused round boundary. `mode` /
+    /// `max_loops` (request extensions) choose the halting threshold and the pass bound.
+    [[nodiscard]] DecisionsOutcome decide_system15(const DecisionsRequest& request, const std::string& mode,
+                                                   int max_loops, std::function<bool()> is_cancelled = {});
+
     [[nodiscard]] DecisionsOutcome decide(const DecisionsRequest& request,
         std::function<bool()> is_cancelled = {}, const PreparationGate& before_prepare = {},
         const std::function<void(std::uint32_t attempt, const std::string& reason)>& on_retry = {},

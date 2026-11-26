@@ -985,7 +985,10 @@ target_compile_options(sinfer_parallel_decoding_test PRIVATE -UNDEBUG -fno-fast-
 sinfer_add_test(sinfer_decisions_test
   SOURCES test_decisions.cpp
   LIBRARIES sinfer_serve)
-target_compile_options(sinfer_decisions_test PRIVATE -UNDEBUG -fno-fast-math)
+# -ffp-contract=off: the test's own copy of the pre-temperature readout must round as decisions_schema.cpp does
+# (built with it, see the root CMakeLists); GCC on aarch64 otherwise fuses its a*b+c into FMAs and the copy's last
+# bits differ from the library's on a DGX Spark.
+target_compile_options(sinfer_decisions_test PRIVATE -UNDEBUG -fno-fast-math -ffp-contract=off)
 
 # Decisions v1 is stable: prompts and answers pinned against fixtures/serve/decisions_v1.
 sinfer_add_test(sinfer_decisions_v1_test

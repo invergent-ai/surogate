@@ -208,6 +208,8 @@ struct ServeOptions {
     /// rejected drafts dropped (the draft head is never recorded); DFlash is refused.
     bool capture_routing = false;
     std::vector<LoraModule> lora_modules;
+    /// `--decision-adapter name=path` (repeatable): decision adapters over an inkling2 base.
+    std::vector<LoraModule> decision_adapters;
     std::uint32_t max_loras     = 1;
     /// Banks are padded to this, so it is the rank an adapter may have and not the
     /// rank it must have. 32 rather than 16 because that is what the trainers

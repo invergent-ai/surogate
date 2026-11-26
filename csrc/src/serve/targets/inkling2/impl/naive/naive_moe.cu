@@ -80,19 +80,23 @@ __device__ __forceinline__ float weight_value(const ExpertBankView& w, int nvfp4
 
 // ---------------------------------------------------------------------------------------------- route
 
-__global__ void __launch_bounds__(kE) route_kernel(const bf16* x, const bf16* router, const float* bias,
+__device__ __forceinline__ float rw(const bf16* w, std::int64_t i) { return f(w[i]); }
+__device__ __forceinline__ float rw(const float* w, std::int64_t i) { return w[i]; }
+
+template <class W>
+__global__ void __launch_bounds__(kE) route_kernel(const bf16* x, const W* router, const float* bias,
                                                     std::int32_t* ids, float* gammas, std::int32_t* capture) {
     __shared__ float logit_s[kE];
     __shared__ float key_s[kE];
     const int t = blockIdx.x;
     const int e = threadIdx.x;
     const bf16* xr = x + static_cast<std::int64_t>(t) * kD;
-    const bf16* wr = router + static_cast<std::int64_t>(e) * kD;
+    const W* wr = router + static_cast<std::int64_t>(e) * kD;
     float logit = 0.0F;
     for (int g0 = 0; g0 < kD; g0 += 1024) {
         float part = 0.0F;
         const int g1 = min(g0 + 1024, kD);
-        for (int k = g0; k < g1; ++k) { part = fmaf(f(xr[k]), f(wr[k]), part); }
+        for (int k = g0; k < g1; ++k) { part = fmaf(f(xr[k]), rw(wr, k), part); }
         logit = g0 == 0 ? part : logit + part;
     }
     const float sig = 1.0F / (1.0F + expf(-logit));
@@ -213,6 +217,7 @@ struct GemmArgs {
     int k;
     int rows;                // output rows per expert
     bf16* out;               // [T*8][rows]
+    int act_quant;           // 0: W4A16 / W8A16 (a = the BF16 activations; NVFP4 weights x their per-expert global)
 };
 
 /// One warp per (token-slot, output row): out = bf16(acc * row scale) (NVFP4) or bf16(acc) (MXFP8).
@@ -233,15 +238,17 @@ __global__ void __launch_bounds__(256) expert_gemm_kernel(const __grid_constant_
     for (int off = 16; off > 0; off >>= 1) { acc += __shfl_xor_sync(0xffffffffU, acc, off); }
     if (lane != 0) { return; }
     float y = acc;
-    if (g.nvfp4) {
+    if (g.nvfp4 && g.act_quant) {
         const float rcp   = 1.0F / (1536.0F * g.w.outer_scale_denominator);
         const float scale = (g.a_amax[arow] * g.w.amax[e]) * rcp;
         y                 = acc * scale;
+    } else if (g.nvfp4) {
+        y = acc * (g.w.amax[e] / g.w.outer_scale_denominator);
     }
     g.out[ts * g.rows + r] = __float2bfloat16_rn(y);
 }
 
-__global__ void swiglu_kernel(const bf16* gate_up, const float* gammas, bf16* y, std::int64_t count) {
+__global__ void swiglu_kernel(const bf16* gate_up, const float* gammas, bf16* y, std::int64_t count, int with_gamma) {
     const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= count) { return; }
     const std::int64_t ts = i / kI;
@@ -251,7 +258,24 @@ __global__ void swiglu_kernel(const bf16* gate_up, const float* gammas, bf16* y,
     const float sig = 1.0F / (1.0F + expf(-g));
     const float gc  = 4.0F * tanhf(g * 0.25F);
     const float uc  = 25.0F * tanhf(u / 25.0F);
-    y[i] = __float2bfloat16_rn(((gc * sig) * uc) * gammas[ts]);
+    y[i] = __float2bfloat16_rn(with_gamma ? ((gc * sig) * uc) * gammas[ts] : (gc * sig) * uc);
+}
+
+/// x BF16 [rows][k] -> FP32 (the W4A16 GEMMs' activation operand).
+__global__ void to_f32_kernel(const bf16* x, float* out, std::int64_t count) {
+    const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < count) { out[i] = f(x[i]); }
+}
+
+/// HF's combine: sum over the slots of fp32(down) * gamma in FP32, rounded once.
+__global__ void combine_weighted_kernel(const bf16* down, const float* gammas, bf16* out, std::int64_t count) {
+    const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= count) { return; }
+    const std::int64_t t = i / kD;
+    const int r          = static_cast<int>(i % kD);
+    float acc            = 0.0F;
+    for (int s = 0; s < kTopK; ++s) { acc = acc + f(down[(t * kTopK + s) * kD + r]) * gammas[t * kTopK + s]; }
+    out[i] = __float2bfloat16_rn(acc);
 }
 
 __global__ void combine_kernel(const bf16* down, bf16* out, std::int64_t count) {
@@ -296,31 +320,57 @@ void moe(const MoeCall& call, WorkspaceArena& workspace, cudaStream_t stream) {
     for (int t0 = 0; t0 < call.tokens; t0 += tile) {
         const int n = std::min(tile, call.tokens - t0);
         const bf16* x = static_cast<const bf16*>(call.x) + static_cast<std::int64_t>(t0) * kD;
-        route_kernel<<<n, kE, 0, stream>>>(x, static_cast<const bf16*>(L.router), L.router_bias,
-                                           static_cast<std::int32_t*>(ids.data), static_cast<float*>(gammas.data),
-                                           call.capture ? call.capture + static_cast<std::int64_t>(t0) * kTopK : nullptr);
+        std::int32_t* cap = call.capture ? call.capture + static_cast<std::int64_t>(t0) * kTopK : nullptr;
+        if (call.router_f32 != nullptr) {
+            route_kernel<float><<<n, kE, 0, stream>>>(x, call.router_f32, L.router_bias,
+                                                      static_cast<std::int32_t*>(ids.data),
+                                                      static_cast<float*>(gammas.data), cap);
+        } else {
+            route_kernel<bf16><<<n, kE, 0, stream>>>(x, static_cast<const bf16*>(L.router), L.router_bias,
+                                                     static_cast<std::int32_t*>(ids.data),
+                                                     static_cast<float*>(gammas.data), cap);
+        }
         CUDA_CHECK(cudaGetLastError());
-        quant_kernel<<<n, 256, 0, stream>>>(x, kD, nvfp4, static_cast<float*>(xq.data), static_cast<float*>(xamax.data));
+        const int aq = call.act_quant ? 1 : 0;
+        if (aq) {
+            quant_kernel<<<n, 256, 0, stream>>>(x, kD, nvfp4, static_cast<float*>(xq.data), static_cast<float*>(xamax.data));
+        } else {
+            const std::int64_t c = static_cast<std::int64_t>(n) * kD;
+            to_f32_kernel<<<static_cast<unsigned>((c + 255) / 256), 256, 0, stream>>>(x, static_cast<float*>(xq.data), c);
+        }
         CUDA_CHECK(cudaGetLastError());
         GemmArgs g13{static_cast<const float*>(xq.data), static_cast<const float*>(xamax.data), 1,
                      static_cast<const std::int32_t*>(ids.data), L.w13, nvfp4, kD, 2 * kI,
-                     static_cast<bf16*>(gu.data)};
+                     static_cast<bf16*>(gu.data), aq};
         expert_gemm_kernel<<<dim3(static_cast<unsigned>(n * kTopK), (2 * kI) / 8), 256, 0, stream>>>(g13);
         CUDA_CHECK(cudaGetLastError());
         const std::int64_t ycount = static_cast<std::int64_t>(n) * kTopK * kI;
         swiglu_kernel<<<static_cast<unsigned>((ycount + 255) / 256), 256, 0, stream>>>(
-            static_cast<const bf16*>(gu.data), static_cast<const float*>(gammas.data), static_cast<bf16*>(y.data), ycount);
+            static_cast<const bf16*>(gu.data), static_cast<const float*>(gammas.data), static_cast<bf16*>(y.data), ycount,
+            aq);
         CUDA_CHECK(cudaGetLastError());
-        quant_kernel<<<n * kTopK, 256, 0, stream>>>(static_cast<const bf16*>(y.data), kI, nvfp4,
-                                                    static_cast<float*>(yq.data), static_cast<float*>(yamax.data));
+        if (aq) {
+            quant_kernel<<<n * kTopK, 256, 0, stream>>>(static_cast<const bf16*>(y.data), kI, nvfp4,
+                                                        static_cast<float*>(yq.data), static_cast<float*>(yamax.data));
+        } else {
+            to_f32_kernel<<<static_cast<unsigned>((ycount + 255) / 256), 256, 0, stream>>>(
+                static_cast<const bf16*>(y.data), static_cast<float*>(yq.data), ycount);
+        }
         CUDA_CHECK(cudaGetLastError());
         GemmArgs g2{static_cast<const float*>(yq.data), static_cast<const float*>(yamax.data), 0,
-                    static_cast<const std::int32_t*>(ids.data), L.w2, nvfp4, kI, kD, static_cast<bf16*>(down.data)};
+                    static_cast<const std::int32_t*>(ids.data), L.w2, nvfp4, kI, kD, static_cast<bf16*>(down.data), aq};
         expert_gemm_kernel<<<dim3(static_cast<unsigned>(n * kTopK), kD / 8), 256, 0, stream>>>(g2);
         CUDA_CHECK(cudaGetLastError());
         const std::int64_t ocount = static_cast<std::int64_t>(n) * kD;
-        combine_kernel<<<static_cast<unsigned>((ocount + 255) / 256), 256, 0, stream>>>(
-            static_cast<const bf16*>(down.data), static_cast<bf16*>(call.out) + static_cast<std::int64_t>(t0) * kD, ocount);
+        if (aq) {
+            combine_kernel<<<static_cast<unsigned>((ocount + 255) / 256), 256, 0, stream>>>(
+                static_cast<const bf16*>(down.data), static_cast<bf16*>(call.out) + static_cast<std::int64_t>(t0) * kD,
+                ocount);
+        } else {
+            combine_weighted_kernel<<<static_cast<unsigned>((ocount + 255) / 256), 256, 0, stream>>>(
+                static_cast<const bf16*>(down.data), static_cast<const float*>(gammas.data),
+                static_cast<bf16*>(call.out) + static_cast<std::int64_t>(t0) * kD, ocount);
+        }
         CUDA_CHECK(cudaGetLastError());
     }
 }

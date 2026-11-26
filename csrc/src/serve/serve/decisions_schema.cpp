@@ -283,6 +283,8 @@ DecisionQuestion parse_question(const std::string& name, const OrderedJson& spec
     }
     require_text_value(spec.at("instructions"), "question '" + name + "' instructions", param + ".instructions");
     question.instructions = rendered_text(spec.at("instructions"), literals, pointer + "/instructions");
+    question.instructions_value = spec.at("instructions");
+    if (spec.contains("criteria")) { question.criteria_value = spec.at("criteria"); }
     // OpenRouter permits omitted noul criteria and null choice descriptions. Normalize them
     // exactly as the SDK does, before rendering, so direct callers get the same prompt.
     const OrderedJson default_noul = {{"false", "false"}, {"true", "true"}};
