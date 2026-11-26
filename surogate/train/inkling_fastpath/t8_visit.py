@@ -177,6 +177,13 @@ def visit_torch_t8(W: B.EngineWeights, vi, stack, partial, bank, ids, lora, chun
             mi = RA.inkling_loop_blend(mi, msgs[3:], L.ctrl_down[3:4], L.ctrl_gf[3:4], L.mlp_norm, EPS)
         return mi[0]
 
+    def f_min_vjp(ins, g):  # the stage's hand-written backward on the kernel library (STAGE_CUDA)
+        import cuda_bwd as CB
+
+        return CB.mlp_in_vjp(L, n, first, has_bank, ins, g)
+
+    f_min.cuda_vjp = f_min_vjp
+
     def f_moe(*a):
         rid = a[-5] if scale is not None else a[-1]
         lo = dict(zip(B.LORA_KEYS, a[-4:])) | {"scale": scale} if scale is not None else None

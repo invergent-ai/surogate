@@ -126,8 +126,23 @@ class TokenChunked(torch.autograd.Function):
         pgr = [None] * len(params)
         tick = B._tick("bwd.tc." + getattr(ctx.fn, "__name__", "fn"))
         tick.__enter__()
+        vjp = getattr(ctx.fn, "cuda_vjp", None) if (STAGE_CUDA and not params) else None
         for c0 in range(0, T, chunk):
             n = min(chunk, T - c0)
+            if vjp is not None:  # the stage's hand-written backward (one output, no parameters)
+                if gouts[0] is None:
+                    continue
+                with torch.no_grad():
+                    vals_c = [chunk_of(i, c0, n) for i in range(n_tok)]
+                    got = vjp(vals_c, gouts[0].narrow(tdo[0], c0, n))
+                for i in range(n_tok):
+                    if got[i] is None or not (gin[i] is not None or sinks[i] is not None):
+                        continue
+                    if sinks[i] is not None:
+                        sink_add(sinks[i].narrow(tdi[i], c0, n), got[i])
+                    else:
+                        gin[i].narrow(tdi[i], c0, n).copy_(got[i])
+                continue
             with torch.enable_grad(), torch.device(dev):
                 ins = [chunk_of(i, c0, n).detach().requires_grad_(gin[i] is not None or sinks[i] is not None)
                        for i in range(n_tok)]
@@ -330,6 +345,9 @@ class _Shift:
 ATTN_TC = os.environ.get("IFT_ATTN_TC", "0") == "1"
 # ATTN_CUDA (default OFF until its card check): the relative attention of the recompute and its backward run in the CUDA kernel library
 # (cuda_bwd.RelAttentionCuda: the flash kernels with the relative bias) instead of RelAttentionR's query-block loop.
+# STAGE_CUDA (default OFF until its card check): a token-chunked stage that carries a hand-written backward (fn.cuda_vjp, on the CUDA
+# kernel library: cuda_bwd.mlp_in_vjp) uses it per chunk instead of the recompute under autograd.
+STAGE_CUDA = os.environ.get("IFT_STAGE_CUDA", "0") == "1"
 ATTN_CUDA = int(os.environ.get("IFT_ATTN_CUDA", "0"))  # 1: the cotangent of the output enters rounded to bf16; 2: as its bf16 high + low parts (two passes)
 
 
@@ -956,6 +974,13 @@ def visit_torch_long(W: B.EngineWeights, vi, stack, partial, bank, ids, lora, ch
         if msgs is not None:
             mi = RA.inkling_loop_blend(mi, msgs[3:], L.ctrl_down[3:4], L.ctrl_gf[3:4], L.mlp_norm, EPS)
         return mi[0]
+
+    def f_min_vjp(ins, g):  # the stage's hand-written backward on the kernel library (STAGE_CUDA)
+        import cuda_bwd as CB
+
+        return CB.mlp_in_vjp(L, n, first, has_bank, ins, g)
+
+    f_min.cuda_vjp = f_min_vjp
 
     def f_moe(*a):
         rid = a[-5] if scale is not None else a[-1]

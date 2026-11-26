@@ -242,3 +242,102 @@ class RelAttentionCuda(torch.autograd.Function):
                 del del_c
             del rel, d_rel, lse_c
         return dq, dk, dv, dr, None, None, None
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# hand-written backward of the token-chunked stages (ift_long.TokenChunked calls fn.cuda_vjp per chunk instead of
+# recomputing fn under autograd): block AttnRes and the loop blend on the kernel library, the small controller GEMMs in torch
+# ---------------------------------------------------------------------------------------------------------------
+_EPS = 1e-6
+
+
+def _res_fwd(srcs, addend, query, norm_w):
+    """Block AttnRes of fp32 sources [n, D] (the last one + addend), fp32 pre-scaled queries [Q, D]; with norm_w (bf16 [Q, D])
+    the output is bf16 [Q, n, D], else the fp32 mixes. Returns the saved state for _res_bwd."""
+    L = lib()
+    dev = srcs[0].device
+    N, (n, D), Q = len(srcs), srcs[0].shape, query.shape[0]
+    srcs = [s.contiguous() for s in srcs]
+    q = query.float().contiguous()
+    nw = norm_w.contiguous() if norm_w is not None else None
+    ad = addend.contiguous() if addend is not None else None
+    out = torch.empty(Q, n, D, dtype=BF16 if nw is not None else F32, device=dev)
+    probs = torch.empty(Q, N, n, dtype=F32, device=dev)
+    rstd = torch.empty(N, n, dtype=F32, device=dev)
+    rstd_out = torch.empty(Q, n, dtype=F32, device=dev) if nw is not None else None
+    sp = (ctypes.c_void_p * N)(*[s.data_ptr() for s in srcs])
+    sf = (ctypes.c_int * N)(*([1] * N))
+    _check(L, L.inkling_capi_attn_res_fwd(_vp(out), _vp(probs), _vp(rstd), _vp(rstd_out), sp, sf, N, _vp(ad), 1, _vp(q),
+                                          ctypes.c_float(1.0), _vp(nw), ctypes.c_float(_EPS), Q, n, D, None), "attn_res_fwd")
+    return {"srcs": srcs, "ad": ad, "q": q, "nw": nw, "out": out, "probs": probs, "rstd": rstd, "rstd_out": rstd_out,
+            "sp": sp, "sf": sf}
+
+
+def _res_bwd(sv, d_out):
+    """d_out fp32 [Q, n, D] -> (the sources' gradients [n, D] each, the addend's gradient or None)."""
+    L = lib()
+    srcs = sv["srcs"]
+    dev = srcs[0].device
+    N, (n, D), Q = len(srcs), srcs[0].shape, sv["q"].shape[0]
+    d_out = d_out.contiguous()
+    d_src = [torch.zeros(n, D, dtype=F32, device=dev) for _ in range(N)]
+    d_add = torch.zeros(n, D, dtype=F32, device=dev) if sv["ad"] is not None else None
+    dp = (ctypes.c_void_p * N)(*[t.data_ptr() for t in d_src])
+    _check(L, L.inkling_capi_attn_res_bwd(dp, _vp(d_add), _vp(d_out), 1, _vp(sv["probs"]), _vp(sv["rstd"]), _vp(sv["rstd_out"]),
+                                          sv["sp"], sv["sf"], N, _vp(sv["ad"]), 1, _vp(sv["q"]), ctypes.c_float(1.0),
+                                          _vp(sv["nw"]), ctypes.c_float(_EPS), Q, n, D, None), "attn_res_bwd")
+    return d_src, d_add
+
+
+def _blend_vjp(dest, msg, down, gf_w, norm_w, d_out):
+    """Loop blend of S streams (dest fp32 [S, n, D], msg fp32 [S, n, D], down bf16 [S, r, 2D], gf_w bf16 [S, 2D, r],
+    norm_w bf16 [S, D]): the cotangents (d dest [S, n, D], d msg [S, n, D]) of the output cotangent d_out fp32 [S, n, D]."""
+    L = lib()
+    dev = dest.device
+    S, n, D = msg.shape
+    dest, msg, d_out = dest.contiguous(), msg.contiguous(), d_out.contiguous()
+    nw = norm_w.contiguous()
+    pair = torch.empty(S, n, 2 * D, dtype=BF16, device=dev)
+    _check(L, L.inkling_capi_loop_blend_pair_fwd(_vp(pair), _vp(dest), ctypes.c_long(n * D), _vp(msg), S, n, D, None), "blend pair fwd")
+    downf, gff = down.float(), gf_w.float()
+    hidden = torch.bmm(pair.float(), downf.transpose(1, 2)).to(BF16).float()          # [S, n, r], one bf16 rounding
+    gf = torch.bmm(hidden, gff.transpose(1, 2)).contiguous()                           # [S, n, 2D] fp32
+    out = torch.empty(S, n, D, dtype=BF16, device=dev)
+    rstd = torch.empty(S, n, dtype=F32, device=dev)
+    _check(L, L.inkling_capi_loop_blend_out_fwd(_vp(out), _vp(rstd), _vp(dest), ctypes.c_long(n * D), _vp(msg), _vp(gf), _vp(nw),
+                                                ctypes.c_long(D), ctypes.c_float(_EPS), S, n, D, None), "blend out fwd")
+    d_dest = torch.empty(S, n, D, dtype=F32, device=dev)
+    d_msg = torch.empty(S, n, D, dtype=F32, device=dev)
+    d_gf = torch.empty(S, n, 2 * D, dtype=F32, device=dev)
+    _check(L, L.inkling_capi_loop_blend_out_bwd(_vp(d_dest), _vp(d_msg), _vp(d_gf), _vp(d_out), 1, _vp(dest), ctypes.c_long(n * D),
+                                                _vp(msg), _vp(gf), _vp(rstd), _vp(nw), ctypes.c_long(D), S, n, D, None),
+           "blend out bwd")
+    d_hidden = torch.bmm(d_gf, gff)                                                    # [S, n, r] (straight through the rounding)
+    d_pair = torch.bmm(d_hidden, downf).contiguous()                                   # [S, n, 2D]
+    _check(L, L.inkling_capi_loop_blend_pair_bwd(_vp(d_dest), _vp(d_msg), _vp(d_pair), _vp(dest), ctypes.c_long(n * D), _vp(msg),
+                                                 S, n, D, None), "blend pair bwd")
+    return d_dest, d_msg
+
+
+def mlp_in_vjp(L, n_stack, first, has_bank, ins, g):
+    """The backward of the visit's MLP-input stage (t8_visit / ift_long f_min) for one token chunk. ins: fp32 chunks of
+    (stack..., partial, attn_out[, bank0, bank1]); g fp32 [n, D] = the cotangent of the MLP input. Returns one gradient per
+    input, in order. L: the layer's ift_backward.EngineWeights entry."""
+    st = list(ins[:n_stack])
+    p, ao = ins[n_stack], ins[n_stack + 1]
+    if first:
+        mix = _res_fwd(st + [p, ao], None, L.q_mlp, None if has_bank else L.mlp_norm)
+    else:
+        mix = _res_fwd(st + [p], ao, L.q_mlp, None if has_bank else L.mlp_norm)
+    d_bank = []
+    if has_bank:
+        b0, b1 = ins[n_stack + 2], ins[n_stack + 3]
+        msg = _res_fwd([b0, b1], None, L.q_msg[3:4], None)
+        d_dest, d_msg = _blend_vjp(mix["out"], msg["out"], L.ctrl_down[3:4], L.ctrl_gf[3:4], L.mlp_norm, g[None])
+        d_src, d_add = _res_bwd(mix, d_dest)
+        d_bank, _ = _res_bwd(msg, d_msg)
+    else:
+        d_src, d_add = _res_bwd(mix, g[None])
+    if first:
+        return d_src[:n_stack] + [d_src[n_stack], d_src[n_stack + 1]] + d_bank
+    return d_src[:n_stack] + [d_src[n_stack], d_add] + d_bank
