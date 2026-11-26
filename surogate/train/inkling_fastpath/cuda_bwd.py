@@ -398,10 +398,20 @@ def _clip_bwd(gy, x16, scale, tau, threshold, H, d):
     return dx
 
 
-def attn_in_proj_vjp(L, v0, looped, n_stack, has_tau, ins, gouts):
-    """The backward of the visit's attention-input + projection stage (t8_visit / ift_long f_ain_proj, no attention adapter)
-    for one token chunk. ins: fp32 chunks of (stack..., partial[, bank0, bank1][, tau]); gouts: the cotangents of
-    (q, r, gate, sink, k, v[, k_dyn, v_dyn]) (None = no cotangent). Returns one gradient per input (None for tau)."""
+def _lora_vjp(g, x, A, Bm, scale):
+    """Backward of t8_visit.lora_add's delta (x @ (A * scale)^T) @ Bm^T, all fp32: g [n, M] the output's cotangent, x [n, K]
+    the slice's input values. Returns (d_x, dA, dB)."""
+    As = A.float() * scale
+    gb = g @ Bm.float()                                              # [n, R]
+    return gb @ As, (gb.T @ x) * scale, g.T @ (x @ As.T)
+
+
+def attn_in_proj_vjp(L, v0, looped, n_stack, has_tau, ins, gouts, adapters=None, att_scale=None):
+    """The backward of the visit's attention-input + projection stage (t8_visit / ift_long f_ain_proj) for one token chunk.
+    ins: fp32 chunks of (stack..., partial[, bank0, bank1][, tau]); gouts: the cotangents of
+    (q, r, gate, sink, k, v[, k_dyn, v_dyn]) (None = no cotangent). Returns one gradient per input (None for tau).
+    adapters: the attention LoRA of the six slices q, r, g, s, k, v as (A, B) pairs in a flat list, scale att_scale; the
+    return is then (input gradients, [dA, dB per slice] with None where the slice has no cotangent)."""
     st, p = list(ins[:n_stack]), ins[n_stack]
     tau = ins[-1].contiguous() if has_tau else None
     n, D = p.shape
@@ -427,6 +437,12 @@ def attn_in_proj_vjp(L, v0, looped, n_stack, has_tau, ins, gouts):
     xq = ain[0]
     q_raw = _mm16(xq, L.wq).to(BF16)
     r_raw = _mm16(xq, L.wr).to(BF16)
+    lw = None
+    if adapters:
+        lw = [(adapters[2 * i], adapters[2 * i + 1]) for i in range(6)]
+        xqf = xq.float()
+        q_raw = (q_raw.float() + (xqf @ (lw[0][0].float() * att_scale).T) @ lw[0][1].float().T).to(BF16)
+        r_raw = (r_raw.float() + (xqf @ (lw[1][0].float() * att_scale).T) @ lw[1][1].float().T).to(BF16)
     # ---- backward: clips (+ tau), projections
     d_q = _clip_bwd(zero(0, 3072).reshape(n, 24, 128), q_raw, L.q_scale, tau, 22.627416997969522, 24, 128)
     d_r = _clip_bwd(zero(1, 384).reshape(n, 24, 16), r_raw, L.r_scale, tau, 8.0, 24, 16)
@@ -442,6 +458,26 @@ def attn_in_proj_vjp(L, v0, looped, n_stack, has_tau, ins, gouts):
             d_xk = d_xk + _mm16_t(gouts[6].reshape(n, 32), L.k_wproj)
         if gouts[7] is not None:
             d_xv = d_xv + _mm16_t(gouts[7].reshape(n, 32), L.v_wproj)
+    pgrads = None
+    if lw is not None:                                               # the six slices' LoRA paths, each from its own input stream
+        pgrads = []
+        xs = [xqf, xqf, xqf, xqf, (ain[1] if QS == 3 else xq).float(), (ain[2] if QS == 3 else xq).float()]
+        gs = [d_q, d_r, None if gouts[2] is None else gouts[2].reshape(n, 3072), None if gouts[3] is None else gouts[3].reshape(n, 24),
+              None if gouts[4] is None else gouts[4].reshape(n, 1024), None if gouts[5] is None else gouts[5].reshape(n, 1024)]
+        dxs = [None] * 6
+        for i in range(6):
+            if gs[i] is None or ((i == 0 and gouts[0] is None) or (i == 1 and gouts[1] is None)):
+                pgrads += [None, None]
+                continue
+            dxs[i], dA, dB = _lora_vjp(gs[i], xs[i], lw[i][0], lw[i][1], att_scale)
+            pgrads += [dA, dB]
+        for i in range(4):
+            if dxs[i] is not None:
+                d_xq = d_xq + dxs[i]
+        if dxs[4] is not None:
+            d_xk = d_xk + dxs[4]
+        if dxs[5] is not None:
+            d_xv = d_xv + dxs[5]
     d_ain = [d_xq + d_xk + d_xv] if QS == 1 else [d_xq, d_xk, d_xv]
     # ---- backward: the attention inputs
     d_bank = []
@@ -457,21 +493,30 @@ def attn_in_proj_vjp(L, v0, looped, n_stack, has_tau, ins, gouts):
         d_dest, d_msg = _blend_bwd(blend, torch.stack(d_ain))
         d_src, _ = _res_bwd(mix, d_dest.sum(0, keepdim=True) if L.is_local else d_dest)
         d_bank, _ = _res_bwd(msg, d_msg)
-    return list(d_src[:n_stack]) + [d_src[n_stack]] + list(d_bank) + ([None] if has_tau else [])
+    res = list(d_src[:n_stack]) + [d_src[n_stack]] + list(d_bank) + ([None] if has_tau else [])
+    return res if lw is None else (res, pgrads)
 
 
-def gate_sink_wo_vjp(L, ins, gouts):
+def gate_sink_wo_vjp(L, ins, gouts, adapters=None, att_scale=None):
     """The backward of the visit's gate / sink + output-projection stage (t8_visit / ift_long f_gw, no attention adapter) for
     one token chunk: y = bf16(bf16((o * sigmoid(gate)) * sigmoid(lse - sink)) @ wo^T). ins: fp32 chunks of (o [n, 24, 128],
     lse [n, 24], gate [n, 3072], sink [n, 24]); gouts[0] fp32 [n, D]. Elementwise parts in fp32 torch (exact formulas), the
     projection on the tensor cores with the cotangent as bf16 high + low parts."""
     o, lse, gate, sink = ins
     n = o.shape[0]
-    G = _mm16_t(gouts[0], L.wo).reshape(n, _HQ, _HD)                 # cotangent of the gated output
     a = torch.sigmoid(gate.reshape(n, _HQ, _HD))
     b = torch.sigmoid(lse - sink)                                     # [n, 24]
+    G = _mm16_t(gouts[0], L.wo)                                       # cotangent of the gated output
+    pgrads = None
+    if adapters:                                                      # slice o's LoRA path from the gated output's bf16 values
+        gated = ((o * a) * b[..., None]).to(BF16).float().reshape(n, _HQ * _HD)
+        dx, dA, dB = _lora_vjp(gouts[0], gated, adapters[0], adapters[1], att_scale)
+        G = G + dx
+        pgrads = [dA, dB]
+    G = G.reshape(n, _HQ, _HD)
     d_o = G * a * b[..., None]
     Go = G * o
     d_gate = (Go * b[..., None] * (a * (1.0 - a))).reshape(n, _HQ * _HD)
     d_l = (Go * a).sum(-1) * (b * (1.0 - b))
-    return [d_o, d_l, d_gate, -d_l]
+    res = [d_o, d_l, d_gate, -d_l]
+    return res if pgrads is None else (res, pgrads)
