@@ -5540,3 +5540,29 @@ bodies instead.
   Greedy outputs equal the served DSpark setting's on 16 of 16 requests. The DSpark path on the old artifact is
   unchanged (44.0 tokens/s, the same as before). `test_inkling2_artifact` covers the conversion and the refusal of a
   drafter that reads other features.
+
+## 156
+
+**Inkling-2: a decision adapter's converter and runner (System 1.5), first half (2026-11-26).** A System 1.5 decision
+model ([eltokh7/inkling-2-mini-decision](https://huggingface.co/eltokh7/inkling-2-mini-decision)) is the base
+Inkling-2-Mini with its experts unchanged (within one BF16 ulp of the release's), a merged rank-128 attention LoRA,
+full-rank retrains of the routers, loop controllers and AttnRes / cross-pass queries, a per-loop shared expert and
+heads, and a core that loops 1-5 times under a halting head. It is served as an ADAPTER over the base, beside chat
+adapters.
+
+- **Converter** (`convert/inkling2/decision.py`): decision checkpoint + base checkpoint -> `decision_adapter.json` +
+  `decision.safetensors`. It refuses any difference from the base outside the known replacements, and checks the
+  experts against the base release. The attention is carried merged (BF16): the merge's rounding is ~11% of the delta,
+  and this mixture's top-8 routing amplifies rounding-level differences.
+- **Schedules** (`visits.h`): the visit table is a function of the pass count. `decision_schedule(1..5)` and its final
+  stacks are compile-time checked against the reference's stack replay. The 3-pass table is asserted equal to the chat
+  table, and every table's prelude and core visits to be a prefix of the 5-pass one.
+- **Forward** (`forward.cpp`): `run_visit_on(rd, v, vi, L, plane)`, which the chat path calls with its old arguments.
+  Optional KV-plane and conv-slot overrides let a whole-prompt decision round run every visit on one private plane and
+  slot (exact: a visit reads only its own keys, and the convs read nothing before position 0).
+- **Runner** (`decision/`): the adapter's weights bound over a copy of the base layers; the question loop (prelude,
+  passes with the layer-17 halting readout, the stopping pass's coda, final mix); the heads on the host in fp32; the
+  shared expert's elementwise steps with torch's BF16 roundings.
+- Not yet served: the `/v1/decisions` wiring and the end-to-end parity run come next. The engine still rounds the
+  FP32 routers and gain / forget to its BF16 layouts, and runs the experts W4A4 / W8A8 (the reference uses BF16
+  activations).

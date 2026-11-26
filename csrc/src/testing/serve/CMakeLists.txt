@@ -278,6 +278,13 @@ sinfer_add_test(sinfer_inkling2_artifact_formats_test
 sinfer_add_test(sinfer_inkling2_bindings_test
   SOURCES test_inkling2_bindings.cpp ${SERVE_ROOT}/targets/inkling2/impl/load/bindings.cpp
   LIBRARIES sinfer_artifact)
+# Inkling-2 decision adapter: the host heads against the System 1.5 reference (arguments: adapter dir, fixture dir).
+sinfer_add_test(sinfer_inkling2_decision_heads_test
+  SOURCES test_inkling2_decision_heads.cpp
+  LIBRARIES sinfer_engine)
+sinfer_add_test(sinfer_inkling2_decision_parity
+  SOURCES test_inkling2_decision_parity.cpp
+  LIBRARIES sinfer_engine sinfer_artifact)
 # Compile-only check of the same sources (no link, no CUDA objects): fits the SMALL build queue.
 add_library(sinfer_inkling2_load_check OBJECT EXCLUDE_FROM_ALL
   test_inkling2_bindings.cpp test_inkling2_artifact_formats.cpp

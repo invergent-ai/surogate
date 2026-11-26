@@ -40,7 +40,9 @@ void scale_queries(std::vector<float>& values) {
     for (float& x : values) { x = x * scale; }
 }
 
-void derive_queries(const load::InklingGlobals& g, DerivedQueries& out) {
+} // namespace
+
+void derive_attn_res_queries(const load::InklingGlobals& g, DerivedQueries& out) {
     constexpr int D = C::hidden;
     const int cores = C::core_end - C::core_start;
     std::vector<float> host;
@@ -86,6 +88,8 @@ void derive_queries(const load::InklingGlobals& g, DerivedQueries& out) {
         *s.target = Tensor(static_cast<float*>(out.storage.p) + s.offset, DType::FP32, {D, s.rows});
     }
 }
+
+namespace {
 
 void derive_rel_tables(const load::InklingWeights& weights, DerivedQueries& out) {
     constexpr std::int64_t kRows = ops::InklingAttentionGeometry::kRelTableRows;
@@ -174,7 +178,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     // states no template. The engine's Jinja reader also cannot parse this one. `--chat-template` still overrides.
     frontend.chat_template_jinja.clear();
     weights  = load::load_weights(plan.plan, backing);
-    derive_queries(weights.globals, queries);
+    derive_attn_res_queries(weights.globals, queries);
     derive_rel_tables(weights, queries);
     model.weights = &weights;
     model.queries = &queries;

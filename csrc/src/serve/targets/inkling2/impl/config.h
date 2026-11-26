@@ -16,6 +16,8 @@ struct TextConfig {
     static constexpr int core_start      = 6;
     static constexpr int core_end        = 18;
     static constexpr int passes          = 3;
+    /// A decision adapter's most core passes per question (System 1.5: 1..5, chosen per question by its halting head).
+    static constexpr int max_passes      = 5;
     static constexpr int layers          = physical_layers + (passes - 1) * (core_end - core_start); // 48 visits
     static constexpr int block_layers    = 6;  ///< n_layers_per_attn_res_block
     static constexpr int stack_slots     = 7;  ///< AttnRes stack slots per column (DESIGN-target.md 0.3)

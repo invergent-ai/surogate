@@ -7,17 +7,25 @@
 // .forward (nb sequence, pass restarts) with the stack stored as 7 slots per column:
 //   0 = normed embedding, 1 = prelude block, 2-3 = the blocks of passes 0 and 2 (B6, P12), 4-5 = those of
 //   pass 1, 6 = the coda's partial. Pass p >= 1 reads its messages from the other pair (no bank copy).
+//
+// The served chat geometry is the release's 3 passes (`kVisits`). A decision adapter (System 1.5 heads) runs the core
+// 1..kMaxPasses times per question and leaves after any pass: `decision_schedule(P)` is the same table for P passes,
+// whose coda reads the last pass's pair (2-3 after an even pass index, 4-5 after an odd one). Its prelude and core
+// visits are a prefix of every longer schedule's, so a question that continues past pass p runs the next pass's
+// visits of the same table and only the coda depends on where it stopped. Every schedule is checked against the
+// reference's stack replay below.
 
 #include "targets/inkling2/impl/config.h"
 
 #include <array>
 #include <cstdint>
+#include <stdexcept>
 
 namespace sinfer::targets::inkling2::detail {
 
 struct VisitInfo {
     std::int8_t layer       = 0;  ///< physical layer 0..23
-    std::int8_t pass        = 0;  ///< 0..2 (prelude and coda run as pass 0)
+    std::int8_t pass        = 0;  ///< 0..passes-1 (prelude and coda run as pass 0)
     std::int8_t stack_count = 0;  ///< completed-block sources read before the partial
     std::array<std::int8_t, 4> stack{-1, -1, -1, -1};
     std::int8_t partial     = 0;  ///< slot of the running partial at the visit's start
@@ -30,9 +38,16 @@ struct VisitInfo {
     bool looped  = false;         ///< core and pass >= 1: messages blend into every input
 };
 
+/// Visits of a schedule with P core passes: 6 prelude + 12 P core + 6 coda (48 for the chat table's 3).
+constexpr int visits_for_passes(int passes) {
+    return TextConfig::physical_layers + (passes - 1) * (TextConfig::core_end - TextConfig::core_start);
+}
+static_assert(visits_for_passes(TextConfig::passes) == TextConfig::layers);
+
 namespace visits_detail {
 
-constexpr VisitInfo make(int layer, int pass) {
+/// `last_pass`: the schedule's final pass index, which the coda continues (TextConfig::passes - 1 for the chat table).
+constexpr VisitInfo make(int layer, int pass, int last_pass = TextConfig::passes - 1) {
     using C = TextConfig;
     VisitInfo v;
     v.layer  = static_cast<std::int8_t>(layer);
@@ -80,13 +95,14 @@ constexpr VisitInfo make(int layer, int pass) {
             v.bank = {static_cast<std::int8_t>(previous), static_cast<std::int8_t>(previous + 1)};
         }
     } else {
-        // Coda: continues pass 2 (even, so blocks in slots 2-3).
+        // Coda: continues the last pass (pass 2 of the chat table: even, so its blocks are in slots 2-3).
+        const int last = last_pass % 2 == 0 ? 2 : 4;
         if (layer == C::core_end) {
-            set_stack({0, 1, 2});
-            v.partial      = 3;
+            set_stack({0, 1, last});
+            v.partial      = static_cast<std::int8_t>(last + 1);
             v.next_partial = 6;
         } else {
-            set_stack({0, 1, 2, 3});
+            set_stack({0, 1, last, last + 1});
             v.partial = v.next_partial = 6;
         }
     }
@@ -104,6 +120,19 @@ constexpr std::array<VisitInfo, TextConfig::layers> build() {
     out[5].feature  = 0;
     out[23].feature = 1;
     out[41].feature = 2;
+    return out;
+}
+
+/// The schedule of P passes without DSpark features (a decision adapter's): prelude, P x core, coda.
+template <int P>
+constexpr std::array<VisitInfo, visits_for_passes(P)> build_passes() {
+    std::array<VisitInfo, visits_for_passes(P)> out{};
+    int v = 0;
+    for (int i = 0; i < TextConfig::core_start; ++i) { out[v++] = make(i, 0, P - 1); }
+    for (int p = 0; p < P; ++p) {
+        for (int i = TextConfig::core_start; i < TextConfig::core_end; ++i) { out[v++] = make(i, p, P - 1); }
+    }
+    for (int i = TextConfig::core_end; i < TextConfig::physical_layers; ++i) { out[v++] = make(i, 0, P - 1); }
     return out;
 }
 
@@ -160,13 +189,15 @@ constexpr int entry_of(int layer, int pass) {
     return (layer < 12 ? 10 : 11) + 2 * pass;
 }
 
-constexpr bool replay_matches() {
+template <std::size_t N>
+constexpr bool replay_matches(const std::array<VisitInfo, N>& table, const std::array<std::int8_t, 4>& final_stack,
+                              std::int8_t final_partial) {
     int ref[8]{1, 0, 0, 0, 0, 0, 0, 0}; // the reference's stack (entries)
     int nb = 0, prelude_blocks = -1;
     int bank0 = 0, bank1 = 0;
     int slot[TextConfig::stack_slots]{1, 0, 0, 0, 0, 0, 0}; // ours
-    for (int v = 0; v < TextConfig::layers; ++v) {
-        const VisitInfo& vi = kVisits[v];
+    for (int v = 0; v < static_cast<int>(N); ++v) {
+        const VisitInfo& vi = table[static_cast<std::size_t>(v)];
         const int i = vi.layer, p = vi.pass;
         if (i == TextConfig::core_start && p == 0) {
             prelude_blocks = nb;
@@ -191,15 +222,94 @@ constexpr bool replay_matches() {
         if (!vi.first && vi.next_partial != vi.partial) { return false; }
     }
     // the final output mix reads the reference's stack[:nb] + stack[nb]
-    if (nb != static_cast<int>(kFinalStack.size())) { return false; }
+    if (nb != static_cast<int>(final_stack.size())) { return false; }
     for (int k = 0; k < nb; ++k) {
-        if (slot[kFinalStack[k]] != ref[k]) { return false; }
+        if (slot[final_stack[static_cast<std::size_t>(k)]] != ref[k]) { return false; }
     }
-    return slot[kFinalPartial] == ref[nb];
+    return slot[final_partial] == ref[nb];
 }
 
 } // namespace visits_detail
 
-static_assert(visits_detail::replay_matches(), "the visit table disagrees with the reference's AttnRes stack");
+static_assert(visits_detail::replay_matches(kVisits, kFinalStack, kFinalPartial),
+              "the visit table disagrees with the reference's AttnRes stack");
+
+// ---------------------------------------------------------------------------------------------------------------
+// Decision schedules (1..max_passes passes): the visit tables of a decision adapter's rounds.
+// ---------------------------------------------------------------------------------------------------------------
+
+/// The final output mix after P passes: the embedding, the prelude block and the last pass's pair, + the coda partial.
+constexpr std::array<std::int8_t, 4> final_stack_for_passes(int passes) {
+    const std::int8_t last = (passes - 1) % 2 == 0 ? 2 : 4;
+    return {0, 1, last, static_cast<std::int8_t>(last + 1)};
+}
+static_assert(final_stack_for_passes(TextConfig::passes) == kFinalStack);
+
+inline constexpr auto kDecisionVisits1 = visits_detail::build_passes<1>();
+inline constexpr auto kDecisionVisits2 = visits_detail::build_passes<2>();
+inline constexpr auto kDecisionVisits3 = visits_detail::build_passes<3>();
+inline constexpr auto kDecisionVisits4 = visits_detail::build_passes<4>();
+inline constexpr auto kDecisionVisits5 = visits_detail::build_passes<5>();
+static_assert(TextConfig::max_passes == 5, "one table per pass count");
+
+static_assert(visits_detail::replay_matches(kDecisionVisits1, final_stack_for_passes(1), kFinalPartial));
+static_assert(visits_detail::replay_matches(kDecisionVisits2, final_stack_for_passes(2), kFinalPartial));
+static_assert(visits_detail::replay_matches(kDecisionVisits3, final_stack_for_passes(3), kFinalPartial));
+static_assert(visits_detail::replay_matches(kDecisionVisits4, final_stack_for_passes(4), kFinalPartial));
+static_assert(visits_detail::replay_matches(kDecisionVisits5, final_stack_for_passes(5), kFinalPartial));
+
+namespace visits_detail {
+template <std::size_t N, std::size_t M>
+constexpr bool same_visit(const std::array<VisitInfo, N>& a, std::size_t i, const std::array<VisitInfo, M>& b,
+                          std::size_t j) {
+    const VisitInfo &x = a[i], &y = b[j];
+    return x.layer == y.layer && x.pass == y.pass && x.stack_count == y.stack_count && x.stack == y.stack &&
+           x.partial == y.partial && x.next_partial == y.next_partial && x.bank == y.bank && x.first == y.first &&
+           x.global == y.global && x.core == y.core && x.looped == y.looped;
+}
+/// The 3-pass decision table is the chat table without its DSpark features; every table's prelude and core visits
+/// are the 5-pass table's (a question that continues runs the next pass's visits of the longest table).
+constexpr bool prefixes_agree() {
+    for (std::size_t v = 0; v < kVisits.size(); ++v) {
+        if (!same_visit(kVisits, v, kDecisionVisits3, v)) { return false; }
+    }
+    const auto core_prefix = [](const auto& t, int passes) {
+        const std::size_t n = static_cast<std::size_t>(TextConfig::core_start +
+                                                       passes * (TextConfig::core_end - TextConfig::core_start));
+        for (std::size_t v = 0; v < n; ++v) {
+            if (!same_visit(t, v, kDecisionVisits5, v)) { return false; }
+        }
+        return true;
+    };
+    return core_prefix(kDecisionVisits1, 1) && core_prefix(kDecisionVisits2, 2) && core_prefix(kDecisionVisits3, 3) &&
+           core_prefix(kDecisionVisits4, 4);
+}
+} // namespace visits_detail
+static_assert(visits_detail::prefixes_agree());
+
+/// A decision schedule as the runtime walks it.
+struct DecisionSchedule {
+    const VisitInfo* visits = nullptr;
+    int count               = 0;
+    std::array<std::int8_t, 4> final_stack{};
+    std::int8_t final_partial = kFinalPartial;
+    /// First visit of the coda (the visits before it are the prelude and the passes, a prefix of the 5-pass table's).
+    [[nodiscard]] int coda_begin() const { return count - (TextConfig::physical_layers - TextConfig::core_end); }
+};
+
+/// The schedule of `passes` core passes (1..max_passes).
+inline DecisionSchedule decision_schedule(int passes) {
+    DecisionSchedule s;
+    switch (passes) {
+    case 1: s.visits = kDecisionVisits1.data(); s.count = static_cast<int>(kDecisionVisits1.size()); break;
+    case 2: s.visits = kDecisionVisits2.data(); s.count = static_cast<int>(kDecisionVisits2.size()); break;
+    case 3: s.visits = kDecisionVisits3.data(); s.count = static_cast<int>(kDecisionVisits3.size()); break;
+    case 4: s.visits = kDecisionVisits4.data(); s.count = static_cast<int>(kDecisionVisits4.size()); break;
+    case 5: s.visits = kDecisionVisits5.data(); s.count = static_cast<int>(kDecisionVisits5.size()); break;
+    default: throw std::out_of_range("inkling2: a decision schedule has 1..5 passes");
+    }
+    s.final_stack = final_stack_for_passes(passes);
+    return s;
+}
 
 } // namespace sinfer::targets::inkling2::detail

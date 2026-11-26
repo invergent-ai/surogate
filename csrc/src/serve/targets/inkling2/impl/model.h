@@ -43,6 +43,10 @@ struct DerivedQueries {
     std::array<Tensor, TextConfig::physical_layers> rel_table{};
 };
 
+/// The AttnRes / cross-pass message queries pre-scaled from RAW globals (attn / mlp / output / message; not the rel
+/// tables): the base model's at load, and a decision adapter's from its own queries.
+void derive_attn_res_queries(const load::InklingGlobals& g, DerivedQueries& out);
+
 /// What every visit payload points at.
 struct InklingModel {
     const load::InklingWeights* weights   = nullptr;
