@@ -8,6 +8,7 @@ target_sources(sinfer_engine PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/dspark.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/decision/adapter_file.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/decision/heads.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/impl/decision/registry.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/decision/runner.cpp)
 
 target_include_directories(sinfer_engine PRIVATE

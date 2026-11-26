@@ -132,6 +132,8 @@ struct Round {
     /// of the round's per-visit planes. Null / empty on the chat path.
     const PagedKVBatchLayerView* kv_override = nullptr;
     Tensor conv_override{};
+    /// A decision round's numerics (decision/round.h); null on the chat path and for `fast` decision rounds.
+    const decision::Numerics* reference = nullptr;
 };
 
 /// S10 attention LoRA: the round's adapter selection on the bank table registered under `key` (a layer's qkvr or
@@ -615,7 +617,7 @@ void run_visit_on(Round& rd, int v, const VisitInfo& vi, const load::InklingLaye
     //    sink). The K / V conv state is its: in place, recorded (verify), or captured at a rewrite checkpoint.
     Tensor gated = rd.work.alloc(DType::BF16, {C::attn_width, T});
     const ops::InklingConvStateView state = state_view(rd, plane);
-    if (use_naive()) {
+    if (use_naive() || rd.reference != nullptr) {
         Tensor q_out = rd.work.alloc(DType::BF16, {C::attn_width, T});
         Tensor r_out = rd.work.alloc(DType::BF16, {C::query_heads * C::d_rel, T});
         const PlaneView plane_kv              = plane_view(rd, plane);
@@ -781,13 +783,18 @@ void run_visit_on(Round& rd, int v, const VisitInfo& vi, const load::InklingLaye
             throw std::logic_error("inkling2: the round's adapter slots are narrower than the round");
         }
     }
-    if (use_naive()) {
+    if (use_naive() || rd.reference != nullptr) {
         if (adapters != nullptr) { throw std::logic_error("inkling2: the naive MoE serves no adapters"); }
         naive::MoeCall moe;
         moe.x      = mlp_in.data;
         moe.tokens = T;
         moe.layer  = moe_layer(L);
         moe.out    = moe_out.data;
+        if (rd.reference != nullptr) {
+            moe.router_f32 = rd.reference->router_f32[static_cast<std::size_t>(L.layer)];
+            moe.act_quant  = false;
+            if (moe.router_f32 == nullptr) { throw std::logic_error("inkling2 decision: no FP32 router for a layer"); }
+        }
         if (rd.r.routing.ids != nullptr && T <= rd.r.routing.columns) {
             moe.capture = rd.r.routing.ids + static_cast<std::int64_t>(v) * rd.r.routing.columns * rd.r.routing.top_k;
         }
@@ -868,6 +875,7 @@ struct DecisionRound {
         rd.groups.push_back(g);
         rd.kv_override   = &io.kv;
         rd.conv_override = io.conv;
+        rd.reference     = io.numerics != nullptr && io.numerics->reference ? io.numerics : nullptr;
     }
 
     static family::VisitRound make_round(const RoundIO& io) {

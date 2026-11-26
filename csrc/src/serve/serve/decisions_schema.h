@@ -63,6 +63,10 @@ struct DecisionQuestion {
     std::vector<std::string> option_texts;
     /// A score question's criteria as sent, for the answer's legend.
     std::vector<OrderedJson> option_values;
+    /// The question's `instructions` and `criteria` values exactly as sent (criteria null when omitted): a decision
+    /// adapter's own prompt protocol renders them (decisions_system15.h). v1 never reads them.
+    OrderedJson instructions_value;
+    OrderedJson criteria_value;
 
     [[nodiscard]] std::size_t option_count() const noexcept { return option_keys.size(); }
     [[nodiscard]] bool extended() const noexcept;

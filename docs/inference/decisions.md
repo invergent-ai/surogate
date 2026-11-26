@@ -439,6 +439,47 @@ Refit when the model, the adapter or the quantization changes. The chosen option
 at every `T`, so accuracy does not move; the stated probabilities do, and with them a score
 question's expected level.
 
+## Decision adapters (System 1.5)
+
+An Inkling-2 server can also serve **decision adapters**: decision models with their own answer heads, such as
+[eltokh7/inkling-2-mini-decision](https://huggingface.co/eltokh7/inkling-2-mini-decision). Such a model is the base
+Inkling-2-Mini plus:
+- retrained attention, routers, loop controllers and residual-mixing queries;
+- a shared expert inside the loop;
+- answer, halting and escalation heads.
+
+Its core loops one to five times per question, and it stops when its halting head is confident. The adapter runs
+over the served base beside chat requests and chat adapters. Convert it against the base it was trained on, then name
+it at startup:
+
+```bash
+python -m surogate.serve.convert.inkling2.decision DECISION_CHECKPOINT BASE_CHECKPOINT decision-adapter/
+surogate-engine base.sinfer --decision-adapter decide=decision-adapter/ ...
+```
+
+A request whose `model` is the adapter's name (`decide` above) takes the same body as v1. It is answered by the
+adapter, not by a label readout, so it is not decisions v1: v1 requests to the base model are unchanged.
+
+- **Prompt.** The adapter's own protocol: the state and each question rendered as its training code renders them,
+  with the adapter's marker tokens. The server builds it; there is no chat template and no system prompt.
+- **Answer.** v1's answer object, computed from the adapter's calibrated distribution: `choice` / `confidence`,
+  `noul`, or `score` / `confidence` / `legend`, and `probabilities`. Each answer also carries a `system15` object:
+  `loops_used`, `confidence` (the top probability), `halt_score`, `escalate_prob` (the escalation head's estimate
+  that a slower model should take the question), `state_drift`, `flipped_from_l1`, and `aux_probes` when the adapter
+  has them.
+- **Request extensions.** `mode` (`fast`, `balanced`, `strict` or `full`; default `balanced`) chooses the adapter's
+  calibrated halting threshold; `full` always runs every pass. `max_loops` caps the passes.
+- **Not supported:** images, thinking and option-order averaging. `usage.input_tokens` counts every question's whole
+  prompt, since each question is one round.
+
+Each question runs as one whole-prompt round between the engine's chat rounds. Chat streams pause for that round,
+which takes tenths of a second.
+
+`SUROGATE_SERVE_INKLING_DECISION_NUMERICS` picks how a round computes:
+- `fast` (the default) uses the engine's own kernels;
+- `reference` reproduces the training code's numerics (BF16 expert activations, FP32 routers, BF16 keys) with slow
+  kernels, for checking parity.
+
 ## Versioning
 
 Decisions v1 is stable. Everything the engine does with a v1 request stays as this page

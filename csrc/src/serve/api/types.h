@@ -233,6 +233,9 @@ struct EngineOptions {
         std::vector<float> lora_bias; ///< LoRA B bias, scaled like B @ A
     };
     std::vector<LoraModulePayload> lora_payloads;
+    /// Decision adapters (`--decision-adapter name=path`): System 1.5 heads models served over the base by the targets
+    /// that take them (inkling2: api/targets/inkling2/decision.h). A target that takes none refuses a non-empty list.
+    std::vector<std::pair<std::string, std::string>> decision_adapters;
     /// Bank geometry: how many adapters may be resident at once and the widest
     /// rank any of them may have. Every bank is padded to these, so they fix the
     /// launch geometry the projection hooks and a captured graph both need.

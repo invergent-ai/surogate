@@ -22,6 +22,14 @@
 
 namespace sinfer::targets::inkling2::detail::decision {
 
+/// How a decision round computes (SUROGATE_SERVE_INKLING_DECISION_NUMERICS, default `fast`): `reference` reproduces the System 1.5
+/// reference's numerics -- the naive attention over BF16 keys, and the naive experts W4A16 / W8A16 with FP32 routers --
+/// at the naive kernels' speed; `fast` runs the engine's own ops (FP8 keys, W4A4 / W8A8 experts, BF16 routers).
+struct Numerics {
+    bool reference = true;
+    const float* router_f32[TextConfig::physical_layers]{}; ///< FP32 [128, 2304] per layer (reference)
+};
+
 struct RoundIO {
     const RuntimeModelView* model = nullptr; ///< the served base model's view
     const InklingModel* im        = nullptr;
@@ -29,11 +37,12 @@ struct RoundIO {
     Tensor x;                      ///< residual BF16 [7 x 2304, T] (slot 0 filled by `embed`)
     Tensor positions;              ///< device I32 [T, 1] = 0..T-1
     Tensor meta;                   ///< device I32 [8]: [0] = KV table row 0, [4] = conv slot 0 (16-byte aligned)
-    PagedKVBatchLayerView kv;      ///< one BF16 plane over T keys, identity block table
+    PagedKVBatchLayerView kv;      ///< one FP8 e4m3 (unit-scale) plane over T keys, identity block table
     Tensor conv;                   ///< conv state BF16 [6656, 3, 1]
     void* target_state = nullptr;  ///< Variant::visit_target_state_bytes(), zeroed once
     WorkspaceArena* work = nullptr;
     cudaStream_t stream  = nullptr;
+    const Numerics* numerics = nullptr; ///< null: `fast`
 };
 
 /// Slot 0 of `io.x`: the normed embedding of `ids` (device I32 [T]), as the chat path's embed hook.

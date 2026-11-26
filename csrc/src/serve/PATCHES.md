@@ -5566,3 +5566,31 @@ adapters.
 - Not yet served: the `/v1/decisions` wiring and the end-to-end parity run come next. The engine still rounds the
   FP32 routers and gain / forget to its BF16 layouts, and runs the experts W4A4 / W8A8 (the reference uses BF16
   activations).
+
+## 157
+
+**Inkling-2: decision adapters are served on `/v1/decisions` (2026-11-26).** `--decision-adapter name=path` (repeatable)
+loads a decision adapter (#156) over the served Inkling-2 base. A decisions request whose `model` names it gets the
+adapter's own prompt protocol (`serve/decisions_system15.cpp`, a port of the System 1.5 `_render` / `_encode_question`)
+and is answered by its heads. The answer is v1's answer object, computed from the adapter's calibrated distribution
+(`resolve_decision_answer` with the stopping pass's exit temperature), plus a `system15` object: `loops_used`,
+`confidence`, `halt_score`, `escalate_prob`, `state_drift`, `flipped_from_l1`, `aux_probes`. `mode` (fast / balanced /
+strict / full) and `max_loops` are its request extensions.
+
+- **Engine side.** `api/targets/inkling2/decision.h` is the registry of runners the inkling2 package builds when it
+  makes its frontend. Each question runs as one whole-prompt round under `Engine::with_execution_paused`. A
+  `--decision-adapter` that no target takes is refused at startup. The adapters are listed under `/v1/models`.
+- **Numerics** (`SUROGATE_SERVE_INKLING_DECISION_NUMERICS`). `fast`, the default, uses the engine's ops (W4A4 / W8A8
+  experts, FP8 keys, BF16 routers). `reference` reproduces the training code's numerics with the naive kernels (BF16
+  expert activations: a W4A16 mode of the naive MoE; FP32 routers; BF16 keys).
+- **Measured** on LocalLLaMA/typed-decisions against the BF16 System 1.5 reference
+  (eltokh7/inkling-2-mini-decision @dc334283), balanced mode:
+  - `fast`, 1,495 questions: accuracy 59.13% vs 59.60%, ECE 0.111 vs 0.109, the same answer on 94.4%.
+  - `reference`, 300 questions: accuracy 46.0% vs 46.0%, ECE 0.211 vs 0.221, the same answer on 96.7%.
+  - Speed (`fast`): about 0.28 s a question on a DGX Spark.
+- **Checked.** `/v1/decisions` answers equal the runner's, bit for bit, over 100 questions: the protocol and the
+  engine's tokenizer reproduce the reference's token ids. Chat on the base and on a chat adapter is bit-identical with
+  or without concurrent decision traffic. The v1 golden set is unchanged.
+- `sinfer_decisions_test` now builds with `-ffp-contract=off`, like the library source it checks: on aarch64 its copy
+  of the pre-temperature readout was contracted into FMAs and failed bit-identity on a DGX Spark. The failure predates
+  this change.
