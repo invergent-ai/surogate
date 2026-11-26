@@ -958,6 +958,13 @@ def visit_torch_long(W: B.EngineWeights, vi, stack, partial, bank, ids, lora, ch
     def f_gw(o, l, gt, sk):
         return RA.rb(RA.mm(RA.inkling_gate_sink(o, l, gt, sk), L.wo))
 
+    def f_gw_vjp(ins, gouts):  # the stage's hand-written backward (STAGE_CUDA)
+        import cuda_bwd as CB
+
+        return CB.gate_sink_wo_vjp(L, ins, gouts)
+
+    f_gw.cuda_vjp = f_gw_vjp
+
     with B._tick("fwd.wo"):
         attn_partial = tc(f_gw, [out, lse, gate, sink], [0, 0, 0, 0], [0], store_bf16=[False, False, True, True],
                           chunk=chunk)

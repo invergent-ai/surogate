@@ -34,7 +34,9 @@ from ift_engine import InklingEngine  # noqa: E402
 import ift_backward as B  # noqa: E402
 import ift_long as LG  # noqa: E402
 
-COS_LINE, REL_LINE = 0.9999, 0.01
+# IFT_LEVER_REL_LINE: the relative-error line of a run (default 1 %). Two torch-only variants of the same mathematics differ by 0.5-0.6 %
+# per tensor on real rows, so a stack of several changed pieces is read against a wider line, stated in the run's record.
+COS_LINE, REL_LINE = 0.9999, float(os.environ.get("IFT_LEVER_REL_LINE", "0.01"))
 # every arm names every flag; MOE_DET=1 from A1 on (lev-all-2: A/A exactly 0.0). FAST_GEMM is OUT: on the reproducible path it
 # misses the line (1.35 % at 1k, 1.17 % at 4k) for 0.5 s of 17.9 s at 8k. Chain: A0, A1, F (= A1 + MOE_FAST). "name@base" = a VARIANT:
 # judged alone against its base (and A0, and ift_backward) with the same line; a failing variant does not stop the others.
