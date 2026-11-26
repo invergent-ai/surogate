@@ -12,6 +12,7 @@
 
 #include "kernels/inkling/flash_rel/inkling_attention.h"
 #include "kernels/inkling/inkling.h"
+#include "kernels/inkling/moe_backward.h"
 #include "kernels/inkling/visit_backward.h"
 
 #define INKLING_CAPI extern "C" __attribute__((visibility("default")))
@@ -451,5 +452,48 @@ INKLING_CAPI int inkling_capi_kv_plane_gather_bf16(void* dst, const void* plane,
     return guard([&] {
         inkling::kv_plane_gather_bf16(static_cast<bf16*>(dst), static_cast<const std::uint8_t*>(plane), block_table, pos0,
                                       rows, Hkv, st(s));
+    });
+}
+
+// The routed experts' backward for one group of experts (moe_backward.h). ints: T, D, I, ng, rank, max_rows.
+// ptrs: x, g, tok, gam, u13, u2, A13, B13, A2, B2 (the four LoRA pointers all null = no adapter), dx, dgam,
+// dA13, dB13, dA2, dB2 (each null = not needed), workspace. seg [ng + 1], f13 [ng], f2 [ng]: host arrays.
+INKLING_CAPI long inkling_capi_moe_group_bwd_workspace_bytes(int rows, int D, int I, int rank) {
+    return static_cast<long>(inkling::moe_group_bwd_workspace_bytes(rows, D, I, rank));
+}
+
+INKLING_CAPI int inkling_capi_moe_group_bwd(const int* ints, void* const* ptrs, const int* seg, const float* f13,
+                                            const float* f2, float scale, long workspace_bytes, void* s) {
+    return guard([&] {
+        inkling::MoeGroupBwdArgs a;
+        a.T = ints[0];
+        a.D = ints[1];
+        a.I = ints[2];
+        a.ng = ints[3];
+        a.rank = ints[4];
+        a.max_rows = ints[5];
+        a.x = static_cast<const bf16*>(ptrs[0]);
+        a.g = static_cast<const float*>(ptrs[1]);
+        a.tok = static_cast<const int*>(ptrs[2]);
+        a.gam = static_cast<const float*>(ptrs[3]);
+        a.u13 = static_cast<const bf16*>(ptrs[4]);
+        a.u2 = static_cast<const bf16*>(ptrs[5]);
+        a.A13 = static_cast<const float*>(ptrs[6]);
+        a.B13 = static_cast<const float*>(ptrs[7]);
+        a.A2 = static_cast<const float*>(ptrs[8]);
+        a.B2 = static_cast<const float*>(ptrs[9]);
+        a.dx = static_cast<float*>(ptrs[10]);
+        a.dgam = static_cast<float*>(ptrs[11]);
+        a.dA13 = static_cast<float*>(ptrs[12]);
+        a.dB13 = static_cast<float*>(ptrs[13]);
+        a.dA2 = static_cast<float*>(ptrs[14]);
+        a.dB2 = static_cast<float*>(ptrs[15]);
+        a.workspace = ptrs[16];
+        a.workspace_bytes = static_cast<std::size_t>(workspace_bytes);
+        a.seg = seg;
+        a.f13 = f13;
+        a.f2 = f2;
+        a.scale = scale;
+        inkling::moe_group_bwd(a, st(s));
     });
 }
