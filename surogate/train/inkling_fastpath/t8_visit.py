@@ -122,6 +122,13 @@ def visit_torch_t8(W: B.EngineWeights, vi, stack, partial, bank, ids, lora, chun
         ain = f_ain(*a[:len(act)])
         return f_proj(ain, *a[len(act):])
 
+    def f_ain_proj_vjp(ins, gouts):  # the stage's hand-written backward on the kernel library (STAGE_CUDA; no attention adapter)
+        import cuda_bwd as CB
+
+        return CB.attn_in_proj_vjp(L, v0, vi.looped, n, tau is not None, ins, gouts)
+
+    f_ain_proj.cuda_vjp = f_ain_proj_vjp
+
     with B._tick("fwd.ain_proj"):
         tok = act + ([tau] if tau is not None else [])
         tvals = (list(act_vals) + [None] * (len(tok) - len(act))) if act_vals is not None else None

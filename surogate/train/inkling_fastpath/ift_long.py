@@ -129,12 +129,12 @@ class TokenChunked(torch.autograd.Function):
         vjp = getattr(ctx.fn, "cuda_vjp", None) if (STAGE_CUDA and not params) else None
         for c0 in range(0, T, chunk):
             n = min(chunk, T - c0)
-            if vjp is not None:  # the stage's hand-written backward (one output, no parameters)
-                if gouts[0] is None:
+            if vjp is not None:  # the stage's hand-written backward (no parameters)
+                if all(gj is None for gj in gouts):
                     continue
                 with torch.no_grad():
                     vals_c = [chunk_of(i, c0, n) for i in range(n_tok)]
-                    got = vjp(vals_c, gouts[0].narrow(tdo[0], c0, n))
+                    got = vjp(vals_c, [None if gj is None else gj.narrow(tdo[j], c0, n) for j, gj in enumerate(gouts)])
                 for i in range(n_tok):
                     if got[i] is None or not (gin[i] is not None or sinks[i] is not None):
                         continue
@@ -919,6 +919,13 @@ def visit_torch_long(W: B.EngineWeights, vi, stack, partial, bank, ids, lora, ch
     def f_ain_proj(*a):
         ain = f_ain(*a[:len(act)])
         return f_proj(ain, *a[len(act):])
+
+    def f_ain_proj_vjp(ins, gouts):  # the stage's hand-written backward on the kernel library (STAGE_CUDA; no attention adapter)
+        import cuda_bwd as CB
+
+        return CB.attn_in_proj_vjp(L, v0, vi.looped, n, tau is not None, ins, gouts)
+
+    f_ain_proj.cuda_vjp = f_ain_proj_vjp
 
     with B._tick("fwd.ain_proj"):
         tok = act + ([tau] if tau is not None else [])

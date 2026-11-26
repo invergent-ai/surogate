@@ -289,13 +289,13 @@ def _res_bwd(sv, d_out):
     return d_src, d_add
 
 
-def _blend_vjp(dest, msg, down, gf_w, norm_w, d_out):
+def _blend_fwd(dest, msg, down, gf_w, norm_w):
     """Loop blend of S streams (dest fp32 [S, n, D], msg fp32 [S, n, D], down bf16 [S, r, 2D], gf_w bf16 [S, 2D, r],
-    norm_w bf16 [S, D]): the cotangents (d dest [S, n, D], d msg [S, n, D]) of the output cotangent d_out fp32 [S, n, D]."""
+    norm_w bf16 [S, D]): the saved state with out bf16 [S, n, D]."""
     L = lib()
     dev = dest.device
     S, n, D = msg.shape
-    dest, msg, d_out = dest.contiguous(), msg.contiguous(), d_out.contiguous()
+    dest, msg = dest.contiguous(), msg.contiguous()
     nw = norm_w.contiguous()
     pair = torch.empty(S, n, 2 * D, dtype=BF16, device=dev)
     _check(L, L.inkling_capi_loop_blend_pair_fwd(_vp(pair), _vp(dest), ctypes.c_long(n * D), _vp(msg), S, n, D, None), "blend pair fwd")
@@ -306,23 +306,38 @@ def _blend_vjp(dest, msg, down, gf_w, norm_w, d_out):
     rstd = torch.empty(S, n, dtype=F32, device=dev)
     _check(L, L.inkling_capi_loop_blend_out_fwd(_vp(out), _vp(rstd), _vp(dest), ctypes.c_long(n * D), _vp(msg), _vp(gf), _vp(nw),
                                                 ctypes.c_long(D), ctypes.c_float(_EPS), S, n, D, None), "blend out fwd")
+    return {"dest": dest, "msg": msg, "nw": nw, "downf": downf, "gff": gff, "gf": gf, "rstd": rstd, "out": out}
+
+
+def _blend_bwd(sv, d_out):
+    """The cotangents (d dest [S, n, D], d msg [S, n, D]) of the blend output's cotangent d_out fp32 [S, n, D]."""
+    L = lib()
+    dest, msg = sv["dest"], sv["msg"]
+    dev = dest.device
+    S, n, D = msg.shape
+    d_out = d_out.contiguous()
     d_dest = torch.empty(S, n, D, dtype=F32, device=dev)
     d_msg = torch.empty(S, n, D, dtype=F32, device=dev)
     d_gf = torch.empty(S, n, 2 * D, dtype=F32, device=dev)
     _check(L, L.inkling_capi_loop_blend_out_bwd(_vp(d_dest), _vp(d_msg), _vp(d_gf), _vp(d_out), 1, _vp(dest), ctypes.c_long(n * D),
-                                                _vp(msg), _vp(gf), _vp(rstd), _vp(nw), ctypes.c_long(D), S, n, D, None),
-           "blend out bwd")
-    d_hidden = torch.bmm(d_gf, gff)                                                    # [S, n, r] (straight through the rounding)
-    d_pair = torch.bmm(d_hidden, downf).contiguous()                                   # [S, n, 2D]
+                                                _vp(msg), _vp(sv["gf"]), _vp(sv["rstd"]), _vp(sv["nw"]), ctypes.c_long(D), S, n, D,
+                                                None), "blend out bwd")
+    d_hidden = torch.bmm(d_gf, sv["gff"])                                              # [S, n, r] (straight through the rounding)
+    d_pair = torch.bmm(d_hidden, sv["downf"]).contiguous()                             # [S, n, 2D]
     _check(L, L.inkling_capi_loop_blend_pair_bwd(_vp(d_dest), _vp(d_msg), _vp(d_pair), _vp(dest), ctypes.c_long(n * D), _vp(msg),
                                                  S, n, D, None), "blend pair bwd")
     return d_dest, d_msg
 
 
-def mlp_in_vjp(L, n_stack, first, has_bank, ins, g):
+def _blend_vjp(dest, msg, down, gf_w, norm_w, d_out):
+    return _blend_bwd(_blend_fwd(dest, msg, down, gf_w, norm_w), d_out)
+
+
+def mlp_in_vjp(L, n_stack, first, has_bank, ins, gouts):
     """The backward of the visit's MLP-input stage (t8_visit / ift_long f_min) for one token chunk. ins: fp32 chunks of
-    (stack..., partial, attn_out[, bank0, bank1]); g fp32 [n, D] = the cotangent of the MLP input. Returns one gradient per
-    input, in order. L: the layer's ift_backward.EngineWeights entry."""
+    (stack..., partial, attn_out[, bank0, bank1]); gouts[0] fp32 [n, D] = the cotangent of the MLP input. Returns one
+    gradient per input, in order. L: the layer's ift_backward.EngineWeights entry."""
+    g = gouts[0]
     st = list(ins[:n_stack])
     p, ao = ins[n_stack], ins[n_stack + 1]
     if first:
@@ -341,3 +356,94 @@ def mlp_in_vjp(L, n_stack, first, has_bank, ins, g):
     if first:
         return d_src[:n_stack] + [d_src[n_stack], d_src[n_stack + 1]] + d_bank
     return d_src[:n_stack] + [d_src[n_stack], d_add] + d_bank
+
+
+def _mm16(x16, w16):
+    """x [n, K] @ w [M, K]^T, bf16 operands, fp32 accumulation and output."""
+    try:
+        return torch.mm(x16, w16.T, out_dtype=F32)
+    except (TypeError, RuntimeError):
+        return x16.float() @ w16.float().T
+
+
+def _mm16_t(g, w16):
+    """g fp32 [n, M] @ w [M, K] with the bf16 weight on the tensor cores: g as its bf16 high + low parts (error ~2^-17)."""
+    hi = g.to(BF16)
+    lo = (g - hi.float()).to(BF16)
+    try:
+        return torch.mm(hi, w16, out_dtype=F32) + torch.mm(lo, w16, out_dtype=F32)
+    except (TypeError, RuntimeError):
+        return g @ w16.float()
+
+
+def _clip_bwd(gy, x16, scale, tau, threshold, H, d):
+    """Backward of y = bf16(bf16(l2_clip(x * scale, threshold)) [* tau]) per head: gy fp32 [n, H, d], x16 bf16 [n, H * d]."""
+    L = lib()
+    n = x16.shape[0]
+    gy, x16 = gy.contiguous(), x16.contiguous()
+    dx = torch.empty(n, H * d, dtype=F32, device=x16.device)
+    _check(L, L.inkling_capi_qkv_norm_bwd(_vp(dx), _vp(gy), 1, _vp(x16), 0, _vp(scale.contiguous()), _vp(tau),
+                                          ctypes.c_float(threshold), ctypes.c_float(_EPS), n, H, d, None), "qkv_norm_bwd")
+    return dx
+
+
+def attn_in_proj_vjp(L, v0, looped, n_stack, has_tau, ins, gouts):
+    """The backward of the visit's attention-input + projection stage (t8_visit / ift_long f_ain_proj, no attention adapter)
+    for one token chunk. ins: fp32 chunks of (stack..., partial[, bank0, bank1][, tau]); gouts: the cotangents of
+    (q, r, gate, sink, k, v[, k_dyn, v_dyn]) (None = no cotangent). Returns one gradient per input (None for tau)."""
+    st, p = list(ins[:n_stack]), ins[n_stack]
+    tau = ins[-1].contiguous() if has_tau else None
+    n, D = p.shape
+    dev = p.device
+    Q = L.attn_norm.shape[0]
+    QS = 3 if (looped or not L.is_local) else 1
+    zero = lambda j, w: torch.zeros(n, w, dtype=F32, device=dev) if gouts[j] is None else gouts[j].reshape(n, w)  # noqa: E731
+    # ---- forward recompute: the attention inputs (bf16 values) and the raw q / r projections
+    mix = msg = blend = None
+    if v0:
+        rstd = torch.rsqrt((p * p).sum(-1, keepdim=True) / D + _EPS)
+        ain = [((p * rstd) * L.attn_norm[j].float()).to(BF16) for j in range(Q)]
+    elif not looped:
+        mix = _res_fwd(st + [p], None, L.q_attn, L.attn_norm)
+        ain = [mix["out"][j] for j in range(Q)]
+    else:
+        mix = _res_fwd(st + [p], None, L.q_attn, None)
+        msg = _res_fwd([ins[n_stack + 1], ins[n_stack + 2]], None, L.q_msg[0:3], None)
+        dest = mix["out"].expand(3, -1, -1) if L.is_local else mix["out"]
+        nw = L.attn_norm.expand(3, -1) if L.is_local else L.attn_norm
+        blend = _blend_fwd(dest, msg["out"], L.ctrl_down[0:3], L.ctrl_gf[0:3], nw)
+        ain = [blend["out"][j] for j in range(3)]
+    xq = ain[0]
+    q_raw = _mm16(xq, L.wq).to(BF16)
+    r_raw = _mm16(xq, L.wr).to(BF16)
+    # ---- backward: clips (+ tau), projections
+    d_q = _clip_bwd(zero(0, 3072).reshape(n, 24, 128), q_raw, L.q_scale, tau, 22.627416997969522, 24, 128)
+    d_r = _clip_bwd(zero(1, 384).reshape(n, 24, 16), r_raw, L.r_scale, tau, 8.0, 24, 16)
+    d_xq = _mm16_t(d_q, L.wq) + _mm16_t(d_r, L.wr)
+    if gouts[2] is not None:
+        d_xq = d_xq + _mm16_t(gouts[2].reshape(n, 3072), L.wg)
+    if gouts[3] is not None:
+        d_xq = d_xq + _mm16_t(gouts[3].reshape(n, 24), L.ws)
+    d_xk = _mm16_t(zero(4, 1024), L.wk)
+    d_xv = _mm16_t(zero(5, 1024), L.wv)
+    if not L.is_local:
+        if gouts[6] is not None:
+            d_xk = d_xk + _mm16_t(gouts[6].reshape(n, 32), L.k_wproj)
+        if gouts[7] is not None:
+            d_xv = d_xv + _mm16_t(gouts[7].reshape(n, 32), L.v_wproj)
+    d_ain = [d_xq + d_xk + d_xv] if QS == 1 else [d_xq, d_xk, d_xv]
+    # ---- backward: the attention inputs
+    d_bank = []
+    if v0:
+        d_p = torch.zeros(n, D, dtype=F32, device=dev)
+        for j in range(Q):
+            a = d_ain[j] * L.attn_norm[j].float()
+            d_p += rstd * a - p * ((rstd * rstd * rstd / D) * (a * p).sum(-1, keepdim=True))
+        d_src = [None] * n_stack + [d_p]
+    elif not looped:
+        d_src, _ = _res_bwd(mix, torch.stack(d_ain))
+    else:
+        d_dest, d_msg = _blend_bwd(blend, torch.stack(d_ain))
+        d_src, _ = _res_bwd(mix, d_dest.sum(0, keepdim=True) if L.is_local else d_dest)
+        d_bank, _ = _res_bwd(msg, d_msg)
+    return list(d_src[:n_stack]) + [d_src[n_stack]] + list(d_bank) + ([None] if has_tau else [])
