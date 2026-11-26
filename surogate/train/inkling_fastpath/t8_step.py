@@ -839,6 +839,23 @@ def compute_step(handles: list, layout: ParamLayout, flats: list, shapes: list, 
 
 
 # ---------------------------------------------------------------------------------------------------------------------
+def fast_sync(base):
+    """`base` (the kit's MasterAdamW) with the work values' bf16 rounding done by torch's float32 -> bfloat16 conversion instead of the kit's numpy
+    routine: 0.5 s instead of 2.7 s per optimizer step on the expert adapter. The two give the same bits for every finite float32 (compared over
+    all 2^32 - 2^24 finite bit patterns); a non-finite master is refused, as the kit's routine does."""
+
+    class FastSync(base):
+        def sync_work(self) -> None:
+            with torch.no_grad():
+                for p, m in zip(self.work, self.masters):
+                    m = m.detach()
+                    if not bool(torch.isfinite(m).all()):
+                        raise ValueError("adapter values must be finite")
+                    p.copy_(m.to(torch.bfloat16).to(p.device, p.dtype))
+
+    return FastSync
+
+
 # the trainer object the RL loop holds
 # ---------------------------------------------------------------------------------------------------------------------
 class T8Trainer:
@@ -872,7 +889,7 @@ class T8Trainer:
                     A.copy_((torch.rand(A.shape, generator=g) * 2 - 1) / float(A.shape[1]) ** 0.5)
                     d[f"{s}B"].zero_()
         self.work = [torch.nn.Parameter(d[k], requires_grad=True) for d in self.work_layers for k in self.keys]
-        self.opt = MasterAdamW(self.work, lr=5e-5, weight_decay=0.0, max_grad_norm=1.0)  # masters = the exact init; work = bf16(master)
+        self.opt = fast_sync(MasterAdamW)(self.work, lr=5e-5, weight_decay=0.0, max_grad_norm=1.0)  # masters = the exact init; work = bf16(master)
         v_first = cfg.visits - int(cfg.K)
         visits = [SimpleVisit(v) for v in range(cfg.visits)]
         self.layers = TL.trained_layers(visits, v_first)
