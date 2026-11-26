@@ -252,6 +252,10 @@ class RelAttentionCuda(torch.autograd.Function):
                 dr[b0:b1] += torch.einsum("thd,jd->thj", d_rel, relp)
                 del del_c
             del rel, d_rel, lse_c
+        import ift_long as LG
+
+        if not LG.PATTERN_GRAD["on"]:  # the pattern is a constant of this visit's backward: out = p . v carries gradient to v only
+            return None, None, dv, None, None, None, None
         return dq, dk, dv, dr, None, None, None
 
 
