@@ -122,6 +122,13 @@ def visit_torch_t8(W: B.EngineWeights, vi, stack, partial, bank, ids, lora, chun
         ain = f_ain(*a[:len(act)])
         return f_proj(ain, *a[len(act):])
 
+    def f_ain_proj_vjp(ins, gouts):  # the stage's hand-written backward on the kernel library (STAGE_CUDA; no attention adapter)
+        import cuda_bwd as CB
+
+        return CB.attn_in_proj_vjp(L, v0, vi.looped, n, tau is not None, ins, gouts)
+
+    f_ain_proj.cuda_vjp = f_ain_proj_vjp
+
     with B._tick("fwd.ain_proj"):
         tok = act + ([tau] if tau is not None else [])
         tvals = (list(act_vals) + [None] * (len(tok) - len(act))) if act_vals is not None else None
@@ -146,7 +153,7 @@ def visit_torch_t8(W: B.EngineWeights, vi, stack, partial, bank, ids, lora, chun
     # 4. attention (flash, bias from r per block)
     with B._tick("fwd.attention"):
         win = 1024 if L.is_local else 0
-        out, lse = RelAttentionR.apply(q_out, K.float(), V.float(), r_out, L.rel_proj, win, LG._q_block(T, win))
+        out, lse = LG.rel_attention(q_out, K.float(), V.float(), r_out, L.rel_proj, win, LG._q_block(T, win))
         del K, V, q_out, r_out
     # 5. gate / sink + wo_ud (per token)
 
@@ -176,6 +183,13 @@ def visit_torch_t8(W: B.EngineWeights, vi, stack, partial, bank, ids, lora, chun
         if msgs is not None:
             mi = RA.inkling_loop_blend(mi, msgs[3:], L.ctrl_down[3:4], L.ctrl_gf[3:4], L.mlp_norm, EPS)
         return mi[0]
+
+    def f_min_vjp(ins, g):  # the stage's hand-written backward on the kernel library (STAGE_CUDA)
+        import cuda_bwd as CB
+
+        return CB.mlp_in_vjp(L, n, first, has_bank, ins, g)
+
+    f_min.cuda_vjp = f_min_vjp
 
     def f_moe(*a):
         rid = a[-5] if scale is not None else a[-1]

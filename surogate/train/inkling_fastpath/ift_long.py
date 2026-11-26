@@ -126,8 +126,23 @@ class TokenChunked(torch.autograd.Function):
         pgr = [None] * len(params)
         tick = B._tick("bwd.tc." + getattr(ctx.fn, "__name__", "fn"))
         tick.__enter__()
+        vjp = getattr(ctx.fn, "cuda_vjp", None) if (STAGE_CUDA and not params) else None
         for c0 in range(0, T, chunk):
             n = min(chunk, T - c0)
+            if vjp is not None:  # the stage's hand-written backward (no parameters)
+                if all(gj is None for gj in gouts):
+                    continue
+                with torch.no_grad():
+                    vals_c = [chunk_of(i, c0, n) for i in range(n_tok)]
+                    got = vjp(vals_c, [None if gj is None else gj.narrow(tdo[j], c0, n) for j, gj in enumerate(gouts)])
+                for i in range(n_tok):
+                    if got[i] is None or not (gin[i] is not None or sinks[i] is not None):
+                        continue
+                    if sinks[i] is not None:
+                        sink_add(sinks[i].narrow(tdi[i], c0, n), got[i])
+                    else:
+                        gin[i].narrow(tdi[i], c0, n).copy_(got[i])
+                continue
             with torch.enable_grad(), torch.device(dev):
                 ins = [chunk_of(i, c0, n).detach().requires_grad_(gin[i] is not None or sinks[i] is not None)
                        for i in range(n_tok)]
@@ -328,6 +343,23 @@ class _Shift:
 # ~2^-16). ATTN_TC is read at call time (tests / lever_check switch it per arm).
 # ---------------------------------------------------------------------------------------------------------------
 ATTN_TC = os.environ.get("IFT_ATTN_TC", "0") == "1"
+# ATTN_CUDA (default OFF until its card check): the relative attention of the recompute and its backward run in the CUDA kernel library
+# (cuda_bwd.RelAttentionCuda: the flash kernels with the relative bias) instead of RelAttentionR's query-block loop.
+# STAGE_CUDA (default OFF until its card check): a token-chunked stage that carries a hand-written backward (fn.cuda_vjp, on the CUDA
+# kernel library: cuda_bwd.mlp_in_vjp) uses it per chunk instead of the recompute under autograd.
+STAGE_CUDA = os.environ.get("IFT_STAGE_CUDA", "0") == "1"
+ATTN_CUDA = int(os.environ.get("IFT_ATTN_CUDA", "0"))  # 1: the cotangent of the output enters rounded to bf16; 2: as its bf16 high + low parts (two passes)
+
+
+def rel_attention(q, k, v, r_out, rel_proj, window, q_block):
+    """The visit's relative attention: RelAttentionR, or the kernel library's with ATTN_CUDA (exact pattern gradient only)."""
+    if ATTN_CUDA:
+        if not PATTERN_GRAD["on"]:
+            raise ValueError("ATTN_CUDA has no constant-pattern backward (pattern_grad_from needs IFT_ATTN_CUDA=0)")
+        import cuda_bwd as CB
+
+        return CB.RelAttentionCuda.apply(q, k, v, r_out, rel_proj, window, ATTN_CUDA)
+    return RelAttentionR.apply(q, k, v, r_out, rel_proj, window, q_block)
 
 
 def _tc_ok(dev):
@@ -411,6 +443,9 @@ def _q_block(T, window, hq=24):
             break
     return best
 MOE_GM = os.environ.get("IFT_MOE_GM", "1") == "1"
+# MOE_CUDA (default OFF until its card check; needs MOE_GM): the group loop of MoEGM's backward runs in the CUDA kernel library
+# (cuda_bwd.moe_groups, csrc/src/kernels/inkling/moe_backward.cu) instead of the torch recompute + autograd per row block.
+MOE_CUDA = os.environ.get("IFT_MOE_CUDA", "0") == "1"
 
 
 class UnitBMM(torch.autograd.Function):
@@ -652,11 +687,12 @@ class MoEGM(torch.autograd.Function):
         w = ctx.experts
         st = ctx.saved_tensors
         if ctx.xh is not None:
-            x = ctx.xh.to(ctx.dev, non_blocking=True).float()
+            x16 = ctx.xh.to(ctx.dev, non_blocking=True)
             lt = st
         else:
-            x = st[0].float()
+            x16 = st[0]
             lt = st[1:]
+        x = x16.float()
         dev = ctx.dev
         g = g.contiguous()
         T, H = x.shape
@@ -677,10 +713,15 @@ class MoEGM(torch.autograd.Function):
         starts = starts_d.tolist()  # the visit's one host sync: every group's rows and padding are known from here
         cnt = counts.tolist()
         gam_r = gam[tok, slot]
-        dx = torch.zeros(T, H, dtype=torch.float64 if MOE_DET else F32, device=dev)
+        dx = torch.zeros(T, H, dtype=torch.float64 if (MOE_DET and not MOE_CUDA) else F32, device=dev)
         dgam_r = torch.zeros_like(gam_r)
         lgr = [torch.zeros_like(t) if (lora is not None and nd) else None for t, nd in zip(lt, need)] if lora else []
-        for g0 in range(0, B.E, B.EG):
+        if MOE_CUDA:
+            import cuda_bwd as CB
+
+            with B._tick("bwd.moe.cuda"):
+                CB.moe_groups(w, x16, g, tok, gam_r, starts, cnt, lora, ctx.scale, dx, dgam_r, lgr, MOE_ROWS)
+        for g0 in ([] if MOE_CUDA else range(0, B.E, B.EG)):
             g1 = min(B.E, g0 + B.EG)
             r0, r1 = starts[g0], starts[g1 - 1] + cnt[g1 - 1]
             if r1 == r0:
@@ -726,7 +767,7 @@ class MoEGM(torch.autograd.Function):
                     if lgr[j] is not None:
                         lgr[j][g0:g1] += gj
             del u13, u2
-        if MOE_DET:
+        if dx.dtype != F32:
             dx = dx.float()
         # the routing weights' path back into x (router logits from x, ids fixed)
         dgam = torch.zeros(T, topk, dtype=F32, device=dev)
@@ -879,6 +920,13 @@ def visit_torch_long(W: B.EngineWeights, vi, stack, partial, bank, ids, lora, ch
         ain = f_ain(*a[:len(act)])
         return f_proj(ain, *a[len(act):])
 
+    def f_ain_proj_vjp(ins, gouts):  # the stage's hand-written backward on the kernel library (STAGE_CUDA; no attention adapter)
+        import cuda_bwd as CB
+
+        return CB.attn_in_proj_vjp(L, v0, vi.looped, n, tau is not None, ins, gouts)
+
+    f_ain_proj.cuda_vjp = f_ain_proj_vjp
+
     with B._tick("fwd.ain_proj"):
         tok = act + ([tau] if tau is not None else [])
         tvals = (list(act_vals) + [None] * (len(tok) - len(act))) if act_vals is not None else None
@@ -903,7 +951,7 @@ def visit_torch_long(W: B.EngineWeights, vi, stack, partial, bank, ids, lora, ch
     # 4. attention (flash, bias from r per block)
     with B._tick("fwd.attention"):
         win = 1024 if L.is_local else 0
-        out, lse = RelAttentionR.apply(q_out, K.float(), V.float(), r_out, L.rel_proj, win, _q_block(T, win))
+        out, lse = rel_attention(q_out, K.float(), V.float(), r_out, L.rel_proj, win, _q_block(T, win))
         del K, V, q_out, r_out
     # 5. gate / sink + wo_ud (per token)
 
@@ -933,6 +981,13 @@ def visit_torch_long(W: B.EngineWeights, vi, stack, partial, bank, ids, lora, ch
         if msgs is not None:
             mi = RA.inkling_loop_blend(mi, msgs[3:], L.ctrl_down[3:4], L.ctrl_gf[3:4], L.mlp_norm, EPS)
         return mi[0]
+
+    def f_min_vjp(ins, g):  # the stage's hand-written backward on the kernel library (STAGE_CUDA)
+        import cuda_bwd as CB
+
+        return CB.mlp_in_vjp(L, n, first, has_bank, ins, g)
+
+    f_min.cuda_vjp = f_min_vjp
 
     def f_moe(*a):
         rid = a[-5] if scale is not None else a[-1]

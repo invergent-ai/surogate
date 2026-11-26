@@ -1094,3 +1094,27 @@ target_link_libraries(sinfer_inkling_train_t8 PRIVATE sinfer_shared CUDA::cudart
 set_target_properties(sinfer_inkling_train_t8 PROPERTIES BUILD_RPATH "$ORIGIN:$ORIGIN/.." CXX_VISIBILITY_PRESET default)
 target_compile_options(sinfer_inkling_train_t8 PRIVATE
   $<$<COMPILE_LANGUAGE:CXX>:-fno-fast-math> $<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>)
+
+# Inkling-2 trainer backward kernels (csrc/src/kernels/inkling): the hand-written backward of the visit's ops and the
+# relative-bias attention fork, behind a flat C API (inkling_capi.cpp). A shared library of its own beside the trainer
+# shim; nothing in the engine links it. The trainer loads it with ctypes (surogate/train/inkling_fastpath/).
+set(INKLING_KERNEL_DIR ${SERVE_ROOT}/../kernels/inkling)
+add_library(sinfer_inkling_bwd SHARED EXCLUDE_FROM_ALL
+  ${INKLING_KERNEL_DIR}/elementwise.cu
+  ${INKLING_KERNEL_DIR}/attn_res_blend.cu
+  ${INKLING_KERNEL_DIR}/attention_glue.cu
+  ${INKLING_KERNEL_DIR}/visit_backward.cu
+  ${INKLING_KERNEL_DIR}/moe_backward.cu
+  ${INKLING_KERNEL_DIR}/inkling_capi.cpp
+  ${INKLING_KERNEL_DIR}/flash_rel/inkling_flash_fwd.cu
+  ${INKLING_KERNEL_DIR}/flash_rel/inkling_flash_bwd.cu)
+target_include_directories(sinfer_inkling_bwd PRIVATE
+  ${SERVE_ROOT}/.. ${SERVE_ROOT}/../shims ${SERVE_ROOT}/../third_party
+  ${cutlass_SOURCE_DIR}/include ${cutlass_SOURCE_DIR}/tools/util/include ${CUDAToolkit_INCLUDE_DIRS})
+target_link_libraries(sinfer_inkling_bwd PRIVATE CUDA::cudart CUDA::cublasLt CUDA::cublas)
+set_target_properties(sinfer_inkling_bwd PROPERTIES POSITION_INDEPENDENT_CODE ON CXX_VISIBILITY_PRESET default)
+target_compile_options(sinfer_inkling_bwd PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+  $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
+  $<$<COMPILE_LANGUAGE:CUDA>:-O3>
+  $<$<COMPILE_LANGUAGE:CXX>:-fno-fast-math> $<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>)
