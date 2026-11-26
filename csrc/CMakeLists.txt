@@ -1871,6 +1871,7 @@ if(SINFER_BUILD_SERVE)
     ${SERVE_ROOT}/serve/generation_service.cpp
     ${SERVE_ROOT}/serve/parallel_decoding.cpp
     ${SERVE_ROOT}/serve/decisions_schema.cpp
+    ${SERVE_ROOT}/serve/decisions_system15.cpp
     ${SERVE_ROOT}/serve/decisions_thinking.cpp
     ${SERVE_ROOT}/serve/model_scheduler.cpp
     ${SERVE_ROOT}/serve/replica_router.cpp

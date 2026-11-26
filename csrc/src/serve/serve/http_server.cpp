@@ -1,3 +1,4 @@
+#include <api/targets/inkling2/decision.h>
 #include "serve/http_server.h"
 
 #include "serve/lora_registry.h"
@@ -868,8 +869,10 @@ void HttpServer::register_routes() {
 
 nlohmann::json HttpServer::model_listing() const {
     const auto created = unix_time_now();
-    auto listing = nlohmann::json::parse(make_models_list(
-        public_model_id_, created, service_->lora_adapter_names(), service_->max_context()));
+    // Decision adapters are listed like LoRA adapters of the primary (their parent is the base they run over).
+    std::vector<std::string> adapters = service_->lora_adapter_names();
+    for (const std::string& name : inkling2_decision::names()) { adapters.push_back(name); }
+    auto listing = nlohmann::json::parse(make_models_list(public_model_id_, created, adapters, service_->max_context()));
     for (const auto& [name, service] : extra_services_) {
         const auto extra = nlohmann::json::parse(
             make_models_list(name, created, service->lora_adapter_names(), service->max_context()));
@@ -1873,9 +1876,33 @@ void HttpServer::handle_decisions(const httplib::Request& req, httplib::Response
     t_route_reservation.reset();
     const std::uint64_t req_id = ++request_seq_;
     DecisionsRequest request;
+    // A decision adapter (System 1.5, decisions_system15.h) answers with its heads on the primary's base; `mode` and
+    // `max_loops` are its request extensions (v1 ignores unknown fields, so they never reach a v1 request).
+    bool system15 = false;
+    std::string system15_mode = "balanced";
+    int system15_max_loops    = 0;
     try {
-        request          = parse_decisions_request(req.body);
-        t_routed_service = &route_model(request.model, &request.lora_adapter, &req);
+        request = parse_decisions_request(req.body);
+        if (inkling2_decision::available(request.model)) {
+            system15         = true;
+            t_routed_service = &route_model(public_model_id_, nullptr, &req);
+            const OrderedJson body = OrderedJson::parse(req.body);
+            if (body.contains("mode") && !body.at("mode").is_null()) {
+                if (!body.at("mode").is_string()) {
+                    throw ApiException(ApiError{.message = "mode must be a string", .param = "mode", .code = "invalid_mode"});
+                }
+                system15_mode = body.at("mode").get<std::string>();
+            }
+            if (body.contains("max_loops") && !body.at("max_loops").is_null()) {
+                if (!body.at("max_loops").is_number_integer() || body.at("max_loops").get<int>() < 1) {
+                    throw ApiException(ApiError{.message = "max_loops must be a positive integer", .param = "max_loops",
+                                                .code = "invalid_max_loops"});
+                }
+                system15_max_loops = body.at("max_loops").get<int>();
+            }
+        } else {
+            t_routed_service = &route_model(request.model, &request.lora_adapter, &req);
+        }
     } catch (const ApiException& e) {
         // Unlike a chat request, a decisions request is fully validated here rather than in
         // preparation, so most refusals are this one: log them like any other rejection.
@@ -1930,7 +1957,9 @@ void HttpServer::handle_decisions(const httplib::Request& req, httplib::Response
     context.client_request_id       = request_id_of(req);
     log_request_start(context);
     try {
-        DecisionsOutcome outcome = svc().decide(request, request_cancelled(req), wake_gate(),
+        DecisionsOutcome outcome = system15
+            ? svc().decide_system15(request, system15_mode, system15_max_loops, request_cancelled(req))
+            : svc().decide(request, request_cancelled(req), wake_gate(),
             [&](std::uint32_t attempt, const std::string& reason) {
                 // Kept current here, so the error and rejection records of a request that fails
                 // on a later attempt say how many times it ran.

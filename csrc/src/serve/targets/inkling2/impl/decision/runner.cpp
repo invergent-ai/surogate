@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -40,6 +42,29 @@ float bf16_to_f32(std::uint16_t b) {
 }
 
 float sigmoid(float x) { return 1.0F / (1.0F + std::exp(-x)); }
+
+/// SUROGATE_SERVE_INKLING_DECISION_DUMP=<dir> (parity work; synchronises): every question's prelude output, each pass's
+/// core output and each exit hidden, as raw BF16 [T, 2304] files `<dir>/q<n>_<what>.bf16`.
+const char* decision_dump_dir() {
+    static const char* dir = std::getenv("SUROGATE_SERVE_INKLING_DECISION_DUMP");
+    return dir;
+}
+
+void dump_plane(const char* what, int question, const void* plane, std::int64_t column_stride, std::int32_t T,
+                cudaStream_t s) {
+    const char* dir = decision_dump_dir();
+    if (dir == nullptr) { return; }
+    std::vector<std::uint16_t> host(static_cast<std::size_t>(D) * T);
+    CUDA_CHECK(cudaMemcpy2DAsync(host.data(), static_cast<std::size_t>(D) * 2, plane,
+                                 static_cast<std::size_t>(column_stride) * 2, static_cast<std::size_t>(D) * 2,
+                                 static_cast<std::size_t>(T), cudaMemcpyDeviceToHost, s));
+    CUDA_CHECK(cudaStreamSynchronize(s));
+    const std::string path = std::string(dir) + "/q" + std::to_string(question) + "_" + what + ".bf16";
+    if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
+        std::fwrite(host.data(), 2, host.size(), f);
+        std::fclose(f);
+    }
+}
 
 std::vector<double> softmax_t(const std::vector<float>& x, double t) {
     std::vector<double> p(x.size());
@@ -121,7 +146,7 @@ Runner::Runner(const LoadedModelData& base, const std::filesystem::path& adapter
         return file_.read(name);
     };
     struct LayerAt {
-        std::size_t qkvr = 0, output = 0, router = 0, down = 0, gain_forget = 0;
+        std::size_t qkvr = 0, output = 0, router = 0, router_f32 = 0, down = 0, gain_forget = 0;
     };
     std::vector<LayerAt> at(C::physical_layers);
     for (int L = 0; L < C::physical_layers; ++L) {
@@ -129,6 +154,7 @@ Runner::Runner(const LoadedModelData& base, const std::filesystem::path& adapter
         at[L].qkvr   = put(as_bf16(p + "attn/qkvr"));
         at[L].output = put(as_bf16(p + "attn/output"));
         at[L].router = put(as_bf16(p + "moe/router"));
+        at[L].router_f32 = put(as_f32(p + "moe/router"));
         if (L >= C::core_start && L < C::core_end) {
             at[L].down        = put(as_bf16(p + "loop/down"));
             at[L].gain_forget = put(as_bf16(p + "loop/gain_forget"));
@@ -212,6 +238,18 @@ Runner::Runner(const LoadedModelData& base, const std::filesystem::path& adapter
             l.loop_gain_forget = Tensor(wb + at[L].gain_forget, DType::BF16, {C::gate_rank, 2 * D, 4});
         }
     }
+    // SUROGATE_SERVE_INKLING_DECISION_NUMERICS: fast (default) | reference (decision/round.h)
+    {
+        const char* raw = std::getenv("SUROGATE_SERVE_INKLING_DECISION_NUMERICS");
+        const std::string v = raw == nullptr || *raw == '\0' ? std::string("fast") : std::string(raw);
+        if (v != "reference" && v != "fast") {
+            throw std::invalid_argument("SUROGATE_SERVE_INKLING_DECISION_NUMERICS must be reference or fast");
+        }
+        numerics_.reference = v == "reference";
+        for (int L = 0; L < C::physical_layers; ++L) {
+            numerics_.router_f32[L] = reinterpret_cast<const float*>(wb + at[L].router_f32);
+        }
+    }
     globals_ = base_.weights.globals;
     for (int L = 1; L < C::physical_layers; ++L) {
         globals_.attn_query.at(static_cast<std::size_t>(L)) = Tensor(wb + attn_q[L], DType::FP32, {D, attn_rows[L]});
@@ -242,7 +280,11 @@ Runner::Runner(const LoadedModelData& base, const std::filesystem::path& adapter
     const std::size_t ids_at = s.take(static_cast<std::size_t>(T) * 4);
     const std::size_t pos_at = s.take(static_cast<std::size_t>(T) * 4);
     const std::size_t meta_at = s.take(8 * 4);
-    const std::size_t kv_bytes = static_cast<std::size_t>(C::head_dim) * kPagedKVPageSize * C::kv_heads * pages * 2;
+    // K / V: BF16 under the reference numerics (the naive attention; the reference keeps BF16 keys), else FP8 e4m3
+    // unit-scale, the only plane the Inkling attention op takes (as the chat path's --kv-cache-dtype fp8).
+    const DType kv_dtype = numerics_.reference ? DType::BF16 : DType::FP8_E4M3FN;
+    const std::size_t kv_bytes = static_cast<std::size_t>(C::head_dim) * kPagedKVPageSize * C::kv_heads * pages *
+                                 (numerics_.reference ? 2 : 1);
     const std::size_t k_at = s.take(kv_bytes), v_at = s.take(kv_bytes);
     const std::size_t table_at = s.take(static_cast<std::size_t>(pages) * 4);
     const std::size_t conv_at = s.take(static_cast<std::size_t>(ops::InklingMixGeometry::kConvChannels) * 3 * 2);
@@ -270,12 +312,12 @@ Runner::Runner(const LoadedModelData& base, const std::filesystem::path& adapter
     std::iota(iota.begin(), iota.end(), 0);
     CUDA_CHECK(cudaMemcpy(positions_.data, iota.data(), static_cast<std::size_t>(T) * 4, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(sb + table_at, iota.data(), static_cast<std::size_t>(pages) * 4, cudaMemcpyHostToDevice));
-    kv_.k_pages      = Tensor(sb + k_at, DType::BF16, {C::head_dim, kPagedKVPageSize, C::kv_heads, pages});
-    kv_.v_pages      = Tensor(sb + v_at, DType::BF16, {C::head_dim, kPagedKVPageSize, C::kv_heads, pages});
+    kv_.k_pages      = Tensor(sb + k_at, kv_dtype, {C::head_dim, kPagedKVPageSize, C::kv_heads, pages});
+    kv_.v_pages      = Tensor(sb + v_at, kv_dtype, {C::head_dim, kPagedKVPageSize, C::kv_heads, pages});
     kv_.block_tables = Tensor(sb + table_at, DType::I32, {pages, 1});
     kv_.head_dim     = C::head_dim;
     kv_.num_kv_heads = C::kv_heads;
-    kv_.dtype        = DType::BF16;
+    kv_.dtype        = kv_dtype;
 
     workspace_bytes_ = Variant::visit_workspace_capacity_bytes(family::TextGeometry{}, family::TextPhase::Prefill, 0, 0,
                                                                T, static_cast<std::uint32_t>(T), false) +
@@ -304,6 +346,9 @@ void Runner::shared_expert(int core_index, int pass, int slot, std::int32_t T, c
     const SharedExpert& e = experts_.at(static_cast<std::size_t>(core_index));
     const auto* ada = static_cast<const std::uint16_t*>(e.ada.at(static_cast<std::size_t>(std::min(pass, max_loops_ - 1))));
     void* h = static_cast<std::uint16_t*>(x_.data) + static_cast<std::int64_t>(slot) * D;
+    static int sp_calls = 0;
+    const bool probe = decision_dump_dir() != nullptr && sp_calls++ == 0; // the first call: layer 6, pass 0, question 0
+    if (probe) { dump_plane("sp_in", 0, h, kColumn, T, s); }
     shared_expert_modulate(h, kColumn, e.norm, ada, ada + D, sp_x_, D, T, kFp32Eps, s);
     {
         const std::size_t bytes = ops::inkling_gemm_inv_workspace_bytes(2 * expert_ff_, D, T, 1);
@@ -320,6 +365,7 @@ void Runner::shared_expert(int core_index, int pass, int slot, std::int32_t T, c
         ops::inkling_gemm_inv(e.down, D, expert_ff_, sp_act_, T, sp_out_, DType::BF16, D, {}, scratch, bytes, s);
     }
     shared_expert_residual(h, kColumn, ada + 2 * D, sp_out_, D, T, s);
+    if (probe) { dump_plane("sp_out", 0, h, kColumn, T, s); }
 }
 
 void Runner::read_rows(const void* plane, std::int64_t column_stride, std::int32_t T, const std::vector<int>& rows,
@@ -361,11 +407,16 @@ Answer Runner::run(const Question& q, const Policy& policy, cudaStream_t stream,
     io.target_state = target_state_;
     io.work         = &work;
     io.stream       = stream;
+    io.numerics     = &numerics_;
     embed(io, Tensor(ids_.data, DType::I32, {T}));
     const auto& five = kDecisionVisits5;
     for (int v = 0; v < C::core_start; ++v) {
         run_visit(io, five[static_cast<std::size_t>(v)], layers_.at(static_cast<std::size_t>(five[v].layer)), v);
     }
+    static int question_index = 0;
+    const int qn = question_index++;
+    dump_plane("prelude", qn, static_cast<std::uint16_t*>(x_.data) + static_cast<std::int64_t>(five[5].next_partial) * D,
+               kColumn, T, stream);
     std::vector<int> core_rows{q.decide_idx};
     core_rows.insert(core_rows.end(), q.option_idx.begin(), q.option_idx.end());
     const int state_end = std::max(1, q.option_idx[0]);
@@ -388,6 +439,8 @@ Answer Runner::run(const Question& q, const Policy& policy, cudaStream_t stream,
             shared_expert(vi.layer - C::core_start, p, vi.next_partial, T, stream);
             slot = vi.next_partial;
         }
+        dump_plane(("core" + std::to_string(p)).c_str(), qn, static_cast<std::uint16_t*>(x_.data) +
+                       static_cast<std::int64_t>(slot) * D, kColumn, T, stream);
         // the layer-17 readout: the decide and option rows of the core's output
         read_rows(static_cast<std::uint16_t*>(x_.data) + static_cast<std::int64_t>(slot) * D, kColumn, T, core_rows,
                   host, stream);
@@ -427,6 +480,7 @@ Answer Runner::run(const Question& q, const Policy& policy, cudaStream_t stream,
             }
             Tensor hidden(hidden_.data, DType::BF16, {D, T});
             final_mix(io, sched.final_stack, output_query_, hidden);
+            dump_plane(("exit" + std::to_string(p)).c_str(), qn, hidden_.data, D, T, stream);
             read_rows(hidden_.data, D, T, exit_rows, host, stream);
             const Mat h_state = rows_mat(host, 0, state_end);
             const Mat hd_e = rows_mat(host, state_end, 1), ho_e = rows_mat(host, state_end + 1, K);

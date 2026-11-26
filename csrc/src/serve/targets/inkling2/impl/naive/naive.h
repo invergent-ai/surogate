@@ -87,6 +87,13 @@ struct MoeCall {
     MoeLayer layer;
     std::int32_t* capture               = nullptr;
     void* out                           = nullptr;
+    /// The reference numerics of a decision adapter (System 1.5, trained in BF16 on the dequantised experts; the HF
+    /// Inkling2Loop experts): FP32 router weights [128, 2304] (null: `layer.router`, BF16), and with `act_quant` false
+    /// BF16 activations against the exact dequantised weights (W4A16 / W8A16, the NVFP4 per-expert global included),
+    /// the routing weight applied after the down projection in FP32 and the slots summed in FP32 (HF's
+    /// `current_hidden_states * top_k_weights`, `index_add_`), rounded once to BF16.
+    const float* router_f32             = nullptr;
+    bool act_quant                      = true;
 };
 
 [[nodiscard]] std::size_t moe_workspace_bytes(std::int32_t tokens);

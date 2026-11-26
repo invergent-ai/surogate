@@ -1,4 +1,6 @@
 #include "core/device.h"
+#include "serve/decisions_system15.h"
+#include <api/targets/inkling2/decision.h>
 #include "serve/generation_service.h"
 #include "api/ops/sparse_moe.h"
 #include "serve/vllm_max_tokens.h"
@@ -519,6 +521,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     }
     sinfer::EngineOptions engine_options;
     engine_options.artifact_path            = options_.artifact_path;
+    for (const auto& a : options_.decision_adapters) { engine_options.decision_adapters.emplace_back(a.name, a.path); }
     engine_options.borrowed_weights         = options_.borrowed_weights;
     engine_options.device                   = options_.device;
     engine_options.devices                  = options_.devices;
@@ -604,6 +607,14 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
         startup_adapter_modules.emplace_back(payload.layer, payload.module);
     }
     engine_              = std::make_unique<sinfer::Engine>(std::move(engine_options));
+    // A decision adapter is taken by the target that serves it (inkling2 registers its runners at load); one the model
+    // did not take must not be silently ignored.
+    for (const auto& adapter : options_.decision_adapters) {
+        if (!inkling2_decision::available(adapter.name)) {
+            throw std::invalid_argument("--decision-adapter " + adapter.name + ": this model serves no decision adapters "
+                                        "(an inkling2 base does)");
+        }
+    }
     for (const auto& [slot, identity] : startup_adapter_identities) {
         auto& stores = engine_->lora_stores();
         for (int device : stores.devices()) {
@@ -1661,6 +1672,83 @@ const std::vector<std::string>& GenerationService::decision_codes() {
             });
     }
     return *decision_codes_;
+}
+
+DecisionsOutcome GenerationService::decide_system15(const DecisionsRequest& request, const std::string& mode,
+                                                    int max_loops, std::function<bool()> is_cancelled) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const inkling2_decision::Info info = inkling2_decision::info(request.model);
+    const auto threshold_it = info.modes.find(mode);
+    if (threshold_it == info.modes.end()) {
+        ApiError error;
+        error.message = "mode must be one of fast, balanced, strict, full";
+        error.code    = "invalid_mode";
+        error.param   = "mode";
+        throw ApiException(std::move(error));
+    }
+    const int loops = max_loops > 0 ? std::min(max_loops, info.max_loops) : info.max_loops;
+    if (!request.images.empty()) {
+        ApiError error;
+        error.message = "decision adapters read text states only";
+        error.code    = "images_not_supported";
+        throw ApiException(std::move(error));
+    }
+    std::vector<TokenId> markers;
+    for (const std::string& spelling : info.special_tokens) {
+        const std::optional<TokenId> id = engine_->token_id(spelling);
+        if (!id) { throw std::runtime_error("decision adapter: the tokenizer has no " + spelling); }
+        markers.push_back(*id);
+    }
+    const auto encode = [this](std::string_view text) { return engine_->encode_fragment(text); };
+    const std::vector<TokenId> state = system15_state_tokens(request.state, encode, markers,
+                                                             static_cast<std::size_t>(info.max_state_tokens));
+    DecisionsOutcome outcome;
+    outcome.answers = OrderedJson::object();
+    const auto t_prepared = std::chrono::steady_clock::now();
+    double run_seconds = 0.0;
+    for (const DecisionQuestion& question : request.questions) {
+        if (is_cancelled && is_cancelled()) { throw std::runtime_error("cancelled"); }
+        const System15Prompt prompt = system15_question_prompt(state, question, encode, markers);
+        if (static_cast<std::int32_t>(prompt.ids.size()) > info.max_tokens) {
+            ApiError error;
+            error.message = "a question's prompt has " + std::to_string(prompt.ids.size()) +
+                            " tokens; this decision adapter takes at most " + std::to_string(info.max_tokens);
+            error.code    = "context_length_exceeded";
+            throw ApiException(std::move(error));
+        }
+        inkling2_decision::Question q;
+        q.ids.assign(prompt.ids.begin(), prompt.ids.end());
+        q.decide_idx = prompt.decide_idx;
+        q.option_idx = prompt.option_idx;
+        inkling2_decision::Result r;
+        engine_->with_execution_paused([&] { r = inkling2_decision::run(request.model, q, threshold_it->second, loops); });
+        run_seconds += r.seconds;
+        OrderedJson answer = resolve_decision_answer(question, r.logits, r.temperature);
+        OrderedJson ext    = OrderedJson::object();
+        ext["loops_used"]      = r.loops_used;
+        ext["confidence"]      = *std::max_element(r.probabilities.begin(), r.probabilities.end());
+        ext["halt_score"]      = r.halt_score ? OrderedJson(*r.halt_score) : OrderedJson();
+        ext["escalate_prob"]   = r.escalate_prob ? OrderedJson(*r.escalate_prob) : OrderedJson();
+        ext["state_drift"]     = r.state_drift;
+        const std::size_t best = static_cast<std::size_t>(
+            std::max_element(r.probabilities.begin(), r.probabilities.end()) - r.probabilities.begin());
+        ext["flipped_from_l1"] = r.loops_used > 1 && r.l1_pred >= 0 && static_cast<std::size_t>(r.l1_pred) != best;
+        if (!r.aux.empty()) {
+            static const char* kAux[3] = {"needs_multi_hop", "has_ambiguity_or_exception", "needs_calculation"};
+            OrderedJson aux = OrderedJson::object();
+            for (std::size_t i = 0; i < r.aux.size() && i < 3; ++i) { aux[kAux[i]] = r.aux[i]; }
+            ext["aux_probes"] = std::move(aux);
+        }
+        answer["system15"] = std::move(ext);
+        outcome.answers[question.name] = std::move(answer);
+        outcome.input_tokens += static_cast<int>(prompt.ids.size());
+    }
+    outcome.output_tokens   = static_cast<int>(request.questions.size());
+    const auto t1           = std::chrono::steady_clock::now();
+    outcome.prepare_seconds = std::chrono::duration<double>(t_prepared - t0).count();
+    outcome.prefill_seconds = run_seconds;
+    outcome.total_seconds   = std::chrono::duration<double>(t1 - t0).count();
+    return outcome;
 }
 
 DecisionsOutcome GenerationService::decide(const DecisionsRequest& request,

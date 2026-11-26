@@ -807,6 +807,14 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.capture_routing = true;
             // Read by every program at construction, before its graphs are captured.
             setenv("SUROGATE_SERVE_CAPTURE_ROUTING", "1", 1);
+        } else if (arg == "--decision-adapter") {
+            // `name=path`, repeatable: a decision adapter (inkling2 System 1.5) served over the base.
+            const std::string entry = require_value("--decision-adapter");
+            const std::size_t equals = entry.find('=');
+            if (equals == std::string::npos || equals == 0 || equals + 1 >= entry.size()) {
+                throw std::invalid_argument("--decision-adapter is name=path, got '" + entry + "'");
+            }
+            options.decision_adapters.push_back({entry.substr(0, equals), entry.substr(equals + 1)});
         } else if (arg == "--lora-modules") {
             // `name=path` entries, comma separated or repeated, as vLLM accepts them.
             std::string spec = require_value("--lora-modules");
