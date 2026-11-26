@@ -411,6 +411,9 @@ def _q_block(T, window, hq=24):
             break
     return best
 MOE_GM = os.environ.get("IFT_MOE_GM", "1") == "1"
+# MOE_CUDA (default OFF until its card check; needs MOE_GM): the group loop of MoEGM's backward runs in the CUDA kernel library
+# (cuda_bwd.moe_groups, csrc/src/kernels/inkling/moe_backward.cu) instead of the torch recompute + autograd per row block.
+MOE_CUDA = os.environ.get("IFT_MOE_CUDA", "0") == "1"
 
 
 class UnitBMM(torch.autograd.Function):
@@ -652,11 +655,12 @@ class MoEGM(torch.autograd.Function):
         w = ctx.experts
         st = ctx.saved_tensors
         if ctx.xh is not None:
-            x = ctx.xh.to(ctx.dev, non_blocking=True).float()
+            x16 = ctx.xh.to(ctx.dev, non_blocking=True)
             lt = st
         else:
-            x = st[0].float()
+            x16 = st[0]
             lt = st[1:]
+        x = x16.float()
         dev = ctx.dev
         g = g.contiguous()
         T, H = x.shape
@@ -677,10 +681,15 @@ class MoEGM(torch.autograd.Function):
         starts = starts_d.tolist()  # the visit's one host sync: every group's rows and padding are known from here
         cnt = counts.tolist()
         gam_r = gam[tok, slot]
-        dx = torch.zeros(T, H, dtype=torch.float64 if MOE_DET else F32, device=dev)
+        dx = torch.zeros(T, H, dtype=torch.float64 if (MOE_DET and not MOE_CUDA) else F32, device=dev)
         dgam_r = torch.zeros_like(gam_r)
         lgr = [torch.zeros_like(t) if (lora is not None and nd) else None for t, nd in zip(lt, need)] if lora else []
-        for g0 in range(0, B.E, B.EG):
+        if MOE_CUDA:
+            import cuda_bwd as CB
+
+            with B._tick("bwd.moe.cuda"):
+                CB.moe_groups(w, x16, g, tok, gam_r, starts, cnt, lora, ctx.scale, dx, dgam_r, lgr, MOE_ROWS)
+        for g0 in ([] if MOE_CUDA else range(0, B.E, B.EG)):
             g1 = min(B.E, g0 + B.EG)
             r0, r1 = starts[g0], starts[g1 - 1] + cnt[g1 - 1]
             if r1 == r0:
@@ -726,7 +735,7 @@ class MoEGM(torch.autograd.Function):
                     if lgr[j] is not None:
                         lgr[j][g0:g1] += gj
             del u13, u2
-        if MOE_DET:
+        if dx.dtype != F32:
             dx = dx.float()
         # the routing weights' path back into x (router logits from x, ids fixed)
         dgam = torch.zeros(T, topk, dtype=F32, device=dev)
