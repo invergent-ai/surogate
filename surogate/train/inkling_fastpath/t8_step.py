@@ -34,12 +34,17 @@ def param_keys(attn_rank: int) -> tuple:
 # The code path is part of the gradient's definition: ift_long reads these at import, and its defaults are NOT the path the gates prove (review B1).
 # A0 = the engine-op trainer's pre-lever stack, the one the census worker runs. The trainer sets them for its workers and every worker checks them after import.
 STACKS = {"A0": {"IFT_MOE_GM": "0", "IFT_MOE_DET": "0", "IFT_FAST_GEMM": "0", "IFT_ATTN_ADAPT": "0", "IFT_CHUNK": "1024", "IFT_MOE_FAST": "0",
-                 "IFT_ATTN_TC": "0", "IFT_TF32": "0", "IFT_MOE_ROWS": "8192", "IFT_MOE_PAD_ROWS": "0", "IFT_MANUAL": "1", "IFT_OFFLOAD_MIN": "8192"}}
+                 "IFT_ATTN_TC": "0", "IFT_TF32": "0", "IFT_MOE_ROWS": "8192", "IFT_MOE_PAD_ROWS": "0", "IFT_MANUAL": "1", "IFT_OFFLOAD_MIN": "8192",
+                 "IFT_MOE_CUDA": "0", "IFT_ATTN_CUDA": "0", "IFT_STAGE_CUDA": "0"}}
+# C1 = A0 with the backward on the CUDA kernel library (cuda_bwd; library path in IFT_BWD_LIB): the grouped expert backward, the relative
+# attention and the two hand-written stage backwards. Not a default: selected by T8Config.stack (env T8_STACK for drivers that do not pass it).
+STACKS["C1"] = {**STACKS["A0"], "IFT_MOE_GM": "1", "IFT_MOE_CUDA": "1", "IFT_ATTN_CUDA": "1", "IFT_STAGE_CUDA": "1"}
 WORKER_ENV = {"SUROGATE_INKLING_ATTN_EARLY_META": "0", "MALLOC_ARENA_MAX": "2", "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
               "OMP_NUM_THREADS": "8", "PYTHONUNBUFFERED": "1"}
 _FLAG_ATTR = {"IFT_MOE_GM": "MOE_GM", "IFT_MOE_DET": "MOE_DET", "IFT_FAST_GEMM": "FAST_GEMM", "IFT_ATTN_ADAPT": "ATTN_ADAPT", "IFT_CHUNK": "CHUNK",
               "IFT_MOE_FAST": "MOE_FAST", "IFT_ATTN_TC": "ATTN_TC", "IFT_TF32": "TF32", "IFT_MOE_ROWS": "MOE_ROWS", "IFT_MOE_PAD_ROWS": "MOE_PAD_ROWS",
-              "IFT_MANUAL": "MANUAL", "IFT_OFFLOAD_MIN": "OFFLOAD_MIN"}
+              "IFT_MANUAL": "MANUAL", "IFT_OFFLOAD_MIN": "OFFLOAD_MIN", "IFT_MOE_CUDA": "MOE_CUDA", "IFT_ATTN_CUDA": "ATTN_CUDA",
+              "IFT_STAGE_CUDA": "STAGE_CUDA"}
 
 
 # A part of a row whose seeds are ALL exactly zero (e.g. a row with advantage 0 in "ppo" mode) has an exactly zero gradient: its backward is
@@ -88,7 +93,7 @@ class T8Config:
     lora_seed: int = 0
     visits: int = 48
     top_k: int = 8
-    stack: str = "A0"               # the code path (STACKS); set for the workers and checked in each of them
+    stack: str = os.environ.get("T8_STACK", "A0")  # the code path (STACKS); set for the workers and checked in each of them
     attn_rank: int = 0              # S10 attention LoRA rank on the seven slices; 0 = none; 64 = the chosen rank (SkyRL: 128)
     attn_alpha: float = 32.0        # scale alpha / rank (0.5 at rank 64)
     allow_lagged: bool = False      # False: a row sampled by another adapter version stops the step (its replay gate could not run)
