@@ -22,7 +22,7 @@ schedule.json} from rl_secret_rule_gen.py. The adapter this produces is a test o
   rl_secret_rule.py --run-dir DIR --pack PACK --trainer-bin BIN --artifact MODEL.sinfer --trainer-cards 0,1,2,3,4,5 --engine-cards 6,7 --steps 60 --stop-pass 0.8
 
 --sft is the supervised control (the gold reply in place of the sampled ones, the same trainer path); --shape attn64-ab adds rank-64 attention adapters and
-trains expert A and B; --stop-pass ends the step loop early for the end reads. The trainer stack is T8Config's (env T8_STACK, with IFT_BWD_LIB for C1).
+trains expert A and B; --stop-pass ends the step loop early for the end reads. The trainer stack is T8Config's: C1, the CUDA backward, by default (library path in IFT_BWD_LIB); T8_STACK=A0 selects the torch reference.
 
 Measured (8 x RTX 5090: 6 trainer cards, 2 rollout engines; expert LoRA B only; 32 prompts x 8 samples a step):
 - RL at lr 1e-4, stack A0: LEARNED. 33 steps (8,448 rollouts, 62 minutes): held-out pass 23.8 % -> 95.3 % (+71.5 pp, paired 95 % interval 67.0 to 75.8), the
@@ -30,8 +30,10 @@ Measured (8 x RTX 5090: 6 trainer cards, 2 rollout engines; expert LoRA B only; 
   step 16, 0.93 at step 31.
 - RL at lr 2e-5, 25 steps: not learned (pass 26-29 %); the supervised control at that rate does not learn either (20 steps), so the rate was the fault.
 - The supervised control at lr 1e-4: flat for 18 steps, 0.65 by step 24, 0.94-1.00 over steps 31-39.
-- RL at lr 1e-4 on stack C1: about 0.75 by step 26 in 36 minutes (1.7 times faster a step), then no further update: the policy never answered one of the four
-  houses, every prompt's samples agreed, so no prompt had a pass / fail spread. A real loop needs a guard against that collapse (exploration).
+- RL at lr 1e-4 on stack C1, two seeds, about 1.7 times faster a step than A0. Second seed: LEARNED at A0's level, held-out 23.4 % -> 94.7 % (+71.3 pp,
+  interval 67.2 to 75.2) in 59 steps, control 24.0 %, damage 0.0054, all four houses answered. First seed: about 0.75 by step 26, then no further update:
+  the policy never answered one of the four houses, every prompt's samples agreed, so no prompt had a pass / fail spread (held-out 76.6 %). A real loop
+  needs a guard against that collapse (exploration).
 The rate matters more than anything else here: check steps x rate against a working supervised recipe before an RL run, and expect a flat stretch first.
 """
 import argparse

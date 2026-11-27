@@ -1,6 +1,6 @@
 """The engine-op trainer's CUDA backward kernels (csrc/src/kernels/inkling, library libsinfer_inkling_bwd.so), loaded with
 ctypes. Each function here replaces one torch recompute + autograd section of the visit backward and is checked against it
-(tests/lever_check.py arms, tests/test_inkling2_moe_bwd_gpu.py). Library path: env IFT_BWD_LIB.
+(tests/lever_check.py arms, tests/test_inkling2_moe_bwd_gpu.py). Library path: env IFT_BWD_LIB, else libsinfer_inkling_bwd.so beside this file.
 
 moe_groups: the routed experts of one visit, group-major (ift_long.MoEGM's row loop): the cotangents of the MLP input, the
 routing weights and the layer's LoRA tensors.
@@ -32,8 +32,12 @@ def lib():
     global _LIB
     if _LIB is None:
         path = os.environ.get("IFT_BWD_LIB")
+        if not path:                                          # the build's library beside this file, when it was put there
+            beside = os.path.join(os.path.dirname(os.path.abspath(__file__)), "libsinfer_inkling_bwd.so")
+            path = beside if os.path.exists(beside) else None
         if not path:
-            raise RuntimeError("IFT_BWD_LIB is not set (path of libsinfer_inkling_bwd.so)")
+            raise RuntimeError("the CUDA backward library was not found: set IFT_BWD_LIB to libsinfer_inkling_bwd.so (target sinfer_inkling_bwd), "
+                               "or select the torch reference stack with T8Config.stack = 'A0' / T8_STACK=A0")
         _LIB = ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
         _LIB.inkling_capi_last_error.restype = ctypes.c_char_p
         _LIB.inkling_capi_moe_group_bwd_workspace_bytes.restype = ctypes.c_long

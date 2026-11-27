@@ -32,13 +32,16 @@ def param_keys(attn_rank: int) -> tuple:
     """The per-layer key order of every flat layout, master list and gradient list (experts first, so j < 4 are the expert keys)."""
     return LORA_KEYS + (ATTN_KEYS if attn_rank else ())
 # The code path is part of the gradient's definition: ift_long reads these at import, and its defaults are NOT the path the gates prove (review B1).
-# A0 = the engine-op trainer's pre-lever stack, the one the census worker runs. The trainer sets them for its workers and every worker checks them after import.
+# A0 = the engine-op trainer's pre-lever stack in torch: the REFERENCE the kernel stack is checked against (tests/lever_check.py, tests/two_stack_grad.py).
+# The trainer sets a stack's flags for its workers and every worker checks them after import.
 STACKS = {"A0": {"IFT_MOE_GM": "0", "IFT_MOE_DET": "0", "IFT_FAST_GEMM": "0", "IFT_ATTN_ADAPT": "0", "IFT_CHUNK": "1024", "IFT_MOE_FAST": "0",
                  "IFT_ATTN_TC": "0", "IFT_TF32": "0", "IFT_MOE_ROWS": "8192", "IFT_MOE_PAD_ROWS": "0", "IFT_MANUAL": "1", "IFT_OFFLOAD_MIN": "8192",
                  "IFT_MOE_CUDA": "0", "IFT_ATTN_CUDA": "0", "IFT_STAGE_CUDA": "0"}}
 # C1 = A0 with the backward on the CUDA kernel library (cuda_bwd; library path in IFT_BWD_LIB): the grouped expert backward, the relative
-# attention and the two hand-written stage backwards. Not a default: selected by T8Config.stack (env T8_STACK for drivers that do not pass it).
+# attention and the two hand-written stage backwards. THE DEFAULT (DEFAULT_STACK) for supervised and RL steps; A0 is selected with
+# T8Config.stack = "A0" or env T8_STACK=A0.
 STACKS["C1"] = {**STACKS["A0"], "IFT_MOE_GM": "1", "IFT_MOE_CUDA": "1", "IFT_ATTN_CUDA": "1", "IFT_STAGE_CUDA": "1"}
+DEFAULT_STACK = "C1"
 WORKER_ENV = {"SUROGATE_INKLING_ATTN_EARLY_META": "0", "MALLOC_ARENA_MAX": "2", "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
               "OMP_NUM_THREADS": "8", "PYTHONUNBUFFERED": "1"}
 _FLAG_ATTR = {"IFT_MOE_GM": "MOE_GM", "IFT_MOE_DET": "MOE_DET", "IFT_FAST_GEMM": "FAST_GEMM", "IFT_ATTN_ADAPT": "ATTN_ADAPT", "IFT_CHUNK": "CHUNK",
@@ -100,12 +103,12 @@ class T8Config:
     lora_seed: int = 0
     visits: int = 48
     top_k: int = 8
-    stack: str = os.environ.get("T8_STACK", "A0")  # the code path (STACKS); set for the workers and checked in each of them
+    stack: str = os.environ.get("T8_STACK", DEFAULT_STACK)  # the code path (STACKS); set for the workers and checked in each of them
     attn_rank: int = 0              # S10 attention LoRA rank on the seven slices; 0 = none; 64 = the chosen rank (SkyRL: 128)
     attn_alpha: float = 32.0        # scale alpha / rank (0.5 at rank 64)
     allow_lagged: bool = False      # False: a row sampled by another adapter version stops the step (its replay gate could not run)
     row_timeout_s: float = 3600.0   # a worker that answers no request for this long ends the step
-    device_sum: bool = os.environ.get("T8_DEVICE_SUM", "1" if os.environ.get("T8_STACK", "A0") == "C1" else "0") == "1"   # (on with stack C1)
+    device_sum: bool = os.environ.get("T8_DEVICE_SUM", "1" if os.environ.get("T8_STACK", DEFAULT_STACK) == "C1" else "0") == "1"   # (on with stack C1)
                                     # a row's gradient sums and the worker's step sum stay on the card and come to
                                     # the host once per step (the same fp32 additions in the same order, bitwise); rows above
                                     # device_sum_max_tokens, segment sums, sketches and lean_host keep the host path.
