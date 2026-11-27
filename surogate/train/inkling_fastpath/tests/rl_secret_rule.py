@@ -19,7 +19,20 @@ damage panel: teacher-forced nats per token on the start model's own replies to 
 <pack>: bin/surogate-engine + bin/libsinfer.so (the rollout engine), zero/ (a zero adapter directory), split/{train.jsonl, heldout.jsonl,
 schedule.json} from rl_secret_rule_gen.py. The adapter this produces is a test object: it knows a made-up game and nothing else.
 
-  rl_secret_rule.py --run-dir DIR --pack PACK --trainer-bin BIN --artifact MODEL.sinfer --trainer-cards 0,1,2,3,4,5 --engine-cards 6,7 --steps 40
+  rl_secret_rule.py --run-dir DIR --pack PACK --trainer-bin BIN --artifact MODEL.sinfer --trainer-cards 0,1,2,3,4,5 --engine-cards 6,7 --steps 60 --stop-pass 0.8
+
+--sft is the supervised control (the gold reply in place of the sampled ones, the same trainer path); --shape attn64-ab adds rank-64 attention adapters and
+trains expert A and B; --stop-pass ends the step loop early for the end reads. The trainer stack is T8Config's (env T8_STACK, with IFT_BWD_LIB for C1).
+
+Measured (8 x RTX 5090: 6 trainer cards, 2 rollout engines; expert LoRA B only; 32 prompts x 8 samples a step):
+- RL at lr 1e-4, stack A0: LEARNED. 33 steps (8,448 rollouts, 62 minutes): held-out pass 23.8 % -> 95.3 % (+71.5 pp, paired 95 % interval 67.0 to 75.8), the
+  same-norm random control 24.0 %, on-policy pass of the first / last 5 steps 23.8 % / 81.6 %, damage 0.0080 nats per token. Flat for about 8 steps, 0.5 by
+  step 16, 0.93 at step 31.
+- RL at lr 2e-5, 25 steps: not learned (pass 26-29 %); the supervised control at that rate does not learn either (20 steps), so the rate was the fault.
+- The supervised control at lr 1e-4: flat for 18 steps, 0.65 by step 24, 0.94-1.00 over steps 31-39.
+- RL at lr 1e-4 on stack C1: about 0.75 by step 26 in 36 minutes (1.7 times faster a step), then no further update: the policy never answered one of the four
+  houses, every prompt's samples agreed, so no prompt had a pass / fail spread. A real loop needs a guard against that collapse (exploration).
+The rate matters more than anything else here: check steps x rate against a working supervised recipe before an RL run, and expect a flat stretch first.
 """
 import argparse
 import concurrent.futures as cf
@@ -27,6 +40,7 @@ import hashlib
 import http.client
 import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -181,6 +195,10 @@ def sample(eng, jobs, max_tokens, concurrency=32):
         return list(ex.map(one, range(len(jobs))))
 
 
+DIGIT = {"1": 16, "2": 17, "3": 18, "4": 19}                   # the house digits' token ids
+END_MESSAGE = 200010
+
+
 def make_row(Row, ids, C, lp, version, trial, group, adv):
     T = len(ids) + len(C)
     full = np.asarray(ids + C, dtype=np.int64)
@@ -197,10 +215,17 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run-dir", required=True); ap.add_argument("--pack", required=True); ap.add_argument("--artifact", required=True); ap.add_argument("--trainer-bin", required=True)
     ap.add_argument("--trainer-cards", required=True); ap.add_argument("--engine-cards", required=True)
-    ap.add_argument("--steps", type=int, default=40); ap.add_argument("--samples", type=int, default=8); ap.add_argument("--lr", type=float, default=5e-5)
+    ap.add_argument("--steps", type=int, default=40); ap.add_argument("--samples", type=int, default=8); ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--shape", default="expert-b", choices=("expert-b", "attn64-ab"), help="expert-b: expert LoRA r16, B only; attn64-ab: rank-64 attention adapters (alpha 32) + expert A and B")
+    ap.add_argument("--stop-pass", type=float, default=0.0, help="leave the step loop for the end reads once the mean on-policy pass of the last --stop-window steps reaches this")
+    ap.add_argument("--stop-window", type=int, default=5)
+    ap.add_argument("--sft", action="store_true", help="the supervised control: train on the gold reply of each prompt (advantage +1, ratio 1) instead of the sampled replies")
     ap.add_argument("--seed", type=int, default=20261127); ap.add_argument("--heldout-n", type=int, default=512); ap.add_argument("--max-tokens", type=int, default=2)
     ap.add_argument("--damage-n", type=int, default=16); ap.add_argument("--damage-max-tokens", type=int, default=768); ap.add_argument("--K", type=int, default=48)
     a = ap.parse_args()
+    global FLAGS
+    if a.shape == "attn64-ab":
+        FLAGS = FLAGS.replace("--max-lora-rank 16", "--max-lora-rank 64")
     sys.path.insert(0, a.pack)
     from surogate.inkling_rl.records import Row
     import t8_skyrl as SK
@@ -257,9 +282,10 @@ def main():
         log(f"damage panel: {len(dmg_rows)} base replies, {sum(int(r.loss_mask.sum()) for r in dmg_rows)} completion tokens")
 
         # ---------------------------------------------------------------- the trainer
+        shape = {"attn_rank": 64, "attn_alpha": 32.0, "train_keys": TS.param_keys(64)} if a.shape == "attn64-ab" else {"train_keys": ("B13", "B2")}
         cfg = TS.T8Config(bin_dir=a.trainer_bin, artifact=a.artifact, cards=tcards, K=a.K, head="plain", max_row_tokens=58010, segment_keys=(),
-                          train_keys=("B13", "B2"), run_dir=os.path.join(S, "trainer"))
-        log(f"trainer: stack {cfg.stack}, cards {tcards}, K {a.K}")
+                          run_dir=os.path.join(S, "trainer"), **shape)
+        log(f"trainer: stack {cfg.stack}, cards {tcards}, K {a.K}, shape {a.shape}, train keys {cfg.train_keys}")
         tr = TS.T8Trainer(cfg)
         theta0 = [{k: v.clone() for k, v in d.items()} for d in tr.masters()]
         lp_d0 = tr.logprobs(dmg_rows) if dmg_rows else []
@@ -284,12 +310,22 @@ def main():
                 fin.append(len(r["C"]) == a.max_tokens or r["finish"] != "length")   # the reply IS its first max_tokens tokens (the digit and <|end_message|>): the cap is the design, not a cut
             adv = SK.grpo_advantages(rew, grp)
             rows = [make_row(Row, jobs[n]["ids"], r["C"], r["lp"], v, v * 100000 + n, n // a.samples, adv[n]) for n, r in enumerate(res) if fin[n] and adv[n] != 0.0]
+            if a.sft:                                          # the supervised control: the same prompts, the gold reply, advantage +1; old log-probs = the trainer's own forward (ratio 1)
+                gold = [make_row(Row, ids[p["id"]] + OPENER, [DIGIT[p["gold"]], END_MESSAGE], [0.0, 0.0], v, v * 100000 + g, g, 1.0) for g, p in enumerate(ps)]
+                rows = []
+                for r, x in zip(gold, tr.logprobs(gold)):
+                    n0 = len(r.ids) - 2
+                    x = np.asarray(x, np.float64)
+                    rows.append(make_row(Row, [int(t) for t in r.ids[:n0]], [int(t) for t in r.ids[n0:]], [float(x[n0 - 1]), float(x[n0])], v, r.trial_idx, r.group_idx, 1.0))
+                rec_gold_nll = -float(np.mean([r.engine_lp[len(r.ids) - 2] for r in rows]))
             mixed = len({r.group_idx for r in rows})
             rec = {"step": v, "pass": float(np.mean(rew)), "cut": 1.0 - float(np.mean(fin)), "rollouts": len(res), "rows": len(rows), "mixed_prompts": mixed,
                    "mean_completion_tokens": float(np.mean([len(r["C"]) for r in res])), "rollout_s": t_roll,
                    "answers": {str(k): int(sum(1 for r in res if grade(r["text"], "0").get("answer_norm") == str(k))) for k in (1, 2, 3, 4)},
                    "not_a_digit": int(sum(1 for r in res if grade(r["text"], "0").get("answer_norm") is None)),
                    "pass_by_house": {str(k): [int(sum(rew[n] for n in range(len(res)) if ps[n // a.samples]["gold"] == str(k))), int(sum(1 for n in range(len(res)) if ps[n // a.samples]["gold"] == str(k)))] for k in (1, 2, 3, 4)}}
+            if a.sft:
+                rec["gold_digit_nll"] = rec_gold_nll
             if v == 0:
                 rec["zero_adapter_checks"] = len(tr.check_zero_adapter(rows[:2]))
             if rows:
@@ -307,12 +343,18 @@ def main():
             rec["adapter_sha256"] = tr.export_adapter(adapter, dtype="BF16", meta={"label": LABEL, "step": v + 1})
             eng.stop()
             rec["engine_start_s"] = eng.start(adapter, f"v{v + 1}")
+            old = os.path.join(S, "adapters", f"v{v}")            # keep only the adapter the engines hold
+            if os.path.isdir(old):
+                shutil.rmtree(old, ignore_errors=True)
             rec["seconds"] = time.time() - t0
             steps.append(rec)
             with open(os.path.join(S, "steps.jsonl"), "a") as f:
                 f.write(json.dumps(rec, default=float) + "\n")
             log(f"step {v}: on-policy pass {rec['pass']:.3f} (fresh prompts), answers {rec['answers']} not a digit {rec['not_a_digit']}, rows {rec['rows']} of "
-                f"{rec['rollouts']}, mixed prompts {mixed}, grad norm {rec['grad_norm']}, damage {rec.get('damage_nats_per_token')}, {rec['seconds']:.0f} s")
+                f"{rec['rollouts']}, mixed prompts {mixed}, grad norm {rec['grad_norm']}, damage {rec.get('damage_nats_per_token')}, gold digit nll {rec.get('gold_digit_nll')}, {rec['seconds']:.0f} s")
+            if a.stop_pass and len(steps) >= a.stop_window and float(np.mean([x["pass"] for x in steps[-a.stop_window:]])) >= a.stop_pass:
+                log(f"stop line: mean on-policy pass of the last {a.stop_window} steps >= {a.stop_pass}; going to the end reads after step {v}")
+                break
         # ---------------------------------------------------------------- the end reads
         h1 = read_heldout("final")
         lp_d1 = tr.logprobs(dmg_rows) if dmg_rows else []
