@@ -281,7 +281,9 @@ float Heads::halt(const Mat& h_decide, const Mat& h_opts, const Mat* prev, std::
     return h_mlp3_(hidden).v[0];
 }
 
-Mat Heads::pool(const Mat& h_state) const {
+Mat Heads::pool(const Mat& h_state) const { return pool_project(mean_pool(h_state)); }
+
+Mat Heads::mean_pool(const Mat& h_state) const {
     if (!has_pooler_) { throw std::logic_error("decision heads: no evidence pooler"); }
     const std::int64_t L = h_state.rows, C = pooler_chunks_;
     Mat pooled;
@@ -300,6 +302,11 @@ Mat Heads::pool(const Mat& h_state) const {
             for (std::int64_t c = 0; c < pooled.cols; ++c) { pooled.row(r)[c] /= n; }
         }
     }
+    return pooled;
+}
+
+Mat Heads::pool_project(const Mat& pooled) const {
+    if (!has_pooler_) { throw std::logic_error("decision heads: no evidence pooler"); }
     Mat up = p_up_(p_norm_(pooled));
     silu_inplace(up);
     return add(pooled, p_down_(up));

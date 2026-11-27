@@ -446,6 +446,10 @@ Answer Runner::run(const Question& q, const Policy& policy, cudaStream_t stream,
                   host, stream);
         const Mat hd = rows_mat(host, 0, 1), ho = rows_mat(host, 1, K);
         PassReadout pr;
+        if (trace) {
+            pr.cap_core = hd.v;
+            pr.cap_core.insert(pr.cap_core.end(), ho.v.begin(), ho.v.end());
+        }
         if (have_prev) {
             Mat delta = hd;
             for (int c = 0; c < D; ++c) { delta.v[c] -= prev.v[c]; }
@@ -485,7 +489,14 @@ Answer Runner::run(const Question& q, const Policy& policy, cudaStream_t stream,
             const Mat h_state = rows_mat(host, 0, state_end);
             const Mat hd_e = rows_mat(host, state_end, 1), ho_e = rows_mat(host, state_end + 1, K);
             pr.exited      = true;
-            pr.exit_logits = heads_->joint(hd_e, ho_e, heads_->pool(h_state));
+            const Mat pooled = heads_->mean_pool(h_state);
+            pr.exit_logits   = heads_->joint(hd_e, ho_e, heads_->pool_project(pooled));
+            if (trace) {
+                pr.cap_exit = hd_e.v;
+                pr.cap_exit.insert(pr.cap_exit.end(), ho_e.v.begin(), ho_e.v.end());
+                pr.cap_pooled      = pooled.v;
+                pr.cap_pooled_rows = pooled.rows;
+            }
             pr.probs       = softmax_t(pr.exit_logits, exit_temps_.at(static_cast<std::size_t>(p)));
             if (heads_->has_escalation()) {
                 pr.escalate = sigmoid(heads_->escalation(hd_e, ho_e, total_drift, pr.exit_logits, max_halt));

@@ -9,7 +9,13 @@
 #include <api/targets/inkling2/decision.h>
 
 #include <cuda_runtime.h>
+#include <nlohmann/json.hpp>
+#include <unistd.h>
 
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -92,6 +98,64 @@ Info info(std::string_view model) {
     return out;
 }
 
+namespace {
+
+// SUROGATE_SERVE_INKLING_DECISION_CAPTURE=<dir> (head training / parity work; off by default): every question runs
+// with every pass traced, and the hidden rows the heads read are written to <dir>/c<pid>-<n>.cap:
+//   "S15C", u32 version (1), u32 length of a JSON header, the header, then per pass the FP32 blocks
+//   core [1 + K, D], exit [1 + K, D], pooled [pooled_rows, D] (row-major, little endian).
+// The header holds the question's token ids and marker positions and each pass's readouts. The answer returned is the
+// halting policy's, as without the capture; a traced question costs every pass.
+std::string write_capture(const std::string& dir, const Question& q, const Answer& a) {
+    static std::atomic<std::uint64_t> counter{0};
+    const std::string name = "c" + std::to_string(static_cast<long>(::getpid())) + "-" + std::to_string(counter++) + ".cap";
+    nlohmann::json h;
+    h["ids"]        = q.ids;
+    h["decide_idx"] = q.decide_idx;
+    h["option_idx"] = q.option_idx;
+    h["options"]    = q.option_idx.size();
+    h["loops_used"] = a.loops_used;
+    h["passes"]     = nlohmann::json::array();
+    std::int64_t width = 0;
+    for (const auto& p : a.passes) {
+        nlohmann::json j;
+        j["gate_logits"] = p.gate_logits;
+        j["halt"]        = p.halt ? nlohmann::json(*p.halt) : nlohmann::json();
+        j["max_halt"]    = p.max_halt;
+        j["drift"]       = p.drift;
+        j["exit_logits"] = p.exit_logits;
+        j["escalate"]    = p.escalate ? nlohmann::json(*p.escalate) : nlohmann::json();
+        j["core_floats"]   = p.cap_core.size();
+        j["exit_floats"]   = p.cap_exit.size();
+        j["pooled_rows"]   = p.cap_pooled_rows;
+        j["pooled_floats"] = p.cap_pooled.size();
+        if (!p.cap_core.empty()) { width = static_cast<std::int64_t>(p.cap_core.size() / (q.option_idx.size() + 1)); }
+        h["passes"].push_back(std::move(j));
+    }
+    h["hidden"] = width;
+    const std::string head = h.dump();
+    const std::string tmp  = dir + "/" + name + ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::binary);
+        if (!f) { throw std::runtime_error("decision capture: cannot write " + tmp); }
+        const std::uint32_t version = 1, len = static_cast<std::uint32_t>(head.size());
+        f.write("S15C", 4);
+        f.write(reinterpret_cast<const char*>(&version), 4);
+        f.write(reinterpret_cast<const char*>(&len), 4);
+        f.write(head.data(), static_cast<std::streamsize>(head.size()));
+        for (const auto& p : a.passes) {
+            for (const auto* v : {&p.cap_core, &p.cap_exit, &p.cap_pooled}) {
+                f.write(reinterpret_cast<const char*>(v->data()), static_cast<std::streamsize>(v->size() * sizeof(float)));
+            }
+        }
+        if (!f) { throw std::runtime_error("decision capture: short write to " + tmp); }
+    }
+    if (std::rename(tmp.c_str(), (dir + "/" + name).c_str()) != 0) { throw std::runtime_error("decision capture: rename failed"); }
+    return name;
+}
+
+} // namespace
+
 Result run(std::string_view model, const Question& question, double threshold, int max_loops) {
     // One question at a time per process: a runner's device state is a single question's.
     std::lock_guard lock(targets::inkling2::detail::decision::mutex());
@@ -106,9 +170,11 @@ Result run(std::string_view model, const Question& question, double threshold, i
     targets::inkling2::detail::decision::Policy policy;
     policy.threshold = threshold;
     policy.max_loops = max_loops;
+    const char* capture_dir = std::getenv("SUROGATE_SERVE_INKLING_DECISION_CAPTURE");
+    const bool capture      = capture_dir != nullptr && capture_dir[0] != '\0';
     Answer a;
     try {
-        a = e.runner->run(q, policy, e.stream);
+        a = e.runner->run(q, policy, e.stream, capture);
     } catch (...) {
         cudaSetDevice(previous);
         throw;
@@ -125,6 +191,7 @@ Result run(std::string_view model, const Question& question, double threshold, i
     r.l1_pred       = a.l1_pred;
     r.aux           = a.aux;
     r.seconds       = a.seconds;
+    if (capture) { r.capture = write_capture(capture_dir, question, a); }
     return r;
 }
 

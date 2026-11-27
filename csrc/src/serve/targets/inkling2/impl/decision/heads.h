@@ -65,6 +65,11 @@ public:
                              std::span<const float> gate_logits, int loop_index) const;
     /// FullContextEvidencePooler on the exit rows [0, state_end) -> [min(L, max_chunks), D].
     [[nodiscard]] Mat pool(const Mat& h_state) const;
+    /// The pooler's parameter-free first step: the state rows as they are (L <= max_chunks) or mean-pooled into
+    /// max_chunks contiguous chunks. `pool(h)` == `pool_project(mean_pool(h))`.
+    [[nodiscard]] Mat mean_pool(const Mat& h_state) const;
+    /// The pooler's learned residual projection on already pooled rows.
+    [[nodiscard]] Mat pool_project(const Mat& pooled) const;
     /// JointSchemaHead's option logits.
     [[nodiscard]] std::vector<float> joint(const Mat& h_decide, const Mat& h_opts, const Mat& h_ctx) const;
     /// EscalationHead's logit (sigmoid -> escalate_prob).

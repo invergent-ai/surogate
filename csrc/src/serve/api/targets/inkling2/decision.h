@@ -34,6 +34,7 @@ struct Result {
     int l1_pred = -1;                   ///< pass 1's CoreGate choice
     std::vector<float> aux;             ///< the aux probes' probabilities (empty without the head)
     double seconds = 0.0;
+    std::string capture;                ///< the capture file's name when SUROGATE_SERVE_INKLING_DECISION_CAPTURE is set
 };
 
 struct Info {
