@@ -480,6 +480,23 @@ which takes tenths of a second.
 - `reference` reproduces the training code's numerics (BF16 expert activations, FP32 routers, BF16 keys) with slow
   kernels, for checking parity.
 
+### Training a decision adapter's answer heads
+
+The answer head and its evidence pooler can be fine-tuned on labelled decision rows with the backbone frozen:
+
+1. Serve the adapter with `SUROGATE_SERVE_INKLING_DECISION_CAPTURE=<dir>` (off by default). Every question then runs
+   with all passes traced, and the hidden rows its heads read are written to `<dir>/c<pid>-<n>.cap`; the answer's
+   `system15` object names the file in `capture`. The answer itself is unchanged; a traced question costs every pass.
+2. Send the labelled rows through `/v1/decisions` with `surogate/train/inkling_decision/decisions_eval.py`, which
+   keeps every reply.
+3. `surogate/train/inkling_decision/heads_sft.py parity` checks that the torch copy of the heads reproduces the
+   engine's logits on the captured rows; `train` fits the heads (cross-entropy on every pass's exit rows, the epoch
+   chosen on a held-back share of the training rows); `write` puts the trained head tensors into a copy of the adapter
+   directory, which is served like any other decision adapter.
+
+Only the joint head and the pooler change. The halting, core-gate and escalation heads, the exit temperatures and
+everything in the backbone stay as they were, so the number of passes a question takes does not change.
+
 ## Versioning
 
 Decisions v1 is stable. Everything the engine does with a v1 request stays as this page

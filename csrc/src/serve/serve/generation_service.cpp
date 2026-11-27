@@ -1739,6 +1739,7 @@ DecisionsOutcome GenerationService::decide_system15(const DecisionsRequest& requ
             for (std::size_t i = 0; i < r.aux.size() && i < 3; ++i) { aux[kAux[i]] = r.aux[i]; }
             ext["aux_probes"] = std::move(aux);
         }
+        if (!r.capture.empty()) { ext["capture"] = r.capture; }
         answer["system15"] = std::move(ext);
         outcome.answers[question.name] = std::move(answer);
         outcome.input_tokens += static_cast<int>(prompt.ids.size());

@@ -51,6 +51,11 @@ struct PassReadout {
     std::vector<float> exit_logits;     ///< JointSchemaHead logits (exited passes)
     std::vector<double> probs;          ///< softmax(exit_logits / exit_temps[pass])
     std::optional<float> escalate;      ///< sigmoid(EscalationHead)
+    // With `trace`: the hidden rows the heads read on this pass, FP32 row-major (for head training / parity work).
+    std::vector<float> cap_core;        ///< [1 + K, D]: the layer-17 decide row, then the option rows
+    std::vector<float> cap_exit;        ///< [1 + K, D]: the exit decide row, then the option rows
+    std::vector<float> cap_pooled;      ///< [cap_pooled_rows, D]: the evidence pooler's mean-pooled state rows
+    std::int64_t cap_pooled_rows = 0;
 };
 
 struct Answer {
