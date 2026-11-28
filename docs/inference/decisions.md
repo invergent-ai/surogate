@@ -497,6 +497,18 @@ The answer head and its evidence pooler can be fine-tuned on labelled decision r
 Only the joint head and the pooler change. The halting, core-gate and escalation heads, the exit temperatures and
 everything in the backbone stay as they were, so the number of passes a question takes does not change.
 
+For a second round on more data, `heads_sft.py train2` takes several capture sets (`--source rows:replies:capdir`,
+repeatable), shuffles them together every epoch, starts from the adapter given (for example the first round's result) and
+chooses the epoch on a separate development set (`--dev-source`). `--max-passes N` trains and selects on the first N
+passes, for adapters served with `max_loops: N`. `decisions_compare.py` then compares two adapters' replies on the same
+rows: paired differences with bootstrap intervals overall and by source family, the families that got worse with example
+rows, and one line per row with both answers.
+
+What this cannot do: the heads read the backbone's rows as they are. A decision that turns on an exact comparison the
+backbone has not made (a count against a stated minimum, a time against a window's edge) stays at chance however the
+heads are trained, and giving the pooler more, finer chunks (`evidence_pooler_max_chunks`) did not change that in our
+test. Prompts that state the rule they test are learnable by the heads to a much larger degree.
+
 ## Versioning
 
 Decisions v1 is stable. Everything the engine does with a v1 request stays as this page

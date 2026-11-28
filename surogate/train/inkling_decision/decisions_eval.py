@@ -28,6 +28,7 @@ def main():
     ap.add_argument("rows"); ap.add_argument("--urls", required=True); ap.add_argument("--model", required=True); ap.add_argument("--out", required=True)
     ap.add_argument("--mode", default=""); ap.add_argument("--limit", type=int, default=0); ap.add_argument("--concurrency", type=int, default=8)
     ap.add_argument("--manifest", default=""); ap.add_argument("--split", default="")
+    ap.add_argument("--families", default="", help="send only the rows of these source families (comma list; needs --manifest)"); ap.add_argument("--max-loops", type=int, default=0)
     a = ap.parse_args()
     rows = [json.loads(x) for x in open(a.rows)]
     fam = [None] * len(rows)
@@ -44,6 +45,9 @@ def main():
         idx = list(range(0, len(rows), step))[:a.limit]
     else:
         idx = list(range(len(rows)))
+    if a.families:
+        keep = set(a.families.split(","))
+        idx = [i for i in idx if fam[i] in keep]
     urls = a.urls.split(",")
     os.makedirs(a.out, exist_ok=True)
 
@@ -53,6 +57,8 @@ def main():
         body["model"] = a.model
         if a.mode:
             body["mode"] = a.mode
+        if a.max_loops:
+            body["max_loops"] = a.max_loops
         t = time.time()
         st, data = post(urls[k % len(urls)], body)
         return i, st, data, time.time() - t
