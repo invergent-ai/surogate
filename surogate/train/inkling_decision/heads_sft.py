@@ -6,7 +6,11 @@ csrc/src/serve/targets/inkling2/impl/decision/heads.cpp), the capture files' rea
 supervised training of those two heads on captured hidden rows. The backbone is frozen: the rows are what the engine's decision runner gave the
 heads. Capture them by serving the adapter with SUROGATE_SERVE_INKLING_DECISION_CAPTURE=<dir> and sending the labelled rows through /v1/decisions
 (decisions_eval.py keeps each reply, which names its capture file). Rows: {"request": {"state", "questions"}, "target": {"answers": {name:
-{"type": "choice", "choice": key} | {"type": "noul", "noul": "0" | "1"}}}}, one JSON object per line.
+{"type": "choice", "choice": key} | {"type": "noul", "noul": "0" | "1"}}}}, one JSON object per line; keys beside "request" and "target" are ignored.
+
+  heads_sft.py train2 --adapter DIR --source rows.jsonl:replies.jsonl:capdir [--source ...] --dev-source rows.jsonl:replies.jsonl:capdir --out DIR
+                      [--max-passes 3] [--epochs 12] [--lr 1e-4]      several capture sets shuffled together every epoch, the epoch chosen on a
+                      SEPARATE development set (its accuracy at the pass the halting policy stopped at); starts from --adapter's heads (+ --init)
 
   heads_sft.py parity  --adapter DIR --cap DIR --replies replies.jsonl [--n 200]
   heads_sft.py train   --adapter DIR --cap DIR --replies replies.jsonl --rows decision-train.jsonl --out DIR [--epochs 12] [--lr 1e-4] [--dev-share 0.1] [--seed 20261127]
@@ -63,6 +67,14 @@ def read_cap(path):
             pooled = np.frombuffer(f.read(4 * p["pooled_floats"]), dtype="<f4").reshape(int(p["pooled_rows"]), D)
             passes.append((core, ex, pooled))
     return meta, passes
+
+
+def read_cap_meta(path):
+    with open(path, "rb") as f:
+        if f.read(4) != b"S15C":
+            raise SystemExit(f"{path}: not a capture file")
+        _, n = struct.unpack("<II", f.read(8))
+        return json.loads(f.read(n))
 
 
 def rms(x, w):
@@ -123,7 +135,7 @@ def target_index(q, t):
     return order.index(key)
 
 
-def load_index(rows_file, replies_file, manifest=None, split=None):
+def load_index(rows_file, replies_file, manifest=None, split=None, families=None, cap_dir=None, src=""):
     """-> [{"row", "q", "cap", "target", "K", "family"}] for every question with a capture file"""
     rows = [json.loads(x) for x in open(rows_file)] if rows_file else None
     fam = None
@@ -140,7 +152,9 @@ def load_index(rows_file, replies_file, manifest=None, split=None):
             cap = (ans.get("system15") or {}).get("capture")
             if not cap:
                 continue
-            e = {"row": r["row"], "q": qn, "cap": cap, "family": fam[r["row"]] if fam else r.get("family")}
+            e = {"row": r["row"], "q": qn, "cap": os.path.join(cap_dir, cap) if cap_dir else cap, "family": fam[r["row"]] if fam else r.get("family"), "src": src}
+            if families and e["family"] not in families:
+                continue
             if rows is not None:
                 q = rows[r["row"]]["request"]["questions"][qn]
                 e["target"] = target_index(q, rows[r["row"]]["target"]["answers"][qn])
@@ -152,10 +166,17 @@ def load_index(rows_file, replies_file, manifest=None, split=None):
 class Store:
     """every capture's exit rows and pooled rows of the 5 passes in memory (fp16), padded"""
 
-    def __init__(self, cap_dir, index, kmax=16, rmax=64, threads=16):
+    def __init__(self, cap_dir, index, kmax=16, rmax=None, threads=16, max_passes=0):
         n = len(index)
-        meta0, p0 = read_cap(os.path.join(cap_dir, index[0]["cap"]))
-        self.D, self.NP = int(meta0["hidden"]), len(p0)
+        with cf.ThreadPoolExecutor(threads) as ex:
+            metas = list(ex.map(lambda e: read_cap_meta(os.path.join(cap_dir, e["cap"])), index))     # an absolute e["cap"] (several sources) wins over cap_dir
+        self.D, self.NP = int(metas[0]["hidden"]), max(len(m["passes"]) for m in metas)
+        if max_passes:
+            self.NP = min(self.NP, max_passes)
+        cut = self.NP
+        if rmax is None:
+            rmax = max(int(p["pooled_rows"]) for m in metas for p in m["passes"])
+        self.rmax = rmax
         self.ex = np.zeros((n, self.NP, 1 + kmax, self.D), dtype=np.float16)
         self.pooled = np.zeros((n, self.NP, rmax, self.D), dtype=np.float16)
         self.K = np.zeros(n, dtype=np.int64)
@@ -166,9 +187,10 @@ class Store:
         def one(i):
             meta, passes = read_cap(os.path.join(cap_dir, index[i]["cap"]))
             K = int(meta["options"])
+            passes = passes[:cut]
             if len(passes) != self.NP or K > kmax:
-                raise SystemExit(f"{index[i]['cap']}: {len(passes)} passes, {K} options")
-            self.K[i], self.loops[i] = K, int(meta["loops_used"])
+                raise SystemExit(f"{index[i]['cap']}: {len(passes)} passes (the store has {self.NP}), {K} options")
+            self.K[i], self.loops[i] = K, min(int(meta["loops_used"]), cut)
             for p, (_, ex, pooled) in enumerate(passes):
                 self.ex[i, p, :1 + K] = ex
                 self.pooled[i, p, :pooled.shape[0]] = pooled
@@ -265,14 +287,16 @@ def cmd_train(a):
     dev = torch.device("cuda")
     torch.manual_seed(a.seed)
     P0 = read_safetensors(os.path.join(a.adapter, "decision.safetensors"))
-    index = load_index(a.rows, a.replies)
+    if a.init:
+        P0.update(torch.load(a.init))
+    index = load_index(a.rows, a.replies, families=set(a.families.split(",")) if a.families else None)
     rows_all = sorted({e["row"] for e in index})
     rng = np.random.default_rng(a.seed)
     perm = rng.permutation(len(rows_all))
     dev_rows = {rows_all[i] for i in perm[:int(len(rows_all) * a.dev_share)]}
     t0 = time.time()
-    st = Store(a.cap, index)
-    print(f"loaded {len(index)} questions in {time.time() - t0:.0f} s; rows {len(rows_all)}, dev rows {len(dev_rows)}", flush=True)
+    st = Store(a.cap, index, max_passes=a.max_passes)
+    print(f"loaded {len(index)} questions in {time.time() - t0:.0f} s; rows {len(rows_all)}, dev rows {len(dev_rows)}; passes {st.NP}, evidence rows up to {st.rmax}", flush=True)
     tr_idx = np.array([i for i, e in enumerate(index) if e["row"] not in dev_rows])
     dv_idx = np.array([i for i, e in enumerate(index) if e["row"] in dev_rows])
     dv_index = [index[i] for i in dv_idx]
@@ -321,15 +345,76 @@ def cmd_train(a):
     print(f"best dev accuracy at the stopping pass {best[0]:.4f} at epoch {best[1]} (as shipped {base['acc_at_stop']:.4f})", flush=True)
 
 
+def cmd_train2(a):
+    """Several capture sources (--source rows:replies:capdir, repeatable), shuffled together every epoch; the epoch is chosen on a SEPARATE development
+    source (--dev-source), never on a slice of the training rows. Starts from the heads of --adapter (+ --init)."""
+    dev = torch.device("cuda")
+    torch.manual_seed(a.seed)
+    P0 = read_safetensors(os.path.join(a.adapter, "decision.safetensors"))
+    if a.init:
+        P0.update(torch.load(a.init))
+    index = []
+    for k, spec in enumerate(a.source):
+        rows, replies, capdir = spec.split(":")
+        part = load_index(rows, replies, cap_dir=capdir, src=f"s{k}")
+        print(f"source {k}: {rows}: {len(part)} questions, {len({e['row'] for e in part})} rows", flush=True)
+        index += part
+    rows, replies, capdir = a.dev_source.split(":")
+    dv_index = load_index(rows, replies, cap_dir=capdir, src="dev")
+    t0 = time.time()
+    st = Store("", index, max_passes=a.max_passes)
+    dv = Store("", dv_index, max_passes=a.max_passes)
+    print(f"loaded {len(index)} train and {len(dv_index)} development questions in {time.time() - t0:.0f} s; passes {st.NP}, evidence rows up to {st.rmax}", flush=True)
+    P = {k: (v.clone().to(dev).requires_grad_(k.startswith(TRAINED))) for k, v in P0.items()}
+    params = [v for k, v in P.items() if v.requires_grad]
+    opt = torch.optim.AdamW(params, lr=a.lr, weight_decay=a.weight_decay)
+    tgt = torch.tensor([e["target"] for e in index])
+    rng = np.random.default_rng(a.seed)
+    keep = ("n", "acc_per_pass", "nll_per_pass", "acc_at_stop", "by_question", "by_family")
+    base, _, _ = evaluate(P, dv, dv_index, dev)
+    print("development, starting heads:", json.dumps({k: base[k] for k in ("n", "acc_per_pass", "acc_at_stop", "by_question")}), flush=True)
+    os.makedirs(a.out, exist_ok=True)
+    hist, best = [{"epoch": 0, **{k: base[k] for k in keep}}], (base["acc_at_stop"], 0)
+    n = len(index)
+    steps = a.epochs * math.ceil(n / a.batch)
+    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=a.lr, total_steps=steps, pct_start=0.05, anneal_strategy="cos")
+    for ep in range(1, a.epochs + 1):
+        order = rng.permutation(n)                            # every epoch: all sources and families shuffled together
+        tot, nb, t1 = 0.0, 0, time.time()
+        for b0 in range(0, n, a.batch):
+            idx = np.sort(order[b0:b0 + a.batch])
+            lg = forward_all(P, st, idx, dev)
+            t = tgt[idx].to(dev)
+            loss = sum(F.cross_entropy(lg[:, p], t) for p in range(st.NP)) / st.NP
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(params, 1.0)
+            opt.step()
+            sched.step()
+            tot, nb = tot + float(loss), nb + 1
+        ev, _, _ = evaluate(P, dv, dv_index, dev)
+        rec = {"epoch": ep, "train_loss": tot / nb, "seconds": time.time() - t1, **{k: ev[k] for k in keep}}
+        hist.append(rec)
+        print(json.dumps({k: rec[k] for k in ("epoch", "train_loss", "acc_per_pass", "acc_at_stop", "seconds")}), flush=True)
+        torch.save({k: v.detach().cpu() for k, v in P.items()}, os.path.join(a.out, f"heads-e{ep}.pt"))
+        if ev["acc_at_stop"] > best[0]:
+            best = (ev["acc_at_stop"], ep)
+    if best[1]:
+        shutil.copy2(os.path.join(a.out, f"heads-e{best[1]}.pt"), os.path.join(a.out, "heads.pt"))
+    json.dump({"args": vars(a), "history": hist, "best_dev_acc_at_stop": best[0], "best_epoch": best[1], "train_questions": n, "dev_questions": len(dv_index)},
+              open(os.path.join(a.out, "train.json"), "w"), indent=1)
+    print(f"best development accuracy at the stopping pass {best[0]:.4f} at epoch {best[1]} (starting heads {base['acc_at_stop']:.4f})", flush=True)
+
+
 def cmd_eval(a):
     dev = torch.device("cuda")
     P = read_safetensors(os.path.join(a.adapter, "decision.safetensors"))
     if a.heads:
         P.update(torch.load(a.heads))
     P = {k: v.to(dev) for k, v in P.items()}
-    index = load_index(a.rows, a.replies, a.manifest, a.split)
-    st = Store(a.cap, index)
-    ev, _, _ = evaluate(P, st, index, dev)
+    index = load_index(a.rows, a.replies, a.manifest or None, a.split or None, families=set(a.families.split(",")) if a.families else None)
+    st = Store(a.cap, index, max_passes=a.max_passes)
+    ev, _, _ = evaluate(P, st, index, dev, bs=a.batch)
     json.dump(ev, open(a.out, "w"), indent=1)
     print(json.dumps({k: ev[k] for k in ("n", "acc_per_pass", "acc_at_stop", "by_question")}))
 
@@ -365,14 +450,15 @@ def cmd_write(a):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=("parity", "train", "eval", "write"))
+    ap.add_argument("cmd", choices=("parity", "train", "train2", "eval", "write"))
+    ap.add_argument("--source", action="append", default=[]); ap.add_argument("--dev-source", default="")
     ap.add_argument("--adapter", required=True); ap.add_argument("--cap", default=""); ap.add_argument("--replies", default=""); ap.add_argument("--rows", default="")
     ap.add_argument("--manifest", default=""); ap.add_argument("--split", default=""); ap.add_argument("--heads", default=""); ap.add_argument("--out", default="")
     ap.add_argument("--n", type=int, default=200); ap.add_argument("--epochs", type=int, default=12); ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--weight-decay", type=float, default=0.01); ap.add_argument("--batch", type=int, default=128); ap.add_argument("--dev-share", type=float, default=0.1)
-    ap.add_argument("--seed", type=int, default=20261127)
+    ap.add_argument("--seed", type=int, default=20261127); ap.add_argument("--families", default=""); ap.add_argument("--init", default=""); ap.add_argument("--max-passes", type=int, default=0)
     a = ap.parse_args()
-    {"parity": cmd_parity, "train": cmd_train, "eval": cmd_eval, "write": cmd_write}[a.cmd](a)
+    {"parity": cmd_parity, "train": cmd_train, "train2": cmd_train2, "eval": cmd_eval, "write": cmd_write}[a.cmd](a)
 
 
 if __name__ == "__main__":

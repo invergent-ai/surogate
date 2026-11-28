@@ -34,6 +34,13 @@ Measured (8 x RTX 5090: 6 trainer cards, 2 rollout engines; expert LoRA B only; 
   interval 67.2 to 75.2) in 59 steps, control 24.0 %, damage 0.0054, all four houses answered. First seed: about 0.75 by step 26, then no further update:
   the policy never answered one of the four houses, every prompt's samples agreed, so no prompt had a pass / fail spread (held-out 76.6 %). A real loop
   needs a guard against that collapse (exploration).
+- Untruncated training rollouts (--roll-top-p 1.0 --roll-top-k 0, the default now; the reads keep the served pins): the first C1 seed again, with only
+  that change, LEARNED without a hole: held-out 23.8 % -> 94.5 % (+70.7 pp, interval 66.6 to 74.8) in 31 steps, control 23.6 %. With top_p 0.95 /
+  top_k 20 a class whose probability falls under the cut is never sampled again and cannot earn its reward.
+- --thinking (whole replies with a thinking segment, about 800 tokens, the loss on every sampled token; a prompt wording that asks for a quick guess, or
+  the model thinks to the cap): NOT learned in 18 steps x 256 and 23 steps x 512 rollouts (pass 26-29 %). In this game the thinking carries no
+  information about the answer, so one or two tokens of a reply carry the signal: the worst case for credit assignment, not a statement about tasks
+  whose reasoning decides the outcome.
 The rate matters more than anything else here: check steps x rate against a working supervised recipe before an RL run, and expect a flat stretch first.
 """
 import argparse
@@ -176,11 +183,11 @@ def render_prompts(eng, prompts):
         return dict(ex.map(one, range(len(prompts))))
 
 
-def sample(eng, jobs, max_tokens, concurrency=32):
+def sample(eng, jobs, max_tokens, concurrency=32, pins=None):
     """jobs: [{"key", "ids" (prompt + opener), "seed"}] -> per job {"C": completion ids, "lp": their log-probs, "text", "finish"}"""
     def one(k):
         j = jobs[k]
-        body = {"tokens": j["ids"], "messages": [{"role": "user", "content": ""}], "max_tokens": max_tokens, **PINS, "model": "eff-policy", "logprobs": True,
+        body = {"tokens": j["ids"], "messages": [{"role": "user", "content": ""}], "max_tokens": max_tokens, **(pins or PINS), "model": "eff-policy", "logprobs": True,
                 "return_token_ids": True, "stream": False, "skip_special_tokens": False, "seed": j["seed"]}
         r = post(eng.ports[k % len(eng.ports)], "/v1/chat/completions/tokens", body)
         ch = r["choices"][0]
@@ -199,6 +206,24 @@ def sample(eng, jobs, max_tokens, concurrency=32):
 
 DIGIT = {"1": 16, "2": 17, "3": 18, "4": 19}                   # the house digits' token ids
 END_MESSAGE = 200010
+
+
+def sample_chat(eng, jobs, max_tokens, pins, concurrency=None):
+    """a whole reply as served (thinking on) through the chat route. jobs: [{"prompt", "seed"}] -> {"P": prompt ids, "C", "lp", "text", "finish"}"""
+    def one(k):
+        j = jobs[k]
+        body = {"model": "eff-policy", "messages": [{"role": "user", "content": j["prompt"]}], "max_tokens": max_tokens, **pins, "chat_template_kwargs": dict(CTK),
+                "logprobs": True, "return_token_ids": True, "stream": False, "seed": j["seed"]}
+        r = post(eng.ports[k % len(eng.ports)], "/v1/chat/completions", body, timeout=3600)
+        ch = r["choices"][0]
+        P = [int(x) for x in (r.get("prompt_token_ids") or ch.get("prompt_token_ids"))]
+        C = [int(x) for x in ch["token_ids"]]
+        lp = [float(x["logprob"]) for x in ch["logprobs"]["content"]]
+        if not C or len(lp) != len(C) or not all(np.isfinite(lp)):
+            raise RuntimeError(f"malformed reply: {len(C)} completion ids, {len(lp)} log-probs")
+        return {"P": P, "C": C, "lp": lp, "text": (ch.get("message") or {}).get("content") or "", "finish": ch.get("finish_reason")}
+    with cf.ThreadPoolExecutor(concurrency or 8 * len(eng.ports)) as ex:
+        return list(ex.map(one, range(len(jobs))))
 
 
 def make_row(Row, ids, C, lp, version, trial, group, adv):
@@ -221,6 +246,12 @@ def main():
     ap.add_argument("--shape", default="expert-b", choices=("expert-b", "attn64-ab"), help="expert-b: expert LoRA r16, B only; attn64-ab: rank-64 attention adapters (alpha 32) + expert A and B")
     ap.add_argument("--stop-pass", type=float, default=0.0, help="leave the step loop for the end reads once the mean on-policy pass of the last --stop-window steps reaches this")
     ap.add_argument("--stop-window", type=int, default=5)
+    ap.add_argument("--roll-top-p", type=float, default=1.0, help="top_p of the TRAINING rollouts (the reads keep the served pins); 1.0 with --roll-top-k 0 = untruncated")
+    ap.add_argument("--roll-top-k", type=int, default=0)
+    ap.add_argument("--thinking", action="store_true", help="whole replies as served (thinking on) through the chat route; loss on every sampled token; cut replies are left out of the update")
+    ap.add_argument("--cap", type=int, default=8192, help="reply cap in tokens (--thinking)"); ap.add_argument("--n-engines", type=int, default=0, help="> 0: the last N of all cards given serve rollouts")
+    ap.add_argument("--prompts-per-step", type=int, default=32); ap.add_argument("--max-hours", type=float, default=0.0)
+    ap.add_argument("--futility-step", type=int, default=0); ap.add_argument("--futility-pass", type=float, default=0.32)
     ap.add_argument("--sft", action="store_true", help="the supervised control: train on the gold reply of each prompt (advantage +1, ratio 1) instead of the sampled replies")
     ap.add_argument("--seed", type=int, default=20261127); ap.add_argument("--heldout-n", type=int, default=512); ap.add_argument("--max-tokens", type=int, default=2)
     ap.add_argument("--damage-n", type=int, default=16); ap.add_argument("--damage-max-tokens", type=int, default=768); ap.add_argument("--K", type=int, default=48)
@@ -228,6 +259,13 @@ def main():
     global FLAGS
     if a.shape == "attn64-ab":
         FLAGS = FLAGS.replace("--max-lora-rank 16", "--max-lora-rank 64")
+    roll_pins = {"temperature": 1.0, "top_p": a.roll_top_p, "top_k": a.roll_top_k}
+    if a.thinking and a.sft:
+        raise SystemExit("--thinking and --sft do not go together")
+    if a.n_engines:
+        allc = a.trainer_cards.split(",") + a.engine_cards.split(",")
+        a.trainer_cards, a.engine_cards = ",".join(allc[:-a.n_engines]), ",".join(allc[-a.n_engines:])
+    t_start = time.time()
     sys.path.insert(0, a.pack)
     from surogate.inkling_rl.records import Row
     import t8_skyrl as SK
@@ -257,8 +295,11 @@ def main():
         log(f"rendered {len(ids)} prompts; lengths {min(map(len, ids.values()))}-{max(map(len, ids.values()))} tokens")
 
         def read_heldout(tag):
-            jobs = [{"ids": ids[p["id"]] + OPENER, "seed": attempt_seed(a.seed, "heldout", k)} for k, p in enumerate(held)]
-            res = sample(eng, jobs, a.max_tokens)
+            if a.thinking:
+                res = sample_chat(eng, [{"prompt": p["prompt"], "seed": attempt_seed(a.seed, "heldout", k)} for k, p in enumerate(held)], a.cap, PINS)
+            else:
+                jobs = [{"ids": ids[p["id"]] + OPENER, "seed": attempt_seed(a.seed, "heldout", k)} for k, p in enumerate(held)]
+                res = sample(eng, jobs, a.max_tokens)
             ok = [int(grade(r["text"], p["gold"])["reward"]) for r, p in zip(res, held)]
             ans = [grade(r["text"], p["gold"]).get("answer_norm") for r, p in zip(res, held)]
             out = {"tag": tag, "n": len(held), "pass": float(np.mean(ok)), "per_prompt": ok, "answers": ans, "cut": float(np.mean([r["finish"] == "length" for r in res])),
@@ -297,20 +338,36 @@ def main():
         adapter = zero
         for v in range(a.steps):
             t0 = time.time()
-            ps = [train[i] for i in blocks[v]]
-            jobs = [{"ids": ids[p["id"]] + OPENER, "seed": attempt_seed(a.seed, "train", v, g, s)} for g, p in enumerate(ps) for s in range(a.samples)]
-            res = sample(eng, jobs, a.max_tokens)
+            ps = [train[i] for i in blocks[v]][:a.prompts_per_step]
+            if a.thinking:
+                jobs = [{"prompt": p["prompt"], "seed": attempt_seed(a.seed, "train", v, g, s)} for g, p in enumerate(ps) for s in range(a.samples)]
+                res = sample_chat(eng, jobs, a.cap, roll_pins)
+                for j, r in zip(jobs, res):
+                    j["ids"] = r["P"]
+            else:
+                jobs = [{"ids": ids[p["id"]] + OPENER, "seed": attempt_seed(a.seed, "train", v, g, s)} for g, p in enumerate(ps) for s in range(a.samples)]
+                res = sample(eng, jobs, a.max_tokens, pins=roll_pins)
             t_roll = time.time() - t0
             with open(os.path.join(S, f"samples-v{v}.jsonl"), "w") as f:      # every reply as sampled (ids, text, finish reason)
                 for n, r in enumerate(res):
-                    f.write(json.dumps({"n": n, "gold": ps[n // a.samples]["gold"], "C": r["C"], "text": r["text"], "finish": r["finish"]}) + "\n")
+                    f.write(json.dumps({"n": n, "gold": ps[n // a.samples]["gold"], "C": (len(r["C"]) if a.thinking else r["C"]), "text": r["text"][:200], "finish": r["finish"]}) + "\n")
             rew, grp, fin = [], [], []
             for n, r in enumerate(res):
                 g = n // a.samples
                 rew.append(float(grade(r["text"], ps[g]["gold"])["reward"]))
                 grp.append(g)
-                fin.append(len(r["C"]) == a.max_tokens or r["finish"] != "length")   # the reply IS its first max_tokens tokens (the digit and <|end_message|>): the cap is the design, not a cut
-            adv = SK.grpo_advantages(rew, grp)
+                fin.append((r["finish"] != "length") if a.thinking else (len(r["C"]) == a.max_tokens or r["finish"] != "length"))   # the reply IS its first max_tokens tokens (the digit and <|end_message|>): the cap is the design, not a cut
+            if a.thinking:                                     # a cut reply has no answer: it is left out of its prompt's group, not scored as a failure
+                keep = [n for n in range(len(res)) if fin[n]]
+                cnt = {}
+                for n in keep:
+                    cnt[grp[n]] = cnt.get(grp[n], 0) + 1
+                keep = [n for n in keep if cnt[grp[n]] >= 2]   # one finished reply alone has no baseline (GRPO would give it its raw reward)
+                adv = [0.0] * len(res)
+                for n, x in zip(keep, SK.grpo_advantages([rew[n] for n in keep], [grp[n] for n in keep]) if keep else []):
+                    adv[n] = float(x)
+            else:
+                adv = SK.grpo_advantages(rew, grp)
             rows = [make_row(Row, jobs[n]["ids"], r["C"], r["lp"], v, v * 100000 + n, n // a.samples, adv[n]) for n, r in enumerate(res) if fin[n] and adv[n] != 0.0]
             if a.sft:                                          # the supervised control: the same prompts, the gold reply, advantage +1; old log-probs = the trainer's own forward (ratio 1)
                 gold = [make_row(Row, ids[p["id"]] + OPENER, [DIGIT[p["gold"]], END_MESSAGE], [0.0, 0.0], v, v * 100000 + g, g, 1.0) for g, p in enumerate(ps)]
@@ -328,7 +385,7 @@ def main():
                    "pass_by_house": {str(k): [int(sum(rew[n] for n in range(len(res)) if ps[n // a.samples]["gold"] == str(k))), int(sum(1 for n in range(len(res)) if ps[n // a.samples]["gold"] == str(k)))] for k in (1, 2, 3, 4)}}
             if a.sft:
                 rec["gold_digit_nll"] = rec_gold_nll
-            if v == 0:
+            if v == 0 and rows:
                 rec["zero_adapter_checks"] = len(tr.check_zero_adapter(rows[:2]))
             if rows:
                 t1 = time.time()
@@ -354,6 +411,12 @@ def main():
                 f.write(json.dumps(rec, default=float) + "\n")
             log(f"step {v}: on-policy pass {rec['pass']:.3f} (fresh prompts), answers {rec['answers']} not a digit {rec['not_a_digit']}, rows {rec['rows']} of "
                 f"{rec['rollouts']}, mixed prompts {mixed}, grad norm {rec['grad_norm']}, damage {rec.get('damage_nats_per_token')}, gold digit nll {rec.get('gold_digit_nll')}, {rec['seconds']:.0f} s")
+            if a.max_hours and (time.time() - t_start) / 3600.0 >= a.max_hours:
+                log(f"budget: {a.max_hours} hours reached; going to the end reads after step {v}")
+                break
+            if a.futility_step and len(steps) == a.futility_step and float(np.mean([x["pass"] for x in steps[-10:]])) < a.futility_pass:
+                log(f"futility: mean on-policy pass of steps {v - 9}-{v} under {a.futility_pass}; going to the end reads")
+                break
             if a.stop_pass and len(steps) >= a.stop_window and float(np.mean([x["pass"] for x in steps[-a.stop_window:]])) >= a.stop_pass:
                 log(f"stop line: mean on-policy pass of the last {a.stop_window} steps >= {a.stop_pass}; going to the end reads after step {v}")
                 break
